@@ -19,7 +19,7 @@ import inspect
 import json
 from typing import Any, Callable, Generic, TypeVar, get_type_hints, overload
 
-from thorn._context import ExecutionContext, get_context
+from thorn._context import ExecutionContext, get_context, reset_context, set_context
 from thorn._loop import _WrappedTool, run_agent_loop
 from thorn._schema import func_to_tool_schema, serialize_for_tool_result
 
@@ -165,12 +165,18 @@ def skill(
     *,
     tools: list[Any] | None = None,
     system: str | None = None,
+    role: type | None = None,
 ) -> Any:
     """Decorator that turns a function stub into a prompt-based skill.
 
     The function's **docstring** becomes the prompt template (with
     ``{param_name}`` placeholders filled from the call arguments), and
     the **return annotation** determines the expected result type.
+
+    When *role* is an ``Agent`` subclass, the skill automatically
+    instantiates it (forwarding the call's bound arguments as kwargs),
+    collects its system prompts and tools via MRO, and sets
+    ``context.agent`` on the child execution context.
 
     Can be used bare or with configuration::
 
@@ -181,6 +187,10 @@ def skill(
         @skill(tools=[read_file])
         async def lint(path: str) -> list[str]:
             \"\"\"Lint the file at {path}.\"\"\"
+
+        @skill(role=Architect)
+        async def architect_module(module: str) -> None:
+            \"\"\"Define architecture for module `{module}`.\"\"\"
     """
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -190,7 +200,6 @@ def skill(
 
         @functools.wraps(fn)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            # Bind positional + keyword args to parameter names.
             sig = inspect.signature(fn)
             bound = sig.bind(*args, **kwargs)
             bound.apply_defaults()
@@ -199,29 +208,46 @@ def skill(
             prompt_text = template.format(**all_kwargs)
 
             ctx = get_context()
-            child = ctx.push_scope(f"skill:{fn.__name__}")
 
-            sys_prompts: list[str] | None = None
-            if system:
-                sys_prompts = [system]
+            if role is not None:
+                role_instance = role(**all_kwargs)
+                sys_prompts = role_instance._render_system_prompts()
+                if system:
+                    sys_prompts.append(system)
 
-            return await run_agent_loop(
-                context=child,
-                user_prompt=prompt_text,
-                tools=_prepare_tools(tools),
-                system_prompts=sys_prompts,
-                result_type=return_type,
-            )
+                role_tools = type(role_instance)._collect_tools()
+                combined = role_tools + (tools or [])
+                prepared = _prepare_tools(combined)
 
-        # Attach metadata so wrap_function / the CLI can inspect it.
+                child = ctx.push_scope(f"skill:{fn.__name__}", agent=role_instance)
+                token = set_context(child)
+                try:
+                    return await run_agent_loop(
+                        context=child,
+                        user_prompt=prompt_text,
+                        tools=prepared,
+                        system_prompts=sys_prompts,
+                        result_type=return_type,
+                    )
+                finally:
+                    reset_context(token)
+            else:
+                child = ctx.push_scope(f"skill:{fn.__name__}")
+                sys_prompts = [system] if system else None
+                return await run_agent_loop(
+                    context=child,
+                    user_prompt=prompt_text,
+                    tools=_prepare_tools(tools),
+                    system_prompts=sys_prompts,
+                    result_type=return_type,
+                )
+
         wrapper._thorn_skill = True  # type: ignore[attr-defined]
         wrapper._thorn_return_type = return_type  # type: ignore[attr-defined]
         return wrapper
 
     if fn is not None:
-        # Bare ``@skill`` (no parentheses).
         return decorator(fn)
-    # ``@skill(tools=[...])`` — return the decorator for later application.
     return decorator
 
 

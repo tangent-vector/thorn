@@ -36,6 +36,7 @@ from thorn._context import (
     get_context,
     set_context,
 )
+from thorn._agent import Agent
 from thorn._discovery import discover_tools
 from thorn._func import prompt, skill, tool, wrap_function
 from thorn._loop import _WrappedTool
@@ -66,6 +67,7 @@ T = TypeVar("T")
 
 __all__ = [
     # Core API
+    "Agent",
     "prompt",
     "skill",
     "tool",

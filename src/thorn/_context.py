@@ -111,6 +111,21 @@ class ConsoleEventSink(EventSink):
         self._console = Console()
         self._in_text = False
 
+    def _safe_print(self, *args: Any, **kwargs: Any) -> None:
+        """Print with fallback for terminals that cannot encode all characters."""
+        try:
+            self._console.print(*args, **kwargs)
+        except UnicodeEncodeError:
+            sanitized = tuple(
+                s.encode("ascii", errors="replace").decode("ascii")
+                if isinstance(s, str) else s
+                for s in args
+            )
+            try:
+                self._console.print(*sanitized, **kwargs)
+            except UnicodeEncodeError:
+                pass
+
     async def on_response_chunk(
         self,
         chunk: ResponseChunk,
@@ -120,19 +135,19 @@ class ConsoleEventSink(EventSink):
 
         match chunk:
             case TextChunk():
-                self._console.print(chunk.text, end="", highlight=False)
+                self._safe_print(chunk.text, end="", highlight=False)
                 self._in_text = True
             case ToolCallChunk():
                 if self._in_text:
-                    self._console.print()
+                    self._safe_print()
                     self._in_text = False
                 indent = "  " * (scope.depth if scope else 1)
-                self._console.print(
+                self._safe_print(
                     f"{indent}[dim]tool:[/dim] {chunk.name}", highlight=False,
                 )
             case FinishChunk():
                 if self._in_text:
-                    self._console.print()
+                    self._safe_print()
                     self._in_text = False
 
     async def on_status(
@@ -141,12 +156,15 @@ class ConsoleEventSink(EventSink):
         scope: Scope | None = None,
     ) -> None:
         indent = "  " * (scope.depth if scope else 1)
-        self._console.print(f"{indent}[dim]{message}[/dim]", highlight=False)
+        self._safe_print(f"{indent}[dim]{message}[/dim]", highlight=False)
 
 
 # ---------------------------------------------------------------------------
 # Execution context
 # ---------------------------------------------------------------------------
+
+_UNSET = object()
+
 
 @dataclass
 class ExecutionContext:
@@ -158,15 +176,23 @@ class ExecutionContext:
         scope:      Current position in the nested scope chain.
         system_prompts: Extra system-prompt strings that apply to every
                         agent created under this context.
+        agent:      The current ``Agent`` instance, if running inside one.
     """
 
     provider: LLMProvider
     event_sink: EventSink = field(default_factory=NullEventSink)
     scope: Scope | None = None
     system_prompts: list[str] = field(default_factory=list)
+    agent: Any = None
 
-    def push_scope(self, description: str, **metadata: Any) -> ExecutionContext:
-        """Return a *new* context with one more scope level pushed."""
+    def push_scope(
+        self, description: str, *, agent: Any = _UNSET, **metadata: Any,
+    ) -> ExecutionContext:
+        """Return a *new* context with one more scope level pushed.
+
+        The *agent* field is propagated from the parent unless explicitly
+        overridden (pass ``agent=<instance>`` or ``agent=None``).
+        """
         new_scope = Scope(
             description=description,
             outer=self.scope,
@@ -177,6 +203,7 @@ class ExecutionContext:
             event_sink=self.event_sink,
             scope=new_scope,
             system_prompts=list(self.system_prompts),
+            agent=self.agent if agent is _UNSET else agent,
         )
 
 

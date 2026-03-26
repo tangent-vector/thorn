@@ -1,100 +1,405 @@
-"""Build tools for the calc example project.
+"""Development workflow tools and roles for the calc project.
 
-These are auto-discovered by thorn from the .thorn/ directory.
+Combines deterministic filesystem-based module management, agent role
+definitions, and structured workflow functions.
 """
 
 from __future__ import annotations
 
-import asyncio
+import importlib.util
+import re
 from pathlib import Path
+from typing import Any
 
-import thorn
-from thorn import tool, prompt, skill
+from thorn import Agent, read_file, run_shell, skill, tool, write_file
+from thorn._tools import list_directory
+
+# ---------------------------------------------------------------------------
+# Project layout
+# ---------------------------------------------------------------------------
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-SOURCE_DIR = PROJECT_DIR / "src"
+SOURCE_ROOT = PROJECT_DIR / "src"
+
+# ---------------------------------------------------------------------------
+# Import build tools from sibling file (private names to avoid re-discovery)
+# ---------------------------------------------------------------------------
+
+
+def _load_sibling(name: str) -> Any:
+    path = Path(__file__).parent / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(
+        f"_thorn_sibling_.{name}", path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load sibling module: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_build_mod = _load_sibling("build_tools")
+_build = _build_mod.build
+_run_calc = _build_mod.run_calc
+
+# ---------------------------------------------------------------------------
+# Deterministic module tools (pure Python, no LLM calls)
+# ---------------------------------------------------------------------------
+
 
 @tool
-async def add_module(name: str, description: str) -> None:
-    """Add a new module to the project, given a name and brief description."""
+def list_submodules(name: str) -> list[str]:
+    """List the direct child module names of the given module.
 
-    await prompt(f"""
-Add a new module named `{name}` to the project, comprising a paired header and source file under the `src/` directory.
-If somehow corresponding files already exist, do not overwrite them, and instead raise an error to ensure the situation is brought to the user's attention.
-
-You should fill in the header file with an initial comment based on user-provided description:
-
-{description}
-
-Do NOT include additional content in the header file. Your only task is to put the files into place.
-
-The source file should include the header file, and should be empty otherwise.
-""",
-        tools=[thorn.read_file, thorn.write_file, thorn.list_directory])
-
-@skill(tools=[thorn.read_file, thorn.list_directory])
-async def list_submodules(name: str) -> list[str]:
+    Returns simple (unqualified) names. For example, list_submodules("parser")
+    might return ["lexer", "ast_node"]. Returns [] for leaf modules.
     """
-List the names of the sub-modules of the module `{name}`.
+    if name == "main":
+        children_dir = SOURCE_ROOT
+    else:
+        children_dir = SOURCE_ROOT / name.replace(".", "/")
 
-You should use the content of the header and/or source file for the module
-to determine what its sub-modules are, from the architecture description given.
-"""
+    if not children_dir.is_dir():
+        return []
+    return sorted(p.stem for p in children_dir.glob("*.h"))
+
 
 @tool
-async def define_architecture(name: str) -> str:
-    """Define the architecture for a module."""
+def module_header_path(name: str) -> str:
+    """Return the filesystem path to a module's header file.
 
-    await prompt(f"""
-You are responsible for defining the architecture for the module `{name}`.
-The source and header files for the module should already be in place under `src/`;
-if they are not, you should raise an error to ensure the situation is brought to the user's attention.
+    Example: module_header_path("parser.lexer") returns the path to
+    src/parser/lexer.h.
+    """
+    parts = name.split(".")
+    dir_path = SOURCE_ROOT
+    for p in parts[:-1]:
+        dir_path = dir_path / p
+    return str(dir_path / (parts[-1] + ".h"))
 
-In the case where the module is `main`, you should take responsibility for the `main.cpp` file,
-and there will (almost always) be no corresponding header.
 
-Be aware that your responsibilities are very narrow. You should:
+@tool
+def module_source_path(name: str) -> str:
+    """Return the filesystem path to a module's source file.
 
-  - Read and respect any existing comments or other content in the files you are
-    responsible for. If there are existing design decisions laid out in the comments
-    for your module, then assume those represent the user's intentions and do not
-    override them.
+    Example: module_source_path("parser.lexer") returns the path to
+    src/parser/lexer.cpp.
+    """
+    parts = name.split(".")
+    dir_path = SOURCE_ROOT
+    for p in parts[:-1]:
+        dir_path = dir_path / p
+    return str(dir_path / (parts[-1] + ".cpp"))
 
-  - Ensure the header file for the module (or `main.cpp`) starts with a comment block
-    that clearly states the purpose, responsibilities, and requirements of the module.
 
-  - Describe how the module is decomposed into sub-modules, if any, and for
-    each sub-module, ensure that its files have been created using the `add_module` tool.
+@tool
+def add_module(name: str, parent: str, description: str) -> str:
+    """Create a new module (header + source) as a child of the given parent.
 
-    When in doubt, assume that even simple programs should be decomposed into modules,
-    so long as there are clearly distinct responsibilities or concerns that can be defined.
-    
-    If you are being invoked on a module that has well-written comments explaining its purpose,
-    but seemingly has no sub-modules, then you should assume you are responsible for creating
-    appropriate sub-modules, unless you are exceedingly confident that the implementation
-    of the module would comprise less than 50-100 lines of code.
+    Creates the files at the correct filesystem location per the project's
+    module hierarchy conventions. The header gets an initial comment block
+    with the Purpose section; the source just #includes the header.
 
-  - Describe the dependencies of the module, whether on other modules in the project,
-    standard libaries, or third-party libraries, and ensure that correct include directives
-    are added to the header and/or source file. Dependencies that are expected to impact
-    the public API of the module should be documented and included in the header file.
-    Dependencies that are expected to only be relevant to the implementation of the module
-    should be included in the source file only, and may be documented in the source file
-    rather than the header file, if they are best thought of as implementation details only.
+    Returns the qualified name of the new module.
+    """
+    qualified = f"{parent}.{name}" if parent != "main" else name
 
-Do NOT write any code, whether that's declarations, definitions, etc.
+    header = Path(module_header_path(qualified))
+    source = Path(module_source_path(qualified))
 
-Do NOT be overly prescriptive about the architecture and design of your sub-modules.
-If you are listing specific names for types, functions, etc. that you expect a sub-module to define or provide,
-then you are trying to do more than your job description allows.
+    if header.exists():
+        raise FileExistsError(f"Header already exists: {header}")
+    if source.exists():
+        raise FileExistsError(f"Source already exists: {source}")
+
+    header.parent.mkdir(parents=True, exist_ok=True)
+    source.parent.mkdir(parents=True, exist_ok=True)
+
+    include_path = header.relative_to(SOURCE_ROOT).as_posix()
+    guard = f"CALC_{qualified.upper().replace('.', '_')}_H"
+
+    header.write_text(
+        f"""\
+#ifndef {guard}
+#define {guard}
+
+// ============================================================================
+// Module: {qualified}
+// ============================================================================
+//
+// Purpose:
+//   {description}
+//
+// Responsibilities:
+//   (to be defined by architect)
+//
+// Dependencies:
+//   (to be defined by architect)
+//
+
+#endif // {guard}
 """,
-        tools=[thorn.read_file, thorn.write_file, thorn.list_directory, add_module])
+        encoding="utf-8",
+    )
+
+    source.write_text(f'#include "{include_path}"\n', encoding="utf-8")
+
+    return qualified
+
 
 @tool
-async def fully_define_architecture(name: str) -> str:
-    """Define the architecture for a module and its sub-modules, recursively."""
+def list_all_modules(root: str) -> list[str]:
+    """Recursively list all module qualified names in the subtree.
 
-    await define_architecture(name)
-    submodules = await list_submodules(name)
-    for submodule in submodules:
-        await fully_define_architecture(submodule)
+    Includes the root itself. Uses filesystem traversal, not LLM calls.
+    """
+    result = [root]
+    for child in list_submodules(root):
+        qualified = f"{root}.{child}" if root != "main" else child
+        result.extend(list_all_modules(qualified))
+    return result
+
+
+_INCLUDE_RE = re.compile(r'#include\s+"([^"]+)"')
+
+
+@tool
+def dependency_order(root: str) -> list[str]:
+    """Return modules in bottom-up dependency order (dependencies first).
+
+    Parses #include "..." directives from header files to build a
+    dependency graph among modules in the tree. Uses Kahn's algorithm
+    for topological sorting.
+    """
+    all_modules = list_all_modules(root)
+    module_set = set(all_modules)
+
+    deps: dict[str, set[str]] = {m: set() for m in all_modules}
+
+    for mod in all_modules:
+        if mod == "main":
+            file_path = SOURCE_ROOT / "main.cpp"
+        else:
+            file_path = Path(module_header_path(mod))
+
+        if not file_path.exists():
+            continue
+
+        content = file_path.read_text(encoding="utf-8")
+        for match in _INCLUDE_RE.finditer(content):
+            inc = match.group(1)
+            if inc.endswith(".h"):
+                inc = inc[:-2]
+            qualified = inc.replace("/", ".").replace("\\", ".")
+            if qualified in module_set and qualified != mod:
+                deps[mod].add(qualified)
+
+    # Kahn's algorithm
+    in_degree = {m: len(deps[m]) for m in all_modules}
+    dependents: dict[str, list[str]] = {m: [] for m in all_modules}
+    for m, dep_set in deps.items():
+        for d in dep_set:
+            dependents[d].append(m)
+
+    queue = sorted(m for m in all_modules if in_degree[m] == 0)
+    result: list[str] = []
+
+    while queue:
+        node = queue.pop(0)
+        result.append(node)
+        for dep in sorted(dependents[node]):
+            in_degree[dep] -= 1
+            if in_degree[dep] == 0:
+                queue.append(dep)
+                queue.sort()
+
+    if len(result) < len(all_modules):
+        remaining = sorted(m for m in all_modules if m not in set(result))
+        result.extend(remaining)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Shared system prompt fragments
+# ---------------------------------------------------------------------------
+
+_COMMENT_CONVENTION = """\
+Code files use structured leading comments (C++ style) with these sections:
+- Purpose: 1-2 sentences on what the module does
+- Responsibilities: Bullet list of this module's responsibilities
+- Dependencies: Internal project modules and external libraries
+- Requirements/Constraints: Design constraints (optional)
+
+Do NOT include a "Sub-modules" section in comments. Sub-module structure \
+is determined by the filesystem (the presence of a name/ directory), not \
+by comments."""
+
+_FILESYSTEM_CONVENTION = """\
+This project uses a hierarchical module layout under src/:
+
+- Module code: parent_dir/name.h + parent_dir/name.cpp
+- Children directory: if module has children, they live in parent_dir/name/
+- Root module (main): src/main.cpp is the entry point (no header). \
+Its children are .h files directly in src/.
+- Include paths are relative to src/. \
+Examples: #include "expression.h", #include "parser/lexer.h"
+- Namespaces should mirror the module hierarchy (e.g., namespace parser::lexer)
+
+Qualified names use dots: parser.lexer means the file at src/parser/lexer.h. \
+The root module "main" is special -- its children use simple names \
+(e.g., "parser", not "main.parser")."""
+
+# ---------------------------------------------------------------------------
+# Role definitions (project-agnostic names)
+# ---------------------------------------------------------------------------
+
+
+class Developer(Agent):
+    """Base for modular development workflow agents."""
+
+    system_prompts = [
+        "You are working on module `{module}` of a C++ project.",
+        "You are ONLY responsible for `{module}` itself -- not its parent, "
+        "not its children. Each module has its own responsible agent.",
+        _COMMENT_CONVENTION,
+        _FILESYSTEM_CONVENTION,
+    ]
+    tools = [
+        read_file, list_directory, list_submodules,
+        module_header_path, module_source_path, list_all_modules,
+    ]
+
+
+class Architect(Developer):
+    """Decomposes modules into sub-modules, defines structure."""
+
+    system_prompts = [
+        "You are architect@{module}. Your job is to decompose this module "
+        "into sub-modules and define the high-level structure.",
+        "You write/update description comments in header files and create "
+        "sub-module files via the add_module tool. You do NOT write any code "
+        "(no declarations, no definitions, no implementations).",
+        "If this module already has well-written description comments and you "
+        "do not see a need for sub-modules, that is a valid outcome.",
+    ]
+    tools = [write_file, add_module]
+
+
+class APIDesigner(Developer):
+    """Designs public API declarations for a module."""
+
+    system_prompts = [
+        "You are api_designer@{module}. You design the public API by writing "
+        "declarations (types, function signatures, class definitions) in the "
+        "module's header file.",
+        "Write declarations ONLY. Do not write function bodies or "
+        "implementations. Read sibling and dependency module headers to "
+        "understand the types available.",
+    ]
+    tools = [write_file]
+
+
+class TestEngineer(Developer):
+    """Writes black-box tests against declared APIs."""
+
+    system_prompts = [
+        "You are test_engineer@{module}. You write black-box tests that "
+        "exercise the public API declared in the module's header.",
+        "Do not modify the module's header or source file. Only create or "
+        "modify test files.",
+    ]
+    tools = [write_file]
+
+
+class Implementer(Developer):
+    """Implements declared APIs in source files."""
+
+    system_prompts = [
+        "You are implementer@{module}. You fill in the implementation in "
+        "the module's .cpp source file to satisfy the declarations in its "
+        "header.",
+        "Do not modify the header file or test files. Build and run tests "
+        "to verify your implementation.",
+    ]
+    tools = [write_file, run_shell, _build, _run_calc]
+
+
+class Coordinator(Developer):
+    """Local authority that inspects state and delegates work."""
+
+    system_prompts = [
+        "You are coordinator@{module}. You inspect the current state of "
+        "your module and its children, decide what work needs to be done, "
+        "and delegate to the appropriate role-specific agent.",
+        "You do NOT write code or modify files directly.",
+    ]
+    tools = []
+
+
+# ---------------------------------------------------------------------------
+# Workflow functions
+# ---------------------------------------------------------------------------
+
+
+@skill(role=Architect)
+async def architect_module(module: str) -> None:
+    """Define architecture for module `{module}`. Read its existing files,
+    flesh out the description, and create sub-modules via add_module as
+    needed. Do not write code -- only descriptions and structure."""
+
+
+@tool
+async def fully_architect(name: str) -> None:
+    """Architect a module and recursively architect all children."""
+    await architect_module(name)
+    for child in list_submodules(name):
+        qualified = f"{name}.{child}" if name != "main" else child
+        await fully_architect(qualified)
+
+
+@skill(role=APIDesigner)
+async def design_module_api(module: str) -> None:
+    """Design the public API for module `{module}`. Write type definitions
+    and function declarations in the header file. Read dependency headers
+    to understand available types. Write declarations only -- no
+    implementations."""
+
+
+@tool
+async def design_all_apis(root: str) -> None:
+    """Design APIs for all modules bottom-up in dependency order."""
+    for name in dependency_order(root):
+        if name == "main":
+            continue
+        await design_module_api(name)
+
+
+@skill(role=TestEngineer)
+async def write_module_tests(module: str) -> None:
+    """Write black-box tests for module `{module}`. Create test files that
+    exercise the public API declared in the module's header. Focus on
+    correctness and edge cases."""
+
+
+@tool
+async def test_all(root: str) -> None:
+    """Write tests for all modules bottom-up in dependency order."""
+    for name in dependency_order(root):
+        if name == "main":
+            continue
+        await write_module_tests(name)
+
+
+@skill(role=Implementer)
+async def implement_module(module: str) -> None:
+    """Implement the declared API for module `{module}` in its .cpp source
+    file. Fill in function bodies to satisfy the declarations in the header.
+    Build the project after making changes to verify compilation."""
+
+
+@tool
+async def implement_all(root: str) -> None:
+    """Implement all modules bottom-up in dependency order."""
+    for name in dependency_order(root):
+        await implement_module(name)
