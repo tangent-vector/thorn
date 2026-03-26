@@ -145,6 +145,11 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool) -> No
                     context=ctx,
                     user_prompt=prompt_text,
                     tools=tools,
+                    system_prompts=[
+                        "You are executing a single non-interactive request. "
+                        "Complete the task and report results concisely. "
+                        "Do not offer follow-up actions or ask questions.",
+                    ],
                 )
         finally:
             reset_context(token)
@@ -193,6 +198,10 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool) -> None:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
 
+    ctx.system_prompts.append(
+        "You are in an interactive chat session with a human user. "
+        "You may ask clarifying questions and suggest next steps."
+    )
     messages: list = []
 
     console.print("[bold]thorn[/bold] interactive chat  (Ctrl+C to exit)\n")
