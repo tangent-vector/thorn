@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from typing import Any
 
 import click
 from rich.console import Console
@@ -14,8 +15,9 @@ from thorn._context import (
     set_context,
     reset_context,
 )
+from thorn._discovery import discover_tools
 from thorn._func import _prepare_tools, prompt
-from thorn._loop import run_agent_loop
+from thorn._loop import run_agent_loop, _WrappedTool
 from thorn._provider import load_provider_from_env
 from thorn._tools import ALL_BUILTIN_TOOLS
 from thorn.errors import SkillError, ThornError
@@ -28,6 +30,27 @@ def _build_context() -> ExecutionContext:
     provider = load_provider_from_env()
     sink = ConsoleEventSink()
     return ExecutionContext(provider=provider, event_sink=sink)
+
+
+def _collect_tools(
+    *,
+    no_tools: bool,
+    no_discover: bool,
+) -> list[_WrappedTool]:
+    """Assemble the full tool set from builtins + discovered ``.thorn/`` tools."""
+    raw: list[Any] = []
+    if not no_tools:
+        raw.extend(ALL_BUILTIN_TOOLS)
+    if not no_discover:
+        discovered = discover_tools()
+        if discovered:
+            names = [getattr(fn, "__name__", "?") for fn in discovered]
+            console.print(
+                f"[dim]discovered tools:[/dim] {', '.join(names)}",
+                highlight=False,
+            )
+        raw.extend(discovered)
+    return _prepare_tools(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +74,13 @@ def main() -> None:
     default=False,
     help="Disable built-in tools (file I/O, shell, etc.).",
 )
-def run(prompt_text: str, no_tools: bool) -> None:
+@click.option(
+    "--no-discover",
+    is_flag=True,
+    default=False,
+    help="Skip .thorn/ directory discovery.",
+)
+def run(prompt_text: str, no_tools: bool, no_discover: bool) -> None:
     """Execute a single prompt and print the result."""
     try:
         ctx = _build_context()
@@ -59,7 +88,7 @@ def run(prompt_text: str, no_tools: bool) -> None:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
 
-    tools = _prepare_tools(ALL_BUILTIN_TOOLS) if not no_tools else []
+    tools = _collect_tools(no_tools=no_tools, no_discover=no_discover)
 
     async def _run() -> str:
         token = set_context(ctx)
@@ -96,7 +125,13 @@ def run(prompt_text: str, no_tools: bool) -> None:
     default=False,
     help="Disable built-in tools.",
 )
-def chat(no_tools: bool) -> None:
+@click.option(
+    "--no-discover",
+    is_flag=True,
+    default=False,
+    help="Skip .thorn/ directory discovery.",
+)
+def chat(no_tools: bool, no_discover: bool) -> None:
     """Start an interactive chat session."""
     try:
         ctx = _build_context()
@@ -104,7 +139,7 @@ def chat(no_tools: bool) -> None:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
 
-    tools = _prepare_tools(ALL_BUILTIN_TOOLS) if not no_tools else []
+    tools = _collect_tools(no_tools=no_tools, no_discover=no_discover)
     messages: list = []
 
     console.print("[bold]thorn[/bold] interactive chat  (Ctrl+C to exit)\n")

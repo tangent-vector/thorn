@@ -36,7 +36,8 @@ from thorn._context import (
     get_context,
     set_context,
 )
-from thorn._func import prompt, skill, wrap_function
+from thorn._discovery import discover_tools
+from thorn._func import prompt, skill, tool, wrap_function
 from thorn._loop import _WrappedTool
 from thorn._provider import LLMProvider, MockProvider, load_provider_from_env
 from thorn._tools import (
@@ -62,8 +63,10 @@ __all__ = [
     # Core API
     "prompt",
     "skill",
+    "tool",
     "run",
     "wrap_function",
+    "discover_tools",
     # Context
     "ExecutionContext",
     "EventSink",

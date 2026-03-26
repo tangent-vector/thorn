@@ -1,11 +1,12 @@
-"""Unified function abstraction: ``prompt``, ``@skill``, and ``wrap_function``.
+"""Unified function abstraction: ``prompt``, ``@skill``, ``@tool``, and ``wrap_function``.
 
-This module provides the three ways user code interacts with the agent
-system:
+This module provides the ways user code interacts with the agent system:
 
 * ``prompt("...")`` / ``prompt[T]("...")`` — inline ad-hoc prompts
 * ``@skill`` — decorator that turns a function stub + docstring into a
   prompt-based callable
+* ``@tool`` — marker decorator that tags a Python function for
+  auto-discovery (body is unchanged)
 * ``wrap_function(fn)`` — wraps any Python function so it can be handed
   to an agent as a tool
 """
@@ -222,3 +223,23 @@ def skill(
         return decorator(fn)
     # ``@skill(tools=[...])`` — return the decorator for later application.
     return decorator
+
+
+# ---------------------------------------------------------------------------
+# @tool — marker decorator for auto-discovery
+# ---------------------------------------------------------------------------
+
+def tool(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark a Python function as a discoverable thorn tool.
+
+    Unlike ``@skill``, this does **not** replace the function body.
+    The function keeps its original implementation and is simply tagged
+    so that ``.thorn/`` directory discovery can find it::
+
+        @tool
+        async def grep_codebase(pattern: str, path: str = ".") -> str:
+            \"\"\"Search for *pattern* in files under *path*.\"\"\"
+            ...
+    """
+    fn._thorn_tool = True  # type: ignore[attr-defined]
+    return fn
