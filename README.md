@@ -1,11 +1,39 @@
 Thorn: A Tool for Building Agent Workflows
 ============================================
 
-Thorn is a command-line tool and Python library that makes it easy to create agent workflows that flexibly mix deterministic code with AI prompts:
+Thorn is a command-line tool and Python library for creating agent workflows that flexibly mix deterministic code with AI prompts:
 
-- Thorn allows you to easily write ordinary Python code that just happens to use AI for some of the steps.
+- **Typed AI calls as a primitive**: Use `await prompt[list[str]](...)` to get structured data back from an LLM -- no parsing boilerplate, no schema wrangling, just the type you asked for.
 
-- Thorn allows you to easily expose your Python code to agents as tools they can use. Tools you author with thorn are available not only to the Thorn agent, but also to other agents via Thorn's built in MCP server support.
+- **Composable building blocks**: Tools, skills, and agent roles all nest naturally. A skill can call tools; a role aggregates skills; your Python code orchestrates everything.
+
+- **Write tools once, use them everywhere**: Define project-specific tools in a `.thorn/` directory and they're instantly available to the built-in Thorn agent. Run `thorn serve` to expose the same tools to any MCP-compatible agent (Cursor, Claude Code, etc.).
+
+Quick Start
+-----------
+
+Thorn is a Python package, but is not currently distributed via any package registries.
+Clone this repository and install it locally:
+
+```console
+$ cd path/to/thorn/
+$ pip install -e .
+```
+
+Thorn uses a few environment variables to determine how it accesses your LLM provider:
+
+- `OPENAI_API_URL`: the URL to your model provider (e.g., `https://api.openai.com/v1`)
+- `OPENAI_API_KEY`: your access key with the provider
+- `OPENAI_API_MODEL_NAME`: the name of the model you would like to use (e.g., `claude-4.6-opus-high`)
+
+Thorn currently only supports providers that expose an OpenAI-compatible web API.
+
+Once installed and configured, verify with:
+
+```console
+$ thorn run "say hello, Thorn"
+Hello! 👋 I'm Thorn, ...
+```
 
 Overview
 --------
@@ -25,117 +53,170 @@ def build_project() -> None:
     ...
 
 @tool
-def list_contributors_currently_active_on_slack() : list[str]
+def list_contributors_currently_active_on_slack() -> list[str]:
     """List the (human) project contributors who are currently online/active on Slack."""
     ...
 ```
 
-Thorn uses Pydantic to expose the parameter signature and result type of your function as part of the generated tool description.
+Thorn uses Pydantic to expose the parameter types and result type of your function as part of the generated tool description.
 
 If your `@tool` function raises a Python exception, it will be surfaced to the agent as a tool-call failure.
 
 #### Running Prompts From Python
 
-Within any Python function, call `prompt` to prompt a fresh agent with a string.
+Within any async Python function, use `await prompt(...)` to send a prompt to a fresh agent.
 Provide it an explicit list of the `tools` you want it to have access to:
 
 ```python
-issues = prompt[list[str]]("""
+issues = await prompt[list[str]]("""
     Build the project and provide a list of issues you can identify, if any.
     """,
-    tools=[read_file,list_directory,build_project])
+    tools=[read_file, list_directory, build_project])
 ```
 
-Thorn makes sure that the data returned by `prompt[T](...)` has the requested type `T`;
+The `prompt[T](...)` syntax uses Python's subscript operator to specify the expected return type.
+Thorn ensures that the value returned by `await prompt[T](...)` has the requested type `T`;
 you don't need to do any extra work to get structured data like lists back from agents.
 
 The agent that `prompt` runs will only have access to the tools you explicitly give it.
-The tools can be any Python function decorated with `@tool` or `@skill`, including functions that Thorn provides for common tools like file reading.
+The tools can be any Python function decorated with `@tool` or `@skill`, including functions that Thorn provides for common operations like file reading.
 
 Agents run by Thorn are able to report errors when they are unable to perform the requested task, and these are surfaced to Python code as `SkillError` exceptions.
 
 #### Defining Skills
 
-Mark a 
+If you want to pull a `prompt`-based operation out as its own reusable function -- whether to call it from various places in your Python code, or to expose it as a tool to other agents -- you can use the `@skill` decorator:
+
+```python
+@skill(tools=[github_reading])
+async def review_pull_request(pull_request_number: int) -> list[str]:
+    """
+Review pull request #{pull_request_number} and provide a list of
+concerns or issues that should be addressed before it is committed.
+If you approve of the pull request, then return an empty list.
+"""
+```
+
+The `@skill` decorator gives the function an implementation that passes its docstring (with parameter values filled in) through to `prompt()`.
+A `@skill` function can be called from your Python code like any other async function.
+
+#### Defining Agent Roles
+
+All of our prompting examples so far have had some clear limitations:
+
+- No custom system prompts are being defined (only user prompts), and adding recurring/shared context to all the `prompt` calls in a project could result in tedious duplication.
+
+- The available tools had to be stated explicitly for every `prompt` or `@skill`.
+
+- All of the prompts have been one-and-done, with no persistent agent history. (Often this is actually a good choice, but being able to use history when it makes sense is also important.)
+
+These limitations can be addressed by using Thorn to define custom agent *roles*.
+An agent role is a Python `class` that extends `thorn.Agent`:
+
+```python
+from thorn import Agent
+
+class MyProjectDeveloper(Agent):
+    system_prompts = [
+"""You are a developer working on `my-project`.
+
+Your responsibilities are ...
+"""
+    ]
+    tools = [
+        read_file,
+        write_file,
+        list_directory,
+        build_project,
+        github_reading,
+    ]
+```
+
+Roles can inherit from one another, and the complete system prompt and tool list for an agent is accumulated from all the roles it transitively inherits from.
+
+A `@skill` decorator can be passed a `role=` argument to use that role's system prompts and tools:
+
+```python
+@skill(role=MyProjectDeveloper)
+async def review_pull_request(pull_request_number: int) -> list[str]:
+    ...
+```
+
+You can also construct agent instances directly and use their `prompt` method:
+
+```python
+developer = MyProjectDeveloper()
+summary = await developer.prompt[str]("""
+    Build the project and summarize any issues you find.
+""")
+```
+
+Creating explicit `Agent` instances allows your code to make thoughtful decisions about when to retain history in a persistent agent, and when to start fresh.
+For example, here is a loop that uses one long-lived agent to pick tasks and a fresh agent for each task:
+
+```python
+prioritizer = MyProjectDeveloper()
+while True:
+    task = await prioritizer.prompt[str]("""
+Pick a development task from `TODO.md` that makes sense to do next.
+""")
+    developer = MyProjectDeveloper()
+    await developer.prompt[str](f"""
+Do the following development task:
+{task}
+""")
+    ...
+```
 
 ### The Tool
 
-- Use `thorn run "..."` to execute a single prompt, or `thorn chat` to start an interactive CLI chat session.
+The `thorn` command-line tool can help you run the tasks and workflows you've defined.
 
-- Thorn automatically locates any `.thorn/` directories in the current working directory or its ancestors, as well as any `.thorn/` directory in your user directory.
+#### Basic Usage
 
-- Thorn loads 
+Use `thorn run "..."` to execute a single prompt, or `thorn chat` to start an interactive CLI chat session.
 
-Example
--------
+#### Providing Tools and Skills
 
-We'll present a very simple example here, as a way of illustrating how Thorn can be used in a project.
-Please note that this example is intended only as a sketch, and leaves out many details that would be needed for a real-world application.
+When you run `thorn`, it automatically searches for any `.thorn/` directories in the current working directory (or its ancestors), as well as any `.thorn/` directory in your user home directory.
+Any `.py` files in a `.thorn/` directory are automatically loaded, and any `@tool` or `@skill` functions defined in them will be available to the top-level Thorn agent.
 
-For this example, imagine that we are developing a code project `my-app`.
-
-### Adding Thorn Support to a Project
-
-We start by adding a `.thorn/` directory to the root of the `my-app` repository (yes, yet another `.`-directory... if you can think of something better we're all ears):
-
-```console
-$ cd path/to/my-app/
-$ mkdir .thorn
-```
-
-Then we can add ordinary Python code files under `.thorn/` that represent the tools, skills, etc. that we want to use for our project.
-
-### A Simple Vibe Coding Loop
-
-We can start by creating a simple vibe-coding loop that uses a policy of having a top-level `TODO.md` file listing tasks.
-We'll use one prompt to pick the next task to execute, and another to actually execute the task, wrapping the whole thing in an infinite loop:
+As an example, if you have defined a file `.thorn/dev_tools.py` in your repository, and it contains:
 
 ```python
-from thorn import prompt, read_file, write_file, list_directory
+@tool
+def build_project() -> None:
+    """Build the project. ..."""
+    ...
 
-def run_development_loop():
-    while True:
-        task = prompt[str]("""
-            Read `TODO.md` and pick an incomplete task that seems to be unblocked.
-            """,
-            tools=[read_file, list_directory])
-    
-        prompt(f"""
-            Complete the following development task and then mark it as done in `TODO.md`:
-
-            {task}
-            """,
-            tools=[read_file, write_file, list_directory])
+@tool
+def run_tests() -> None:
+    """Run the test suite. ..."""
+    ...
 ```
 
-The `prompt` operation that Thorn provides 
-If we want to improve this simple workflow, we can add a review loop:
-
-
-
-Installing and Configuring
---------------------------
-
-Thorn is a Python package, but is not currently distributed via any package registries.
-The easiest way to start using Thorn is to clone this repository locally and install it via `pip`:
+Then you should be able to prompt `thorn` and have it use those tools:
 
 ```console
-$ cd path/to/thorn/
-$ pip install -e .
+$ thorn run "build and test the project, and summarize any failures"
+...
 ```
 
-Thorn uses a few environment variables to determine how it accesses your LLM provider:
+#### Serving Tools to Other Agents via MCP
 
-- `OPENAI_API_URL`: the URL to your model provider (e.g., `https://api.openai.com/v1`)
-- `OPENAI_API_KEY`: your access key with the provider
-- `OPENAI_API_MODEL_NAME`: the name of the model you would like to use (e.g., `claude-4.6-opus-high`)
-
-Thron currently only supports providers that expose an OpenAI-compatible web API.
-
-If you have Thorn installed and configured, you should be able to run a simple test command like:
+While you can use `thorn` directly as a coding agent, it is a small tool and not as full-featured as popular coding agents like Cursor or Claude Code.
+Luckily, you don't have to choose; you can define project-specific tools using Thorn and serve them to your preferred agent via MCP:
 
 ```console
-$ thorn run "say hello, Thorn"
-Hello! 👋 I'm Thorn, ...
+$ thorn serve --transport streamable-http
 ```
 
+This means you can define a `build_project` tool in your `.thorn/` directory once, and immediately use it from Cursor, Claude Code, or any other MCP client -- without any of those tools needing to know how your project's build system works.
+
+The `--transport` option selects between `streamable-http` or `stdio`, depending on what your MCP client supports.
+
+Example Project
+---------------
+
+The `examples/calc/` directory demonstrates a non-trivial Thorn setup: a C++ calculator project with `.thorn/` tools for building, testing, and a multi-agent development workflow with distinct `Architect`, `APIDesigner`, `Implementer`, and `TestEngineer` roles.
+It's a good starting point for understanding how the pieces fit together in practice.

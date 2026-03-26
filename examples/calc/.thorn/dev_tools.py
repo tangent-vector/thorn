@@ -240,15 +240,18 @@ This project uses a hierarchical module layout under src/:
 
 - Module code: parent_dir/name.h + parent_dir/name.cpp
 - Children directory: if module has children, they live in parent_dir/name/
-- Root module (main): src/main.cpp is the entry point (no header). \
-Its children are .h files directly in src/.
+- Root module (main): src/main.cpp is the entry point. \
+It has NO header file (main.h does NOT exist). \
+Its children are .h/.cpp files directly in src/.
 - Include paths are relative to src/. \
 Examples: #include "expression.h", #include "parser/lexer.h"
 - Namespaces should mirror the module hierarchy (e.g., namespace parser::lexer)
 
 Qualified names use dots: parser.lexer means the file at src/parser/lexer.h. \
 The root module "main" is special -- its children use simple names \
-(e.g., "parser", not "main.parser")."""
+(e.g., "parser", not "main.parser"). \
+Use the module_header_path and module_source_path tools to resolve paths \
+rather than guessing."""
 
 # ---------------------------------------------------------------------------
 # Role definitions (project-agnostic names)
@@ -277,11 +280,28 @@ class Architect(Developer):
     system_prompts = [
         "You are architect@{module}. Your job is to decompose this module "
         "into sub-modules and define the high-level structure.",
+
         "You write/update description comments in header files and create "
         "sub-module files via the add_module tool. You do NOT write any code "
         "(no declarations, no definitions, no implementations).",
+
+        "IMPORTANT DESIGN PRINCIPLES:\n"
+        "- Prefer FLAT architectures. Most modules should be LEAF modules "
+        "with no sub-modules.\n"
+        "- Only create a sub-module when it represents a clearly distinct "
+        "concern that would be large or complex on its own (50+ lines of "
+        "non-trivial code).\n"
+        "- A module with 3-6 closely related responsibilities should stay "
+        "as a single leaf module, NOT be split further.\n"
+        "- Aim for a MAXIMUM of 3-5 sub-modules per parent. If you feel "
+        "you need more, reconsider whether some responsibilities should be "
+        "merged.\n"
+        "- The hierarchy should rarely exceed 2 levels deep (parent -> "
+        "child). Avoid grandchild modules unless truly warranted.",
+
         "If this module already has well-written description comments and you "
-        "do not see a need for sub-modules, that is a valid outcome.",
+        "do not see a need for sub-modules, that is a valid outcome. In fact, "
+        "most modules should NOT have sub-modules.",
     ]
     tools = [write_file, add_module]
 
@@ -344,9 +364,20 @@ class Coordinator(Developer):
 
 @skill(role=Architect)
 async def architect_module(module: str) -> None:
-    """Define architecture for module `{module}`. Read its existing files,
-    flesh out the description, and create sub-modules via add_module as
-    needed. Do not write code -- only descriptions and structure."""
+    """Define architecture for module `{module}`.
+
+    Steps:
+    1. Use module_header_path / module_source_path to find the file paths,
+       then read the existing files for this module.
+    2. Flesh out the Purpose, Responsibilities, and Dependencies sections
+       in the header's leading comments (use write_file to update).
+    3. Decide whether sub-modules are needed. Most modules should be leaf
+       modules with NO sub-modules. Only create sub-modules for clearly
+       distinct, large concerns.
+    4. If sub-modules are warranted, create them with add_module (max 3-5).
+    5. Call return_result when done.
+
+    Do not write code -- only descriptions and structure."""
 
 
 @tool
