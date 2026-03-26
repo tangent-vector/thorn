@@ -166,9 +166,9 @@ async def run_agent_loop(
 # Completion request (with retry)
 # ---------------------------------------------------------------------------
 
-async def _backoff_retry(attempt: int) -> None:
+async def _backoff_retry(attempt: int, reason: str = "rate limited") -> None:
     delay = min(_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1), _BACKOFF_CAP)
-    logger.info("rate limited, retrying in %.1fs (attempt %d)", delay, attempt + 1)
+    logger.info("%s, retrying in %.1fs (attempt %d)", reason, delay, attempt + 1)
     await asyncio.sleep(delay)
 
 
@@ -221,9 +221,8 @@ async def _request_completion(
                     f"too many consecutive provider failures ({consecutive_failures})",
                     consecutive_failures,
                 )
-            logger.warning(
-                "provider error (failure %d/%d), retrying",
-                consecutive_failures, max_failures,
+            await _backoff_retry(
+                consecutive_failures - 1, reason="provider error"
             )
 
 
