@@ -57,6 +57,11 @@ from thorn.errors import (
     ThornError,
 )
 
+try:
+    from thorn._mcp import MCPServerConfig, MCPToolSource, load_mcp_configs, serve_tools
+except ImportError:
+    pass
+
 T = TypeVar("T")
 
 __all__ = [
@@ -93,6 +98,11 @@ __all__ = [
     "RateLimitError",
     "LoopLimitError",
     "AgentFailureError",
+    # MCP (available when thorn[mcp] is installed)
+    "MCPServerConfig",
+    "MCPToolSource",
+    "load_mcp_configs",
+    "serve_tools",
 ]
 
 
