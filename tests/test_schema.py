@@ -138,6 +138,62 @@ class TestFuncToToolSchema:
         # No type annotation → empty schema (unconstrained)
         assert schema["function"]["parameters"]["properties"]["x"] == {}
 
+    def test_google_style_param_descriptions(self):
+        def read_file(path: str, encoding: str = "utf-8") -> str:
+            """Read and return the contents of a file.
+
+            Args:
+                path: The absolute or relative path to the file.
+                encoding: The text encoding to use.
+            """
+            ...
+
+        schema = func_to_tool_schema(read_file)
+        func = schema["function"]
+        assert func["description"] == "Read and return the contents of a file."
+        props = func["parameters"]["properties"]
+        assert props["path"]["description"] == "The absolute or relative path to the file."
+        assert props["encoding"]["description"] == "The text encoding to use."
+
+    def test_no_args_section_no_descriptions(self):
+        def simple(x: int) -> int:
+            """Double a number."""
+            ...
+
+        schema = func_to_tool_schema(simple)
+        assert "description" not in schema["function"]["parameters"]["properties"]["x"]
+
+    def test_description_strips_args_section(self):
+        def example(name: str) -> str:
+            """Greet the user.
+
+            This is a longer description.
+
+            Args:
+                name: Who to greet.
+            """
+            ...
+
+        schema = func_to_tool_schema(example)
+        desc = schema["function"]["description"]
+        assert "Args:" not in desc
+        assert "Greet the user." in desc
+        assert "This is a longer description." in desc
+
+    def test_rest_style_param_descriptions(self):
+        def fetch(url: str, timeout: int = 30) -> str:
+            """Fetch a URL.
+
+            :param url: The URL to fetch.
+            :param timeout: Request timeout in seconds.
+            """
+            ...
+
+        schema = func_to_tool_schema(fetch)
+        props = schema["function"]["parameters"]["properties"]
+        assert props["url"]["description"] == "The URL to fetch."
+        assert props["timeout"]["description"] == "Request timeout in seconds."
+
 
 # ---------------------------------------------------------------------------
 # make_return_result_schema

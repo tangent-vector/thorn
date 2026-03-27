@@ -81,6 +81,19 @@ you don't need to do any extra work to get structured data like lists back from 
 The agent that `prompt` runs will only have access to the tools you explicitly give it.
 The tools can be any Python function decorated with `@tool` or `@skill`, including functions that Thorn provides for common operations like file reading.
 
+Thorn's API is async. For synchronous scripts, wrap your workflow with `thorn.run()`:
+
+```python
+import thorn
+from thorn import prompt
+
+async def main():
+    issues = await prompt[list[str]]("List code issues.", tools=[build_project])
+    print(issues)
+
+thorn.run(main())
+```
+
 #### Defining Skills
 
 If you want to pull a `prompt`-based operation out as its own reusable function -- whether to call it from various places in your Python code, or to expose it as a tool to other agents -- you can use the `@skill` decorator:
@@ -143,12 +156,19 @@ Your responsibilities are ...
 
 Roles can inherit from one another, and the complete system prompt and tool list for an agent is accumulated from all the roles it transitively inherits from.
 
-A `@skill` decorator can be passed a `role=` argument to use that role's system prompts and tools:
+A `@skill` decorator or a `prompt` call can be passed a `role=` argument to use that role's system prompts and tools:
 
 ```python
 @skill(role=MyProjectDeveloper)
 async def review_pull_request(pull_request_number: int) -> list[str]:
     ...
+```
+
+```python
+issues = await prompt[list[str]]("""
+    Build the project and provide a list of issues you can identify, if any.
+    """,
+    role=MyProjectDeveloper)
 ```
 
 You can also construct agent instances directly and use their `prompt` method:

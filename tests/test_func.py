@@ -234,3 +234,72 @@ class TestSkillDecorator:
 
         assert my_func._thorn_skill is True
         assert my_func._thorn_return_type is str
+
+
+# ---------------------------------------------------------------------------
+# prompt with role=
+# ---------------------------------------------------------------------------
+
+class TestPromptWithRole:
+    async def test_text_mode_with_role_class(self, ctx):
+        from thorn._agent import Agent
+
+        class Helper(Agent):
+            system_prompts = ["You are helpful."]
+
+        result = await prompt("say hello", role=Helper)
+        assert isinstance(result, str)
+
+    async def test_text_mode_with_role_instance(self, ctx):
+        from thorn._agent import Agent
+
+        class Helper(Agent):
+            system_prompts = ["Working on {module}."]
+
+        agent = Helper(module="parser")
+        result = await prompt("say hello", role=agent)
+        assert isinstance(result, str)
+
+    async def test_structured_mode_with_role(self):
+        from thorn._agent import Agent
+        from thorn._context import ExecutionContext, set_context, reset_context
+
+        class Helper(Agent):
+            system_prompts = ["You count things."]
+
+        provider = MockProvider(canned_responses=[[
+            ToolCallChunk(
+                call_id="c1", name="return_result",
+                arguments='{"value": ["a", "b"]}',
+            ),
+            FinishChunk(reason="stop"),
+        ]])
+        ctx = ExecutionContext(provider=provider)
+        token = set_context(ctx)
+        try:
+            result = await prompt[list[str]]("list items", role=Helper)
+            assert result == ["a", "b"]
+        finally:
+            reset_context(token)
+
+    async def test_role_with_extra_tools(self, ctx):
+        from thorn._agent import Agent
+
+        async def extra() -> str:
+            """Extra tool."""
+            return "extra"
+
+        class Helper(Agent):
+            system_prompts = ["You are helpful."]
+
+        result = await prompt("do it", role=Helper, tools=[extra])
+        assert isinstance(result, str)
+
+    async def test_role_with_extra_system(self, ctx):
+        from thorn._agent import Agent
+
+        class Helper(Agent):
+            system_prompts = ["Base prompt."]
+
+        result = await prompt("do it", role=Helper, system="Extra instruction.")
+        assert isinstance(result, str)

@@ -10,6 +10,7 @@ import inspect
 import json
 from typing import Any, Callable, get_type_hints
 
+from docstring_parser import parse as parse_docstring
 from pydantic import TypeAdapter
 
 
@@ -55,12 +56,21 @@ def func_to_tool_schema(fn: Callable[..., Any]) -> dict[str, Any]:
         }
 
     Parameters named ``self``, ``cls``, or starting with ``_`` are
-    excluded.  Parameter descriptions are not populated here (we'd need
-    structured docstring parsing for that) but the types are faithfully
-    converted.
+    excluded.  Parameter descriptions are extracted from structured
+    docstrings (Google, reST, NumPy styles are all supported via
+    ``docstring-parser``).
     """
     hints = get_type_hints(fn)
     sig = inspect.signature(fn)
+
+    raw_doc = inspect.getdoc(fn) or ""
+    parsed = parse_docstring(raw_doc)
+
+    description = parsed.short_description or ""
+    if parsed.long_description:
+        description += "\n\n" + parsed.long_description
+
+    param_docs = {p.arg_name: p.description for p in parsed.params if p.description}
 
     properties: dict[str, Any] = {}
     required: list[str] = []
@@ -71,6 +81,8 @@ def func_to_tool_schema(fn: Callable[..., Any]) -> dict[str, Any]:
 
         annotation = hints.get(name, inspect.Parameter.empty)
         prop_schema = type_to_json_schema(annotation)
+        if name in param_docs:
+            prop_schema["description"] = param_docs[name]
         properties[name] = prop_schema
 
         if param.default is inspect.Parameter.empty:
@@ -82,8 +94,6 @@ def func_to_tool_schema(fn: Callable[..., Any]) -> dict[str, Any]:
     }
     if required:
         params_schema["required"] = required
-
-    description = inspect.getdoc(fn) or ""
 
     return {
         "type": "function",

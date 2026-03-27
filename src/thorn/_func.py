@@ -93,7 +93,19 @@ class _TypedPrompt:
         *,
         tools: list[Any] | None = None,
         system: str | None = None,
+        role: Any | None = None,
     ) -> Any:
+        if role is not None:
+            from thorn._agent import Agent, _run_agent_prompt
+            agent = role() if isinstance(role, type) else role
+            return await _run_agent_prompt(
+                agent=agent,
+                text=text,
+                result_type=self._result_type,
+                extra_tools=tools,
+                extra_system=system,
+            )
+
         ctx = get_context()
         child = ctx.push_scope(f"prompt[{_type_label(self._result_type)}]")
 
@@ -113,10 +125,11 @@ class _TypedPrompt:
 class _PromptAccessor:
     """The ``prompt`` object exposed in the public API.
 
-    Supports two call patterns::
+    Supports three call patterns::
 
         await prompt("...")               # -> str  (text mode)
         await prompt[list[str]]("...")    # -> list[str]  (structured mode)
+        await prompt("...", role=MyRole)  # -> str  (with agent role)
     """
 
     def __getitem__(self, result_type: type) -> _TypedPrompt:
@@ -128,8 +141,20 @@ class _PromptAccessor:
         *,
         tools: list[Any] | None = None,
         system: str | None = None,
+        role: Any | None = None,
     ) -> str:
         """Execute a prompt and return the assistant's text response."""
+        if role is not None:
+            from thorn._agent import Agent, _run_agent_prompt
+            agent = role() if isinstance(role, type) else role
+            return await _run_agent_prompt(
+                agent=agent,
+                text=text,
+                result_type=str,
+                extra_tools=tools,
+                extra_system=system,
+            )
+
         ctx = get_context()
         child = ctx.push_scope("prompt")
 

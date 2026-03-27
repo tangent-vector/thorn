@@ -100,6 +100,64 @@ def main() -> None:
 
 
 # ---------------------------------------------------------------------------
+# thorn init
+# ---------------------------------------------------------------------------
+
+_STARTER_TOOLS = '''\
+"""Project-specific tools for thorn.
+
+Functions decorated with @tool or @skill are automatically discovered
+by `thorn run`, `thorn chat`, and `thorn serve`.
+"""
+
+from thorn import tool
+
+# @tool
+# async def build_project() -> str:
+#     """Build the project and return a summary of the results."""
+#     ...
+'''
+
+_STARTER_MCP_JSON = '{\n    "mcpServers": {}\n}\n'
+
+
+@main.command()
+@click.option(
+    "--with-mcp",
+    is_flag=True,
+    default=False,
+    help="Also create a stub mcp.json for MCP server configuration.",
+)
+def init(with_mcp: bool) -> None:
+    """Create a .thorn/ directory with starter files in the current directory."""
+    from pathlib import Path
+
+    thorn_dir = Path.cwd() / ".thorn"
+
+    if thorn_dir.exists():
+        console.print(
+            f"[yellow].thorn/ already exists at {thorn_dir}[/yellow]"
+        )
+        sys.exit(1)
+
+    thorn_dir.mkdir()
+
+    tools_path = thorn_dir / "tools.py"
+    tools_path.write_text(_STARTER_TOOLS, encoding="utf-8")
+    console.print(f"  Created {tools_path}")
+
+    if with_mcp:
+        mcp_path = thorn_dir / "mcp.json"
+        mcp_path.write_text(_STARTER_MCP_JSON, encoding="utf-8")
+        console.print(f"  Created {mcp_path}")
+
+    console.print(
+        "\n[green]Initialized .thorn/ directory.[/green] "
+        "Edit tools.py to define your project's tools."
+    )
+
+
+# ---------------------------------------------------------------------------
 # thorn run
 # ---------------------------------------------------------------------------
 

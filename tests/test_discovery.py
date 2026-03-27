@@ -272,3 +272,52 @@ class TestDiscoverTools:
         for fn in result:
             source = getattr(fn, "__module__", "")
             assert "thorn_user" not in source or tmp_path.name not in source
+
+
+# ---------------------------------------------------------------------------
+# thorn init (CLI command)
+# ---------------------------------------------------------------------------
+
+from click.testing import CliRunner
+from thorn._cli import main as cli_main
+
+
+class TestThornInit:
+    def test_creates_files_in_cwd(self, tmp_path: Path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(cli_main, ["init"], catch_exceptions=False)
+        assert result.exit_code == 0
+
+        thorn_dir = tmp_path / ".thorn"
+        assert thorn_dir.is_dir()
+        tools_py = thorn_dir / "tools.py"
+        assert tools_py.is_file()
+        content = tools_py.read_text(encoding="utf-8")
+        assert "from thorn import tool" in content
+
+    def test_refuses_if_already_exists(self, tmp_path: Path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".thorn").mkdir()
+        runner = CliRunner()
+        result = runner.invoke(cli_main, ["init"], catch_exceptions=False)
+        assert result.exit_code != 0
+
+    def test_with_mcp_creates_mcp_json(self, tmp_path: Path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(cli_main, ["init", "--with-mcp"], catch_exceptions=False)
+        assert result.exit_code == 0
+
+        mcp_json = tmp_path / ".thorn" / "mcp.json"
+        assert mcp_json.is_file()
+        import json
+        data = json.loads(mcp_json.read_text(encoding="utf-8"))
+        assert "mcpServers" in data
+
+    def test_without_mcp_no_mcp_json(self, tmp_path: Path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(cli_main, ["init"], catch_exceptions=False)
+        assert result.exit_code == 0
+        assert not (tmp_path / ".thorn" / "mcp.json").exists()
