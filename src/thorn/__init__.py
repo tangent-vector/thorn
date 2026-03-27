@@ -39,6 +39,7 @@ from thorn._context import (
 from thorn._agent import Agent
 from thorn._discovery import discover_tools
 from thorn._func import prompt, skill, tool, wrap_function
+from thorn._retry import bound_retries
 from thorn._loop import _WrappedTool
 from thorn._provider import LLMProvider, MockProvider, load_provider_from_env
 from thorn._tools import (
@@ -74,6 +75,7 @@ __all__ = [
     "run",
     "wrap_function",
     "discover_tools",
+    "bound_retries",
     # Context
     "ExecutionContext",
     "EventSink",
