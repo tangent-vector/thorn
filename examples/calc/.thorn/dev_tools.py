@@ -363,7 +363,7 @@ class Coordinator(Developer):
 
 
 @skill(role=Architect)
-async def architect_module(module: str) -> None:
+async def _architect_module(module: str) -> None:
     """Define architecture for module `{module}`.
 
     Steps:
@@ -383,14 +383,14 @@ async def architect_module(module: str) -> None:
 @tool
 async def fully_architect(name: str) -> None:
     """Architect a module and recursively architect all children."""
-    await architect_module(name)
+    await _architect_module(name)
     for child in list_submodules(name):
         qualified = f"{name}.{child}" if name != "main" else child
         await fully_architect(qualified)
 
 
 @skill(role=APIDesigner)
-async def design_module_api(module: str) -> None:
+async def _design_module_api(module: str) -> None:
     """Design the public API for module `{module}`. Write type definitions
     and function declarations in the header file. Read dependency headers
     to understand available types. Write declarations only -- no
@@ -403,11 +403,11 @@ async def design_all_apis(root: str) -> None:
     for name in dependency_order(root):
         if name == "main":
             continue
-        await design_module_api(name)
+        await _design_module_api(name)
 
 
 @skill(role=TestEngineer)
-async def write_module_tests(module: str) -> None:
+async def _write_module_tests(module: str) -> None:
     """Write black-box tests for module `{module}`. Create test files that
     exercise the public API declared in the module's header. Focus on
     correctness and edge cases."""
@@ -419,11 +419,11 @@ async def test_all(root: str) -> None:
     for name in dependency_order(root):
         if name == "main":
             continue
-        await write_module_tests(name)
+        await _write_module_tests(name)
 
 
 @skill(role=Implementer)
-async def implement_module(module: str) -> None:
+async def _implement_module(module: str) -> None:
     """Implement the declared API for module `{module}` in its .cpp source
     file. Fill in function bodies to satisfy the declarations in the header.
     Build the project after making changes to verify compilation."""
@@ -433,4 +433,4 @@ async def implement_module(module: str) -> None:
 async def implement_all(root: str) -> None:
     """Implement all modules bottom-up in dependency order."""
     for name in dependency_order(root):
-        await implement_module(name)
+        await _implement_module(name)

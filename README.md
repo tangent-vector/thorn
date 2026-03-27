@@ -81,8 +81,6 @@ you don't need to do any extra work to get structured data like lists back from 
 The agent that `prompt` runs will only have access to the tools you explicitly give it.
 The tools can be any Python function decorated with `@tool` or `@skill`, including functions that Thorn provides for common operations like file reading.
 
-Agents run by Thorn are able to report errors when they are unable to perform the requested task, and these are surfaced to Python code as `SkillError` exceptions.
-
 #### Defining Skills
 
 If you want to pull a `prompt`-based operation out as its own reusable function -- whether to call it from various places in your Python code, or to expose it as a tool to other agents -- you can use the `@skill` decorator:
@@ -99,6 +97,17 @@ If you approve of the pull request, then return an empty list.
 
 The `@skill` decorator gives the function an implementation that passes its docstring (with parameter values filled in) through to `prompt()`.
 A `@skill` function can be called from your Python code like any other async function.
+When an agent is unable to perform the requested task, it raises a `SkillError`, which you can handle like any other exception:
+
+```python
+for pr in open_pull_requests:
+    try:
+        concerns = await review_pull_request(pr.number)
+        if concerns:
+            await post_review_comments(pr.number, concerns)
+    except SkillError as e:
+        await notify_team(f"Could not review PR #{pr.number}: {e.detail}")
+```
 
 #### Defining Agent Roles
 
