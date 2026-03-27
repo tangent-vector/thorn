@@ -86,6 +86,7 @@ class _AgentPromptAccessor:
         *,
         tools: list[Any] | None = None,
         system: str | None = None,
+        messages: list | None = None,
     ) -> str:
         return await _run_agent_prompt(
             agent=self._agent,
@@ -93,6 +94,7 @@ class _AgentPromptAccessor:
             result_type=str,
             extra_tools=tools,
             extra_system=system,
+            messages=messages,
         )
 
 
@@ -111,6 +113,7 @@ class _TypedAgentPrompt:
         *,
         tools: list[Any] | None = None,
         system: str | None = None,
+        messages: list | None = None,
     ) -> Any:
         return await _run_agent_prompt(
             agent=self._agent,
@@ -118,6 +121,7 @@ class _TypedAgentPrompt:
             result_type=self._result_type,
             extra_tools=tools,
             extra_system=system,
+            messages=messages,
         )
 
 
@@ -128,9 +132,14 @@ async def _run_agent_prompt(
     result_type: type,
     extra_tools: list[Any] | None = None,
     extra_system: str | None = None,
+    messages: list | None = None,
 ) -> Any:
-    """Shared implementation for agent prompt calls."""
-    # Late imports to avoid circular dependencies at module load time.
+    """Shared implementation for agent prompt calls.
+
+    If *messages* is provided, the conversation history accumulates
+    across calls — enabling multi-turn patterns where the same agent
+    retains context (e.g. write code, then fix build errors).
+    """
     from thorn._context import get_context, reset_context, set_context
     from thorn._func import _prepare_tools, _type_label
     from thorn._loop import run_agent_loop
@@ -157,6 +166,7 @@ async def _run_agent_prompt(
             tools=prepared,
             system_prompts=sys_prompts,
             result_type=result_type,
+            messages=messages,
         )
     finally:
         reset_context(token)

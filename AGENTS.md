@@ -9,6 +9,15 @@
 - Flat code is better than deeply nested code.
   Handle-early-out cases in functions and loops first, so that the main or most complicated path can remain less nested.
 
+- Define explicit types for things rather than just using strings, integers, etc.
+  For example, if you have a function that takes `user_id: str`, then that should almost certainly be `user_id: UserID`.
+
+  Anything that could count as "stringly typed" programming is forbidden.
+
+- Prefer actual class hierarchies over ad hoc tagged union types unless there is a clear reason why you need to use a tagged union.
+
+- Scrutinize every boolean field/parameter you add. Is it really just two states, and will it realistically always remain that way? Should you be defining a new subtype rather than adding yet another flag to an existing one? Does the receiver of this boolean value actually have all the info they need, or is there other associated data (in which case you probably wanted an `Optional[T]` or `T | None`)? 
+
 - Comments should be used to explain *why* you are doing something in a particular way, or using a particular design/architecture approach. They should discuss alternatives considered, where appropriate.
 
   Comments that just state *what* the code is doing are a code smell.

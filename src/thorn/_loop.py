@@ -74,11 +74,18 @@ async def run_agent_loop(
     result_type: type | None = None,
     max_tool_rounds: int = 50,
     max_failures: int = 5,
+    messages: list[Message] | None = None,
 ) -> Any:
     """Drive the request -> tool-call -> response cycle.
 
     Returns a ``str`` in text mode or a validated value of *result_type*
     in structured mode.
+
+    If *messages* is provided, the new ``UserMessage`` is appended to it
+    and the full list is used as conversation history.  The list is
+    mutated in place, so the caller retains the accumulated history
+    after the call returns (enabling multi-turn patterns).  If *messages*
+    is ``None`` (the default), a fresh list is created internally.
     """
     structured = result_type is not None and result_type is not str
 
@@ -109,8 +116,10 @@ async def run_agent_loop(
             "If you cannot fulfil the request, call `raise_error` instead."
         )
 
-    # -- conversation history (local to this invocation) -------------------
-    messages: list[Message] = [UserMessage(content=user_prompt)]
+    # -- conversation history ----------------------------------------------
+    if messages is None:
+        messages = []
+    messages.append(UserMessage(content=user_prompt))
 
     consecutive_failures = 0
 
