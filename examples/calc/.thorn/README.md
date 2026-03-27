@@ -21,7 +21,9 @@ Starting from a directory that contains only this `.thorn/` directory:
 my_project/
   .thorn/
     build_tools.py
-    dev_tools.py
+    module_tools.py
+    roles.py
+    workflows.py
 ```
 
 ### 1. Create the seed files
@@ -88,6 +90,8 @@ The `fully_architect` tool recursively decomposes the project into modules:
 2. For each child module, it creates header and source files via the
    `add_module` tool.
 3. The process recurses into each new child module.
+4. After all modules are created, a dependency-order validation runs to
+   catch any cyclic dependencies early.
 
 After this step, inspect the file tree and header files. You should see
 module files with populated Purpose/Responsibilities/Dependencies comment
@@ -159,6 +163,20 @@ each module. This step is currently best used before implementation (to
 define expectations) but the test framework integration (CTest/Catch2) is
 still a work in progress.
 
+## File Layout
+
+The `.thorn/` directory is organized into focused modules:
+
+| File                | Purpose                                              |
+|---------------------|------------------------------------------------------|
+| `build_tools.py`    | CMake configure/build/clean/run tools                |
+| `module_tools.py`   | Deterministic module tree management (pure Python)   |
+| `roles.py`          | Agent role definitions (Architect, APIDesigner, etc.) |
+| `workflows.py`      | High-level orchestration (`fully_architect`, etc.)    |
+
+Files use relative imports to reference each other (e.g.
+`from .build_tools import build` in `roles.py`).
+
 ## Filesystem Conventions
 
 Modules have dot-separated qualified names reflecting their hierarchy:
@@ -204,15 +222,14 @@ by the filesystem, not by comments.
 | **API Designer**| Write type definitions and function declarations        | Headers only     |
 | **Test Engineer** | Write black-box tests against declared APIs           | Test files only  |
 | **Implementer** | Fill in function bodies in `.cpp` files                 | Source files     |
-| **Coordinator** | Inspect state, delegate work to other roles             | No               |
 
 Each role is scoped to a single module. An `implementer@parser` agent is
 responsible for `parser.cpp` only — not `parser/lexer.cpp`, not `main.cpp`.
 
 ## Deterministic Tools Reference
 
-These Python tools are available to agents and can also be called directly
-from workflow code:
+These Python tools (in `module_tools.py`) are available to agents and can
+also be called directly from workflow code:
 
 - **`list_submodules(name)`** — List direct child module names
 - **`module_header_path(name)`** — Resolve qualified name to header path
@@ -220,10 +237,12 @@ from workflow code:
 - **`add_module(name, parent, description)`** — Create a new child module
 - **`list_all_modules(root)`** — Recursively list all modules in subtree
 - **`dependency_order(root)`** — Topological sort for bottom-up traversal
+  (raises `ValueError` on cyclic dependencies)
 
 ## Workflow Tools Reference
 
-These are the high-level orchestration tools available via `thorn run`:
+These are the high-level orchestration tools (in `workflows.py`) available
+via `thorn run`:
 
 - **`fully_architect <name>`** — Architect a module tree recursively
 - **`design_all_apis <root>`** — Design APIs bottom-up in dependency order
@@ -241,7 +260,7 @@ Build tools (from `build_tools.py`):
 
 **Over-decomposition**: If the Architect creates too many modules or too
 deep a hierarchy, the system prompts contain guidance to prefer flat
-architectures. You can also edit `dev_tools.py` to tighten the constraints
+architectures. You can also edit `roles.py` to tighten the constraints
 in the `Architect` role's `system_prompts`.
 
 **Agents modifying wrong files**: Each role's system prompts instruct it
@@ -252,6 +271,11 @@ version will add path-based write restrictions per role.
 **Build failures after implementation**: The Implementer agent has access
 to the `build` tool but may not always use it. See the roadmap section
 below for plans to make build verification deterministic.
+
+**Cyclic dependencies**: The `dependency_order` tool validates that all
+modules can be topologically sorted. If `fully_architect` produces a
+cycle, the validation at the end will raise a `ValueError` identifying the
+modules involved. Delete the offending headers and re-architect.
 
 ## Roadmap: Reducing Manual Steps
 
@@ -272,11 +296,10 @@ build. On failure, the build errors would be fed back to the agent for
 a fix attempt, with a retry limit. This ensures `implement_all` cannot
 return success without a clean build.
 
-**Coordinator-driven workflow**: The `Coordinator` role is defined but
-does not yet have delegation tools. Once delegation is implemented, a
-coordinator agent could inspect the state of the project (which modules
-exist, which have APIs, which compile) and decide what work to do next,
-replacing the rigid step-by-step pipeline with adaptive decision-making.
+**Coordinator-driven workflow**: A future `Coordinator` role would be able
+to inspect the state of the project (which modules exist, which have APIs,
+which compile) and delegate work to role-specific agents. This would
+replace the rigid step-by-step pipeline with adaptive decision-making.
 
 **Status inspection**: A `status` tool that reports the current state of
 each module (exists? has API declarations? has implementation? compiles?)

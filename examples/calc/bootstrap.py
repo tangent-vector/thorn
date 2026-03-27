@@ -41,7 +41,7 @@ def main() -> None:
             shutil.copy2(src_path, dst)
             print(f"  copied template/{rel}")
 
-    expected_tools = ["build_tools.py", "dev_tools.py"]
+    expected_tools = ["build_tools.py", "module_tools.py", "roles.py", "workflows.py"]
     for name in expected_tools:
         tool_path = THORN_DIR / name
         if tool_path.exists():

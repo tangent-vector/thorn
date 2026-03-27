@@ -1,5 +1,6 @@
+- `thorn do` instead of `thorn run`, and then rename `thorn.prompt` over to be `thorn.do` (and similarly, `Agent.prompt` becomes `agent.do`)
 
-- Fix whatever this `_load_sibling` stuff is... :(
+- Consider splitting `@skill` so that there's a distinction between "a function whose implementation is a prompt" and the exposure of such a function to the rest of the system
 
 - Tools or other support to allow querying the human user as part of a workflow (and making sure those queries are surfaced in a way that makes them fit in naturally during a `thorn chat` or `thorn run` session... and that they fail if stdin doesn't appear to be a tty).
 

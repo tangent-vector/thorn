@@ -63,7 +63,6 @@ async def clean() -> str:
 @tool
 async def run_calc(input_text: str = "") -> str:
     """Run the calc binary with optional input piped to stdin."""
-    import glob
     import os
 
     candidates = list(BUILD_DIR.rglob("calc.exe")) + list(BUILD_DIR.rglob("calc"))

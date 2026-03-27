@@ -4,18 +4,30 @@ Walks from CWD up to the filesystem root (and checks the user home
 directory) looking for ``.thorn/`` directories.  Python files inside
 those directories are imported, and any functions decorated with
 ``@tool`` or ``@skill`` are collected for use as agent tools.
+
+Each ``.thorn/`` directory is registered as a synthetic Python package
+so that files within it can use relative imports to reference siblings::
+
+    # In .thorn/dev_tools.py
+    from .build_tools import build, run_calc
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import logging
 import sys
+import types
 from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# .thorn/ directory location
+# ---------------------------------------------------------------------------
 
 def find_thorn_dirs(start: Path | None = None) -> list[Path]:
     """Locate ``.thorn/`` directories by walking up from *start*.
@@ -49,28 +61,66 @@ def find_thorn_dirs(start: Path | None = None) -> list[Path]:
     return found
 
 
-def load_module_tools(path: Path) -> list[Callable[..., Any]]:
-    """Import a ``.py`` file and return functions marked with ``@tool`` or ``@skill``.
+# ---------------------------------------------------------------------------
+# Synthetic package management for .thorn/ directories
+# ---------------------------------------------------------------------------
 
-    Import errors (syntax errors, missing dependencies, etc.) are logged
-    as warnings rather than propagated — a broken file in ``.thorn/``
-    should not prevent the rest of discovery from working.
+def _package_name_for_dir(thorn_dir: Path) -> str:
+    """Generate a stable synthetic package name for a ``.thorn/`` directory."""
+    dir_hash = hashlib.sha256(str(thorn_dir.resolve()).encode()).hexdigest()[:12]
+    return f"_thorn_user_.d{dir_hash}"
+
+
+def _ensure_package(thorn_dir: Path) -> str:
+    """Register *thorn_dir* as a synthetic Python package in ``sys.modules``.
+
+    Returns the package name.  Repeated calls for the same directory
+    are idempotent.  The package's ``__path__`` is set so that Python's
+    standard ``PathFinder`` can resolve relative imports between sibling
+    ``.py`` files in the directory.
     """
-    module_name = f"_thorn_user_.{path.stem}"
+    thorn_dir = thorn_dir.resolve()
+    pkg_name = _package_name_for_dir(thorn_dir)
+    if pkg_name not in sys.modules:
+        pkg = types.ModuleType(pkg_name)
+        pkg.__path__ = [str(thorn_dir)]
+        pkg.__package__ = pkg_name
+        sys.modules[pkg_name] = pkg
+    return pkg_name
+
+
+def _load_thorn_module(thorn_dir: Path, py_file: Path) -> types.ModuleType | None:
+    """Load a ``.py`` file as a submodule of the synthetic package for *thorn_dir*.
+
+    The module is kept in ``sys.modules`` so that sibling files can
+    import it via relative imports (``from .sibling import thing``).
+
+    Returns the loaded module, or ``None`` on failure.
+    """
+    pkg_name = _ensure_package(thorn_dir)
+    module_name = f"{pkg_name}.{py_file.stem}"
+
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
     try:
-        spec = importlib.util.spec_from_file_location(module_name, path)
+        spec = importlib.util.spec_from_file_location(module_name, py_file)
         if spec is None or spec.loader is None:
-            logger.warning("could not create import spec for %s", path)
-            return []
+            logger.warning("could not create import spec for %s", py_file)
+            return None
         module = importlib.util.module_from_spec(spec)
+        module.__package__ = pkg_name
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
+        return module
     except Exception:
-        logger.warning("failed to import %s", path, exc_info=True)
-        return []
-    finally:
+        logger.warning("failed to import %s", py_file, exc_info=True)
         sys.modules.pop(module_name, None)
+        return None
 
+
+def _scan_tools(module: types.ModuleType) -> list[Callable[..., Any]]:
+    """Extract ``@tool`` and ``@skill`` decorated functions from *module*."""
     collected: list[Callable[..., Any]] = []
     for attr_name in dir(module):
         if attr_name.startswith("_"):
@@ -84,24 +134,53 @@ def load_module_tools(path: Path) -> list[Callable[..., Any]]:
     return collected
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def load_module_tools(path: Path) -> list[Callable[..., Any]]:
+    """Import a ``.py`` file and return functions marked with ``@tool`` or ``@skill``.
+
+    The file is loaded as a submodule of a synthetic package for its
+    parent directory, enabling relative imports between sibling files.
+
+    Import errors (syntax errors, missing dependencies, etc.) are logged
+    as warnings rather than propagated — a broken file in ``.thorn/``
+    should not prevent the rest of discovery from working.
+    """
+    module = _load_thorn_module(path.parent, path)
+    if module is None:
+        return []
+    return _scan_tools(module)
+
+
 def discover_tools(start: Path | None = None) -> list[Callable[..., Any]]:
     """Find all ``@tool`` and ``@skill`` functions in ``.thorn/`` directories.
 
-    Combines :func:`find_thorn_dirs` and :func:`load_module_tools` to
-    produce a flat list of callables ready for ``_prepare_tools()``.
+    Each ``.thorn/`` directory is registered as a synthetic package and
+    all ``.py`` files within it are loaded before scanning for tools.
+    This ensures sibling imports resolve correctly even when loading
+    order would otherwise matter.
     """
     result: list[Callable[..., Any]] = []
     seen_names: set[str] = set()
 
     for thorn_dir in find_thorn_dirs(start):
+        modules: list[types.ModuleType] = []
         for py_file in sorted(thorn_dir.glob("*.py")):
-            for fn in load_module_tools(py_file):
+            module = _load_thorn_module(thorn_dir, py_file)
+            if module is not None:
+                modules.append(module)
+
+        for module in modules:
+            for fn in _scan_tools(module):
                 name = getattr(fn, "__name__", str(fn))
                 if name not in seen_names:
                     result.append(fn)
                     seen_names.add(name)
                 else:
                     logger.debug(
-                        "skipping duplicate tool %r from %s", name, py_file,
+                        "skipping duplicate tool %r from %s",
+                        name, getattr(module, "__file__", "?"),
                     )
     return result

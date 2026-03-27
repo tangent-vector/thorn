@@ -273,6 +273,34 @@ class TestDiscoverTools:
             source = getattr(fn, "__module__", "")
             assert "thorn_user" not in source or tmp_path.name not in source
 
+    def test_sibling_relative_imports(self, tmp_path: Path):
+        thorn_dir = tmp_path / ".thorn"
+        thorn_dir.mkdir()
+
+        (thorn_dir / "helpers.py").write_text(textwrap.dedent("""\
+            from thorn import tool
+
+            @tool
+            def helper_add(a: int, b: int) -> int:
+                \"\"\"Add two numbers.\"\"\"
+                return a + b
+        """))
+        (thorn_dir / "main_tools.py").write_text(textwrap.dedent("""\
+            from thorn import tool
+            from .helpers import helper_add
+
+            @tool
+            def add_and_double(a: int, b: int) -> int:
+                \"\"\"Add two numbers and double the result.\"\"\"
+                return helper_add(a, b) * 2
+        """))
+
+        result = discover_tools(start=tmp_path)
+        by_name = {fn.__name__: fn for fn in result}
+        assert "helper_add" in by_name
+        assert "add_and_double" in by_name
+        assert by_name["add_and_double"](3, 4) == 14
+
 
 # ---------------------------------------------------------------------------
 # thorn init (CLI command)

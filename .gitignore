@@ -21,3 +21,9 @@ client/dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Example projects
+
+examples/calc/
+!examples/calc/.thorn/
+!examples/calc/template/

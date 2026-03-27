@@ -42,6 +42,7 @@ from thorn._func import prompt, skill, tool, wrap_function
 from thorn._retry import bound_retries
 from thorn._loop import _WrappedTool
 from thorn._provider import LLMProvider, MockProvider, load_provider_from_env
+from thorn import tools
 from thorn._tools import (
     ALL_BUILTIN_TOOLS,
     ask_user,
@@ -88,7 +89,8 @@ __all__ = [
     "LLMProvider",
     "MockProvider",
     "load_provider_from_env",
-    # Built-in tools
+    # Built-in tools (also available as thorn.tools.*)
+    "tools",
     "read_file",
     "write_file",
     "list_directory",
