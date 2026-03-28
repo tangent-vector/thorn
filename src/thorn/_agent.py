@@ -24,14 +24,49 @@ class Agent:
     Subclasses declare ``system_prompts`` and ``tools`` as class variables.
     The framework walks the MRO (outermost-first) to collect them.
     System prompts are string templates rendered against instance attributes.
+
+    Subclasses are automatically registered and can be queried via
+    :meth:`get_subclasses`.  Mark intermediate base classes with
+    ``abstract=True`` to exclude them from the registry::
+
+        class Developer(Agent, abstract=True):
+            ...
+
+        class Architect(Developer):  # registered
+            ...
     """
+
+    _registry: ClassVar[dict[str, type[Agent]]] = {}
+    _abstract: ClassVar[bool] = True
 
     system_prompts: ClassVar[list[str]] = []
     tools: ClassVar[list[Any]] = []
 
+    def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        cls._abstract = abstract
+        if not abstract:
+            Agent._registry[cls.__name__] = cls
+
     def __init__(self, **kwargs: Any) -> None:
         for k, v in kwargs.items():
             setattr(self, k, v)
+
+    @classmethod
+    def get_subclasses(cls, base: type[Agent] | None = None) -> dict[str, type[Agent]]:
+        """Return registered (non-abstract) subclasses, optionally filtered.
+
+        When *base* is provided, only subclasses of *base* are returned.
+        When *base* is ``None``, subclasses of the calling class are
+        returned -- so ``Agent.get_subclasses()`` returns everything,
+        while ``MyBase.get_subclasses()`` returns only its descendants.
+        """
+        filter_base = base if base is not None else cls
+        return {
+            name: klass
+            for name, klass in Agent._registry.items()
+            if issubclass(klass, filter_base)
+        }
 
     @classmethod
     def _collect_system_prompts(cls) -> list[str]:

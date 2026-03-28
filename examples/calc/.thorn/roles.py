@@ -1,7 +1,12 @@
 """Agent role definitions for the modular C++ development workflow.
 
-Each role inherits from Developer and defines the system prompts and
-tools appropriate for its scope of responsibility.
+Defines the role hierarchy:
+
+- ``Developer`` (abstract): shared project knowledge and inspection tools
+- ``WorkflowRole`` (abstract): base for delegatable roles scoped to a
+  single module (Architect, APIDesigner, TestEngineer, Implementer)
+- ``Coordinator``: orchestrates work across a module subtree via delegation
+- ``Concierge``: injects system prompts into the top-level thorn agent
 """
 
 from __future__ import annotations
@@ -12,10 +17,17 @@ from thorn.tools import list_directory
 from .build_tools import build, run_calc
 from .module_tools import (
     add_module,
+    dependency_order,
     list_all_modules,
     list_submodules,
     module_header_path,
     module_source_path,
+    module_status,
+)
+from .orchestration import (
+    delegate_to_child,
+    delegate_to_role,
+    register_role,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,18 +63,24 @@ The root module "main" is special -- its children use simple names \
 Use the module_header_path and module_source_path tools to resolve paths \
 rather than guessing."""
 
+_MANDATE_WARNING = (
+    "If completing your task is impossible within your allowed scope "
+    "(for example, because a dependency has bugs, a required API is "
+    "missing, or a test appears to be incorrect), you MUST call "
+    "raise_error with a clear explanation rather than attempting work "
+    "outside your mandate."
+)
+
 # ---------------------------------------------------------------------------
-# Role definitions
+# Abstract bases
 # ---------------------------------------------------------------------------
 
 
-class Developer(Agent):
-    """Base for modular development workflow agents."""
+class Developer(Agent, abstract=True):
+    """Base for all workflow agents with shared project knowledge."""
 
     system_prompts = [
-        "You are working on module `{module}` of a C++ project.",
-        "You are ONLY responsible for `{module}` itself -- not its parent, "
-        "not its children. Each module has its own responsible agent.",
+        "You are working on a C++ project.",
         _COMMENT_CONVENTION,
         _FILESYSTEM_CONVENTION,
     ]
@@ -72,7 +90,23 @@ class Developer(Agent):
     ]
 
 
-class Architect(Developer):
+class WorkflowRole(Developer, abstract=True):
+    """Base for delegatable development roles scoped to a single module."""
+
+    system_prompts = [
+        "You are ONLY responsible for module `{module}` itself -- not "
+        "its parent, not its children. Each module has its own "
+        "responsible agent.",
+        _MANDATE_WARNING,
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Delegatable roles
+# ---------------------------------------------------------------------------
+
+
+class Architect(WorkflowRole):
     """Decomposes modules into sub-modules, defines structure."""
 
     system_prompts = [
@@ -104,7 +138,10 @@ class Architect(Developer):
     tools = [write_file, add_module]
 
 
-class APIDesigner(Developer):
+register_role("architect", Architect)
+
+
+class APIDesigner(WorkflowRole):
     """Designs public API declarations for a module."""
 
     system_prompts = [
@@ -118,7 +155,10 @@ class APIDesigner(Developer):
     tools = [write_file]
 
 
-class TestEngineer(Developer):
+register_role("api_designer", APIDesigner)
+
+
+class TestEngineer(WorkflowRole):
     """Writes black-box tests against declared APIs."""
 
     system_prompts = [
@@ -130,7 +170,10 @@ class TestEngineer(Developer):
     tools = [write_file]
 
 
-class Implementer(Developer):
+register_role("test_engineer", TestEngineer)
+
+
+class Implementer(WorkflowRole):
     """Implements declared APIs in source files."""
 
     system_prompts = [
@@ -141,3 +184,91 @@ class Implementer(Developer):
         "to verify your implementation.",
     ]
     tools = [write_file, run_shell, build, run_calc]
+
+
+register_role("implementer", Implementer)
+
+
+# ---------------------------------------------------------------------------
+# Coordinator
+# ---------------------------------------------------------------------------
+
+
+class Coordinator(Developer):
+    """Orchestrates development work across a module subtree via delegation."""
+
+    system_prompts = [
+        "You are coordinator@{module}. You coordinate development work "
+        "for this module and its subtree by delegating to specialized "
+        "roles and child coordinators.",
+
+        "DELEGATION AUTHORITY:\n"
+        "- delegate_to_role: Invoke a development role at YOUR module. "
+        "Available roles: architect, api_designer, test_engineer, "
+        "implementer.\n"
+        "- delegate_to_child: Invoke a coordinator at a direct child "
+        "module (use list_submodules to discover children).\n"
+        "You can ONLY delegate downward. You cannot modify files directly, "
+        "invoke roles at other modules, or delegate to your parent or "
+        "siblings.",
+
+        "AVAILABLE ROLES:\n"
+        "- architect: Decomposes the module into sub-modules and defines "
+        "high-level structure. Writes description comments and creates "
+        "sub-module files. Does NOT write code.\n"
+        "- api_designer: Designs the public API by writing type definitions "
+        "and function signatures in the header. Declarations only.\n"
+        "- test_engineer: Writes black-box tests against the declared API. "
+        "Only creates/modifies test files.\n"
+        "- implementer: Fills in function bodies in .cpp source files. "
+        "Uses the build tool to verify compilation.",
+
+        "TYPICAL SEQUENCING (guidance, not rigid rules):\n"
+        "1. Architecture: delegate_to_role('architect', ...) to define "
+        "module structure and sub-modules.\n"
+        "2. API design: delegate_to_role('api_designer', ...) to declare "
+        "interfaces. Design dependencies before dependents.\n"
+        "3. Testing: delegate_to_role('test_engineer', ...) to write "
+        "tests against the declared API.\n"
+        "4. Implementation: delegate_to_role('implementer', ...) to "
+        "write the code. Implement dependencies before dependents.\n"
+        "For existing codebases, inspect module state first and skip "
+        "steps that are already done. Adapt the sequence to the task.",
+
+        "BEFORE DELEGATING, INSPECT:\n"
+        "Use module_status, list_submodules, dependency_order, and "
+        "read_file to understand current state. Don't assume the "
+        "module needs all phases -- check what exists first.",
+
+        "ERROR HANDLING:\n"
+        "If a delegated agent reports an error, you may retry with "
+        "adjusted instructions, try a different approach, or delegate "
+        "to a different role. If the task truly cannot be completed "
+        "within your authority (your module and its descendants), you "
+        "MUST call raise_error with a clear explanation so your parent "
+        "can decide what to do.",
+    ]
+    tools = [
+        delegate_to_role,
+        delegate_to_child,
+        dependency_order,
+        module_status,
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Concierge (injects system prompts into the top-level thorn agent)
+# ---------------------------------------------------------------------------
+
+
+class Concierge(Agent):
+    """Workflow-specific guidance for the top-level thorn agent."""
+
+    system_prompts = [
+        "This project uses a coordinator-based development workflow. "
+        "For any task that involves modifying the project's source code "
+        "(implementing features, fixing bugs, refactoring, designing "
+        "APIs, adding tests, etc.), you MUST use the `coordinate` tool. "
+        "Do not attempt to edit source files or invoke development roles "
+        "directly.",
+    ]

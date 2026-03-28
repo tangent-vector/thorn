@@ -1,8 +1,12 @@
 """Deterministic module management tools for hierarchical C++ projects.
 
 Pure Python functions for navigating and manipulating the module tree.
-No LLM calls -- these provide the structural backbone that workflow
-agents build on top of.
+Most functions are pure Python with no LLM calls -- they provide the
+structural backbone that workflow agents build on top of.
+
+The ``module_status`` tool is the exception: it provides a deterministic
+overview by default but can optionally delegate to an LLM sub-agent for
+targeted questions.
 """
 
 from __future__ import annotations
@@ -10,7 +14,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from thorn import tool
+from thorn import prompt, read_file, tool
+from thorn.tools import list_directory
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 SOURCE_ROOT = PROJECT_DIR / "src"
@@ -199,3 +204,97 @@ def dependency_order(root: str) -> list[str]:
         )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Module status inspection
+# ---------------------------------------------------------------------------
+
+_COMMENT_LINE_RE = re.compile(r"^\s*//")
+_PRAGMA_RE = re.compile(r"^\s*#")
+_BLANK_RE = re.compile(r"^\s*$")
+
+
+def _has_substantive_content(path: Path, skip_first_include: bool = False) -> bool:
+    """Check whether a file has content beyond comments, pragmas, and blanks."""
+    if not path.exists():
+        return False
+    skipped_include = not skip_first_include
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if _BLANK_RE.match(line):
+            continue
+        if _COMMENT_LINE_RE.match(line):
+            continue
+        if _PRAGMA_RE.match(line):
+            if not skipped_include and line.strip().startswith("#include"):
+                skipped_include = True
+                continue
+            continue
+        return True
+    return False
+
+
+@tool
+async def module_status(name: str, query: str = "") -> str:
+    """Report the development status of a module.
+
+    By default (empty query), returns a structured overview: whether the
+    module's header and source files exist, whether they contain API
+    declarations or implementation code, and whether test files exist.
+
+    When a query is provided, delegates to an LLM sub-agent that reads
+    the module's files and answers the specific question.  This is useful
+    for reducing context-window pressure -- ask targeted questions like
+    ``module_status("parser", "does the error handling cover all edge
+    cases?")`` instead of reading entire files yourself.
+
+    Args:
+        name: Qualified module name (e.g. "parser", "parser.lexer").
+        query: Optional specific question about the module.
+    """
+    if query:
+        header = module_header_path(name)
+        source = module_source_path(name)
+        return await prompt(
+            f"Examine module `{name}` and answer the following question:\n"
+            f"{query}\n\n"
+            f"The module's header is at `{header}` and source at `{source}`.",
+            tools=[read_file, list_directory, list_submodules,
+                   module_header_path, module_source_path],
+        )
+
+    lines: list[str] = []
+
+    if name == "main":
+        main_cpp = SOURCE_ROOT / "main.cpp"
+        lines.append(f"Module: {name}")
+        lines.append(f"  main.cpp: {'exists' if main_cpp.exists() else 'MISSING'}")
+        if main_cpp.exists():
+            has_impl = _has_substantive_content(main_cpp, skip_first_include=False)
+            lines.append(f"  implementation: {'yes' if has_impl else 'no (scaffold only)'}")
+    else:
+        header = Path(module_header_path(name))
+        source = Path(module_source_path(name))
+
+        lines.append(f"Module: {name}")
+        lines.append(f"  header: {'exists' if header.exists() else 'MISSING'}")
+        if header.exists():
+            has_api = _has_substantive_content(header)
+            lines.append(f"  API declarations: {'yes' if has_api else 'no (comments/guards only)'}")
+        lines.append(f"  source: {'exists' if source.exists() else 'MISSING'}")
+        if source.exists():
+            has_impl = _has_substantive_content(source, skip_first_include=True)
+            lines.append(f"  implementation: {'yes' if has_impl else 'no (bare include only)'}")
+
+    children = list_submodules(name)
+    lines.append(f"  children: {', '.join(children) if children else '(none -- leaf module)'}")
+
+    test_dir = SOURCE_ROOT.parent / "tests"
+    test_patterns = [f"test_{name.replace('.', '_')}*", f"{name.replace('.', '/')}*test*"]
+    test_files: list[str] = []
+    if test_dir.is_dir():
+        for pattern in test_patterns:
+            test_files.extend(str(p.relative_to(SOURCE_ROOT.parent)) for p in test_dir.rglob(pattern))
+    lines.append(f"  tests: {', '.join(test_files) if test_files else '(none found)'}")
+
+    return "\n".join(lines)

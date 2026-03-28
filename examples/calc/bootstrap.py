@@ -41,7 +41,7 @@ def main() -> None:
             shutil.copy2(src_path, dst)
             print(f"  copied template/{rel}")
 
-    expected_tools = ["build_tools.py", "module_tools.py", "roles.py", "workflows.py"]
+    expected_tools = ["build_tools.py", "module_tools.py", "orchestration.py", "roles.py"]
     for name in expected_tools:
         tool_path = THORN_DIR / name
         if tool_path.exists():
@@ -51,7 +51,7 @@ def main() -> None:
 
     print("\nProject is ready. Next steps:")
     print('  cd examples/calc')
-    print('  thorn run "fully_architect main"')
+    print('  thorn run "coordinate \'implement a calculator\'"')
 
 
 if __name__ == "__main__":

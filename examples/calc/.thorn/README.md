@@ -1,10 +1,10 @@
 # Modular C++ Development Workflow
 
-A structured, agent-driven workflow for building C++ projects from scratch
-("vibe-coding"). It uses [thorn](../../../README.md) to orchestrate a
-pipeline of LLM-powered agents, each scoped to a single module and a single
-role, with deterministic Python code handling the sequencing, file layout,
-and dependency ordering.
+A coordinator-based development workflow for C++ projects using
+[thorn](../../../README.md).  Instead of rigid phase-by-phase tools,
+a hierarchy of **coordinator agents** autonomously decompose tasks and
+delegate to specialized **roles**, with deterministic validation
+(build, test) enforced after each delegation.
 
 ## Prerequisites
 
@@ -22,16 +22,15 @@ my_project/
   .thorn/
     build_tools.py
     module_tools.py
+    orchestration.py
     roles.py
-    workflows.py
 ```
 
 ### 1. Create the seed files
 
 The workflow needs two files to start from:
 
-**`CMakeLists.txt`** — Minimal CMake configuration. The key requirement is
-that it globs `src/*.cpp` recursively and sets include directories to `src/`:
+**`CMakeLists.txt`** -- minimal CMake configuration:
 
 ```cmake
 cmake_minimum_required(VERSION 3.20)
@@ -45,11 +44,9 @@ add_executable(my_project ${SOURCES})
 target_include_directories(my_project PRIVATE src)
 ```
 
-**`src/main.cpp`** — The root module. This file is the seed for the entire
-architecture. Write a detailed leading comment block describing *what* the
-application should do, its responsibilities, requirements, and constraints.
-The `main()` function body can be empty — it will be filled in during the
-implementation phase.
+**`src/main.cpp`** -- the root module.  Write a detailed leading comment
+describing what the application should do.  The `main()` body can be
+empty -- it will be filled in during implementation:
 
 ```cpp
 // ============================================================================
@@ -61,7 +58,6 @@ implementation phase.
 //
 // Responsibilities:
 //   - Bullet list of top-level responsibilities
-//   - Each one may become a module during architecture
 //
 // Requirements/Constraints:
 //   - Language standard, dependency constraints, etc.
@@ -73,235 +69,217 @@ int main()
 }
 ```
 
-The quality of this description directly affects the quality of the
-architecture the agents produce. Be specific about what the application
-should do, but leave *how* to the agents.
-
-### 2. Architecture
+### 2. Run the coordinator
 
 ```
-thorn run "fully_architect main"
+thorn run "coordinate 'implement a stack-based expression evaluator'"
 ```
 
-The `fully_architect` tool recursively decomposes the project into modules:
+The `coordinate` tool creates a `coordinator@main` agent that will:
 
-1. An **Architect** agent reads `main.cpp`, fleshes out the description,
-   and decides what child modules are needed.
-2. For each child module, it creates header and source files via the
-   `add_module` tool.
-3. The process recurses into each new child module.
-4. After all modules are created, a dependency-order validation runs to
-   catch any cyclic dependencies early.
+1. Inspect the current project state
+2. Delegate to `architect@main` to decompose into modules
+3. Delegate to child coordinators for each sub-module
+4. Within each module, delegate to API designers, test engineers, and
+   implementers as needed
+5. Validate (build) after each step, retrying on failure
 
-After this step, inspect the file tree and header files. You should see
-module files with populated Purpose/Responsibilities/Dependencies comment
-blocks, but no actual code declarations or implementations.
-
-**What to look for:**
-- A flat-ish hierarchy (most modules should be leaves with no children)
-- 3-5 child modules at most per parent
-- Clear, distinct responsibilities for each module
-- No code — only structured comments
-
-If the decomposition is too deep or too fine-grained, you can delete the
-offending files and re-run `fully_architect` on the parent module.
-
-### 3. API Design
+You can also target a specific module:
 
 ```
-thorn run "design_all_apis main"
+thorn run "coordinate 'add error recovery' --module parser"
 ```
 
-The `design_all_apis` tool walks all modules in bottom-up dependency order
-and has an **API Designer** agent write type definitions, class declarations,
-and function signatures in each module's header file.
-
-After this step, headers should contain complete API declarations (types,
-classes, function prototypes) but no function bodies.
-
-**What to look for:**
-- Clean, consistent type hierarchies
-- Proper use of namespaces mirroring the module hierarchy
-- Forward declarations and includes that reflect actual dependencies
-- No implementations — declarations only
-
-### 4. Implementation
+Or use `thorn chat` for interactive sessions:
 
 ```
-thorn run "implement_all main"
+thorn chat
+you> coordinate "fix the division-by-zero bug in the evaluator"
 ```
 
-The `implement_all` tool walks all modules in bottom-up dependency order
-and has an **Implementer** agent fill in the `.cpp` source files.
+## Architecture
 
-The Implementer has access to the build tool and can (and should) build
-the project to verify compilation after writing code.
-
-### 5. Build and verify
+### Agent Hierarchy
 
 ```
-thorn run "build"
+concierge (thorn run / thorn chat)
+  └─> coordinate(task)
+        └─> coordinator@main
+              ├─> architect@main
+              ├─> api_designer@main
+              ├─> implementer@main
+              ├─> coordinator@parser
+              │     ├─> architect@parser
+              │     ├─> api_designer@parser
+              │     ├─> coordinator@parser.lexer
+              │     │     └─> ...
+              │     └─> ...
+              └─> ...
 ```
 
-Or manually:
+Each agent is identified as `role@module`.  Coordinators can only
+delegate **downward**: to roles at their own module, or to coordinators
+at child modules.
+
+### Roles
+
+| Role              | Responsibility                                       | Can write            |
+|-------------------|------------------------------------------------------|----------------------|
+| **Coordinator**   | Inspect state, decompose tasks, delegate to roles/children | Nothing (read-only)  |
+| **Architect**     | Decompose modules, define structure, create sub-modules | Header comments only |
+| **API Designer**  | Write type definitions and function declarations     | Headers only         |
+| **Test Engineer** | Write black-box tests against declared APIs          | Test files only      |
+| **Implementer**   | Fill in function bodies in `.cpp` files              | Source files         |
+
+Every role is scoped to a single module.  `implementer@parser` is
+responsible for `parser.cpp` only -- not `parser/lexer.cpp`, not
+`main.cpp`.
+
+If a role cannot complete its task within its allowed scope (e.g. an
+implementer finds a broken test, or an API designer discovers a missing
+dependency), it **raises an error** rather than exceeding its mandate.
+The coordinator sees the error and decides how to proceed.
+
+### Delegation Flow
 
 ```
-cmake -S . -B build
-cmake --build build
+coordinator@module
+  │
+  ├─ delegate_to_role("architect", task)
+  │    └─ architect@module runs → validation → retry on fail
+  │
+  ├─ delegate_to_role("api_designer", task)
+  │    └─ api_designer@module runs → validation → retry on fail
+  │
+  ├─ delegate_to_child("parser", task)
+  │    └─ coordinator@parser runs (same pattern recursively)
+  │
+  └─ delegate_to_role("implementer", task)
+       └─ implementer@module runs → validation → retry on fail
 ```
 
-Run the resulting binary to verify it works as expected.
+After each delegation, **validation rules** run deterministically.
+If validation fails (e.g. build error), the sub-agent is given the
+errors and retries automatically, up to a configurable limit.
 
-### 6. (Optional) Testing
+### Validation Rules
+
+Validation rules are project-level checks defined in `orchestration.py`:
+
+```python
+VALIDATION_RULES = {
+    "build": build,   # from build_tools.py
+}
+
+DEFAULT_RULES = frozenset({"build"})
+```
+
+The set of active rules propagates through the delegation chain via a
+`ContextVar`.  Each delegation can skip or enable rules:
 
 ```
-thorn run "test_all main"
+delegate_to_role("architect", task, skip_validation=["build"])
 ```
 
-The `test_all` tool has a **Test Engineer** agent write black-box tests for
-each module. This step is currently best used before implementation (to
-define expectations) but the test framework integration (CTest/Catch2) is
-still a work in progress.
+The default expectation: agents are invoked with all validations
+passing, and must leave the codebase in a state where all validations
+pass.
 
 ## File Layout
-
-The `.thorn/` directory is organized into focused modules:
 
 | File                | Purpose                                              |
 |---------------------|------------------------------------------------------|
 | `build_tools.py`    | CMake configure/build/clean/run tools                |
-| `module_tools.py`   | Deterministic module tree management (pure Python)   |
-| `roles.py`          | Agent role definitions (Architect, APIDesigner, etc.) |
-| `workflows.py`      | High-level orchestration (`fully_architect`, etc.)    |
+| `module_tools.py`   | Module tree navigation + `module_status` inspection  |
+| `orchestration.py`  | Delegation, validation, `coordinate` entry point     |
+| `roles.py`          | Role definitions (all Agent subclasses)              |
 
 Files use relative imports to reference each other (e.g.
-`from .build_tools import build` in `roles.py`).
+`from .orchestration import delegate_to_role` in `roles.py`).
 
-## Filesystem Conventions
+## Module Conventions
 
 Modules have dot-separated qualified names reflecting their hierarchy:
-`parser`, `parser.lexer`, `parser.lexer.token`.
 
-The filesystem layout follows these rules:
-
-| Qualified name       | Header path              | Source path              |
-|----------------------|--------------------------|--------------------------|
-| `expression`         | `src/expression.h`       | `src/expression.cpp`     |
-| `parser`             | `src/parser.h`           | `src/parser.cpp`         |
-| `parser.lexer`       | `src/parser/lexer.h`     | `src/parser/lexer.cpp`   |
-| `parser.lexer.token` | `src/parser/lexer/token.h` | `src/parser/lexer/token.cpp` |
+| Qualified name       | Header path                | Source path                |
+|----------------------|----------------------------|----------------------------|
+| `expression`         | `src/expression.h`         | `src/expression.cpp`       |
+| `parser`             | `src/parser.h`             | `src/parser.cpp`           |
+| `parser.lexer`       | `src/parser/lexer.h`       | `src/parser/lexer.cpp`     |
 
 Key rules:
 - **Module code** lives at `parent_dir/name.h` + `parent_dir/name.cpp`
 - **Children directory**: if a module has children, they live in
   `parent_dir/name/`
-- **Root module** (`main`): `src/main.cpp` only — no header. Its children
-  are files directly in `src/`.
-- **Include paths** are relative to `src/`: `#include "expression.h"`,
-  `#include "parser/lexer.h"`
+- **Root module** (`main`): `src/main.cpp` only -- no header
+- **Include paths** are relative to `src/`
 
-No files need to move when a leaf module gains or loses children.
+## Tool Reference
 
-## Comment Conventions
+### Concierge tools (available via `thorn run` / `thorn chat`)
 
-All code files use structured leading comments with these sections:
+- **`coordinate(task, module="main", ...)`** -- delegate a development
+  task to the coordinator hierarchy.  This is the primary entry point
+  for any development work.
+- **`build`** -- build the project via CMake
+- **`configure`** -- run CMake configure step
+- **`clean`** -- remove the build directory
+- **`run_calc`** -- run the built binary with optional stdin
+- **`module_status(name, query="")`** -- inspect a module's state
+- **`list_submodules(name)`** -- list direct children
+- **`dependency_order(root)`** -- topological sort of modules
+- **`add_module(name, parent, description)`** -- create a new module
+- **`module_header_path(name)`** / **`module_source_path(name)`** --
+  resolve qualified names to file paths
 
-- **Purpose**: 1-2 sentences on what the module does
-- **Responsibilities**: Bullet list of this module's responsibilities
-- **Dependencies**: Internal project modules and external libraries
-- **Requirements/Constraints**: Design constraints (optional)
+### Coordinator delegation tools (not available to concierge)
 
-Do NOT include a "Sub-modules" section. Sub-module structure is determined
-by the filesystem, not by comments.
+- **`delegate_to_role(role, task, ...)`** -- invoke a role at the
+  coordinator's own module
+- **`delegate_to_child(child, task, ...)`** -- invoke a coordinator at
+  a child module
 
-## Roles
+## Extending the Workflow
 
-| Role            | Responsibility                                          | Can write files? |
-|-----------------|---------------------------------------------------------|------------------|
-| **Architect**   | Decompose modules, define structure, create sub-modules | Headers only (comments) |
-| **API Designer**| Write type definitions and function declarations        | Headers only     |
-| **Test Engineer** | Write black-box tests against declared APIs           | Test files only  |
-| **Implementer** | Fill in function bodies in `.cpp` files                 | Source files     |
+### Adding a new role
 
-Each role is scoped to a single module. An `implementer@parser` agent is
-responsible for `parser.cpp` only — not `parser/lexer.cpp`, not `main.cpp`.
+Define a new `WorkflowRole` subclass in `roles.py` and register it:
 
-## Deterministic Tools Reference
+```python
+class SecurityAuditor(WorkflowRole):
+    system_prompts = [
+        "You are security_auditor@{module}. Review the module's code "
+        "for security vulnerabilities.",
+    ]
+    tools = [write_file]
 
-These Python tools (in `module_tools.py`) are available to agents and can
-also be called directly from workflow code:
+register_role("security_auditor", SecurityAuditor)
+```
 
-- **`list_submodules(name)`** — List direct child module names
-- **`module_header_path(name)`** — Resolve qualified name to header path
-- **`module_source_path(name)`** — Resolve qualified name to source path
-- **`add_module(name, parent, description)`** — Create a new child module
-- **`list_all_modules(root)`** — Recursively list all modules in subtree
-- **`dependency_order(root)`** — Topological sort for bottom-up traversal
-  (raises `ValueError` on cyclic dependencies)
+The coordinator will automatically see the new role as a delegation
+target.
 
-## Workflow Tools Reference
+### Adding a validation rule
 
-These are the high-level orchestration tools (in `workflows.py`) available
-via `thorn run`:
+Add an entry to `VALIDATION_RULES` in `orchestration.py`:
 
-- **`fully_architect <name>`** — Architect a module tree recursively
-- **`design_all_apis <root>`** — Design APIs bottom-up in dependency order
-- **`test_all <root>`** — Write tests bottom-up in dependency order
-- **`implement_all <root>`** — Implement all modules bottom-up
+```python
+VALIDATION_RULES["test"] = run_tests   # your test runner function
+DEFAULT_RULES = frozenset({"build", "test"})
+```
 
-Build tools (from `build_tools.py`):
+The rule will be enforced after every delegation by default.
 
-- **`configure`** — Run CMake configure step
-- **`build`** — Build the project (auto-configures if needed)
-- **`clean`** — Remove the build directory
-- **`run_calc`** — Run the built binary with optional stdin input
+## Separation of Concerns
 
-## Troubleshooting
+The file organization anticipates future factoring:
 
-**Over-decomposition**: If the Architect creates too many modules or too
-deep a hierarchy, the system prompts contain guidance to prefer flat
-architectures. You can also edit `roles.py` to tighten the constraints
-in the `Architect` role's `system_prompts`.
+- **Build system specifics** (CMake): `build_tools.py`
+- **Language conventions** (C++): `module_tools.py` + prompts in `roles.py`
+- **Core orchestration**: `orchestration.py` (mostly generic)
+- **Role definitions**: `roles.py` (mix of generic and project-specific)
 
-**Agents modifying wrong files**: Each role's system prompts instruct it
-to only modify specific file types. Currently this is enforced by
-convention (system prompt instructions), not by the framework. A future
-version will add path-based write restrictions per role.
-
-**Build failures after implementation**: The Implementer agent has access
-to the `build` tool but may not always use it. See the roadmap section
-below for plans to make build verification deterministic.
-
-**Cyclic dependencies**: The `dependency_order` tool validates that all
-modules can be topologically sorted. If `fully_architect` produces a
-cycle, the validation at the end will raise a `ValueError` identifying the
-modules involved. Delete the offending headers and re-architect.
-
-## Roadmap: Reducing Manual Steps
-
-The current workflow requires the user to invoke four separate commands
-(architect, design, implement, build) and manually verify between steps.
-Several improvements are planned:
-
-**Single-command pipeline**: A `develop_all` tool that chains the entire
-pipeline — architecture through build verification — in a single
-invocation. This is straightforward to implement as a `@tool` function
-that calls the existing workflow tools in sequence.
-
-**Deterministic build verification**: Currently the Implementer agent
-*may* call the build tool, but this is at its discretion. A better design
-would make `implement_module` a hybrid Python function that calls a
-`@skill` to have the LLM write code, then deterministically runs the
-build. On failure, the build errors would be fed back to the agent for
-a fix attempt, with a retry limit. This ensures `implement_all` cannot
-return success without a clean build.
-
-**Coordinator-driven workflow**: A future `Coordinator` role would be able
-to inspect the state of the project (which modules exist, which have APIs,
-which compile) and delegate work to role-specific agents. This would
-replace the rigid step-by-step pipeline with adaptive decision-making.
-
-**Status inspection**: A `status` tool that reports the current state of
-each module (exists? has API declarations? has implementation? compiles?)
-would help both human users and coordinator agents understand where the
-project stands.
+`orchestration.py` deliberately avoids importing role classes directly,
+resolving everything through the role registry and `Agent` subclass
+registry.  This makes the orchestration logic extractable into `thorn`
+core without pulling in project-specific code.

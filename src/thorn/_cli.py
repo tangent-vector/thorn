@@ -16,6 +16,7 @@ from thorn._context import (
     set_context,
     reset_context,
 )
+from thorn._agent import Agent
 from thorn._discovery import discover_tools, find_thorn_dirs
 from thorn._func import _prepare_tools, prompt
 from thorn._loop import run_agent_loop, _WrappedTool
@@ -88,6 +89,18 @@ async def _collect_all_tools(
             pass
 
     return tools
+
+
+def _collect_concierge_prompts() -> list[str]:
+    """Return system prompts from any registered ``Concierge`` Agent subclass.
+
+    Called after tool discovery so that ``.thorn/`` modules have had a
+    chance to define and register their ``Concierge`` class.
+    """
+    concierge_cls = Agent._registry.get("Concierge")
+    if concierge_cls is None:
+        return []
+    return concierge_cls._collect_system_prompts()
 
 
 # ---------------------------------------------------------------------------
@@ -199,15 +212,17 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool) -> No
                     no_discover=no_discover,
                     no_mcp=no_mcp,
                 )
+                sys_prompts = [
+                    "You are executing a single non-interactive request. "
+                    "Complete the task and report results concisely. "
+                    "Do not offer follow-up actions or ask questions.",
+                ]
+                sys_prompts.extend(_collect_concierge_prompts())
                 return await run_agent_loop(
                     context=ctx,
                     user_prompt=prompt_text,
                     tools=tools,
-                    system_prompts=[
-                        "You are executing a single non-interactive request. "
-                        "Complete the task and report results concisely. "
-                        "Do not offer follow-up actions or ask questions.",
-                    ],
+                    system_prompts=sys_prompts,
                 )
         finally:
             reset_context(token)
@@ -278,6 +293,7 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool) -> None:
                     no_discover=no_discover,
                     no_mcp=no_mcp,
                 )
+                ctx.system_prompts.extend(_collect_concierge_prompts())
                 tool_schemas = [t.schema for t in tools]
                 tool_dispatch = {
                     t.schema.get("function", {}).get("name", ""): t
