@@ -26,7 +26,7 @@ from thorn._messages import (
     ToolResultMessage,
     UserMessage,
 )
-from thorn._provider import FinishChunk, TextChunk, ToolCallChunk
+from thorn._provider import FinishChunk, TextChunk, ToolCallChunk, UsageChunk
 from thorn._schema import (
     RAISE_ERROR_SCHEMA,
     make_return_result_schema,
@@ -125,7 +125,7 @@ async def run_agent_loop(
     consecutive_failures = 0
 
     for round_num in range(max_tool_rounds):
-        text, tool_calls, _finish = await _request_completion(
+        text, tool_calls, _finish, usage = await _request_completion(
             context=context,
             system_prompts=prompts,
             tool_schemas=all_schemas,
@@ -134,6 +134,13 @@ async def run_agent_loop(
             max_failures=max_failures,
         )
         consecutive_failures = 0
+
+        if usage is not None:
+            context.usage.add(
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+                usage.get("total_tokens", 0),
+            )
 
         assistant_msg = AssistantMessage(content=text, tool_calls=tool_calls)
         messages.append(assistant_msg)
@@ -190,7 +197,8 @@ async def _request_completion(
     messages: list[Message],
     consecutive_failures: int,
     max_failures: int,
-) -> tuple[str, list[ToolCall], str]:
+) -> tuple[str, list[ToolCall], str, dict[str, int] | None]:
+    """Return ``(text, tool_calls, finish_reason, usage)``."""
     rate_limit_retries = 0
 
     while True:
@@ -198,7 +206,9 @@ async def _request_completion(
             text_parts: list[str] = []
             tool_call_chunks: list[ToolCallChunk] = []
             finish_reason = "stop"
+            usage: dict[str, int] | None = None
 
+            t0 = time.monotonic()
             response = context.provider.complete(
                 system_prompts, tool_schemas, messages,
             )
@@ -211,12 +221,23 @@ async def _request_completion(
                         text_parts.append(chunk.text)
                     case ToolCallChunk():
                         tool_call_chunks.append(chunk)
+                    case UsageChunk():
+                        usage = {
+                            "prompt_tokens": chunk.prompt_tokens,
+                            "completion_tokens": chunk.completion_tokens,
+                            "total_tokens": chunk.total_tokens,
+                        }
                     case FinishChunk():
                         finish_reason = chunk.reason
 
+            duration_s = time.monotonic() - t0
+            await context.event_sink.on_completion_end(
+                duration_s=duration_s, usage=usage, scope=context.scope,
+            )
+
             text = "".join(text_parts)
             tool_calls = [tc.to_tool_call() for tc in tool_call_chunks]
-            return text, tool_calls, finish_reason
+            return text, tool_calls, finish_reason, usage
 
         except RateLimitError:
             rate_limit_retries += 1

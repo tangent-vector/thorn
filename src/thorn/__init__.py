@@ -33,6 +33,7 @@ from thorn._context import (
     ExecutionContext,
     NullEventSink,
     Scope,
+    UsageTracker,
     Verbosity,
     get_context,
     set_context,
@@ -43,7 +44,7 @@ from thorn._file_access import FileAccessLevel, FileAccessPolicy, FileAccessRule
 from thorn._func import prompt, skill, tool, wrap_function
 from thorn._retry import bound_retries
 from thorn._loop import _WrappedTool
-from thorn._provider import LLMProvider, MockProvider, load_provider_from_env
+from thorn._provider import LLMProvider, MockProvider, UsageChunk, load_provider_from_env
 from thorn import tools
 from thorn._tools import (
     ALL_BUILTIN_TOOLS,
@@ -89,6 +90,7 @@ __all__ = [
     "JsonLinesSink",
     "Verbosity",
     "Scope",
+    "UsageTracker",
     "get_context",
     "set_context",
     # File access control
@@ -98,6 +100,7 @@ __all__ = [
     # Providers
     "LLMProvider",
     "MockProvider",
+    "UsageChunk",
     "load_provider_from_env",
     # Built-in tools (also available as thorn.tools.*)
     "tools",

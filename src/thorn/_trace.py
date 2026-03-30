@@ -58,6 +58,16 @@ class CompositeEventSink(EventSink):
                 name, duration_s=duration_s, error=error, scope=scope,
             )
 
+    async def on_completion_end(
+        self, *, duration_s: float | None = None,
+        usage: dict[str, int] | None = None,
+        scope: Scope | None = None,
+    ) -> None:
+        for sink in self._sinks:
+            await sink.on_completion_end(
+                duration_s=duration_s, usage=usage, scope=scope,
+            )
+
 
 class JsonLinesSink(EventSink):
     """Writes one JSON object per event to a file handle.
@@ -86,7 +96,9 @@ class JsonLinesSink(EventSink):
     async def on_response_chunk(
         self, chunk: ResponseChunk, scope: Scope | None = None,
     ) -> None:
-        from thorn._provider import TextChunk, ToolCallChunk, FinishChunk
+        from thorn._provider import (
+            FinishChunk, TextChunk, ToolCallChunk, UsageChunk,
+        )
 
         match chunk:
             case TextChunk():
@@ -96,6 +108,13 @@ class JsonLinesSink(EventSink):
                     "tool_call_chunk", scope,
                     name=chunk.name, call_id=chunk.call_id,
                     arguments=chunk.arguments,
+                )
+            case UsageChunk():
+                self._write(
+                    "usage_chunk", scope,
+                    prompt_tokens=chunk.prompt_tokens,
+                    completion_tokens=chunk.completion_tokens,
+                    total_tokens=chunk.total_tokens,
                 )
             case FinishChunk():
                 self._write("finish_chunk", scope, reason=chunk.reason)
@@ -131,4 +150,14 @@ class JsonLinesSink(EventSink):
         self._write(
             "tool_end", scope,
             name=name, duration_s=duration_s, error=error,
+        )
+
+    async def on_completion_end(
+        self, *, duration_s: float | None = None,
+        usage: dict[str, int] | None = None,
+        scope: Scope | None = None,
+    ) -> None:
+        self._write(
+            "completion_end", scope,
+            duration_s=duration_s, **(usage or {}),
         )

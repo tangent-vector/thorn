@@ -68,6 +68,15 @@ class FinishChunk(ResponseChunk):
     reason: str
 
 
+@dataclass
+class UsageChunk(ResponseChunk):
+    """Token usage statistics returned by the provider."""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
 # ---------------------------------------------------------------------------
 # Provider interface
 # ---------------------------------------------------------------------------
@@ -125,6 +134,7 @@ class MockProvider(LLMProvider):
                     break
             chunks = [
                 TextChunk(text=f"[mock] {last_user_text}"),
+                UsageChunk(prompt_tokens=0, completion_tokens=0, total_tokens=0),
                 FinishChunk(reason="stop"),
             ]
         for chunk in chunks:
@@ -210,6 +220,7 @@ class OpenAIProvider(LLMProvider):
             "model": self.config.model_name,
             "messages": api_messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             body["tools"] = tools
@@ -264,6 +275,14 @@ async def _iter_sse_chunks(
             payload = json.loads(data)
         except json.JSONDecodeError:
             continue
+
+        usage = payload.get("usage")
+        if usage is not None:
+            yield UsageChunk(
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
+            )
 
         choices = payload.get("choices", [])
         if not choices:

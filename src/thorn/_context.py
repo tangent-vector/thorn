@@ -137,6 +137,23 @@ class EventSink(ABC):
                 label += f" ({duration_s:.1f}s)"
             await self.on_status(label, scope=scope)
 
+    async def on_completion_end(
+        self,
+        *,
+        duration_s: float | None = None,
+        usage: dict[str, int] | None = None,
+        scope: Scope | None = None,
+    ) -> None:
+        """Called after each LLM completion round finishes."""
+        label = "completion"
+        if usage:
+            total = usage.get("total_tokens")
+            if total is not None:
+                label += f": {total} tokens"
+        if duration_s is not None:
+            label += f" ({duration_s:.1f}s)"
+        await self.on_status(label, scope=scope)
+
 
 class NullEventSink(EventSink):
     """Silently discards all events."""
@@ -171,6 +188,13 @@ class NullEventSink(EventSink):
     async def on_tool_end(
         self, name: str, *, duration_s: float | None = None,
         error: str | None = None, scope: Scope | None = None,
+    ) -> None:
+        pass
+
+    async def on_completion_end(
+        self, *, duration_s: float | None = None,
+        usage: dict[str, int] | None = None,
+        scope: Scope | None = None,
     ) -> None:
         pass
 
@@ -347,6 +371,49 @@ class ConsoleEventSink(EventSink):
                 highlight=False,
             )
 
+    # -- completion lifecycle -----------------------------------------------
+
+    async def on_completion_end(
+        self,
+        *,
+        duration_s: float | None = None,
+        usage: dict[str, int] | None = None,
+        scope: Scope | None = None,
+    ) -> None:
+        if self._verbosity < Verbosity.VERBOSE:
+            return
+        indent = self._indent(scope)
+        label = "completion"
+        if usage:
+            total = usage.get("total_tokens")
+            if total is not None:
+                label += f": {total} tokens"
+        if duration_s is not None:
+            label += f" ({duration_s:.1f}s)"
+        self._safe_print(f"{indent}[dim]{label}[/dim]", highlight=False)
+
+
+# ---------------------------------------------------------------------------
+# Usage tracking
+# ---------------------------------------------------------------------------
+
+@dataclass
+class UsageTracker:
+    """Accumulates LLM token usage across completions.
+
+    A single instance is shared across nested scopes so that the root
+    context holds the grand totals after a run completes.
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def add(self, prompt: int, completion: int, total: int) -> None:
+        self.prompt_tokens += prompt
+        self.completion_tokens += completion
+        self.total_tokens += total
+
 
 # ---------------------------------------------------------------------------
 # Execution context
@@ -374,6 +441,7 @@ class ExecutionContext:
         global_ignores: Ceiling policy loaded from ``.aiignore`` /
                         ``.thornignore`` at startup.  Applied as an upper
                         bound on every per-agent policy.
+        usage:      Shared accumulator for LLM token counts.
     """
 
     provider: LLMProvider
@@ -384,6 +452,7 @@ class ExecutionContext:
     workspace_root: Path | None = None
     file_access_policy: FileAccessPolicy | None = None
     global_ignores: FileAccessPolicy | None = None
+    usage: UsageTracker = field(default_factory=UsageTracker)
 
     def push_scope(
         self,
@@ -425,6 +494,7 @@ class ExecutionContext:
             workspace_root=self.workspace_root,
             file_access_policy=resolved_policy,
             global_ignores=self.global_ignores,
+            usage=self.usage,
         )
 
 
