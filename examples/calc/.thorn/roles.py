@@ -11,7 +11,7 @@ Defines the role hierarchy:
 
 from __future__ import annotations
 
-from thorn import Agent, read_file, run_shell, write_file
+from thorn import Agent, read_file, write_file
 from thorn.tools import list_directory
 
 from .build_tools import build, run_calc
@@ -71,6 +71,14 @@ _MANDATE_WARNING = (
     "outside your mandate."
 )
 
+_SUMMARY_GUIDANCE = (
+    "When reporting what you did, be concise: use a short bulleted list "
+    "of actions taken. Do NOT generate ASCII-art trees, directory "
+    "listings, code fences with file contents, or any other repetitive "
+    "structured output in your summary. Just state what you created, "
+    "modified, or verified."
+)
+
 # ---------------------------------------------------------------------------
 # Abstract bases
 # ---------------------------------------------------------------------------
@@ -83,6 +91,7 @@ class Developer(Agent, abstract=True):
         "You are working on a C++ project.",
         _COMMENT_CONVENTION,
         _FILESYSTEM_CONVENTION,
+        _SUMMARY_GUIDANCE,
     ]
     tools = [
         read_file, list_directory, list_submodules,
@@ -92,6 +101,9 @@ class Developer(Agent, abstract=True):
 
 class WorkflowRole(Developer, abstract=True):
     """Base for delegatable development roles scoped to a single module."""
+
+    def __str__(self) -> str:
+        return f"{type(self).__name__.lower()}@{self.module}"
 
     system_prompts = [
         "You are ONLY responsible for module `{module}` itself -- not "
@@ -111,29 +123,34 @@ class Architect(WorkflowRole):
 
     system_prompts = [
         "You are architect@{module}. Your job is to decompose this module "
-        "into sub-modules and define the high-level structure.",
+        "into sub-modules and define the high-level structure.\n\n"
+        "ALLOWED ACTIONS — you may ONLY do these two things:\n"
+        "1. Update the Purpose/Responsibilities/Dependencies COMMENT BLOCK "
+        "in the module's header file (or main.cpp for the root module). "
+        "Do NOT add or modify any code outside the comment block — no "
+        "#include directives, no declarations, no namespaces, no code.\n"
+        "2. Call add_module to create new child modules. The tool creates "
+        "properly formatted scaffold files; do NOT write to those files "
+        "yourself.\n\n"
+        "NEVER write code. NEVER write #include directives. NEVER write "
+        "declarations, definitions, type definitions, or function signatures. "
+        "Those are the api_designer's and implementer's jobs.\n\n"
+        "NEVER modify .cpp source files (except main.cpp comments for the "
+        "root module). NEVER create files via write_file — use add_module.\n\n"
+        "If the module's header already has good description comments and "
+        "doesn't need sub-modules, say so and you are done.",
 
-        "You write/update description comments in header files and create "
-        "sub-module files via the add_module tool. You do NOT write any code "
-        "(no declarations, no definitions, no implementations).",
-
-        "IMPORTANT DESIGN PRINCIPLES:\n"
+        "DESIGN PRINCIPLES:\n"
         "- Prefer FLAT architectures. Most modules should be LEAF modules "
         "with no sub-modules.\n"
         "- Only create a sub-module when it represents a clearly distinct "
-        "concern that would be large or complex on its own (50+ lines of "
-        "non-trivial code).\n"
-        "- A module with 3-6 closely related responsibilities should stay "
-        "as a single leaf module, NOT be split further.\n"
-        "- Aim for a MAXIMUM of 3-5 sub-modules per parent. If you feel "
-        "you need more, reconsider whether some responsibilities should be "
-        "merged.\n"
-        "- The hierarchy should rarely exceed 2 levels deep (parent -> "
-        "child). Avoid grandchild modules unless truly warranted.",
-
-        "If this module already has well-written description comments and you "
-        "do not see a need for sub-modules, that is a valid outcome. In fact, "
-        "most modules should NOT have sub-modules.",
+        "concern (50+ lines of non-trivial code on its own).\n"
+        "- A module with 3-6 related responsibilities should stay as a "
+        "single leaf module.\n"
+        "- Maximum 3-5 sub-modules per parent. Hierarchy rarely exceeds "
+        "2 levels deep.\n"
+        "- Use clear, descriptive names (e.g., 'expression' not 'expr', "
+        "'evaluator' not 'eval'). Avoid abbreviations.",
     ]
     tools = [write_file, add_module]
 
@@ -145,12 +162,15 @@ class APIDesigner(WorkflowRole):
     """Designs public API declarations for a module."""
 
     system_prompts = [
-        "You are api_designer@{module}. You design the public API by writing "
-        "declarations (types, function signatures, class definitions) in the "
-        "module's header file.",
-        "Write declarations ONLY. Do not write function bodies or "
-        "implementations. Read sibling and dependency module headers to "
-        "understand the types available.",
+        "You are api_designer@{module}. You design the public API by "
+        "writing declarations in the module's HEADER file ONLY.\n\n"
+        "ALLOWED: Write the complete header file including #include "
+        "directives, namespace blocks, type definitions, class definitions, "
+        "and function signatures (declarations without bodies).\n\n"
+        "FORBIDDEN: Do NOT write function bodies or implementations. "
+        "Do NOT modify any .cpp source file. Do NOT modify any other "
+        "module's files. You may only write to this module's header.\n\n"
+        "Read dependency module headers first to understand available types.",
     ]
     tools = [write_file]
 
@@ -163,9 +183,9 @@ class TestEngineer(WorkflowRole):
 
     system_prompts = [
         "You are test_engineer@{module}. You write black-box tests that "
-        "exercise the public API declared in the module's header.",
-        "Do not modify the module's header or source file. Only create or "
-        "modify test files.",
+        "exercise the public API declared in the module's header.\n\n"
+        "FORBIDDEN: Do NOT modify the module's header or source file. "
+        "Only create or modify test files.",
     ]
     tools = [write_file]
 
@@ -177,13 +197,18 @@ class Implementer(WorkflowRole):
     """Implements declared APIs in source files."""
 
     system_prompts = [
-        "You are implementer@{module}. You fill in the implementation in "
-        "the module's .cpp source file to satisfy the declarations in its "
-        "header.",
-        "Do not modify the header file or test files. Build and run tests "
-        "to verify your implementation.",
+        "You are implementer@{module}. You write the implementation in "
+        "the module's .cpp SOURCE file to satisfy the declarations in "
+        "its header.\n\n"
+        "ALLOWED: Write to this module's .cpp source file ONLY. "
+        "Use the build tool to verify compilation.\n\n"
+        "FORBIDDEN: Do NOT modify the header file. Do NOT modify any "
+        "other module's files. Do NOT modify main.cpp (unless you ARE "
+        "implementer@main). Do NOT modify test files. Do NOT create "
+        "new files. Do NOT use shell commands to compile tests or "
+        "create build targets.",
     ]
-    tools = [write_file, run_shell, build, run_calc]
+    tools = [write_file, build, run_calc]
 
 
 register_role("implementer", Implementer)
@@ -197,56 +222,59 @@ register_role("implementer", Implementer)
 class Coordinator(Developer):
     """Orchestrates development work across a module subtree via delegation."""
 
+    def __str__(self) -> str:
+        return f"coordinator@{self.module}"
+
     system_prompts = [
         "You are coordinator@{module}. You coordinate development work "
         "for this module and its subtree by delegating to specialized "
         "roles and child coordinators.",
 
         "DELEGATION AUTHORITY:\n"
-        "- delegate_to_role: Invoke a development role at YOUR module. "
-        "Available roles: architect, api_designer, test_engineer, "
-        "implementer.\n"
-        "- delegate_to_child: Invoke a coordinator at a direct child "
-        "module (use list_submodules to discover children).\n"
-        "You can ONLY delegate downward. You cannot modify files directly, "
-        "invoke roles at other modules, or delegate to your parent or "
-        "siblings.",
+        "- delegate_to_role(role, task): Invoke a role at YOUR module.\n"
+        "- delegate_to_child(child, task): Invoke a coordinator for a "
+        "direct child module.\n"
+        "You can ONLY delegate downward. You cannot modify files "
+        "directly or delegate to your parent or siblings.",
 
         "AVAILABLE ROLES:\n"
-        "- architect: Decomposes the module into sub-modules and defines "
-        "high-level structure. Writes description comments and creates "
-        "sub-module files. Does NOT write code.\n"
-        "- api_designer: Designs the public API by writing type definitions "
-        "and function signatures in the header. Declarations only.\n"
-        "- test_engineer: Writes black-box tests against the declared API. "
-        "Only creates/modifies test files.\n"
-        "- implementer: Fills in function bodies in .cpp source files. "
-        "Uses the build tool to verify compilation.",
+        "- architect: Decomposes the module into sub-modules. Updates "
+        "description comments and creates sub-module scaffolds via "
+        "add_module. Does NOT write any code.\n"
+        "- api_designer: Writes the full header file with type "
+        "definitions and function signatures. Declarations only.\n"
+        "- implementer: Fills in function bodies in the .cpp source "
+        "file. Builds to verify.\n"
+        "- test_engineer: Writes tests. Only use when a test framework "
+        "is configured; skip otherwise.",
 
-        "TYPICAL SEQUENCING (guidance, not rigid rules):\n"
-        "1. Architecture: delegate_to_role('architect', ...) to define "
-        "module structure and sub-modules.\n"
-        "2. API design: delegate_to_role('api_designer', ...) to declare "
-        "interfaces. Design dependencies before dependents.\n"
-        "3. Testing: delegate_to_role('test_engineer', ...) to write "
-        "tests against the declared API.\n"
-        "4. Implementation: delegate_to_role('implementer', ...) to "
-        "write the code. Implement dependencies before dependents.\n"
-        "For existing codebases, inspect module state first and skip "
-        "steps that are already done. Adapt the sequence to the task.",
+        "WORKFLOW FOR BUILDING A MODULE FROM SCRATCH:\n"
+        "1. delegate_to_role('architect', ...) — define structure, "
+        "create any sub-modules.\n"
+        "2. After architecture, check list_submodules('{module}'). "
+        "For each child, use delegate_to_child to have it fully "
+        "developed (API + implementation). Process dependencies FIRST.\n"
+        "3. delegate_to_role('api_designer', ...) — declare this "
+        "module's own API in its header.\n"
+        "4. delegate_to_role('implementer', ...) — implement this "
+        "module's code.\n"
+        "Skip steps that are already done. For existing code, inspect "
+        "state first and adapt.",
+
+        "SPECIAL CASE — ROOT MODULE (main):\n"
+        "The root module 'main' has NO header file; it is just main.cpp. "
+        "Therefore api_designer does NOT apply to 'main'. For the root "
+        "module: architect (to create child modules) → develop children "
+        "via delegate_to_child → implement main.cpp via implementer.",
 
         "BEFORE DELEGATING, INSPECT:\n"
-        "Use module_status, list_submodules, dependency_order, and "
-        "read_file to understand current state. Don't assume the "
-        "module needs all phases -- check what exists first.",
+        "Use module_status and list_submodules to understand current "
+        "state. Don't blindly run all phases.",
 
         "ERROR HANDLING:\n"
-        "If a delegated agent reports an error, you may retry with "
-        "adjusted instructions, try a different approach, or delegate "
-        "to a different role. If the task truly cannot be completed "
-        "within your authority (your module and its descendants), you "
-        "MUST call raise_error with a clear explanation so your parent "
-        "can decide what to do.",
+        "If a delegate reports an error, you may retry or try a "
+        "different approach. If the task cannot be completed within "
+        "your authority, call raise_error with a clear explanation.",
     ]
     tools = [
         delegate_to_role,

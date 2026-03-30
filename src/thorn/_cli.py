@@ -13,6 +13,7 @@ from rich.console import Console
 from thorn._context import (
     ConsoleEventSink,
     ExecutionContext,
+    Verbosity,
     set_context,
     reset_context,
 )
@@ -27,10 +28,40 @@ from thorn.errors import SkillError, ThornError
 console = Console()
 
 
-def _build_context() -> ExecutionContext:
-    """Create an execution context from environment variables."""
+def _resolve_verbosity(verbose: int, quiet: bool) -> Verbosity:
+    """Map ``-v``/``-q`` CLI flags to a :class:`Verbosity` level."""
+    if quiet:
+        return Verbosity.QUIET
+    if verbose >= 2:
+        return Verbosity.DEBUG
+    if verbose == 1:
+        return Verbosity.VERBOSE
+    return Verbosity.NORMAL
+
+
+def _build_context(
+    verbosity: Verbosity = Verbosity.NORMAL,
+    trace_file: Any | None = None,
+) -> ExecutionContext:
+    """Create an execution context from environment variables.
+
+    When *trace_file* is an open file handle, a :class:`JsonLinesSink`
+    is composed alongside the console sink so that a structured JSONL
+    trace is written in parallel.
+    """
+    from thorn._context import EventSink
+
     provider = load_provider_from_env()
-    sink = ConsoleEventSink()
+    console_sink: EventSink = ConsoleEventSink(verbosity=verbosity)
+
+    if trace_file is not None:
+        from thorn._trace import CompositeEventSink, JsonLinesSink
+        sink: EventSink = CompositeEventSink([
+            console_sink, JsonLinesSink(trace_file),
+        ])
+    else:
+        sink = console_sink
+
     return ExecutionContext(provider=provider, event_sink=sink)
 
 
@@ -194,12 +225,18 @@ def init(with_mcp: bool) -> None:
     default=False,
     help="Skip MCP server tool sources.",
 )
-def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool) -> None:
+@click.option("-v", "--verbose", count=True, help="Increase output detail (-v, -vv).")
+@click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
+@click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
+def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None) -> None:
     """Execute a single prompt and print the result."""
+    trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        ctx = _build_context()
+        ctx = _build_context(_resolve_verbosity(verbose, quiet), trace_file=trace_file)
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
+        if trace_file:
+            trace_file.close()
         sys.exit(1)
 
     async def _run() -> str:
@@ -238,6 +275,9 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool) -> No
     except KeyboardInterrupt:
         console.print("\n[dim]Interrupted.[/dim]")
         sys.exit(130)
+    finally:
+        if trace_file:
+            trace_file.close()
 
 
 # ---------------------------------------------------------------------------
@@ -263,12 +303,18 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool) -> No
     default=False,
     help="Skip MCP server tool sources.",
 )
-def chat(no_tools: bool, no_discover: bool, no_mcp: bool) -> None:
+@click.option("-v", "--verbose", count=True, help="Increase output detail (-v, -vv).")
+@click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
+@click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
+def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None) -> None:
     """Start an interactive chat session."""
+    trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        ctx = _build_context()
+        ctx = _build_context(_resolve_verbosity(verbose, quiet), trace_file=trace_file)
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
+        if trace_file:
+            trace_file.close()
         sys.exit(1)
 
     ctx.system_prompts.append(
@@ -358,6 +404,9 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool) -> None:
     except ThornError as exc:
         console.print(f"\n[red]Error:[/red] {exc}")
         sys.exit(1)
+    finally:
+        if trace_file:
+            trace_file.close()
 
 
 # ---------------------------------------------------------------------------

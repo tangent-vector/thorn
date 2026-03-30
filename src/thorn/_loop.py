@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from typing import Any
 
 from thorn._context import ExecutionContext, Scope
@@ -311,17 +312,22 @@ async def _execute_tool_calls(
                 content=f"Unknown tool: {tc.name!r}",
                 is_error=True,
             ))
-            await context.event_sink.on_status(
-                f"tool {tc.name}: unknown", scope=context.scope,
+            await context.event_sink.on_tool_end(
+                tc.name, error="unknown tool", scope=context.scope,
             )
             continue
 
         # -- execute -------------------------------------------------------
+        await context.event_sink.on_tool_start(
+            tc.name, kwargs, scope=context.scope,
+        )
+        t0 = time.monotonic()
         try:
             result_str = await tool.execute(**kwargs)
         except SkillError:
             raise
         except Exception as exc:
+            duration_s = time.monotonic() - t0
             logger.exception("error executing tool %s", tc.name)
             result_str = None
             results.append(ToolResultMessage(
@@ -329,17 +335,19 @@ async def _execute_tool_calls(
                 content=f"Error: {exc}",
                 is_error=True,
             ))
-            await context.event_sink.on_status(
-                f"tool {tc.name}: error — {exc}", scope=context.scope,
+            await context.event_sink.on_tool_end(
+                tc.name, duration_s=duration_s, error=str(exc),
+                scope=context.scope,
             )
             continue
 
+        duration_s = time.monotonic() - t0
         results.append(ToolResultMessage(
             call_id=tc.call_id,
             content=result_str if isinstance(result_str, str) else serialize_for_tool_result(result_str),
         ))
-        await context.event_sink.on_status(
-            f"tool {tc.name}: ok", scope=context.scope,
+        await context.event_sink.on_tool_end(
+            tc.name, duration_s=duration_s, scope=context.scope,
         )
 
     return results, captured

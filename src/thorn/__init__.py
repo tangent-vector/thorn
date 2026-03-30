@@ -33,6 +33,7 @@ from thorn._context import (
     ExecutionContext,
     NullEventSink,
     Scope,
+    Verbosity,
     get_context,
     set_context,
 )
@@ -60,6 +61,8 @@ from thorn.errors import (
     ThornError,
 )
 
+from thorn._trace import CompositeEventSink, JsonLinesSink
+
 try:
     from thorn._mcp import MCPServerConfig, MCPToolSource, load_mcp_configs, serve_tools
 except ImportError:
@@ -82,6 +85,9 @@ __all__ = [
     "EventSink",
     "NullEventSink",
     "ConsoleEventSink",
+    "CompositeEventSink",
+    "JsonLinesSink",
+    "Verbosity",
     "Scope",
     "get_context",
     "set_context",

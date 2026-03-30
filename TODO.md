@@ -1,5 +1,7 @@
 - `thorn do` instead of `thorn run`, and then rename `thorn.prompt` over to be `thorn.do` (and similarly, `Agent.prompt` becomes `agent.do`)
 
+- In the workflow: a "clarify and then delegate" role/step/tool that the concierge can invoke, that works to explore the project and (optionally) grill the user to get clarification on their intent, before moving on to actually delegating to a `coordinator` agent to get the work done.
+
 - Consider splitting `@skill` so that there's a distinction between "a function whose implementation is a prompt" and the exposure of such a function to the rest of the system
 
 - Tools or other support to allow querying the human user as part of a workflow (and making sure those queries are surfaced in a way that makes them fit in naturally during a `thorn chat` or `thorn run` session... and that they fail if stdin doesn't appear to be a tty).
@@ -41,4 +43,14 @@
 - Support for git worktrees seems like one of the most important things to get right, sooner or later. It's not really something you want users to have to implement for themselves in user space, over and over.
 
 - Support using "slash command" syntax when using `thorn run` or `thorn chat` so that a user can be completely explicit about their intention to run a specific tool/skill
+
+- Rich `Live` display for real-time spinners/progress indicators during tool execution, replacing the completed-tool line in-place
+
+- Rich `Tree` rendering for a post-run execution summary (the full agent/tool call tree printed after the run completes)
+
+- Cost/token tracking per agent and in aggregate, sourced from the provider's response metadata (token usage fields in the OpenAI streaming API)
+
+- Collapsible terminal output using ANSI folding sequences (the same mechanism GitHub Actions uses for grouped log lines), so tool call details can be expanded on demand
+
+- A `thorn trace view` command that opens a local web page to visualize JSONL trace files (produced by `--trace`) as an interactive execution tree with timing
 

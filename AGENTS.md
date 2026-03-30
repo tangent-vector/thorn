@@ -1,3 +1,6 @@
+- Don't guess or presume. If you aren't exceptionally confident that you understand the situation, the user's intent, etc. then you should ask clarifying questions.
+  We are collaborators, and you should leverage the things that the user is good at and the knowledge they have that you may lack.
+
 - Make sure any code you add builds, has no linter issues, and passes all tests.
 
 - If you see build/lint/test failures that don't seem related to your own work, you are still responsible for addressing them or (if you cannot fix them) bringing them to the attention of the user.

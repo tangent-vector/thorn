@@ -38,11 +38,10 @@ async def configure() -> str:
 
 @tool
 async def build() -> str:
-    """Build the calc project (configure first if needed)."""
-    if not (BUILD_DIR / "CMakeCache.txt").exists():
-        cfg = await configure()
-        if "[configure FAILED" in cfg:
-            return cfg
+    """Build the calc project (always re-configures to pick up new files)."""
+    cfg = await configure()
+    if "[configure FAILED" in cfg:
+        return cfg
 
     rc, output = await _run(f'cmake --build "{BUILD_DIR}"')
     if rc != 0:

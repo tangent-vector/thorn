@@ -52,6 +52,9 @@ class Agent:
         for k, v in kwargs.items():
             setattr(self, k, v)
 
+    def __str__(self) -> str:
+        return type(self).__name__
+
     @classmethod
     def get_subclasses(cls, base: type[Agent] | None = None) -> dict[str, type[Agent]]:
         """Return registered (non-abstract) subclasses, optionally filtered.
@@ -175,6 +178,8 @@ async def _run_agent_prompt(
     across calls — enabling multi-turn patterns where the same agent
     retains context (e.g. write code, then fix build errors).
     """
+    import time
+
     from thorn._context import get_context, reset_context, set_context
     from thorn._func import _prepare_tools, _type_label
     from thorn._loop import run_agent_loop
@@ -193,6 +198,8 @@ async def _run_agent_prompt(
         scope_label += f"[{_type_label(result_type)}]"
     child = ctx.push_scope(scope_label, agent=agent)
 
+    await child.event_sink.on_scope_enter(child.scope)
+    t0 = time.monotonic()
     token = set_context(child)
     try:
         return await run_agent_loop(
@@ -204,4 +211,8 @@ async def _run_agent_prompt(
             messages=messages,
         )
     finally:
+        duration_s = time.monotonic() - t0
+        await child.event_sink.on_scope_exit(
+            child.scope, duration_s=duration_s,
+        )
         reset_context(token)

@@ -17,6 +17,7 @@ import asyncio
 import functools
 import inspect
 import json
+import time
 from typing import Any, Callable, Generic, TypeVar, get_type_hints, overload
 
 from thorn._context import ExecutionContext, get_context, reset_context, set_context
@@ -109,17 +110,25 @@ class _TypedPrompt:
         ctx = get_context()
         child = ctx.push_scope(f"prompt[{_type_label(self._result_type)}]")
 
+        await child.event_sink.on_scope_enter(child.scope)
+        t0 = time.monotonic()
+
         sys_prompts: list[str] | None = None
         if system:
             sys_prompts = [system]
 
-        return await run_agent_loop(
-            context=child,
-            user_prompt=text,
-            tools=_prepare_tools(tools),
-            system_prompts=sys_prompts,
-            result_type=self._result_type,
-        )
+        try:
+            return await run_agent_loop(
+                context=child,
+                user_prompt=text,
+                tools=_prepare_tools(tools),
+                system_prompts=sys_prompts,
+                result_type=self._result_type,
+            )
+        finally:
+            await child.event_sink.on_scope_exit(
+                child.scope, duration_s=time.monotonic() - t0,
+            )
 
 
 class _PromptAccessor:
@@ -158,17 +167,25 @@ class _PromptAccessor:
         ctx = get_context()
         child = ctx.push_scope("prompt")
 
+        await child.event_sink.on_scope_enter(child.scope)
+        t0 = time.monotonic()
+
         sys_prompts: list[str] | None = None
         if system:
             sys_prompts = [system]
 
-        return await run_agent_loop(
-            context=child,
-            user_prompt=text,
-            tools=_prepare_tools(tools),
-            system_prompts=sys_prompts,
-            result_type=str,
-        )
+        try:
+            return await run_agent_loop(
+                context=child,
+                user_prompt=text,
+                tools=_prepare_tools(tools),
+                system_prompts=sys_prompts,
+                result_type=str,
+            )
+        finally:
+            await child.event_sink.on_scope_exit(
+                child.scope, duration_s=time.monotonic() - t0,
+            )
 
 
 prompt = _PromptAccessor()
@@ -245,6 +262,8 @@ def skill(
                 prepared = _prepare_tools(combined)
 
                 child = ctx.push_scope(f"skill:{fn.__name__}", agent=role_instance)
+                await child.event_sink.on_scope_enter(child.scope)
+                t0 = time.monotonic()
                 token = set_context(child)
                 try:
                     return await run_agent_loop(
@@ -255,17 +274,27 @@ def skill(
                         result_type=return_type,
                     )
                 finally:
+                    await child.event_sink.on_scope_exit(
+                        child.scope, duration_s=time.monotonic() - t0,
+                    )
                     reset_context(token)
             else:
                 child = ctx.push_scope(f"skill:{fn.__name__}")
+                await child.event_sink.on_scope_enter(child.scope)
+                t0 = time.monotonic()
                 sys_prompts = [system] if system else None
-                return await run_agent_loop(
-                    context=child,
-                    user_prompt=prompt_text,
-                    tools=_prepare_tools(tools),
-                    system_prompts=sys_prompts,
-                    result_type=return_type,
-                )
+                try:
+                    return await run_agent_loop(
+                        context=child,
+                        user_prompt=prompt_text,
+                        tools=_prepare_tools(tools),
+                        system_prompts=sys_prompts,
+                        result_type=return_type,
+                    )
+                finally:
+                    await child.event_sink.on_scope_exit(
+                        child.scope, duration_s=time.monotonic() - t0,
+                    )
 
         wrapper._thorn_skill = True  # type: ignore[attr-defined]
         wrapper._thorn_return_type = return_type  # type: ignore[attr-defined]

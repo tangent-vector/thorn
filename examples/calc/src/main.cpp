@@ -23,115 +23,102 @@
 //   - No third-party dependencies (standard library only)
 //   - Clean separation of concerns across modules
 //
-// Dependencies:
-//   - environment: for managing variable bindings
-//   - expression: for expression representation and evaluation
-//   - parser: for parsing input into expressions
-//
 
-#include "environment.h"
-#include "expression.h"
 #include "parser.h"
+#include "evaluator.h"
+#include "expression.h"
 
+#include <cctype>
+#include <exception>
 #include <iostream>
 #include <string>
-#include <unordered_map>
-
-/// Trims leading whitespace from a string_view
-static std::string_view trimLeft(std::string_view sv) {
-    while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front()))) {
-        sv.remove_prefix(1);
-    }
-    return sv;
-}
-
-/// Checks if a line starts with a specific prefix (case-insensitive for commands)
-static bool startsWithCommand(std::string_view line, std::string_view cmd) {
-    if (line.size() < cmd.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < cmd.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(line[i])) != 
-            std::tolower(static_cast<unsigned char>(cmd[i]))) {
-            return false;
-        }
-    }
-    // After the command, must be end of line or whitespace
-    if (line.size() == cmd.size()) {
-        return true;
-    }
-    return std::isspace(static_cast<unsigned char>(line[cmd.size()]));
-}
 
 int main()
 {
-    // Use a map of variable names to expressions for substitution
-    std::unordered_map<std::string, expression::ExpressionPtr> variables;
-    
+    evaluator::Environment env;
     std::string line;
     
     while (std::getline(std::cin, line)) {
-        // Trim leading whitespace for command detection
-        std::string_view trimmed = trimLeft(line);
+        // Trim leading whitespace
+        std::size_t start = line.find_first_not_of(" \t");
+        if (start == std::string::npos) {
+            continue;  // Empty line
+        }
+        line = line.substr(start);
         
-        // Skip empty lines
-        if (trimmed.empty()) {
+        // Comment check
+        if (!line.empty() && line[0] == '#') {
             continue;
         }
         
-        // Skip comments
-        if (trimmed.front() == '#') {
-            continue;
-        }
-        
-        // Handle quit/exit commands
-        if (startsWithCommand(trimmed, "quit") || startsWithCommand(trimmed, "exit")) {
+        // Quit/exit check
+        if (line.starts_with("quit") || line.starts_with("exit")) {
             break;
         }
         
-        // Parse the input as a statement (could be expression or assignment)
-        auto result = parser::parseStatement(line);
-        
-        if (!result.success) {
-            std::cout << "Error: " << result.error->message << std::endl;
-            continue;
+        // Check for variable assignment: var = expr
+        std::size_t equals_pos = std::string::npos;
+        int paren_depth = 0;
+        for (std::size_t i = 0; i < line.size(); ++i) {
+            if (line[i] == '(') {
+                paren_depth++;
+            } else if (line[i] == ')') {
+                paren_depth--;
+            } else if (line[i] == '=' && paren_depth == 0) {
+                equals_pos = i;
+                break;
+            }
         }
         
-        if (result.isAssignment) {
-            // Handle assignment: <variable> = <expression>
-            const auto& assignment = result.getAssignment();
+        if (equals_pos != std::string::npos && equals_pos > 0) {
+            std::string var_part = line.substr(0, equals_pos);
+            std::string expr_part = line.substr(equals_pos + 1);
             
-            // Substitute known variables in the expression
-            auto substituted = expression::substitute(assignment.value, variables);
-            
-            // Simplify the expression
-            auto simplified = expression::simplify(substituted);
-            
-            // Store in variables map
-            variables[assignment.variableName] = simplified;
-            
-            // Print the result
-            std::cout << assignment.variableName << " = " 
-                      << expression::toPrettyString(simplified) << std::endl;
-        } else {
-            // Handle expression evaluation
-            auto expr = result.getExpression();
-            
-            // Substitute known variables
-            auto substituted = expression::substitute(expr, variables);
-            
-            // Simplify the expression
-            auto simplified = expression::simplify(substituted);
-            
-            // Try to evaluate to a numeric result
-            auto evalResult = expression::evaluate(simplified);
-            
-            if (evalResult.success) {
-                std::cout << evalResult.value << std::endl;
-            } else {
-                // If evaluation failed (e.g., has unbound variables), print simplified form
-                std::cout << expression::toPrettyString(simplified) << std::endl;
+            // Trim var_part
+            std::size_t var_end = var_part.find_last_not_of(" \t");
+            if (var_end != std::string::npos) {
+                var_part = var_part.substr(0, var_end + 1);
             }
+            
+            // Check if valid identifier
+            bool valid_var = !var_part.empty() && 
+                (std::isalpha(static_cast<unsigned char>(var_part[0])) || var_part[0] == '_');
+            for (std::size_t i = 1; valid_var && i < var_part.size(); ++i) {
+                valid_var = std::isalnum(static_cast<unsigned char>(var_part[i])) || var_part[i] == '_';
+            }
+            
+            if (valid_var) {
+                try {
+                    parser::ParseResult result = parser::parse(std::string_view(expr_part));
+                    if (result.success()) {
+                        evaluator::EvalResult eval_result = evaluator::evaluate(**result.expr, env);
+                        std::cout << var_part << " = " << expression::to_string(*eval_result.expr) << std::endl;
+                        env[var_part] = std::move(eval_result.expr);
+                    } else {
+                        std::cerr << "Error: " << result.error << std::endl;
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "Error: " << e.what() << std::endl;
+                }
+                continue;
+            }
+        }
+        
+        // Regular expression evaluation
+        try {
+            parser::ParseResult result = parser::parse(std::string_view(line));
+            if (result.success()) {
+                evaluator::EvalResult eval_result = evaluator::evaluate(**result.expr, env);
+                if (eval_result.value.has_value()) {
+                    std::cout << eval_result.value.value() << std::endl;
+                } else {
+                    std::cout << expression::to_string(*eval_result.expr) << std::endl;
+                }
+            } else {
+                std::cerr << "Error: " << result.error << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
         }
     }
     
