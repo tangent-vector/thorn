@@ -54,3 +54,9 @@
 
 - A `thorn trace view` command that opens a local web page to visualize JSONL trace files (produced by `--trace`) as an interactive execution tree with timing
 
+- The LLM provider (`_provider.py`) does not set `max_tokens` on API requests, so a degenerate model response can produce unbounded output. The agent loop (`_loop.py`) also has no repetition detection. Together these allow a stuck LLM to spin forever repeating tokens. Short-term: add a configurable `max_tokens` to `OpenAIProvider.complete`. Longer-term: add repetition/loop detection in the agent loop itself.
+
+- Terminal output from `thorn run` can be truncated when the process completes, making it hard to diagnose issues from the log alone. Consider flushing/syncing output before exit, or writing a separate structured trace log.
+
+- Validation is currently skipped for non-implementer roles (architect, api_designer, test_engineer) as a pragmatic workaround. Longer-term options: (a) an `implement_stubs` tool for the api_designer so the build can pass after API design, (b) context-dependent validation decisions made by coordinators, (c) a general mechanism for coordinators to specify which validation rules apply per-delegation.
+

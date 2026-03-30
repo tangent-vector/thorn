@@ -78,6 +78,33 @@ def _prepare_tools(raw_tools: list[Any] | None) -> list[_WrappedTool]:
 # prompt — the core inline-prompt primitive
 # ---------------------------------------------------------------------------
 
+def _push_bare_prompt_scope(
+    ctx: ExecutionContext,
+    label: str,
+    extra_file_access: list[Any] | None,
+) -> ExecutionContext:
+    """Build a file-access policy for a bare ``prompt()`` call and push a scope.
+
+    Uses the base ``Agent`` default rules (write within workspace,
+    ``.thorn/`` read-only) so that bare ``prompt()`` calls don't get
+    more permissions than an explicit ``Agent()``.
+    """
+    from thorn._agent import Agent
+    from thorn._file_access import FileAccessLevel, FileAccessPolicy
+
+    rules = list(Agent._collect_file_access())
+    if extra_file_access:
+        rules.extend(extra_file_access)
+    policy = FileAccessPolicy(
+        rules, default=FileAccessLevel.NONE, workspace=ctx.workspace_root,
+    )
+
+    if ctx.global_ignores is not None:
+        policy = policy.with_ceiling(ctx.global_ignores)
+
+    return ctx.push_scope(label, file_access_policy=policy)
+
+
 class _TypedPrompt:
     """Callable returned by ``prompt[T]`` that executes a prompt expecting
     a result of type *T*.
@@ -95,6 +122,7 @@ class _TypedPrompt:
         tools: list[Any] | None = None,
         system: str | None = None,
         role: Any | None = None,
+        file_access: list[Any] | None = None,
     ) -> Any:
         if role is not None:
             from thorn._agent import Agent, _run_agent_prompt
@@ -105,10 +133,15 @@ class _TypedPrompt:
                 result_type=self._result_type,
                 extra_tools=tools,
                 extra_system=system,
+                extra_file_access=file_access,
             )
 
         ctx = get_context()
-        child = ctx.push_scope(f"prompt[{_type_label(self._result_type)}]")
+        child = _push_bare_prompt_scope(
+            ctx,
+            f"prompt[{_type_label(self._result_type)}]",
+            file_access,
+        )
 
         await child.event_sink.on_scope_enter(child.scope)
         t0 = time.monotonic()
@@ -151,6 +184,7 @@ class _PromptAccessor:
         tools: list[Any] | None = None,
         system: str | None = None,
         role: Any | None = None,
+        file_access: list[Any] | None = None,
     ) -> str:
         """Execute a prompt and return the assistant's text response."""
         if role is not None:
@@ -162,10 +196,11 @@ class _PromptAccessor:
                 result_type=str,
                 extra_tools=tools,
                 extra_system=system,
+                extra_file_access=file_access,
             )
 
         ctx = get_context()
-        child = ctx.push_scope("prompt")
+        child = _push_bare_prompt_scope(ctx, "prompt", file_access)
 
         await child.event_sink.on_scope_enter(child.scope)
         t0 = time.monotonic()

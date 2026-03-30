@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING, Any
 from thorn._provider import LLMProvider, ResponseChunk
 
 if TYPE_CHECKING:
-    pass
+    from pathlib import Path
+
+    from thorn._file_access import FileAccessPolicy
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +366,14 @@ class ExecutionContext:
         system_prompts: Extra system-prompt strings that apply to every
                         agent created under this context.
         agent:      The current ``Agent`` instance, if running inside one.
+        workspace_root: Resolved absolute path to the workspace directory.
+                        File access patterns are matched relative to this.
+        file_access_policy: Active file-access policy for the current
+                            agent scope.  ``None`` only at the root
+                            context before any agent scope is pushed.
+        global_ignores: Ceiling policy loaded from ``.aiignore`` /
+                        ``.thornignore`` at startup.  Applied as an upper
+                        bound on every per-agent policy.
     """
 
     provider: LLMProvider
@@ -371,9 +381,17 @@ class ExecutionContext:
     scope: Scope | None = None
     system_prompts: list[str] = field(default_factory=list)
     agent: Any = None
+    workspace_root: Path | None = None
+    file_access_policy: FileAccessPolicy | None = None
+    global_ignores: FileAccessPolicy | None = None
 
     def push_scope(
-        self, description: str, *, agent: Any = _UNSET, **metadata: Any,
+        self,
+        description: str,
+        *,
+        agent: Any = _UNSET,
+        file_access_policy: FileAccessPolicy | None = _UNSET,  # type: ignore[assignment]
+        **metadata: Any,
     ) -> ExecutionContext:
         """Return a *new* context with one more scope level pushed.
 
@@ -381,8 +399,16 @@ class ExecutionContext:
         overridden (pass ``agent=<instance>`` or ``agent=None``).
         The resolved agent is also stored in ``scope.metadata["agent"]``
         so that event sinks can access it without the full context.
+
+        *file_access_policy* follows the same propagation rule: it
+        inherits from the parent unless explicitly supplied.
         """
         resolved_agent = self.agent if agent is _UNSET else agent
+        resolved_policy = (
+            self.file_access_policy
+            if file_access_policy is _UNSET
+            else file_access_policy
+        )
         if resolved_agent is not None:
             metadata.setdefault("agent", resolved_agent)
         new_scope = Scope(
@@ -396,6 +422,9 @@ class ExecutionContext:
             scope=new_scope,
             system_prompts=list(self.system_prompts),
             agent=resolved_agent,
+            workspace_root=self.workspace_root,
+            file_access_policy=resolved_policy,
+            global_ignores=self.global_ignores,
         )
 
 

@@ -11,7 +11,7 @@ Defines the role hierarchy:
 
 from __future__ import annotations
 
-from thorn import Agent, read_file, write_file
+from thorn import Agent, FileAccessLevel, FileAccessRule, read_file, write_file
 from thorn.tools import list_directory
 
 from .build_tools import build, run_calc
@@ -97,6 +97,11 @@ class Developer(Agent, abstract=True):
         read_file, list_directory, list_submodules,
         module_header_path, module_source_path, list_all_modules,
     ]
+    file_access = [
+        FileAccessRule("**", FileAccessLevel.READ),
+        FileAccessRule(".thorn", FileAccessLevel.HIDDEN),
+        FileAccessRule(".thorn/**", FileAccessLevel.HIDDEN),
+    ]
 
 
 class WorkflowRole(Developer, abstract=True):
@@ -124,6 +129,9 @@ class Architect(WorkflowRole):
     system_prompts = [
         "You are architect@{module}. Your job is to decompose this module "
         "into sub-modules and define the high-level structure.\n\n"
+        "FILE ACCESS: You have write access ONLY to the module's header "
+        "file (or main.cpp for the root module). All other files are "
+        "read-only. Use the add_module tool to create new child modules.\n\n"
         "ALLOWED ACTIONS — you may ONLY do these two things:\n"
         "1. Update the Purpose/Responsibilities/Dependencies COMMENT BLOCK "
         "in the module's header file (or main.cpp for the root module). "
@@ -154,6 +162,14 @@ class Architect(WorkflowRole):
     ]
     tools = [write_file, add_module]
 
+    def _instance_file_access(self) -> list[FileAccessRule]:
+        header = module_header_path(self.module)
+        source = module_source_path(self.module)
+        rules = [FileAccessRule(header, FileAccessLevel.WRITE)]
+        if self.module == "main":
+            rules.append(FileAccessRule(source, FileAccessLevel.WRITE))
+        return rules
+
 
 register_role("architect", Architect)
 
@@ -164,6 +180,8 @@ class APIDesigner(WorkflowRole):
     system_prompts = [
         "You are api_designer@{module}. You design the public API by "
         "writing declarations in the module's HEADER file ONLY.\n\n"
+        "FILE ACCESS: You have write access ONLY to the module's header "
+        "file. All other files are read-only.\n\n"
         "ALLOWED: Write the complete header file including #include "
         "directives, namespace blocks, type definitions, class definitions, "
         "and function signatures (declarations without bodies).\n\n"
@@ -173,6 +191,10 @@ class APIDesigner(WorkflowRole):
         "Read dependency module headers first to understand available types.",
     ]
     tools = [write_file]
+
+    def _instance_file_access(self) -> list[FileAccessRule]:
+        header = module_header_path(self.module)
+        return [FileAccessRule(header, FileAccessLevel.WRITE)]
 
 
 register_role("api_designer", APIDesigner)
@@ -184,10 +206,17 @@ class TestEngineer(WorkflowRole):
     system_prompts = [
         "You are test_engineer@{module}. You write black-box tests that "
         "exercise the public API declared in the module's header.\n\n"
+        "FILE ACCESS: You have write access ONLY to test files for this "
+        "module. All other files are read-only.\n\n"
         "FORBIDDEN: Do NOT modify the module's header or source file. "
         "Only create or modify test files.",
     ]
     tools = [write_file]
+
+    def _instance_file_access(self) -> list[FileAccessRule]:
+        # Grant write to test files in the module's directory
+        # For now, grant write to a tests/ directory pattern
+        return [FileAccessRule("tests/**", FileAccessLevel.WRITE)]
 
 
 register_role("test_engineer", TestEngineer)
@@ -200,15 +229,20 @@ class Implementer(WorkflowRole):
         "You are implementer@{module}. You write the implementation in "
         "the module's .cpp SOURCE file to satisfy the declarations in "
         "its header.\n\n"
+        "FILE ACCESS: You have write access ONLY to the module's .cpp "
+        "source file. All other files are read-only.\n\n"
         "ALLOWED: Write to this module's .cpp source file ONLY. "
         "Use the build tool to verify compilation.\n\n"
         "FORBIDDEN: Do NOT modify the header file. Do NOT modify any "
         "other module's files. Do NOT modify main.cpp (unless you ARE "
         "implementer@main). Do NOT modify test files. Do NOT create "
-        "new files. Do NOT use shell commands to compile tests or "
-        "create build targets.",
+        "new files.",
     ]
     tools = [write_file, build, run_calc]
+
+    def _instance_file_access(self) -> list[FileAccessRule]:
+        source = module_source_path(self.module)
+        return [FileAccessRule(source, FileAccessLevel.WRITE)]
 
 
 register_role("implementer", Implementer)
@@ -228,7 +262,9 @@ class Coordinator(Developer):
     system_prompts = [
         "You are coordinator@{module}. You coordinate development work "
         "for this module and its subtree by delegating to specialized "
-        "roles and child coordinators.",
+        "roles and child coordinators.\n\n"
+        "FILE ACCESS: You have read-only access to all project files. "
+        "Use delegation tools to make changes.",
 
         "DELEGATION AUTHORITY:\n"
         "- delegate_to_role(role, task): Invoke a role at YOUR module.\n"

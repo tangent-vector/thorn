@@ -10,6 +10,7 @@ dependencies = [
     "rich>=13.0",
     "python-dotenv>=1.0",
     "docstring-parser>=0.16",
+    "pathspec>=0.12",
 ]
 
 [project.scripts]

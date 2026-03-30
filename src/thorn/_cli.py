@@ -42,14 +42,22 @@ def _resolve_verbosity(verbose: int, quiet: bool) -> Verbosity:
 def _build_context(
     verbosity: Verbosity = Verbosity.NORMAL,
     trace_file: Any | None = None,
+    workspace: str | None = None,
 ) -> ExecutionContext:
     """Create an execution context from environment variables.
 
     When *trace_file* is an open file handle, a :class:`JsonLinesSink`
     is composed alongside the console sink so that a structured JSONL
     trace is written in parallel.
+
+    *workspace* overrides the workspace root.  When ``None``, the
+    heuristic in :func:`thorn.infer_workspace_root` is used.
     """
+    from pathlib import Path
+
+    from thorn import infer_workspace_root
     from thorn._context import EventSink
+    from thorn._file_access import load_global_ignores
 
     provider = load_provider_from_env()
     console_sink: EventSink = ConsoleEventSink(verbosity=verbosity)
@@ -62,7 +70,15 @@ def _build_context(
     else:
         sink = console_sink
 
-    return ExecutionContext(provider=provider, event_sink=sink)
+    ws_root = Path(workspace).resolve() if workspace else infer_workspace_root()
+    global_ignores = load_global_ignores(ws_root)
+
+    return ExecutionContext(
+        provider=provider,
+        event_sink=sink,
+        workspace_root=ws_root,
+        global_ignores=global_ignores,
+    )
 
 
 async def _collect_all_tools(
@@ -211,7 +227,7 @@ def init(with_mcp: bool) -> None:
     "--no-tools",
     is_flag=True,
     default=False,
-    help="Disable built-in tools (file I/O, shell, etc.).",
+    help="Disable built-in tools (file I/O, etc.).",
 )
 @click.option(
     "--no-discover",
@@ -228,11 +244,12 @@ def init(with_mcp: bool) -> None:
 @click.option("-v", "--verbose", count=True, help="Increase output detail (-v, -vv).")
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
-def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None) -> None:
+@click.option("--workspace", "workspace_path", type=click.Path(exists=True, file_okay=False), default=None, help="Override workspace root directory.")
+def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None) -> None:
     """Execute a single prompt and print the result."""
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        ctx = _build_context(_resolve_verbosity(verbose, quiet), trace_file=trace_file)
+        ctx = _build_context(_resolve_verbosity(verbose, quiet), trace_file=trace_file, workspace=workspace_path)
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         if trace_file:
@@ -306,11 +323,12 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
 @click.option("-v", "--verbose", count=True, help="Increase output detail (-v, -vv).")
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
-def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None) -> None:
+@click.option("--workspace", "workspace_path", type=click.Path(exists=True, file_okay=False), default=None, help="Override workspace root directory.")
+def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None) -> None:
     """Start an interactive chat session."""
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        ctx = _build_context(_resolve_verbosity(verbose, quiet), trace_file=trace_file)
+        ctx = _build_context(_resolve_verbosity(verbose, quiet), trace_file=trace_file, workspace=workspace_path)
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         if trace_file:

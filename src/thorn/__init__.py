@@ -39,6 +39,7 @@ from thorn._context import (
 )
 from thorn._agent import Agent
 from thorn._discovery import discover_tools
+from thorn._file_access import FileAccessLevel, FileAccessPolicy, FileAccessRule
 from thorn._func import prompt, skill, tool, wrap_function
 from thorn._retry import bound_retries
 from thorn._loop import _WrappedTool
@@ -49,7 +50,6 @@ from thorn._tools import (
     ask_user,
     list_directory,
     read_file,
-    run_shell,
     write_file,
 )
 from thorn.errors import (
@@ -91,6 +91,10 @@ __all__ = [
     "Scope",
     "get_context",
     "set_context",
+    # File access control
+    "FileAccessLevel",
+    "FileAccessRule",
+    "FileAccessPolicy",
     # Providers
     "LLMProvider",
     "MockProvider",
@@ -100,7 +104,6 @@ __all__ = [
     "read_file",
     "write_file",
     "list_directory",
-    "run_shell",
     "ask_user",
     "ALL_BUILTIN_TOOLS",
     # Errors
@@ -124,6 +127,7 @@ def run(
     provider: LLMProvider | None = None,
     event_sink: EventSink | None = None,
     system: str | None = None,
+    workspace: str | None = None,
 ) -> T:
     """Run an async workflow with a thorn execution context.
 
@@ -133,11 +137,21 @@ def run(
 
     If *provider* is ``None``, one is loaded from environment variables
     via ``load_provider_from_env()``.
+
+    *workspace* sets the workspace root for file-access rules.  When
+    ``None``, the heuristic in :func:`infer_workspace_root` is used.
     """
+    from pathlib import Path
+
+    from thorn._file_access import load_global_ignores
+
     if provider is None:
         provider = load_provider_from_env()
     if event_sink is None:
         event_sink = NullEventSink()
+
+    ws_root = Path(workspace).resolve() if workspace else infer_workspace_root()
+    global_ignores = load_global_ignores(ws_root)
 
     system_prompts: list[str] = []
     if system:
@@ -147,6 +161,8 @@ def run(
         provider=provider,
         event_sink=event_sink,
         system_prompts=system_prompts,
+        workspace_root=ws_root,
+        global_ignores=global_ignores,
     )
 
     async def _run_with_context() -> T:
@@ -158,3 +174,20 @@ def run(
             reset_context(token)
 
     return asyncio.run(_run_with_context())
+
+
+def infer_workspace_root() -> Path:
+    """Determine the workspace root using the .thorn/ heuristic.
+
+    Precedence:
+    1. Deepest ancestor of CWD that contains a ``.thorn/`` directory.
+    2. CWD, if no ``.thorn/`` directory is found.
+    """
+    from pathlib import Path
+
+    from thorn._discovery import find_thorn_dirs
+
+    thorn_dirs = find_thorn_dirs()
+    if thorn_dirs:
+        return thorn_dirs[0].parent.resolve()
+    return Path.cwd().resolve()

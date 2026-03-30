@@ -1,14 +1,18 @@
 """Agent base class for role-based agent execution.
 
-Subclasses declare ``system_prompts`` and ``tools`` as class variables.
-The framework walks the MRO (outermost-first) to collect them, renders
-prompt templates against instance attributes, and provides a ``prompt``
-accessor for running LLM calls with the role's context.
+Subclasses declare ``system_prompts``, ``tools``, and ``file_access``
+as class variables.  The framework walks the MRO (outermost-first) to
+collect them, renders prompt templates against instance attributes, and
+provides a ``prompt`` accessor for running LLM calls with the role's
+context.
 """
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
+
+if TYPE_CHECKING:
+    from thorn._file_access import FileAccessRule
 
 
 class _SafeDict(dict):
@@ -41,6 +45,7 @@ class Agent:
 
     system_prompts: ClassVar[list[str]] = []
     tools: ClassVar[list[Any]] = []
+    file_access: ClassVar[list[FileAccessRule]]
 
     def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -94,6 +99,35 @@ class Agent:
                         seen_names.add(tool_name)
         return collected
 
+    @classmethod
+    def _collect_file_access(cls) -> list[FileAccessRule]:
+        """Walk MRO outermost-first, collecting file-access rules from each class's own ``__dict__``.
+
+        If no class in the MRO defines ``file_access``, the default
+        policy (write within workspace, ``.thorn/`` read-only) is
+        returned.
+        """
+        from thorn._file_access import FileAccessLevel, FileAccessRule as _FAR  # noqa: F811
+
+        collected: list[_FAR] = []
+        found_any = False
+        for klass in reversed(cls.__mro__):
+            if "file_access" in klass.__dict__:
+                collected.extend(klass.__dict__["file_access"])
+                found_any = True
+        if not found_any:
+            collected = _default_file_access()
+        return collected
+
+    def _instance_file_access(self) -> list[FileAccessRule]:
+        """Return per-instance file-access rules (e.g. based on a module name).
+
+        Subclasses override this to grant dynamic access that depends
+        on instance attributes.  The returned rules are appended after
+        the MRO-collected class rules, so they have highest priority.
+        """
+        return []
+
     def _render_system_prompts(self) -> list[str]:
         """Render collected prompts as templates against instance attributes."""
         attrs = _SafeDict(
@@ -105,6 +139,16 @@ class Agent:
     def prompt(self) -> _AgentPromptAccessor:
         """Accessor for ``agent.prompt("...")`` and ``agent.prompt[T]("...")``."""
         return _AgentPromptAccessor(self)
+
+
+def _default_file_access() -> list[FileAccessRule]:
+    """The fallback file-access rules when no class in the MRO defines any."""
+    from thorn._file_access import FileAccessLevel, FileAccessRule
+    return [
+        FileAccessRule("**", FileAccessLevel.WRITE),
+        FileAccessRule(".thorn", FileAccessLevel.READ),
+        FileAccessRule(".thorn/**", FileAccessLevel.READ),
+    ]
 
 
 class _AgentPromptAccessor:
@@ -124,6 +168,7 @@ class _AgentPromptAccessor:
         *,
         tools: list[Any] | None = None,
         system: str | None = None,
+        file_access: list[FileAccessRule] | None = None,
         messages: list | None = None,
     ) -> str:
         return await _run_agent_prompt(
@@ -132,6 +177,7 @@ class _AgentPromptAccessor:
             result_type=str,
             extra_tools=tools,
             extra_system=system,
+            extra_file_access=file_access,
             messages=messages,
         )
 
@@ -151,6 +197,7 @@ class _TypedAgentPrompt:
         *,
         tools: list[Any] | None = None,
         system: str | None = None,
+        file_access: list[FileAccessRule] | None = None,
         messages: list | None = None,
     ) -> Any:
         return await _run_agent_prompt(
@@ -159,6 +206,7 @@ class _TypedAgentPrompt:
             result_type=self._result_type,
             extra_tools=tools,
             extra_system=system,
+            extra_file_access=file_access,
             messages=messages,
         )
 
@@ -170,6 +218,7 @@ async def _run_agent_prompt(
     result_type: type,
     extra_tools: list[Any] | None = None,
     extra_system: str | None = None,
+    extra_file_access: list[FileAccessRule] | None = None,
     messages: list | None = None,
 ) -> Any:
     """Shared implementation for agent prompt calls.
@@ -181,6 +230,7 @@ async def _run_agent_prompt(
     import time
 
     from thorn._context import get_context, reset_context, set_context
+    from thorn._file_access import FileAccessLevel, FileAccessPolicy
     from thorn._func import _prepare_tools, _type_label
     from thorn._loop import run_agent_loop
 
@@ -193,10 +243,23 @@ async def _run_agent_prompt(
     prepared = _prepare_tools(combined)
 
     ctx = get_context()
+
+    rules = type(agent)._collect_file_access()
+    rules = list(rules)
+    rules.extend(agent._instance_file_access())
+    if extra_file_access:
+        rules.extend(extra_file_access)
+    policy = FileAccessPolicy(
+        rules, default=FileAccessLevel.NONE, workspace=ctx.workspace_root,
+    )
+
+    if ctx.global_ignores is not None:
+        policy = policy.with_ceiling(ctx.global_ignores)
+
     scope_label = f"agent:{type(agent).__name__}"
     if result_type is not str:
         scope_label += f"[{_type_label(result_type)}]"
-    child = ctx.push_scope(scope_label, agent=agent)
+    child = ctx.push_scope(scope_label, agent=agent, file_access_policy=policy)
 
     await child.event_sink.on_scope_enter(child.scope)
     t0 = time.monotonic()
