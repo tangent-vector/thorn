@@ -24,6 +24,7 @@ Thumbs.db
 
 # Example projects
 examples/calc/build_test/
+examples/calc/trials*/
 examples/calc/**/*.cpp
 examples/calc/**/*.h
 !examples/calc/.thorn/

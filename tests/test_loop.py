@@ -72,6 +72,17 @@ class TestTextMode:
         )
         assert result == "sorry, I could not do that"
 
+    async def test_raise_error_in_text_mode(self):
+        """raise_error is available even in text mode (result_type=str)."""
+        provider = MockProvider(canned_responses=[
+            _tool_call_response("c1", "raise_error", '{"message": "blocked by dep"}'),
+        ])
+        ctx = ExecutionContext(provider=provider)
+        with pytest.raises(SkillError, match="blocked by dep"):
+            await run_agent_loop(
+                context=ctx, user_prompt="do it", tools=[],
+            )
+
     async def test_tool_exception_reports_error_to_agent(self):
         """Exception in a tool → error result sent back."""
         async def boom() -> str:

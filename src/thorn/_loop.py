@@ -98,12 +98,14 @@ async def run_agent_loop(
 
     all_schemas = [t.schema for t in all_tools]
 
-    # In structured mode, inject the return_result and raise_error tools.
+    # raise_error is always available so any agent can signal failure.
+    all_schemas.append(RAISE_ERROR_SCHEMA)
+
+    # In structured mode, also inject the return_result tool.
     structured_result: list[Any] = []  # mutable box for the captured value
     if structured:
         rr_schema = make_return_result_schema(result_type)
         all_schemas.append(rr_schema)
-        all_schemas.append(RAISE_ERROR_SCHEMA)
 
     # -- assemble system prompts -------------------------------------------
     prompts = list(context.system_prompts)
