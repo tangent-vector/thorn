@@ -23,7 +23,8 @@ client/dist/
 Thumbs.db
 
 # Example projects
-
-examples/calc/
+examples/calc/build_test/
+examples/calc/**/*.cpp
+examples/calc/**/*.h
 !examples/calc/.thorn/
 !examples/calc/template/
