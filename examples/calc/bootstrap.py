@@ -1,8 +1,8 @@
 """Bootstrap script for the calc example project.
 
 Resets the project to a clean starting state by:
-1. Removing existing src/ and build/ directories
-2. Copying template files into place
+1. Removing existing src/, build/, and tests/ directories
+2. Copying template files into place (including doctest.h)
 3. Verifying .thorn/ tools exist
 
 Run from the repo root or from examples/calc/:
@@ -19,19 +19,17 @@ PROJECT_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = PROJECT_DIR / "template"
 SRC_DIR = PROJECT_DIR / "src"
 BUILD_DIR = PROJECT_DIR / "build"
+TESTS_DIR = PROJECT_DIR / "tests"
 THORN_DIR = PROJECT_DIR / ".thorn"
 
 
 def main() -> None:
     print(f"Bootstrapping calc project in {PROJECT_DIR}")
 
-    if SRC_DIR.exists():
-        shutil.rmtree(SRC_DIR)
-        print(f"  removed {SRC_DIR.relative_to(PROJECT_DIR)}/")
-
-    if BUILD_DIR.exists():
-        shutil.rmtree(BUILD_DIR)
-        print(f"  removed {BUILD_DIR.relative_to(PROJECT_DIR)}/")
+    for d in (SRC_DIR, BUILD_DIR, TESTS_DIR):
+        if d.exists():
+            shutil.rmtree(d)
+            print(f"  removed {d.relative_to(PROJECT_DIR)}/")
 
     for src_path in TEMPLATE_DIR.rglob("*"):
         if src_path.is_file():

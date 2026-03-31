@@ -50,6 +50,39 @@ async def build() -> str:
 
 
 @tool
+async def build_tests() -> str:
+    """Build all test executables (re-configures first to pick up new files)."""
+    cfg = await configure()
+    if "[configure FAILED" in cfg:
+        return cfg
+
+    rc, output = await _run(f'cmake --build "{BUILD_DIR}"')
+    if rc != 0:
+        return f"[build_tests FAILED, exit {rc}]\n{output}"
+    return f"[build_tests OK]\n{output}"
+
+
+@tool
+async def run_tests() -> str:
+    """Build all test executables then run them via ctest.
+
+    Returns a pass/fail summary with failure details.
+    """
+    build_result = await build_tests()
+    if "[build_tests FAILED" in build_result or "[configure FAILED" in build_result:
+        return build_result
+
+    rc, output = await _run(
+        f'ctest --test-dir "{BUILD_DIR}" -C Debug --output-on-failure'
+    )
+    if "No tests were found" in output:
+        return "[run_tests OK] No tests found."
+    if rc != 0:
+        return f"[run_tests FAILED, exit {rc}]\n{output}"
+    return f"[run_tests OK]\n{output}"
+
+
+@tool
 async def clean() -> str:
     """Remove the build directory entirely."""
     import shutil

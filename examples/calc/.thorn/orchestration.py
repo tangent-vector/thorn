@@ -21,7 +21,7 @@ from typing import Any, Callable
 from thorn import Agent, get_context, tool
 from thorn.errors import SkillError
 
-from .build_tools import build
+from .build_tools import build, run_tests
 from .module_tools import list_submodules, qualify
 
 logger = logging.getLogger(__name__)
@@ -38,13 +38,18 @@ ValidationCheck = Callable[..., Any]
 
 VALIDATION_RULES: dict[str, ValidationCheck] = {
     "build": build,
+    "test": run_tests,
 }
 
-DEFAULT_RULES: frozenset[str] = frozenset({"build"})
+DEFAULT_RULES: frozenset[str] = frozenset({"build", "test"})
 
 MAX_VALIDATION_RETRIES: int = 3
 
-_VALIDATED_ROLES: frozenset[str] = frozenset({"implementer"})
+_VALIDATED_ROLES: frozenset[str] = frozenset({"implementer", "test_engineer"})
+
+_ROLE_SKIP_RULES: dict[str, frozenset[str]] = {
+    "test_engineer": frozenset({"test"}),
+}
 
 
 def _compute_effective_rules(
@@ -188,8 +193,11 @@ async def delegate_to_role(
         )
 
     parent_rules = _active_validation_rules.get(DEFAULT_RULES)
+    implicit_skip = _ROLE_SKIP_RULES.get(role, frozenset())
     child_rules = _compute_effective_rules(
-        parent_rules, skip_validation or [], enable_validation or [],
+        parent_rules,
+        list(implicit_skip) + (skip_validation or []),
+        enable_validation or [],
     )
 
     token = _active_validation_rules.set(child_rules)

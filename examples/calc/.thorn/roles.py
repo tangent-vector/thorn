@@ -14,7 +14,7 @@ from __future__ import annotations
 from thorn import Agent, FileAccessLevel, FileAccessRule, read_file, write_file
 from thorn.tools import list_directory
 
-from .build_tools import build, run_calc
+from .build_tools import build, build_tests, run_calc
 from .module_tools import (
     add_module,
     dependency_order,
@@ -207,15 +207,36 @@ class TestEngineer(WorkflowRole):
         "You are test_engineer@{module}. You write black-box tests that "
         "exercise the public API declared in the module's header.\n\n"
         "FILE ACCESS: You have write access ONLY to test files for this "
-        "module. All other files are read-only.\n\n"
+        "module under the tests/ directory. All other files are read-only.\n\n"
         "FORBIDDEN: Do NOT modify the module's header or source file. "
         "Only create or modify test files.",
+
+        "TEST FILE CONVENTIONS:\n"
+        "- Top-level module 'foo': tests/foo_test.cpp\n"
+        "- Nested module 'parent.child': tests/parent/child_test.cpp\n"
+        "- Each test file must start with:\n"
+        "    #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN\n"
+        "    #include \"doctest.h\"\n"
+        "  This provides main() automatically — do NOT write your own main.\n"
+        "- Use TEST_CASE(\"...\") for test cases, SUBCASE(\"...\") for "
+        "sub-cases, CHECK(...) for non-fatal assertions, and REQUIRE(...) "
+        "for fatal assertions.\n"
+        "- #include the module's header to access its API. Include paths "
+        "are relative to src/ (e.g., #include \"expression.h\", "
+        "#include \"parser/lexer.h\").\n"
+        "- Do NOT use GoogleTest, Catch2, or any other framework. doctest "
+        "is already vendored in the tests/ directory.",
+
+        "Write tests against the DECLARED API in the module's header — "
+        "not against implementation details. Read the header first to "
+        "understand what types, functions, and classes are available.\n\n"
+        "NOTE: Tests will not link until the implementer has provided "
+        "definitions for the declared API. build_tests may report link "
+        "errors before implementation — that is expected.",
     ]
-    tools = [write_file]
+    tools = [write_file, build_tests]
 
     def _instance_file_access(self) -> list[FileAccessRule]:
-        # Grant write to test files in the module's directory
-        # For now, grant write to a tests/ directory pattern
         return [FileAccessRule("tests/**", FileAccessLevel.WRITE)]
 
 
@@ -279,29 +300,33 @@ class Coordinator(Developer):
         "add_module. Does NOT write any code.\n"
         "- api_designer: Writes the full header file with type "
         "definitions and function signatures. Declarations only.\n"
+        "- test_engineer: Writes black-box tests against the declared "
+        "API using doctest. Tests are placed in the tests/ directory.\n"
         "- implementer: Fills in function bodies in the .cpp source "
-        "file. Builds to verify.\n"
-        "- test_engineer: Writes tests. Only use when a test framework "
-        "is configured; skip otherwise.",
+        "file. Builds and runs tests to verify.",
 
         "WORKFLOW FOR BUILDING A MODULE FROM SCRATCH:\n"
         "1. delegate_to_role('architect', ...) — define structure, "
         "create any sub-modules.\n"
         "2. After architecture, check list_submodules('{module}'). "
         "For each child, use delegate_to_child to have it fully "
-        "developed (API + implementation). Process dependencies FIRST.\n"
+        "developed (API + tests + implementation). Process dependencies "
+        "FIRST.\n"
         "3. delegate_to_role('api_designer', ...) — declare this "
         "module's own API in its header.\n"
-        "4. delegate_to_role('implementer', ...) — implement this "
-        "module's code.\n"
+        "4. delegate_to_role('test_engineer', ...) — write tests "
+        "against the declared API BEFORE implementation.\n"
+        "5. delegate_to_role('implementer', ...) — implement this "
+        "module's code. Tests must pass after implementation.\n"
         "Skip steps that are already done. For existing code, inspect "
         "state first and adapt.",
 
         "SPECIAL CASE — ROOT MODULE (main):\n"
         "The root module 'main' has NO header file; it is just main.cpp. "
-        "Therefore api_designer does NOT apply to 'main'. For the root "
-        "module: architect (to create child modules) → develop children "
-        "via delegate_to_child → implement main.cpp via implementer.",
+        "Therefore api_designer and test_engineer do NOT apply to 'main'. "
+        "For the root module: architect (to create child modules) → "
+        "develop children via delegate_to_child → implement main.cpp "
+        "via implementer.",
 
         "BEFORE DELEGATING, INSPECT:\n"
         "Use module_status and list_submodules to understand current "

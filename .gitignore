@@ -28,4 +28,4 @@ examples/calc/trials*/
 examples/calc/**/*.cpp
 examples/calc/**/*.h
 !examples/calc/.thorn/
-!examples/calc/template/
+!examples/calc/template/**/*
