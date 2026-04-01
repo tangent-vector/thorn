@@ -159,10 +159,10 @@ def run_trials(
     output_dir: str = "trials",
     task: str | None = None,
     parallel: int = 1,
-) -> Path:
+) -> dict[str, Any]:
     """Run *num_trials* independent trials and write a summary.
 
-    Returns the resolved output directory.
+    Returns the summary dict (also written to ``summary.json``).
     """
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -216,7 +216,7 @@ def run_trials(
     print(f"\n  Results in: {out}")
     print(f"  Summary:    {summary_path}")
 
-    return out
+    return summary
 
 
 def main() -> None:
