@@ -1,13 +1,13 @@
-"""Batch runner for calc workflow trials.
+"""Batch runner for evaluation trials.
 
-Runs N independent trials of the calc agentic workflow, collects structured
-results, and produces summary statistics.
+Runs N independent trials of a given workflow/scenario combination,
+collects structured results, and produces summary statistics.
 
 Usage::
 
-    python run_trials.py --num-trials 5
-    python run_trials.py -n 10 -p 3 --output-dir ./results
-    python run_trials.py -n 1 --task "implement a scientific calculator"
+    python run_trials.py --workflow thorn_cpp --scenario calc --num-trials 5
+    python run_trials.py -w thorn_cpp -s calc -n 10 -p 3 --output-dir ./results
+    python run_trials.py -w thorn_cpp -s calc -n 1 --task "implement a scientific calculator"
 """
 
 from __future__ import annotations
@@ -22,19 +22,28 @@ from pathlib import Path
 from typing import Any
 
 TRIAL_SCRIPT = Path(__file__).resolve().parent / "trial.py"
-DEFAULT_TASK = "implement a calculator"
 
 
-def _run_one(output_dir: str, trial_id: str, task: str) -> dict[str, Any]:
+def _run_one(
+    workflow: str,
+    scenario: str,
+    output_dir: str,
+    trial_id: str,
+    task: str | None,
+) -> dict[str, Any]:
     """Run a single trial as a subprocess and return its result dict."""
     cmd = [
         sys.executable,
         str(TRIAL_SCRIPT),
+        "--workflow", workflow,
+        "--scenario", scenario,
         "--output-dir", output_dir,
         "--trial-id", trial_id,
-        "--task", task,
         "--quiet",
     ]
+    if task is not None:
+        cmd.extend(["--task", task])
+
     proc = subprocess.run(cmd, capture_output=True, text=True)
 
     result_file = Path(output_dir) / trial_id / "result.json"
@@ -144,9 +153,11 @@ def _print_summary(summary: dict[str, Any]) -> None:
 
 
 def run_trials(
+    workflow: str,
+    scenario: str,
     num_trials: int = 3,
     output_dir: str = "trials",
-    task: str = DEFAULT_TASK,
+    task: str | None = None,
     parallel: int = 1,
 ) -> Path:
     """Run *num_trials* independent trials and write a summary.
@@ -156,23 +167,22 @@ def run_trials(
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
-    trial_args = [
-        (str(out), f"trial_{i:03d}", task)
-        for i in range(1, num_trials + 1)
-    ]
+    trial_ids = [f"trial_{i:03d}" for i in range(1, num_trials + 1)]
 
     results: list[dict[str, Any]] = []
 
     if parallel <= 1:
-        for i, (od, tid, t) in enumerate(trial_args, 1):
+        for i, tid in enumerate(trial_ids, 1):
             print(f"[{i}/{num_trials}] Running {tid} ...")
-            results.append(_run_one(od, tid, t))
+            results.append(_run_one(workflow, scenario, str(out), tid, task))
     else:
         print(f"Running {num_trials} trials ({parallel} concurrent) ...")
         with ThreadPoolExecutor(max_workers=parallel) as pool:
             futures = {
-                pool.submit(_run_one, od, tid, t): tid
-                for od, tid, t in trial_args
+                pool.submit(
+                    _run_one, workflow, scenario, str(out), tid, task,
+                ): tid
+                for tid in trial_ids
             }
             for future in as_completed(futures):
                 tid = futures[future]
@@ -197,6 +207,8 @@ def run_trials(
         results.sort(key=lambda r: r.get("trial_id", ""))
 
     summary = _compute_summary(results)
+    summary["workflow"] = workflow
+    summary["scenario"] = scenario
     summary_path = out / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
@@ -209,7 +221,17 @@ def run_trials(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run multiple trials of the calc agentic workflow.",
+        description="Run multiple evaluation trials.",
+    )
+    parser.add_argument(
+        "--workflow", "-w",
+        required=True,
+        help="Name of the workflow to evaluate (e.g. 'thorn_cpp')",
+    )
+    parser.add_argument(
+        "--scenario", "-s",
+        required=True,
+        help="Name of the scenario (e.g. 'calc')",
     )
     parser.add_argument(
         "--num-trials", "-n",
@@ -224,8 +246,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--task",
-        default=DEFAULT_TASK,
-        help=f"Prompt to pass to coordinate (default: {DEFAULT_TASK!r})",
+        default=None,
+        help="Override the scenario's default prompt",
     )
     parser.add_argument(
         "--parallel", "-p",
@@ -236,6 +258,8 @@ def main() -> None:
     args = parser.parse_args()
 
     run_trials(
+        workflow=args.workflow,
+        scenario=args.scenario,
         num_trials=args.num_trials,
         output_dir=args.output_dir,
         task=args.task,

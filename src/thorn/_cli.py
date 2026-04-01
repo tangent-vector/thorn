@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
+import time
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any
 
 import click
@@ -221,6 +224,36 @@ def init(with_mcp: bool) -> None:
 # thorn run
 # ---------------------------------------------------------------------------
 
+def _write_result_file(
+    path: Path,
+    outcome: str,
+    duration_s: float,
+    usage: Any,
+    error: str | None,
+    trace_path: str | None,
+) -> None:
+    """Write the structured JSON result produced by ``thorn run --result-file``."""
+    if usage is not None:
+        token_usage = {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        }
+    else:
+        token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    result = {
+        "outcome": outcome,
+        "duration_s": round(duration_s, 2),
+        "token_usage": token_usage,
+        "error": error,
+        "trace_file": Path(trace_path).name if trace_path else None,
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+
+
 @main.command()
 @click.argument("prompt_text")
 @click.option(
@@ -245,7 +278,8 @@ def init(with_mcp: bool) -> None:
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
 @click.option("--workspace", "workspace_path", type=click.Path(exists=True, file_okay=False), default=None, help="Override workspace root directory.")
-def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None) -> None:
+@click.option("--result-file", "result_file_path", type=click.Path(), default=None, help="Write a JSON result summary (outcome, duration, token usage).")
+def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, result_file_path: str | None) -> None:
     """Execute a single prompt and print the result."""
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
@@ -254,6 +288,10 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
         console.print(f"[red]Error:[/red] {exc}")
         if trace_file:
             trace_file.close()
+        if result_file_path:
+            _write_result_file(
+                Path(result_file_path), "agent_error", 0.0, None, str(exc), trace_path,
+            )
         sys.exit(1)
 
     async def _run() -> str:
@@ -281,20 +319,37 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
         finally:
             reset_context(token)
 
+    outcome = "success"
+    error_msg: str | None = None
+    exit_code = 0
+    t0 = time.monotonic()
+
     try:
-        result = asyncio.run(_run())
+        asyncio.run(_run())
     except SkillError as exc:
+        outcome, error_msg, exit_code = "agent_error", exc.detail, 1
         console.print(f"\n[red]Agent error:[/red] {exc.detail}")
-        sys.exit(1)
+    except TimeoutError:
+        outcome, error_msg, exit_code = "timeout", "timed out", 1
+        console.print("\n[red]Error:[/red] timed out")
     except ThornError as exc:
+        outcome, error_msg, exit_code = "agent_error", str(exc), 1
         console.print(f"\n[red]Error:[/red] {exc}")
-        sys.exit(1)
     except KeyboardInterrupt:
+        outcome, error_msg, exit_code = "agent_error", "interrupted", 130
         console.print("\n[dim]Interrupted.[/dim]")
-        sys.exit(130)
     finally:
+        duration_s = time.monotonic() - t0
         if trace_file:
             trace_file.close()
+        if result_file_path:
+            _write_result_file(
+                Path(result_file_path), outcome, duration_s,
+                ctx.usage, error_msg, trace_path,
+            )
+
+    if exit_code:
+        sys.exit(exit_code)
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,8 @@ from thorn._context import (
 )
 from thorn._agent import Agent
 from thorn._discovery import discover_tools
+from thorn._module import ModulePath
+from thorn._validation import ValidationRule
 from thorn._file_access import FileAccessLevel, FileAccessPolicy, FileAccessRule
 from thorn._func import prompt, skill, tool, wrap_function
 from thorn._retry import bound_retries
@@ -74,6 +76,8 @@ T = TypeVar("T")
 __all__ = [
     # Core API
     "Agent",
+    "ModulePath",
+    "ValidationRule",
     "prompt",
     "skill",
     "tool",

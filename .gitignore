@@ -29,3 +29,6 @@ examples/calc/**/*.cpp
 examples/calc/**/*.h
 !examples/calc/.thorn/
 !examples/calc/template/**/*
+
+evaluation/trials/
+.cursor/plans/

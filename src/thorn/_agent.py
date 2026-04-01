@@ -43,7 +43,7 @@ class Agent:
     _registry: ClassVar[dict[str, type[Agent]]] = {}
     _abstract: ClassVar[bool] = True
 
-    system_prompts: ClassVar[list[str]] = []
+    system_prompts: ClassVar[list[Any]] = []
     tools: ClassVar[list[Any]] = []
     file_access: ClassVar[list[FileAccessRule]]
 
@@ -77,9 +77,14 @@ class Agent:
         }
 
     @classmethod
-    def _collect_system_prompts(cls) -> list[str]:
-        """Walk MRO outermost-first, collecting prompts from each class's own ``__dict__``."""
-        collected: list[str] = []
+    def _collect_system_prompts(cls) -> list[Any]:
+        """Walk MRO outermost-first, collecting prompts from each class's own ``__dict__``.
+
+        Entries may be plain strings (rendered as templates) or callables
+        ``(Agent) -> str | None`` (invoked at render time; falsy results
+        are skipped).
+        """
+        collected: list[Any] = []
         for klass in reversed(cls.__mro__):
             if "system_prompts" in klass.__dict__:
                 collected.extend(klass.__dict__["system_prompts"])
@@ -129,11 +134,25 @@ class Agent:
         return []
 
     def _render_system_prompts(self) -> list[str]:
-        """Render collected prompts as templates against instance attributes."""
+        """Render collected prompts as templates against instance attributes.
+
+        String entries are rendered via ``str.format_map`` with instance
+        attributes (missing keys are preserved as ``{key}``).  Callable
+        entries receive the agent instance and should return a string;
+        a falsy return value causes the entry to be skipped.
+        """
         attrs = _SafeDict(
             {k: v for k, v in vars(self).items() if not k.startswith("_")}
         )
-        return [p.format_map(attrs) for p in type(self)._collect_system_prompts()]
+        rendered: list[str] = []
+        for p in type(self)._collect_system_prompts():
+            if callable(p):
+                result = p(self)
+                if result:
+                    rendered.append(result)
+            else:
+                rendered.append(p.format_map(attrs))
+        return rendered
 
     @property
     def prompt(self) -> _AgentPromptAccessor:

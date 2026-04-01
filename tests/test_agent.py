@@ -294,6 +294,74 @@ class TestAgentPromptStructuredMode:
 
 
 # ---------------------------------------------------------------------------
+# Callable system_prompts
+# ---------------------------------------------------------------------------
+
+
+class TestCallableSystemPrompts:
+    def test_callable_entry_invoked(self):
+        def dynamic_prompt(agent):
+            return f"Dynamic: {agent.module}"
+
+        class MyAgent(Agent):
+            system_prompts = ["Static.", dynamic_prompt]
+
+        agent = MyAgent(module="parser")
+        rendered = agent._render_system_prompts()
+        assert rendered == ["Static.", "Dynamic: parser"]
+
+    def test_callable_returning_none_skipped(self):
+        def skip_prompt(agent):
+            return None
+
+        class MyAgent(Agent):
+            system_prompts = ["Keep this.", skip_prompt, "And this."]
+
+        agent = MyAgent()
+        rendered = agent._render_system_prompts()
+        assert rendered == ["Keep this.", "And this."]
+
+    def test_callable_returning_empty_string_skipped(self):
+        def empty_prompt(agent):
+            return ""
+
+        class MyAgent(Agent):
+            system_prompts = ["Present.", empty_prompt]
+
+        agent = MyAgent()
+        rendered = agent._render_system_prompts()
+        assert rendered == ["Present."]
+
+    def test_callable_mixed_with_templates(self):
+        def dynamic(agent):
+            return f"Role count: {len(agent.roles)}"
+
+        class MyAgent(Agent):
+            system_prompts = ["Working on {module}.", dynamic]
+
+        agent = MyAgent(module="calc", roles=["a", "b"])
+        rendered = agent._render_system_prompts()
+        assert rendered == ["Working on calc.", "Role count: 2"]
+
+    def test_callable_inherited_via_mro(self):
+        def base_dynamic(agent):
+            return "from-base"
+
+        def child_dynamic(agent):
+            return "from-child"
+
+        class Base(Agent):
+            system_prompts = [base_dynamic]
+
+        class Child(Base):
+            system_prompts = [child_dynamic]
+
+        agent = Child()
+        rendered = agent._render_system_prompts()
+        assert rendered == ["from-base", "from-child"]
+
+
+# ---------------------------------------------------------------------------
 # context.agent propagation
 # ---------------------------------------------------------------------------
 
