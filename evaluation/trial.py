@@ -20,12 +20,19 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
+from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
 EVALUATION_DIR = Path(__file__).resolve().parent
 WORKFLOWS_DIR = EVALUATION_DIR / "workflows"
 SCENARIOS_DIR = EVALUATION_DIR / "scenarios"
+
+
+class Verbosity(IntEnum):
+    QUIET = 0
+    VERBOSE = 1
+    TRACE = 2
 
 
 def _trial_id_now() -> str:
@@ -97,7 +104,7 @@ def run_trial(
     output_dir: str = "trials",
     trial_id: str | None = None,
     task: str | None = None,
-    quiet: bool = False,
+    verbose: Verbosity = Verbosity.VERBOSE,
 ) -> Path:
     """Run a single trial and write results.  Returns the result directory."""
     workflow_dir = _resolve_workflow(workflow)
@@ -130,7 +137,7 @@ def run_trial(
         "--prompt", task,
         "--result-file", str(workflow_result_file),
     ]
-    if quiet:
+    if verbose <= Verbosity.QUIET:
         workflow_cmd.append("--quiet")
 
     subprocess.run(workflow_cmd)
@@ -159,6 +166,8 @@ def run_trial(
         "--workspace-dir", str(work_dir),
         "--result-file", str(eval_result_file),
     ]
+    if verbose >= Verbosity.TRACE:
+        eval_cmd.append("--verbose")
     subprocess.run(eval_cmd)
 
     if eval_result_file.exists():
@@ -257,7 +266,20 @@ def main() -> None:
         action="store_true",
         help="Suppress console output during the workflow run",
     )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="count",
+        default=None,
+        help="Increase verbosity (-v: show workflow output, -vv: also show eval output)",
+    )
     args = parser.parse_args()
+
+    if args.verbose is not None:
+        verbose = Verbosity(min(args.verbose, Verbosity.TRACE))
+    elif args.quiet:
+        verbose = Verbosity.QUIET
+    else:
+        verbose = Verbosity.VERBOSE
 
     run_trial(
         workflow=args.workflow,
@@ -265,7 +287,7 @@ def main() -> None:
         output_dir=args.output_dir,
         trial_id=args.trial_id,
         task=args.task,
-        quiet=args.quiet,
+        verbose=verbose,
     )
 
 

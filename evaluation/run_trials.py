@@ -18,10 +18,17 @@ import statistics
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
 TRIAL_SCRIPT = Path(__file__).resolve().parent / "trial.py"
+
+
+class Verbosity(IntEnum):
+    QUIET = 0
+    VERBOSE = 1
+    TRACE = 2
 
 
 def _run_one(
@@ -30,6 +37,7 @@ def _run_one(
     output_dir: str,
     trial_id: str,
     task: str | None,
+    verbose: Verbosity,
 ) -> dict[str, Any]:
     """Run a single trial as a subprocess and return its result dict."""
     cmd = [
@@ -39,21 +47,32 @@ def _run_one(
         "--scenario", scenario,
         "--output-dir", output_dir,
         "--trial-id", trial_id,
-        "--quiet",
     ]
+    if verbose > Verbosity.QUIET:
+        cmd.extend(["-v"] * verbose)
+    else:
+        cmd.append("--quiet")
     if task is not None:
         cmd.extend(["--task", task])
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if verbose > Verbosity.QUIET:
+        proc = subprocess.run(cmd)
+    else:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
 
     result_file = Path(output_dir) / trial_id / "result.json"
     if result_file.exists():
         return json.loads(result_file.read_text(encoding="utf-8"))
 
+    if verbose > Verbosity.QUIET:
+        stderr_hint = "(see console output above)"
+    else:
+        stderr_hint = (proc.stderr or "")[:500]
+
     return {
         "trial_id": trial_id,
         "outcome": "agent_error",
-        "error": f"subprocess exited {proc.returncode}: {(proc.stderr or '')[:500]}",
+        "error": f"subprocess exited {proc.returncode}: {stderr_hint}",
         "duration_s": 0.0,
         "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "build_ok": False,
@@ -159,11 +178,19 @@ def run_trials(
     output_dir: str = "trials",
     task: str | None = None,
     parallel: int = 1,
+    verbose: Verbosity = Verbosity.QUIET,
 ) -> dict[str, Any]:
     """Run *num_trials* independent trials and write a summary.
 
     Returns the summary dict (also written to ``summary.json``).
     """
+    if parallel > 1 and verbose > Verbosity.QUIET:
+        print(
+            f"  WARNING: --parallel {parallel} forced to 1 in verbose mode "
+            "(concurrent output would interleave)"
+        )
+        parallel = 1
+
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
@@ -174,13 +201,16 @@ def run_trials(
     if parallel <= 1:
         for i, tid in enumerate(trial_ids, 1):
             print(f"[{i}/{num_trials}] Running {tid} ...")
-            results.append(_run_one(workflow, scenario, str(out), tid, task))
+            results.append(
+                _run_one(workflow, scenario, str(out), tid, task, verbose),
+            )
     else:
         print(f"Running {num_trials} trials ({parallel} concurrent) ...")
         with ThreadPoolExecutor(max_workers=parallel) as pool:
             futures = {
                 pool.submit(
                     _run_one, workflow, scenario, str(out), tid, task,
+                    verbose,
                 ): tid
                 for tid in trial_ids
             }
@@ -255,6 +285,12 @@ def main() -> None:
         default=1,
         help="Max concurrent trials (default: 1, sequential)",
     )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="count",
+        default=0,
+        help="Increase verbosity (-v: show workflow output, -vv: also show eval output)",
+    )
     args = parser.parse_args()
 
     run_trials(
@@ -264,6 +300,7 @@ def main() -> None:
         output_dir=args.output_dir,
         task=args.task,
         parallel=args.parallel,
+        verbose=Verbosity(min(args.verbose, Verbosity.TRACE)),
     )
 
 

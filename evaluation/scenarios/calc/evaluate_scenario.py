@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -52,26 +53,27 @@ def _find_calc_binary(work_dir: Path) -> Path | None:
     return None
 
 
-def _check_build(work_dir: Path) -> bool:
+def _check_build(work_dir: Path, *, verbose: bool = False) -> bool:
     """Run cmake configure + build and return True if both succeed."""
+    capture = not verbose
     build_dir = work_dir / "build"
     if not build_dir.exists():
         cfg = subprocess.run(
             ["cmake", "-S", ".", "-B", "build"],
-            capture_output=True,
+            capture_output=capture,
             cwd=work_dir,
         )
         if cfg.returncode != 0:
             return False
     result = subprocess.run(
         ["cmake", "--build", "build"],
-        capture_output=True,
+        capture_output=capture,
         cwd=work_dir,
     )
     return result.returncode == 0
 
 
-def _validate_binary(work_dir: Path) -> dict[str, Any]:
+def _validate_binary(work_dir: Path, *, verbose: bool = False) -> dict[str, Any]:
     """Run canned expressions through the calc binary and check outputs.
 
     Returns ``{"cases": [...], "score": <float 0-1>}``.
@@ -97,6 +99,14 @@ def _validate_binary(work_dir: Path) -> dict[str, Any]:
                 text=True,
                 timeout=10,
             )
+            if verbose:
+                sys.stdout.write(
+                    f"--- {case['name']} (input: {case['input']!r}) ---\n"
+                )
+                if proc.stdout:
+                    sys.stdout.write(proc.stdout)
+                if proc.stderr:
+                    sys.stderr.write(proc.stderr)
             output_lines = [
                 line.strip()
                 for line in (proc.stdout or "").splitlines()
@@ -143,12 +153,12 @@ def _collect_modules(work_dir: Path) -> list[str]:
     return [h.stem for h in headers]
 
 
-def evaluate(work_dir: Path) -> dict[str, Any]:
+def evaluate(work_dir: Path, *, verbose: bool = False) -> dict[str, Any]:
     """Run full evaluation on a completed workspace and return results."""
-    build_ok = _check_build(work_dir)
+    build_ok = _check_build(work_dir, verbose=verbose)
 
     if build_ok:
-        validation = _validate_binary(work_dir)
+        validation = _validate_binary(work_dir, verbose=verbose)
     else:
         validation = {"cases": [], "score": 0.0}
 
@@ -180,10 +190,15 @@ def main() -> None:
         required=True,
         help="Path to write the JSON evaluation result",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print cmake and binary validation output to the console",
+    )
     args = parser.parse_args()
 
     work_dir = Path(args.workspace_dir).resolve()
-    result = evaluate(work_dir)
+    result = evaluate(work_dir, verbose=args.verbose)
 
     result_path = Path(args.result_file).resolve()
     result_path.parent.mkdir(parents=True, exist_ok=True)

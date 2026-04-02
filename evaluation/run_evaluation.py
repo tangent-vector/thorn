@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,12 @@ EVALUATION_DIR = Path(__file__).resolve().parent
 WORKFLOWS_DIR = EVALUATION_DIR / "workflows"
 SCENARIOS_DIR = EVALUATION_DIR / "scenarios"
 RUN_TRIALS_SCRIPT = EVALUATION_DIR / "run_trials.py"
+
+
+class Verbosity(IntEnum):
+    QUIET = 0
+    VERBOSE = 1
+    TRACE = 2
 
 
 def _discover_workflows() -> list[str]:
@@ -55,6 +62,7 @@ def _run_pair(
     output_dir: str,
     task: str | None,
     parallel: int,
+    verbose: Verbosity,
 ) -> dict[str, Any]:
     """Run ``run_trials.py`` for a single (workflow, scenario) pair.
 
@@ -72,12 +80,21 @@ def _run_pair(
     ]
     if task is not None:
         cmd.extend(["--task", task])
+    cmd.extend(["-v"] * verbose)
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if verbose > Verbosity.QUIET:
+        proc = subprocess.run(cmd)
+    else:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
 
     summary_file = Path(output_dir) / "summary.json"
     if summary_file.exists():
         return json.loads(summary_file.read_text(encoding="utf-8"))
+
+    if verbose > Verbosity.QUIET:
+        stderr_hint = "(see console output above)"
+    else:
+        stderr_hint = (proc.stderr or "")[:500]
 
     return {
         "workflow": workflow,
@@ -89,7 +106,7 @@ def _run_pair(
         "token_stats": {"mean": None, "median": None, "stdev": None},
         "validation_score_stats": {"mean": None, "median": None, "stdev": None},
         "trials": [],
-        "error": f"run_trials exited {proc.returncode}: {(proc.stderr or '')[:500]}",
+        "error": f"run_trials exited {proc.returncode}: {stderr_hint}",
     }
 
 
@@ -214,6 +231,7 @@ def run_evaluation(
     output_dir: str = "trials",
     task: str | None = None,
     parallel: int = 1,
+    verbose: Verbosity = Verbosity.QUIET,
 ) -> Path:
     """Run the full evaluation matrix and write ``evaluation.json``.
 
@@ -266,6 +284,7 @@ def run_evaluation(
             output_dir=str(pair_dir),
             task=task,
             parallel=parallel,
+            verbose=verbose,
         )
 
         pair_elapsed = time.monotonic() - pair_start
@@ -351,6 +370,12 @@ def main() -> None:
         default=1,
         help="Max concurrent trials within each pair (default: 1)",
     )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="count",
+        default=0,
+        help="Increase verbosity (-v: show workflow output, -vv: also show eval output)",
+    )
     args = parser.parse_args()
 
     run_evaluation(
@@ -360,6 +385,7 @@ def main() -> None:
         output_dir=args.output_dir,
         task=args.task,
         parallel=args.parallel,
+        verbose=Verbosity(min(args.verbose, Verbosity.TRACE)),
     )
 
 
