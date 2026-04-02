@@ -1,10 +1,10 @@
 """Agent base class for role-based agent execution.
 
-Subclasses declare ``system_prompts``, ``tools``, and ``file_access``
-as class variables.  The framework walks the MRO (outermost-first) to
-collect them, renders prompt templates against instance attributes, and
-provides a ``prompt`` accessor for running LLM calls with the role's
-context.
+Subclasses declare ``system_prompts``, ``tools``, ``file_access``, and
+``validation_rules`` as class variables.  The framework walks the MRO
+(outermost-first) to collect them, renders prompt templates against
+instance attributes, and provides a ``prompt`` accessor for running LLM
+calls with the role's context.
 """
 
 from __future__ import annotations
@@ -25,9 +25,10 @@ class _SafeDict(dict):
 class Agent:
     """Base class for agent roles.
 
-    Subclasses declare ``system_prompts`` and ``tools`` as class variables.
-    The framework walks the MRO (outermost-first) to collect them.
-    System prompts are string templates rendered against instance attributes.
+    Subclasses declare ``system_prompts``, ``tools``, and
+    ``validation_rules`` as class variables.  The framework walks the
+    MRO (outermost-first) to collect them.  System prompts are string
+    templates rendered against instance attributes.
 
     Subclasses are automatically registered and can be queried via
     :meth:`get_subclasses`.  Mark intermediate base classes with
@@ -46,6 +47,7 @@ class Agent:
     system_prompts: ClassVar[list[Any]] = []
     tools: ClassVar[list[Any]] = []
     file_access: ClassVar[list[FileAccessRule]]
+    validation_rules: ClassVar[list[str]] = []
 
     def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -102,6 +104,19 @@ class Agent:
                     if tool_name not in seen_names:
                         collected.append(tool_item)
                         seen_names.add(tool_name)
+        return collected
+
+    @classmethod
+    def _collect_validation_rules(cls) -> list[str]:
+        """Walk MRO outermost-first, collecting validation rule names and deduplicating."""
+        collected: list[str] = []
+        seen: set[str] = set()
+        for klass in reversed(cls.__mro__):
+            if "validation_rules" in klass.__dict__:
+                for name in klass.__dict__["validation_rules"]:
+                    if name not in seen:
+                        collected.append(name)
+                        seen.add(name)
         return collected
 
     @classmethod

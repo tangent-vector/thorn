@@ -82,7 +82,7 @@ The `coordinate` tool creates a `coordinator@main` agent that will:
 3. Delegate to child coordinators for each sub-module
 4. Within each module, delegate to API designers, test engineers, and
    implementers as needed
-5. Validate (build) after each step, retrying on failure
+5. Validate (build + test) after implementation, retrying on failure
 
 You can also target a specific module:
 
@@ -164,26 +164,32 @@ errors and retries automatically, up to a configurable limit.
 
 ### Validation Rules
 
-Validation rules are project-level checks defined in `orchestration.py`:
+Validation checks are registered in `orchestration.py`:
 
 ```python
-VALIDATION_RULES = {
-    "build": build,   # from build_tools.py
+VALIDATION_CHECKS = {
+    "build": build,       # from build_tools.py
+    "test":  run_tests,   # from build_tools.py
 }
-
-DEFAULT_RULES = frozenset({"build"})
 ```
 
-The set of active rules propagates through the delegation chain via a
-`ContextVar`.  Each delegation can skip or enable rules:
+Each agent role declares which validation rules apply to it via a
+`validation_rules` class attribute (accumulated through the MRO, like
+`system_prompts` and `tools`).  For example, the `Implementer` and
+`Coordinator` roles declare `validation_rules = ["build", "test"]`,
+while `Architect`, `APIDesigner`, and `TestEngineer` have no validation
+rules by default.
+
+The effective rules for any agent are computed as:
+
+    (role_defaults | explicitly_enabled) - explicitly_disabled
+
+Explicit overrides propagate through the delegation chain via
+`ContextVar`s.  Each delegation can skip or enable rules:
 
 ```
 delegate_to_role("architect", task, skip_validation=["build"])
 ```
-
-The default expectation: agents are invoked with all validations
-passing, and must leave the codebase in a state where all validations
-pass.
 
 ## File Layout
 
@@ -261,14 +267,23 @@ target.
 
 ### Adding a validation rule
 
-Add an entry to `VALIDATION_RULES` in `orchestration.py`:
+1. Register the check function in `VALIDATION_CHECKS` in
+   `orchestration.py`:
 
 ```python
-VALIDATION_RULES["test"] = run_tests   # your test runner function
-DEFAULT_RULES = frozenset({"build", "test"})
+VALIDATION_CHECKS["lint"] = run_linter   # your check function
 ```
 
-The rule will be enforced after every delegation by default.
+2. Add the rule name to the `validation_rules` list on the agent roles
+   that should be validated by it (in `roles.py`):
+
+```python
+class Implementer(WorkflowRole):
+    validation_rules = ["build", "test", "lint"]
+```
+
+Only roles that list the rule will be validated by it.  Callers can
+also enable it dynamically via `enable_validation=["lint"]`.
 
 ## Separation of Concerns
 

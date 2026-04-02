@@ -2,7 +2,9 @@
 
 Provides the orchestration machinery for the development workflow:
 
-- Validation rules that propagate through the delegation chain via ContextVar
+- Per-role validation rules (declared on Agent subclasses via
+  ``validation_rules``) with explicit enable/disable overrides
+  propagated through the delegation chain via ContextVar
 - Delegation tools for coordinators (delegate_to_role, delegate_to_child)
 - A top-level ``coordinate`` tool discoverable by the concierge
 
@@ -30,46 +32,47 @@ logger = logging.getLogger(__name__)
 # Validation system
 # ---------------------------------------------------------------------------
 
-_active_validation_rules: contextvars.ContextVar[frozenset[str]] = (
-    contextvars.ContextVar("active_validation_rules")
+_validation_enabled: contextvars.ContextVar[frozenset[str]] = (
+    contextvars.ContextVar("validation_enabled", default=frozenset())
+)
+
+_validation_disabled: contextvars.ContextVar[frozenset[str]] = (
+    contextvars.ContextVar("validation_disabled", default=frozenset())
 )
 
 ValidationCheck = Callable[..., Any]
 
-VALIDATION_RULES: dict[str, ValidationCheck] = {
+VALIDATION_CHECKS: dict[str, ValidationCheck] = {
     "build": build,
     "test": run_tests,
 }
 
-DEFAULT_RULES: frozenset[str] = frozenset({"build", "test"})
-
 MAX_VALIDATION_RETRIES: int = 3
 
-_VALIDATED_ROLES: frozenset[str] = frozenset({"implementer", "test_engineer"})
 
-_ROLE_SKIP_RULES: dict[str, frozenset[str]] = {
-    "test_engineer": frozenset({"test"}),
-}
+def effective_validation_rules(agent: Agent) -> frozenset[str]:
+    """Compute the effective validation rules for *agent*.
 
+    Combines the agent's class-level ``validation_rules`` (accumulated
+    through the MRO) with explicit overrides from the delegation context:
 
-def _compute_effective_rules(
-    parent: frozenset[str],
-    skip: list[str],
-    enable: list[str],
-) -> frozenset[str]:
-    """Derive child validation rules from the parent set and overrides."""
-    return (parent - frozenset(skip)) | frozenset(enable)
+        effective = (role_defaults | ctx_enabled) - ctx_disabled
+    """
+    role_rules = frozenset(type(agent)._collect_validation_rules())
+    enabled = _validation_enabled.get(frozenset())
+    disabled = _validation_disabled.get(frozenset())
+    return (role_rules | enabled) - disabled
 
 
 async def _run_validation(rules: frozenset[str]) -> list[tuple[str, str]]:
-    """Run the specified validation rules and return failures.
+    """Run the specified validation checks and return failures.
 
     Each failure is a ``(rule_name, error_detail)`` pair.  An empty list
-    means all rules passed.
+    means all checks passed.
     """
     failures: list[tuple[str, str]] = []
     for name in sorted(rules):
-        check_fn = VALIDATION_RULES.get(name)
+        check_fn = VALIDATION_CHECKS.get(name)
         if check_fn is None:
             continue
         try:
@@ -116,16 +119,24 @@ async def _run_with_validation(
 ) -> str:
     """Run an agent on a task, then validate and retry on failure.
 
+    Validation rules are determined by the agent's class-level
+    ``validation_rules`` combined with any overrides propagated through
+    the delegation context.  If there are no effective rules, the agent
+    runs without validation.
+
     The agent keeps its conversation history across retries so it can
     see what it did previously and what went wrong.
     """
     messages: list = []
-    active_rules = _active_validation_rules.get(DEFAULT_RULES)
+    rules = effective_validation_rules(agent)
 
     summary = await agent.prompt(task, messages=messages)
 
+    if not rules:
+        return summary
+
     for retry in range(max_retries + 1):
-        failures = await _run_validation(active_rules)
+        failures = await _run_validation(rules)
         if not failures:
             return summary
 
@@ -153,6 +164,36 @@ async def _run_with_validation(
         )
 
     return summary  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
+# Delegation helpers
+# ---------------------------------------------------------------------------
+
+
+def _push_overrides(
+    skip: list[str] | None,
+    enable: list[str] | None,
+) -> tuple[contextvars.Token[frozenset[str]], contextvars.Token[frozenset[str]]]:
+    """Accumulate validation overrides and return reset tokens."""
+    parent_enabled = _validation_enabled.get(frozenset())
+    parent_disabled = _validation_disabled.get(frozenset())
+
+    child_enabled = parent_enabled | frozenset(enable or [])
+    child_disabled = parent_disabled | frozenset(skip or [])
+
+    en_token = _validation_enabled.set(child_enabled)
+    dis_token = _validation_disabled.set(child_disabled)
+    return en_token, dis_token
+
+
+def _pop_overrides(
+    en_token: contextvars.Token[frozenset[str]],
+    dis_token: contextvars.Token[frozenset[str]],
+) -> None:
+    """Restore previous validation overrides."""
+    _validation_disabled.reset(dis_token)
+    _validation_enabled.reset(en_token)
 
 
 # ---------------------------------------------------------------------------
@@ -192,27 +233,16 @@ async def delegate_to_role(
             f"Unknown role: {role!r}. Available roles: {available}"
         )
 
-    parent_rules = _active_validation_rules.get(DEFAULT_RULES)
-    implicit_skip = _ROLE_SKIP_RULES.get(role, frozenset())
-    child_rules = _compute_effective_rules(
-        parent_rules,
-        list(implicit_skip) + (skip_validation or []),
-        enable_validation or [],
-    )
-
-    token = _active_validation_rules.set(child_rules)
+    en_token, dis_token = _push_overrides(skip_validation, enable_validation)
     try:
         agent = role_cls(module=module)
-        if role in _VALIDATED_ROLES:
-            return await _run_with_validation(agent, task)
-        else:
-            return await agent.prompt(task)
+        return await _run_with_validation(agent, task)
     except SkillError as exc:
         raise RuntimeError(
             f"{role}@{module} raised an error: {exc.detail}"
         ) from None
     finally:
-        _active_validation_rules.reset(token)
+        _pop_overrides(en_token, dis_token)
 
 
 async def delegate_to_child(
@@ -249,16 +279,11 @@ async def delegate_to_child(
 
     qualified_child = qualify(module, child)
 
-    parent_rules = _active_validation_rules.get(DEFAULT_RULES)
-    child_rules = _compute_effective_rules(
-        parent_rules, skip_validation or [], enable_validation or [],
-    )
-
     coordinator_cls = Agent._registry.get("Coordinator")
     if coordinator_cls is None:
         raise RuntimeError("No Coordinator class registered")
 
-    token = _active_validation_rules.set(child_rules)
+    en_token, dis_token = _push_overrides(skip_validation, enable_validation)
     try:
         agent = coordinator_cls(module=qualified_child)
         return await _run_with_validation(agent, task)
@@ -267,7 +292,7 @@ async def delegate_to_child(
             f"coordinator@{qualified_child} raised an error: {exc.detail}"
         ) from None
     finally:
-        _active_validation_rules.reset(token)
+        _pop_overrides(en_token, dis_token)
 
 
 # ---------------------------------------------------------------------------
@@ -301,10 +326,6 @@ async def coordinate(
         skip_validation: Validation rules to skip.
         enable_validation: Additional validation rules to enable.
     """
-    effective_rules = _compute_effective_rules(
-        DEFAULT_RULES, skip_validation or [], enable_validation or [],
-    )
-
     coordinator_cls = Agent._registry.get("Coordinator")
     if coordinator_cls is None:
         raise RuntimeError(
@@ -312,7 +333,7 @@ async def coordinate(
             "Ensure roles.py defines a Coordinator(Developer) class."
         )
 
-    token = _active_validation_rules.set(effective_rules)
+    en_token, dis_token = _push_overrides(skip_validation, enable_validation)
     try:
         agent = coordinator_cls(module=module)
         return await _run_with_validation(agent, task)
@@ -321,4 +342,4 @@ async def coordinate(
             f"coordinator@{module} could not complete the task: {exc.detail}"
         ) from None
     finally:
-        _active_validation_rules.reset(token)
+        _pop_overrides(en_token, dis_token)

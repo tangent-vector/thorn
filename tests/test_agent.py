@@ -145,9 +145,55 @@ class TestMROCollection:
         assert len(collected) == 1
         assert collected[0] is helper
 
+    def test_single_inheritance_validation_rules(self):
+        class Base(Agent):
+            validation_rules = ["build"]
+
+        class Child(Base):
+            validation_rules = ["test"]
+
+        assert Child._collect_validation_rules() == ["build", "test"]
+
+    def test_validation_rules_dedup(self):
+        class Base(Agent):
+            validation_rules = ["build", "test"]
+
+        class Child(Base):
+            validation_rules = ["build", "lint"]
+
+        collected = Child._collect_validation_rules()
+        assert collected == ["build", "test", "lint"]
+
+    def test_child_without_own_validation_rules_inherits(self):
+        class Base(Agent):
+            validation_rules = ["build"]
+
+        class Child(Base):
+            pass
+
+        assert Child._collect_validation_rules() == ["build"]
+
+    def test_diamond_validation_rules(self):
+        class Base(Agent):
+            validation_rules = ["build"]
+
+        class Left(Base):
+            validation_rules = ["test"]
+
+        class Right(Base):
+            validation_rules = ["lint"]
+
+        class Diamond(Left, Right):
+            validation_rules = ["format"]
+
+        assert Diamond._collect_validation_rules() == [
+            "build", "lint", "test", "format",
+        ]
+
     def test_bare_agent_has_empty_collections(self):
         assert Agent._collect_system_prompts() == []
         assert Agent._collect_tools() == []
+        assert Agent._collect_validation_rules() == []
 
 
 # ---------------------------------------------------------------------------

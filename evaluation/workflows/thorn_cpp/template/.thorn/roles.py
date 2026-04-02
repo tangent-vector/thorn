@@ -14,7 +14,6 @@ from __future__ import annotations
 from thorn import Agent, FileAccessLevel, FileAccessRule, read_file, write_file
 from thorn.tools import list_directory
 
-from .build_tools import build, build_tests, run_calc
 from .module_tools import (
     add_module,
     dependency_order,
@@ -230,11 +229,12 @@ class TestEngineer(WorkflowRole):
         "Write tests against the DECLARED API in the module's header — "
         "not against implementation details. Read the header first to "
         "understand what types, functions, and classes are available.\n\n"
-        "NOTE: Tests will not link until the implementer has provided "
-        "definitions for the declared API. build_tests may report link "
-        "errors before implementation — that is expected.",
+        "Do NOT attempt to build or run tests. The implementation will "
+        "not exist yet when you write tests, so builds would fail with "
+        "link errors. Just write the test files — the build system will "
+        "validate them after the implementer provides definitions.",
     ]
-    tools = [write_file, build_tests]
+    tools = [write_file]
 
     def _instance_file_access(self) -> list[FileAccessRule]:
         return [FileAccessRule("tests/**", FileAccessLevel.WRITE)]
@@ -252,14 +252,17 @@ class Implementer(WorkflowRole):
         "its header.\n\n"
         "FILE ACCESS: You have write access ONLY to the module's .cpp "
         "source file. All other files are read-only.\n\n"
-        "ALLOWED: Write to this module's .cpp source file ONLY. "
-        "Use the build tool to verify compilation.\n\n"
+        "ALLOWED: Write to this module's .cpp source file ONLY.\n\n"
         "FORBIDDEN: Do NOT modify the header file. Do NOT modify any "
         "other module's files. Do NOT modify main.cpp (unless you ARE "
         "implementer@main). Do NOT modify test files. Do NOT create "
-        "new files.",
+        "new files.\n\n"
+        "After you write the implementation, the build and tests will "
+        "be validated automatically. If validation fails, you will be "
+        "given the errors and asked to fix them.",
     ]
-    tools = [write_file, build, run_calc]
+    validation_rules = ["build", "test"]
+    tools = [write_file]
 
     def _instance_file_access(self) -> list[FileAccessRule]:
         source = module_source_path(self.module)
@@ -276,6 +279,8 @@ register_role("implementer", Implementer)
 
 class Coordinator(Developer):
     """Orchestrates development work across a module subtree via delegation."""
+
+    validation_rules = ["build", "test"]
 
     def __str__(self) -> str:
         return f"coordinator@{self.module}"
@@ -303,7 +308,8 @@ class Coordinator(Developer):
         "- test_engineer: Writes black-box tests against the declared "
         "API using doctest. Tests are placed in the tests/ directory.\n"
         "- implementer: Fills in function bodies in the .cpp source "
-        "file. Builds and runs tests to verify.",
+        "file. Build and test validation runs automatically after "
+        "implementation.",
 
         "WORKFLOW FOR BUILDING A MODULE FROM SCRATCH:\n"
         "1. delegate_to_role('architect', ...) — define structure, "
