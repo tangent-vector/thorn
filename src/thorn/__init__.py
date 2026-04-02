@@ -50,9 +50,12 @@ from thorn._provider import LLMProvider, MockProvider, UsageChunk, load_provider
 from thorn import tools
 from thorn._tools import (
     ALL_BUILTIN_TOOLS,
+    FILE_READING,
+    FILE_WRITING,
     ask_user,
     list_directory,
     read_file,
+    search_files,
     write_file,
 )
 from thorn.errors import (
@@ -111,8 +114,11 @@ __all__ = [
     "read_file",
     "write_file",
     "list_directory",
+    "search_files",
     "ask_user",
     "ALL_BUILTIN_TOOLS",
+    "FILE_READING",
+    "FILE_WRITING",
     # Errors
     "ThornError",
     "SkillError",

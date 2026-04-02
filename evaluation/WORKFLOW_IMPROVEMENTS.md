@@ -341,6 +341,135 @@ trace_event("validation_end", passed=not failures,
 This makes traces interpretable and also helps spot cases where
 validation is slow or failing silently.
 
+### F. System Prompt Restructuring for Prefix Caching
+
+**Problem addressed:** 2.1, 2.4, and a structural concern — the
+current system prompts use `{module}` string templates that are
+rendered early in the MRO-collected prompt sequence, breaking the
+shared prefix between agents of the same role class and limiting the
+effectiveness of LLM prompt caching.
+
+**Background — how prompt caching works:**
+LLM APIs (notably Anthropic's) can cache the prefix of a request.
+If two requests share the same first N tokens, those N tokens are
+served from cache at reduced cost (~90% discount) and reduced latency
+(~5× faster).  The cacheable region is the system prompt + tool
+schemas + the beginning of the message history — in that order.
+
+**Current behavior:**
+`_render_system_prompts` in
+[_agent.py](../src/thorn/_agent.py) walks the MRO outermost-first,
+collecting `system_prompts` from each class, and renders `{module}`
+templates immediately.  For an `Implementer@parser.lexer`, the
+rendered prompt list is:
+
+1. `"You are working on a C++ project."` (Developer)
+2. `_COMMENT_CONVENTION` (Developer)
+3. `_FILESYSTEM_CONVENTION` (Developer)
+4. `_SUMMARY_GUIDANCE` (Developer)
+5. `"You are ONLY responsible for module `parser.lexer` itself..."` (WorkflowRole) — **diverges here**
+6. `_MANDATE_WARNING` (WorkflowRole)
+7. `"You are implementer@parser.lexer. You write the implementation..."` (Implementer)
+
+In `OpenAIProvider.complete`, these are joined into a single system
+message via `"\n\n".join(system_prompts)`.  The `{module}` substitution
+at item 5 means the shared prefix between any two agents — even two
+`Implementer` agents for different modules — is only ~450–500 tokens
+(the Developer base prompts).
+
+**Proposed change:**
+Eliminate `{module}` templates from all system prompt strings.  Move
+the module identity to a single trailing entry — either a callable
+`(self) -> str` (already supported by `_render_system_prompts`) or an
+explicit final prompt.
+
+After the change, `WorkflowRole` would look like:
+
+```python
+system_prompts = [
+    "You are ONLY responsible for the module you are assigned to "
+    "-- not its parent, not its children. Each module has its own "
+    "responsible agent.",
+    _MANDATE_WARNING,
+]
+```
+
+And each concrete role would strip `{module}` from its instructions:
+
+```python
+class Implementer(WorkflowRole):
+    system_prompts = [
+        "You are an implementer. You write the implementation in "
+        "the module's .cpp SOURCE file to satisfy the declarations "
+        "in its header.\n\n"
+        "FILE ACCESS: You have write access ONLY to the module's "
+        ".cpp source file. All other files are read-only.\n\n"
+        # ... (rest of generic instructions, no {module}) ...
+    ]
+```
+
+The identity is set via a callable at the tail of the `WorkflowRole`
+prompts (inherited by all roles):
+
+```python
+class WorkflowRole(Developer, abstract=True):
+    system_prompts = [
+        "You are ONLY responsible for the module you are assigned "
+        "to -- not its parent, not its children...",
+        _MANDATE_WARNING,
+        lambda self: (
+            f"AGENT IDENTITY: You are "
+            f"{type(self).__name__.lower()}@{self.module}. "
+            f"Your module is `{self.module}`."
+        ),
+    ]
+```
+
+**Result — shared prefix tiers:**
+
+| Agents compared | Shared prefix (current) | Shared prefix (proposed) |
+|---|---|---|
+| Two Implementers (different modules) | ~450 tokens | ~1,500–2,000 tokens |
+| Implementer vs TestEngineer | ~450 tokens | ~600–800 tokens |
+| Two Coordinators (different modules) | ~450 tokens | ~1,800–2,200 tokens |
+
+Tool schemas (which follow the system message in the API request)
+extend the cacheable prefix further — agents of the same role class
+have identical tools, adding ~500–1,000 tokens to the shared region.
+
+**Estimated impact:**
+- For early-turn calls (~2,500 prompt tokens), a 1,500-token cached
+  prefix covers ~60% of the prompt.
+- For mid-conversation calls (~10,000 prompt tokens), ~15%.
+- For the bloated late-stage calls (~45,000), ~3%.
+- Across 163 completions, the aggregate cached token volume is
+  roughly 163 × 1,500 = ~244 K tokens.  At a 90% cache discount,
+  that's equivalent to saving ~220 K tokens in cost.
+- Latency improvement: cached tokens process ~5× faster, reducing
+  wall time for the system-prompt portion of each call.
+
+**Why it's worth doing even without confirmed caching support:**
+1. **Low effort** — restructuring where `{module}` appears in prompt
+   strings; the existing callable support provides a natural hook.
+2. **Enables future benefit** — if Thorn adds a native Anthropic
+   provider or the OpenAI-compatible endpoint gains caching, the
+   benefit is automatic.
+3. **Compounds with agent pooling (mitigation B)** — for a pooled
+   agent, the entire conversation history becomes a cacheable prefix
+   for subsequent turns.
+4. **Cleaner architecture** — separating "what this role does"
+   (generic) from "which module this agent owns" (instance-specific)
+   makes prompts easier to reason about, test, and evolve.
+
+**Key files:**
+- [_agent.py](../src/thorn/_agent.py): `_render_system_prompts`,
+  `_collect_system_prompts`
+- [roles.py](workflows/thorn_cpp/template/.thorn/roles.py): all
+  `system_prompts` class variables
+- [_provider.py](../src/thorn/_provider.py): `OpenAIProvider.complete`
+  (may need changes if switching to Anthropic's native API format
+  with explicit cache breakpoints)
+
 ---
 
 ## 4. Expected Combined Impact
@@ -352,10 +481,12 @@ validation is slow or failing silently.
 | C. Bounded file reads | ~100 K | Prevent pathological single-file reads |
 | D. Less prescriptive delegation | ~50 K – 100 K | Fewer coordinator turns, shorter tasks |
 | E. Trace visibility | (diagnostic only) | Enables future analysis |
-| **Combined** | **~450 K – 600 K** | **~30–35% reduction** |
+| F. System prompt restructuring | ~220 K (cost-equivalent) | Prefix caching across same-role agents |
+| **Combined** | **~450 K – 600 K direct + ~220 K cached** | **~30–35% reduction + caching gains** |
 
 With all mitigations applied, the estimated run would drop from ~1.7 M
-to ~1.1 M – 1.3 M tokens.
+to ~1.1 M – 1.3 M tokens (direct savings), with an additional ~220 K
+tokens of cost-equivalent savings from prompt caching.
 
 ### Structural Gap
 
@@ -400,11 +531,14 @@ crossover point is not reached.
    developed in parallel?  This would not reduce tokens but could
    significantly reduce wall-clock time.
 
-5. **Prompt caching.** Does the underlying LLM API support prompt
-   caching (reuse of repeated prompt prefixes)?  If so, the Thorn
-   workflow's many short conversations with shared system prompts
-   could benefit substantially.  If not, this is another argument for
-   agent pooling (longer conversations with cacheable prefixes).
+5. **Prompt caching availability.** Mitigation F restructures system
+   prompts to maximize cacheable prefixes, but the actual benefit
+   depends on whether the underlying LLM API supports prefix caching.
+   If the current OpenAI-compatible endpoint does not, this is an
+   argument for adding a native Anthropic provider (which has explicit
+   cache-control support) or for prioritizing agent pooling (which
+   creates longer-lived conversations with naturally cacheable
+   prefixes).
 
 ---
 

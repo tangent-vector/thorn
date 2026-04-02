@@ -18,6 +18,7 @@ import functools
 import inspect
 import json
 import time
+from collections.abc import Iterable
 from typing import Any, Callable, Generic, TypeVar, get_type_hints, overload
 
 from thorn._context import ExecutionContext, get_context, reset_context, set_context
@@ -52,17 +53,39 @@ def wrap_function(fn: Callable[..., Any]) -> _WrappedTool:
     return _WrappedTool(schema=schema, execute=execute)
 
 
+def _flatten_tools(items: Iterable[Any]) -> Iterable[Any]:
+    """Recursively flatten nested iterables of tools into individual items.
+
+    Leaf items (callables, ``_WrappedTool`` instances, and non-iterable
+    objects) are yielded as-is.  Lists, tuples, and other non-string
+    iterables are recursed into.  This allows toolset constants like
+    ``FILE_READING = [read_file, list_directory, search_files]`` to be
+    nested inside another tool list::
+
+        tools = [FILE_READING, write_file]
+        # flattens to [read_file, list_directory, search_files, write_file]
+    """
+    for item in items:
+        if isinstance(item, _WrappedTool) or callable(item):
+            yield item
+        elif isinstance(item, Iterable) and not isinstance(item, (str, bytes)):
+            yield from _flatten_tools(item)
+        else:
+            yield item
+
+
 def _prepare_tools(raw_tools: list[Any] | None) -> list[_WrappedTool]:
     """Normalise a user-supplied tool list into ``_WrappedTool`` instances.
 
     Accepts a mix of:
     - ``_WrappedTool`` instances (passed through)
     - plain callables (auto-wrapped via ``wrap_function``)
+    - nested iterables of the above (recursively flattened)
     """
     if not raw_tools:
         return []
     result: list[_WrappedTool] = []
-    for item in raw_tools:
+    for item in _flatten_tools(raw_tools):
         if isinstance(item, _WrappedTool):
             result.append(item)
         elif callable(item):

@@ -12,8 +12,8 @@ Defines the role hierarchy:
 
 from __future__ import annotations
 
-from thorn import Agent, FileAccessLevel, FileAccessRule, read_file, write_file
-from thorn.tools import list_directory
+from thorn import Agent, FileAccessLevel, FileAccessRule, write_file
+from thorn.tools import FILE_READING
 
 from .module_tools import (
     add_module,
@@ -94,7 +94,7 @@ class Developer(Agent, abstract=True):
         _SUMMARY_GUIDANCE,
     ]
     tools = [
-        read_file, list_directory, list_submodules,
+        FILE_READING, list_submodules,
         module_header_path, module_source_path, list_all_modules,
     ]
     file_access = [

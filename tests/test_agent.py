@@ -145,6 +145,46 @@ class TestMROCollection:
         assert len(collected) == 1
         assert collected[0] is helper
 
+    def test_nested_tool_list_flattened(self):
+        def tool_a() -> str:
+            """A."""
+
+        def tool_b() -> str:
+            """B."""
+
+        def tool_c() -> str:
+            """C."""
+
+        class Base(Agent):
+            tools = [[tool_a, tool_b], tool_c]
+
+        collected = Base._collect_tools()
+        assert collected == [tool_a, tool_b, tool_c]
+
+    def test_nested_toolset_dedup_across_mro(self):
+        """A toolset constant included in both parent and child is
+        flattened and deduplicated correctly."""
+
+        def tool_a() -> str:
+            """A."""
+
+        def tool_b() -> str:
+            """B."""
+
+        def tool_c() -> str:
+            """C."""
+
+        TOOLSET = [tool_a, tool_b]
+
+        class Base(Agent):
+            tools = [TOOLSET]
+
+        class Child(Base):
+            tools = [TOOLSET, tool_c]
+
+        collected = Child._collect_tools()
+        assert collected == [tool_a, tool_b, tool_c]
+
     def test_single_inheritance_validation_rules(self):
         class Base(Agent):
             validation_rules = ["build"]

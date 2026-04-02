@@ -94,12 +94,18 @@ class Agent:
 
     @classmethod
     def _collect_tools(cls) -> list[Any]:
-        """Walk MRO outermost-first, collecting tools and deduplicating by name."""
+        """Walk MRO outermost-first, collecting tools and deduplicating by name.
+
+        Nested iterables (e.g. toolset constants like ``FILE_READING``)
+        are flattened before deduplication.
+        """
+        from thorn._func import _flatten_tools
+
         collected: list[Any] = []
         seen_names: set[str] = set()
         for klass in reversed(cls.__mro__):
             if "tools" in klass.__dict__:
-                for tool_item in klass.__dict__["tools"]:
+                for tool_item in _flatten_tools(klass.__dict__["tools"]):
                     tool_name = getattr(tool_item, "__name__", str(tool_item))
                     if tool_name not in seen_names:
                         collected.append(tool_item)

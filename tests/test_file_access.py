@@ -403,7 +403,76 @@ class TestToolEnforcement:
         token = set_context(ctx)
         try:
             result = await read_file(str(p))
-            assert result == "open data"
+            assert "open data" in result
+        finally:
+            reset_context(token)
+
+    async def test_search_files_denied_single_file(self, tmp_path):
+        from thorn._tools import search_files
+
+        p = tmp_path / "secret.txt"
+        p.write_text("needle in secret", encoding="utf-8")
+
+        policy = FileAccessPolicy(
+            [FileAccessRule("**", FileAccessLevel.NONE)],
+        )
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            file_access_policy=policy,
+        )
+        token = set_context(ctx)
+        try:
+            with pytest.raises(PermissionError, match="READ"):
+                await search_files("needle", str(p))
+        finally:
+            reset_context(token)
+
+    async def test_search_files_hidden_excluded(self, tmp_path):
+        """HIDDEN files must not appear in directory search results."""
+        from thorn._tools import search_files
+
+        (tmp_path / "visible.txt").write_text("needle\n", encoding="utf-8")
+        (tmp_path / "secret.txt").write_text("needle\n", encoding="utf-8")
+
+        policy = FileAccessPolicy([
+            FileAccessRule("**", FileAccessLevel.READ),
+            FileAccessRule("secret.txt", FileAccessLevel.HIDDEN),
+        ])
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            file_access_policy=policy,
+        )
+        token = set_context(ctx)
+        try:
+            result = await search_files("needle", str(tmp_path))
+            assert "visible.txt" in result
+            assert "secret.txt" not in result
+        finally:
+            reset_context(token)
+
+    async def test_search_files_none_excluded(self, tmp_path):
+        """Files with NONE access must not leak content in search results."""
+        from thorn._tools import search_files
+
+        (tmp_path / "public.txt").write_text("needle\n", encoding="utf-8")
+        (tmp_path / "private.txt").write_text("needle\n", encoding="utf-8")
+
+        policy = FileAccessPolicy([
+            FileAccessRule("**", FileAccessLevel.READ),
+            FileAccessRule("private.txt", FileAccessLevel.NONE),
+        ])
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            file_access_policy=policy,
+        )
+        token = set_context(ctx)
+        try:
+            result = await search_files("needle", str(tmp_path))
+            assert "public.txt" in result
+            assert "private.txt" not in result
         finally:
             reset_context(token)
 

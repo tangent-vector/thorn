@@ -146,15 +146,46 @@ Three options, in rough order of practicality:
 | Implementation difficulty | **Medium** -- requires per-file view state and a strategy for presenting it in context |
 | Value for Thorn | **Medium-High** -- reduces redundant content in context, gives agent finer-grained control |
 
-### Practical Considerations
+### Design Refinement: Expand-Only Tools with Automatic Eviction
 
-- Every expand/collapse is a tool call, costing tokens and latency. The agent
-  may not always make optimal decisions about what to expand. Keeping the tools
-  cheap (fast round-trip, minimal output) helps.
-- MemGPT found that agents sometimes enter loops: paging something in,
-  forgetting why, paging it out, needing it again. The hierarchical
-  expand/collapse model may mitigate this since the agent can see *what's
-  collapsed* (structure is always visible, only detail is hidden).
+A key concern with giving the agent both expand and collapse tools is
+**thrashing**: MemGPT found that agents sometimes enter paging loops (bringing
+something in, forgetting why, paging it out, then needing it again). This
+happens because the MemGPT design asks the agent to be both the application
+(doing the actual task) and the kernel (managing its own memory).
+
+A better separation of concerns: **give the agent only tools that bring
+information into context** (`open_file`, `expand_region`, `show_line`), plus a
+voluntary `close_file` for explicit "I'm done with this." The framework handles
+eviction automatically when context pressure exceeds a threshold.
+
+This is more akin to how a user-space application relates to virtual memory: the
+application allocates and frees what it needs, but the OS handles paging
+decisions. Asking an agent to simultaneously do its primary task and act as its
+own virtual memory manager is a heavy cognitive burden, and one that
+current-generation models don't handle reliably.
+
+The analogy to human cognition reinforces this: we don't typically make active
+choices about what to drop from working memory. Things decay, get displaced, or
+lose salience. The deliberate "I should stop thinking about X" decision is
+unusual for humans and apparently also unnatural for LLMs.
+
+For the automatic eviction mechanism:
+
+- **LRU** is a natural baseline heuristic: evict (collapse) the content the
+  agent has interacted with least recently. This works well for files and
+  filesystem views, where recency is a strong signal of relevance.
+- **Hysteresis** should be applied to the compaction trigger to avoid
+  oscillation when the agent's working set is close to the context budget.
+  A standard high-water/low-water approach (e.g., trigger compaction at 80%
+  of budget, compact down to 60%, don't compact again until 80%) prevents
+  the framework from repeatedly compacting and the agent from repeatedly
+  re-expanding.
+- More sophisticated eviction (using a model to assess what's currently most
+  relevant) is possible but puts us back in the territory of model-guided
+  compaction. Still, having the framework make these decisions in a batch
+  -- rather than asking the agent to interleave eviction decisions with its
+  primary task -- preserves the separation of concerns.
 
 
 ## Idea 3: Filesystem Tree as Expandable Hierarchy
@@ -232,6 +263,23 @@ agents.
 
 ### Prior Art
 
+- **Agent skills / plugins**: Many agent frameworks (Cursor, Copilot, custom
+  agents) support "skills" that are presented to the agent as a brief
+  description up front, with the full skill content living in separate files
+  that the agent reads on demand. This is already the expand pattern in
+  practice: the collapsed view is the one-line skill description in the system
+  prompt, and expanding means reading the `SKILL.md` and any referenced
+  documents. The hierarchy is clear -- skill list → skill document → supporting
+  files -- and the agent decides when to drill down based on the task at hand.
+
+  What existing skill systems generally *don't* do is handle the reverse
+  direction: once a skill's content has been paged into context, it typically
+  stays there for the remainder of the conversation, even after the relevant
+  task is complete. The expand-only + automatic eviction model described under
+  Idea 2 would handle this naturally: skill content that hasn't been referenced
+  recently would be evicted by LRU when context pressure hits, without
+  requiring the agent to decide "I'm done with this skill."
+
 - **RAG systems** (vector-store-backed retrieval): well-established, but treat
   knowledge as a flat search space rather than navigable hierarchy.
 - **Reflexion** (Shinn et al., 2023): agents that maintain persistent memory
@@ -242,7 +290,7 @@ agents.
 
 | Dimension | Rating |
 |-----------|--------|
-| Proven in practice? | **Partially** -- RAG is proven; hierarchical navigation of knowledge bases is underexplored |
+| Proven in practice? | **Partially** -- skills demonstrate the expand pattern for knowledge in production; RAG is proven for flat retrieval; hierarchical navigation as a general mechanism is underexplored |
 | Implementation difficulty | **Medium** -- the document model is straightforward; search/indexing adds complexity |
 | Value for Thorn | **Medium-High** -- especially for multi-step tasks that build up domain knowledge |
 
@@ -284,6 +332,39 @@ When presenting the partially-collapsed history to the LLM, the message list
 is reconstructed with collapsed regions replaced by their labels, and expanded
 regions showing the original messages.
 
+### Structural Markers from Agent Planning
+
+An important observation that substantially reduces the difficulty of steps (1)
+and (2) above: when an agent works with a TODO list or other plan
+representation, it is already annotating its own history with hierarchical
+structure as a side effect of normal planning behavior. Consider:
+
+```
+Turn 12: "I'll work on these items: A, B, C"
+Turn 13-24: [work on A]
+Turn 25: "A is done. Starting B."
+Turn 26-40: [work on B]
+Turn 41: "B is done. Starting C."
+...
+```
+
+The span from "here's my plan" to "plan complete" is a natural top-level
+collapsible region. Each individual TODO item's work (from "starting item B"
+to "item B complete") is a natural sub-region. And the TODO list itself serves
+as the summary label for the collapsed region -- no LLM call is needed to
+figure out the hierarchy or generate labels.
+
+This generalizes beyond TODO lists: any structured agent behavior with explicit
+start/end markers creates natural collapsible regions. Tool calls have this
+property (call start → result). Error-handling sequences (error → diagnosis →
+fix → verify) do too. The more structured the agent's behavior, the easier its
+history is to compress without model intervention.
+
+This means that for the common case of an agent working through a plan, the
+"Hard" difficulty rating below may be closer to "Medium" -- the expensive parts
+(segmentation and labeling) come largely for free from the agent's own
+planning structure.
+
 ### Prior Art
 
 - **MemGPT's recall storage**: archived conversation history is searchable and
@@ -300,7 +381,7 @@ regions showing the original messages.
 | Dimension | Rating |
 |-----------|--------|
 | Proven in practice? | **No** -- novel in this formulation |
-| Implementation difficulty | **High** -- requires conversation segmentation, label generation, view reconstruction, and interaction with provider message format expectations |
+| Implementation difficulty | **High** in general, but **Medium** when the agent uses structured planning (see above) -- requires view reconstruction and interaction with provider message format expectations, but segmentation and labeling can be derived from the agent's own plan structure |
 | Value for Thorn | **High** (if it works) -- eliminates the lossy-compaction tradeoff |
 
 
@@ -321,8 +402,44 @@ All six ideas share a common model:
 | Conversation history | Subtask / turn boundaries | Restore original messages | Replace with summary label |
 
 A single well-designed set of primitives -- `open`, `close`, `expand`,
-`collapse`, `search` (which expands matching regions) -- could in principle
-serve all of these, with the hierarchy source being the only thing that varies.
+`search` (which expands matching regions) -- could in principle serve all of
+these, with the hierarchy source being the only thing that varies. Per the
+design refinement discussed under Idea 2, `collapse` is notably absent from
+the agent-facing tools: collapsing is handled automatically by the framework
+when context pressure demands it, keeping the agent focused on its primary
+task rather than on memory management.
+
+
+## Dual Use: Agent Context Management and Human-Facing UI
+
+The hierarchical view that an agent maintains for its own context management
+is also a natural organizing principle for the human-facing UI of an agent
+conversation. Current agent UIs (ChatGPT, Claude, Cursor) present conversation
+history as a flat stream of messages. For long-lived conversations, this makes
+it difficult for a human to find a specific earlier topic or understand what
+the agent currently "has in mind."
+
+If the same hierarchical structure serves both purposes:
+
+- **Browsing**: A human can navigate the collapsed conversation hierarchy to
+  find old topics, much as they would browse a table of contents, rather than
+  scrolling through a flat message stream.
+
+- **Steering**: A human who expands a collapsed region signals to the agent
+  "I want you to reconsider this." This is a much more natural interaction
+  than typing "remember what we discussed about X" -- the human is directly
+  manipulating the agent's context through the same hierarchy the agent uses
+  internally.
+
+- **Transparency**: The set of currently-expanded hierarchy nodes represents
+  what the agent "has in mind" at a given point. Showing this to the human
+  creates a shared mental model of what's relevant, making the agent's
+  behavior more legible and predictable.
+
+This dual-use property is an additional argument for the hierarchical approach
+over flat summarization: a summary is useful to the agent but offers the human
+no interactive affordance. A collapsible hierarchy is both a compression
+mechanism and a navigation interface.
 
 
 ## Suggested Implementation Path for Thorn
@@ -342,10 +459,14 @@ serve all of these, with the hierarchy source being the only thing that varies.
 
 - Introduce an `OpenFileManager` that tracks open files and their current
   expand/collapse state.
-- Add `open_file`, `expand_region`, `collapse_region`, `close_file` tools.
+- Add agent-facing tools: `open_file`, `expand_region`, `show_line`,
+  `close_file`. Collapse is handled automatically by the framework (see the
+  expand-only design refinement under Idea 2).
 - Present current file views as a preamble injected before each LLM call
   (option 2 from the discussion above).
 - Replace past file-operation tool-results with short notes.
+- Implement automatic eviction with LRU and hysteresis when total open-file
+  content exceeds a context budget.
 - **Estimated effort**: 1-2 weeks.
 
 ### Phase 3: Filesystem Tree View
@@ -357,12 +478,19 @@ serve all of these, with the hierarchy source being the only thing that varies.
 
 ### Phase 4: Non-Lossy Conversation Compaction
 
-- Implement conversation segmentation (start with per-turn granularity).
-- Add a labeling pass that generates short summaries for each segment.
+- Start with plan-derived segmentation: when the agent works through a TODO
+  list or similar plan, use its planning transitions as natural region
+  boundaries with the plan items as labels. This avoids the need for
+  LLM-based segmentation in the common case.
 - Build the "collapsed history" view that reconstructs the message list with
   collapsed/expanded regions.
-- Add tools for the agent to re-expand collapsed regions.
-- **Estimated effort**: Several weeks of design and iteration.
+- Implement automatic collapse with LRU and hysteresis (same pattern as
+  Phase 2) when the history exceeds a context budget.
+- Add a tool for the agent to re-expand collapsed regions on demand.
+- Later: add LLM-based segmentation for history that lacks explicit planning
+  structure.
+- **Estimated effort**: 1-2 weeks for the plan-derived case; several more
+  weeks for the general case.
 
 
 ## Key References

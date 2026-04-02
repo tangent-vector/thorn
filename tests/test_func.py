@@ -95,6 +95,71 @@ class TestPrepareTools:
         with pytest.raises(TypeError, match="Expected a callable"):
             _prepare_tools([42])
 
+    def test_nested_list_flattened(self):
+        def fn_a() -> str:
+            """A."""
+            return "a"
+
+        def fn_b() -> str:
+            """B."""
+            return "b"
+
+        def fn_c() -> str:
+            """C."""
+            return "c"
+
+        result = _prepare_tools([[fn_a, fn_b], fn_c])
+        assert len(result) == 3
+        names = [t.schema["function"]["name"] for t in result]
+        assert names == ["fn_a", "fn_b", "fn_c"]
+
+    def test_deeply_nested_flattened(self):
+        def fn_a() -> str:
+            """A."""
+            return "a"
+
+        result = _prepare_tools([[[fn_a]]])
+        assert len(result) == 1
+        assert result[0].schema["function"]["name"] == "fn_a"
+
+    def test_empty_sublists_ignored(self):
+        def fn_a() -> str:
+            """A."""
+            return "a"
+
+        result = _prepare_tools([[], fn_a, []])
+        assert len(result) == 1
+
+    def test_tuple_flattened(self):
+        def fn_a() -> str:
+            """A."""
+            return "a"
+
+        def fn_b() -> str:
+            """B."""
+            return "b"
+
+        result = _prepare_tools([(fn_a, fn_b)])
+        assert len(result) == 2
+
+    def test_nested_non_callable_raises(self):
+        with pytest.raises(TypeError, match="Expected a callable"):
+            _prepare_tools([[42]])
+
+    def test_mixed_nesting_with_wrapped(self):
+        def fn_a() -> str:
+            """A."""
+            return "a"
+
+        def fn_b() -> str:
+            """B."""
+            return "b"
+
+        wrapped_b = wrap_function(fn_b)
+        result = _prepare_tools([[fn_a], wrapped_b])
+        assert len(result) == 2
+        assert result[1] is wrapped_b
+
 
 # ---------------------------------------------------------------------------
 # prompt (text mode)

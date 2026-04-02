@@ -13,9 +13,12 @@ Import it explicitly from ``thorn._tools`` if you need it::
 
 from thorn._tools import (
     ALL_BUILTIN_TOOLS,
+    FILE_READING,
+    FILE_WRITING,
     ask_user,
     list_directory,
     read_file,
+    search_files,
     write_file,
 )
 
@@ -23,6 +26,9 @@ __all__ = [
     "read_file",
     "write_file",
     "list_directory",
+    "search_files",
     "ask_user",
     "ALL_BUILTIN_TOOLS",
+    "FILE_READING",
+    "FILE_WRITING",
 ]

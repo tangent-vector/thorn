@@ -14,8 +14,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from thorn import prompt, read_file, tool
-from thorn.tools import list_directory
+from thorn import prompt, tool
+from thorn.tools import FILE_READING
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 SOURCE_ROOT = PROJECT_DIR / "src"
@@ -259,7 +259,7 @@ async def module_status(name: str, query: str = "") -> str:
             f"Examine module `{name}` and answer the following question:\n"
             f"{query}\n\n"
             f"The module's header is at `{header}` and source at `{source}`.",
-            tools=[read_file, list_directory, list_submodules,
+            tools=[FILE_READING, list_submodules,
                    module_header_path, module_source_path],
         )
 
