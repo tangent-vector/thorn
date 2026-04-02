@@ -70,6 +70,13 @@ MAX_READ_LINES: int = 500
 MAX_READ_CHARS: int = 50_000
 """Hard ceiling on characters returned by a single ``read_file`` call."""
 
+OUTLINE_THRESHOLD: int = 200
+"""When a file exceeds this many lines and no explicit range is
+requested, return an outline view instead of a verbatim prefix.
+Set below ``MAX_READ_LINES`` so that outline kicks in before hard
+truncation; the agent can still request up to ``MAX_READ_LINES``
+via ``offset``/``limit``."""
+
 MAX_SEARCH_MATCHES: int = 100
 """Hard ceiling on matching lines returned by a single ``search_files`` call."""
 
@@ -125,6 +132,15 @@ async def read_file(
 
     all_lines = p.read_text(encoding="utf-8").splitlines()
     total_lines = len(all_lines)
+
+    if offset == 1 and limit is None and total_lines > OUTLINE_THRESHOLD:
+        from thorn._outline import outline_and_format
+
+        return outline_and_format(
+            all_lines,
+            line_budget=OUTLINE_THRESHOLD,
+            char_budget=MAX_READ_CHARS,
+        )
 
     start_idx = max(offset - 1, 0)
     if start_idx >= total_lines:

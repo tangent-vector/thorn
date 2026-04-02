@@ -12,6 +12,7 @@ from thorn._tools import (
     MAX_READ_LINES,
     MAX_SEARCH_CHARS,
     MAX_SEARCH_MATCHES,
+    OUTLINE_THRESHOLD,
     _collect_match_groups,
     _format_lines,
     list_directory,
@@ -108,12 +109,29 @@ class TestReadFile:
         assert "No content" in result
         assert "5 lines" in result
 
-    async def test_truncated_at_max_lines(self, tmp_path):
+    async def test_large_file_gets_outlined(self, tmp_path):
+        """Files exceeding OUTLINE_THRESHOLD get an outline, not raw truncation."""
         n = MAX_READ_LINES + 200
         p = _make_file(tmp_path, "big.txt", n)
         result = await read_file(str(p))
-        lines = result.split("\n")
-        numbered_lines = [l for l in lines if "| line " in l]
+        assert "[Outline:" in result
+        assert f"{n} lines total" in result
+
+    async def test_outline_bypass_with_explicit_offset(self, tmp_path):
+        """Explicit offset skips outlining and uses verbatim + truncation."""
+        n = MAX_READ_LINES + 200
+        p = _make_file(tmp_path, "big.txt", n)
+        result = await read_file(str(p), offset=1, limit=MAX_READ_LINES)
+        numbered_lines = [l for l in result.split("\n") if "| line " in l]
+        assert len(numbered_lines) == MAX_READ_LINES
+        assert "[Truncated:" in result
+
+    async def test_truncated_at_max_lines_with_limit(self, tmp_path):
+        """With explicit limit, old truncation behavior applies at MAX_READ_LINES."""
+        n = MAX_READ_LINES + 200
+        p = _make_file(tmp_path, "big.txt", n)
+        result = await read_file(str(p), limit=n)
+        numbered_lines = [l for l in result.split("\n") if "| line " in l]
         assert len(numbered_lines) == MAX_READ_LINES
         assert "[Truncated:" in result
         assert f"of {n} total" in result
@@ -144,6 +162,29 @@ class TestReadFile:
         p.write_text("", encoding="utf-8")
         result = await read_file(str(p))
         assert "No content" in result
+
+    async def test_file_at_outline_threshold_not_outlined(self, tmp_path):
+        """Files with exactly OUTLINE_THRESHOLD lines are returned verbatim."""
+        p = _make_file(tmp_path, "exact.txt", OUTLINE_THRESHOLD)
+        result = await read_file(str(p))
+        assert "[Outline:" not in result
+        assert f"1| line 1" in result
+
+    async def test_file_just_above_threshold_outlined(self, tmp_path):
+        n = OUTLINE_THRESHOLD + 1
+        p = _make_file(tmp_path, "over.txt", n)
+        result = await read_file(str(p))
+        assert "[Outline:" in result
+        assert f"{n} lines total" in result
+
+    async def test_outline_preserves_explicit_range_read(self, tmp_path):
+        """After seeing an outline, the agent can read specific ranges."""
+        n = OUTLINE_THRESHOLD + 100
+        p = _make_file(tmp_path, "big.txt", n)
+        result = await read_file(str(p), offset=50, limit=10)
+        assert "50| line 50" in result
+        assert "59| line 59" in result
+        assert "[Outline:" not in result
 
 
 # ---------------------------------------------------------------------------
