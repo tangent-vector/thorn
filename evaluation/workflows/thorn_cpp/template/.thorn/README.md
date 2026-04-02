@@ -80,9 +80,10 @@ The `coordinate` tool creates a `coordinator@main` agent that will:
 1. Inspect the current project state
 2. Delegate to `architect@main` to decompose into modules
 3. Delegate to child coordinators for each sub-module
-4. Within each module, delegate to API designers, test engineers, and
-   implementers as needed
-5. Validate (build + test) after implementation, retrying on failure
+4. Within each module, delegate to API designers, stub implementers,
+   test engineers, and implementers as needed
+5. Validate (build) after API design, stub generation, and test
+   authoring; validate (build + test) after implementation
 
 You can also target a specific module:
 
@@ -107,10 +108,14 @@ concierge (thorn run / thorn chat)
         └─> coordinator@main
               ├─> architect@main
               ├─> api_designer@main
+              ├─> stub_implementer@main
+              ├─> test_engineer@main
               ├─> implementer@main
               ├─> coordinator@parser
               │     ├─> architect@parser
               │     ├─> api_designer@parser
+              │     ├─> stub_implementer@parser
+              │     ├─> test_engineer@parser
               │     ├─> coordinator@parser.lexer
               │     │     └─> ...
               │     └─> ...
@@ -123,13 +128,14 @@ at child modules.
 
 ### Roles
 
-| Role              | Responsibility                                       | Can write            |
-|-------------------|------------------------------------------------------|----------------------|
-| **Coordinator**   | Inspect state, decompose tasks, delegate to roles/children | Nothing (read-only)  |
-| **Architect**     | Decompose modules, define structure, create sub-modules | Header comments only |
-| **API Designer**  | Write type definitions and function declarations     | Headers only         |
-| **Test Engineer** | Write black-box tests against declared APIs          | Test files only      |
-| **Implementer**   | Fill in function bodies in `.cpp` files              | Source files         |
+| Role                  | Responsibility                                       | Can write            |
+|-----------------------|------------------------------------------------------|----------------------|
+| **Coordinator**       | Inspect state, decompose tasks, delegate to roles/children | Nothing (read-only)  |
+| **Architect**         | Decompose modules, define structure, create sub-modules | Header comments only |
+| **API Designer**      | Write type definitions and function declarations     | Headers only         |
+| **Stub Implementer**  | Write placeholder implementations (throw/empty bodies) | Source files         |
+| **Test Engineer**     | Write black-box tests against declared APIs          | Test files only      |
+| **Implementer**       | Fill in function bodies in `.cpp` files with real logic | Source files         |
 
 Every role is scoped to a single module.  `implementer@parser` is
 responsible for `parser.cpp` only -- not `parser/lexer.cpp`, not
@@ -146,16 +152,22 @@ The coordinator sees the error and decides how to proceed.
 coordinator@module
   │
   ├─ delegate_to_role("architect", task)
-  │    └─ architect@module runs → validation → retry on fail
+  │    └─ architect@module runs (no validation)
   │
   ├─ delegate_to_role("api_designer", task)
-  │    └─ api_designer@module runs → validation → retry on fail
+  │    └─ api_designer@module runs → build validation → retry on fail
+  │
+  ├─ delegate_to_role("stub_implementer", task)
+  │    └─ stub_implementer@module runs → build validation → retry on fail
   │
   ├─ delegate_to_child("parser", task)
   │    └─ coordinator@parser runs (same pattern recursively)
   │
+  ├─ delegate_to_role("test_engineer", task)
+  │    └─ test_engineer@module runs → build validation → retry on fail
+  │
   └─ delegate_to_role("implementer", task)
-       └─ implementer@module runs → validation → retry on fail
+       └─ implementer@module runs → build + test validation → retry on fail
 ```
 
 After each delegation, **validation rules** run deterministically.
@@ -175,10 +187,11 @@ VALIDATION_CHECKS = {
 
 Each agent role declares which validation rules apply to it via a
 `validation_rules` class attribute (accumulated through the MRO, like
-`system_prompts` and `tools`).  For example, the `Implementer` and
-`Coordinator` roles declare `validation_rules = ["build", "test"]`,
-while `Architect`, `APIDesigner`, and `TestEngineer` have no validation
-rules by default.
+`system_prompts` and `tools`).  For example:
+
+- `Implementer` and `Coordinator`: `validation_rules = ["build", "test"]`
+- `APIDesigner`, `StubImplementer`, and `TestEngineer`: `validation_rules = ["build"]`
+- `Architect`: no validation rules
 
 The effective rules for any agent are computed as:
 

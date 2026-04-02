@@ -4,7 +4,8 @@ Defines the role hierarchy:
 
 - ``Developer`` (abstract): shared project knowledge and inspection tools
 - ``WorkflowRole`` (abstract): base for delegatable roles scoped to a
-  single module (Architect, APIDesigner, TestEngineer, Implementer)
+  single module (Architect, APIDesigner, StubImplementer, TestEngineer,
+  Implementer)
 - ``Coordinator``: orchestrates work across a module subtree via delegation
 - ``Concierge``: injects system prompts into the top-level thorn agent
 """
@@ -187,8 +188,12 @@ class APIDesigner(WorkflowRole):
         "FORBIDDEN: Do NOT write function bodies or implementations. "
         "Do NOT modify any .cpp source file. Do NOT modify any other "
         "module's files. You may only write to this module's header.\n\n"
-        "Read dependency module headers first to understand available types.",
+        "Read dependency module headers first to understand available types.\n\n"
+        "After you finish, the build will be validated automatically. "
+        "Stub implementations will already exist from earlier steps (or "
+        "will be generated immediately after), so the code should link.",
     ]
+    validation_rules = ["build"]
     tools = [write_file]
 
     def _instance_file_access(self) -> list[FileAccessRule]:
@@ -197,6 +202,47 @@ class APIDesigner(WorkflowRole):
 
 
 register_role("api_designer", APIDesigner)
+
+
+class StubImplementer(WorkflowRole):
+    """Writes stub implementations so that declared APIs link successfully."""
+
+    system_prompts = [
+        "You are stub_implementer@{module}. Your ONLY purpose is to write "
+        "placeholder implementations that allow the project to compile and "
+        "link. You are NOT writing real logic.\n\n"
+        "FILE ACCESS: You have write access ONLY to the module's .cpp "
+        "source file. All other files are read-only.\n\n"
+        "PROCEDURE:\n"
+        "1. Read the module's header file to discover all declared "
+        "functions, methods, and classes.\n"
+        "2. Write the .cpp source file with stub bodies for every "
+        "declaration that requires a definition.\n\n"
+        "STUB BODY RULES:\n"
+        "- Non-void functions: throw std::runtime_error(\"not implemented\");\n"
+        "- Void functions: throw std::runtime_error(\"not implemented\");\n"
+        "- Constructors: empty body {}\n"
+        "- Destructors: empty body {}\n"
+        "- Operators returning a value: throw std::runtime_error(\"not "
+        "implemented\");\n"
+        "- #include <stdexcept> for std::runtime_error.\n"
+        "- #include the module's own header.\n\n"
+        "FORBIDDEN:\n"
+        "- Do NOT write real implementation logic.\n"
+        "- Do NOT write conditional logic, loops, or algorithms.\n"
+        "- Do NOT modify the header file or any other file.\n"
+        "- Do NOT create new files.\n"
+        "- Every function body must be trivially short (one throw or empty).",
+    ]
+    validation_rules = ["build"]
+    tools = [write_file]
+
+    def _instance_file_access(self) -> list[FileAccessRule]:
+        source = module_source_path(self.module)
+        return [FileAccessRule(source, FileAccessLevel.WRITE)]
+
+
+register_role("stub_implementer", StubImplementer)
 
 
 class TestEngineer(WorkflowRole):
@@ -229,11 +275,12 @@ class TestEngineer(WorkflowRole):
         "Write tests against the DECLARED API in the module's header — "
         "not against implementation details. Read the header first to "
         "understand what types, functions, and classes are available.\n\n"
-        "Do NOT attempt to build or run tests. The implementation will "
-        "not exist yet when you write tests, so builds would fail with "
-        "link errors. Just write the test files — the build system will "
-        "validate them after the implementer provides definitions.",
+        "Stub implementations exist, so the build should succeed. "
+        "However, do NOT attempt to run the tests — stubs will fail at "
+        "runtime. Just write the test files; the build is validated "
+        "automatically to catch compile errors.",
     ]
+    validation_rules = ["build"]
     tools = [write_file]
 
     def _instance_file_access(self) -> list[FileAccessRule]:
@@ -305,34 +352,40 @@ class Coordinator(Developer):
         "add_module. Does NOT write any code.\n"
         "- api_designer: Writes the full header file with type "
         "definitions and function signatures. Declarations only.\n"
+        "- stub_implementer: Writes placeholder implementations "
+        "(throwing/empty bodies) so the code links. Run this "
+        "immediately after api_designer.\n"
         "- test_engineer: Writes black-box tests against the declared "
         "API using doctest. Tests are placed in the tests/ directory.\n"
         "- implementer: Fills in function bodies in the .cpp source "
-        "file. Build and test validation runs automatically after "
-        "implementation.",
+        "file with real logic. Build and test validation runs "
+        "automatically after implementation.",
 
         "WORKFLOW FOR BUILDING A MODULE FROM SCRATCH:\n"
         "1. delegate_to_role('architect', ...) — define structure, "
         "create any sub-modules.\n"
         "2. After architecture, check list_submodules('{module}'). "
         "For each child, use delegate_to_child to have it fully "
-        "developed (API + tests + implementation). Process dependencies "
-        "FIRST.\n"
+        "developed (API + stubs + tests + implementation). Process "
+        "dependencies FIRST.\n"
         "3. delegate_to_role('api_designer', ...) — declare this "
         "module's own API in its header.\n"
-        "4. delegate_to_role('test_engineer', ...) — write tests "
-        "against the declared API BEFORE implementation.\n"
-        "5. delegate_to_role('implementer', ...) — implement this "
-        "module's code. Tests must pass after implementation.\n"
+        "4. delegate_to_role('stub_implementer', ...) — generate "
+        "placeholder implementations so the code links. This MUST "
+        "happen before test_engineer runs.\n"
+        "5. delegate_to_role('test_engineer', ...) — write tests "
+        "against the declared API BEFORE real implementation.\n"
+        "6. delegate_to_role('implementer', ...) — replace stubs with "
+        "real implementation. Tests must pass after implementation.\n"
         "Skip steps that are already done. For existing code, inspect "
         "state first and adapt.",
 
         "SPECIAL CASE — ROOT MODULE (main):\n"
         "The root module 'main' has NO header file; it is just main.cpp. "
-        "Therefore api_designer and test_engineer do NOT apply to 'main'. "
-        "For the root module: architect (to create child modules) → "
-        "develop children via delegate_to_child → implement main.cpp "
-        "via implementer.",
+        "Therefore api_designer, stub_implementer, and test_engineer do "
+        "NOT apply to 'main'. For the root module: architect (to create "
+        "child modules) → develop children via delegate_to_child → "
+        "implement main.cpp via implementer.",
 
         "BEFORE DELEGATING, INSPECT:\n"
         "Use module_status and list_submodules to understand current "
