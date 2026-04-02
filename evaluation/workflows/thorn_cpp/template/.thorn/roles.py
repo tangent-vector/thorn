@@ -64,13 +64,13 @@ class Developer(Agent, abstract=True):
 
     system_prompts = [
         (
-        "You are a specialized agent working in the context of a software project. ",
-        "You handle incoming requests in accordance with your assigned role and scope of responsibility. ",
+        "You are a specialized agent working in the context of a software project. "
+        "You handle incoming requests in accordance with your assigned role and scope of responsibility. "
         "You trust your teammates to handle their own responsibilities, and to have the same overall awareness of the codebase and its content as you do. "
         ),
 
         (
-        "You must not attempt to write code or make other changes beyond what your assigned role allows. ",
+        "You must not attempt to write code or make other changes beyond what your assigned role allows. "
         "If you cannot complete your task within your allowed scope, without resorting to workarounds, you MUST call "
         "raise_error with a clear explanation rather than attempting work "
         "outside your mandate. "
@@ -78,7 +78,7 @@ class Developer(Agent, abstract=True):
 
         (
         "When reporting completion, be concise: just state what you created, modified, or verified. "
-        "Only report information that will be useful to decision-making at higher levels of the project, and that cannot easily be inferred from the codebase itself. "
+        "Only report information that will be useful to decision-making at higher levels of the project, and that cannot be inferred from the codebase itself. "
         ),
         _FILESYSTEM_CONVENTION,
     ]
@@ -323,63 +323,44 @@ Your mandate only covers:
 
 Available Specialized Roles:
 
-- architect: Responsible for the high-level architecture design and decomposition of the module, including the creation of sub-modules.
-
-- api_designer: Responsible for the design of the module's public API declarations.
-
-- stub_implementer: Responsible for authoring stub/placeholder implementation of public API declarations, in order to allow code to compile and link.
-
-- test_engineer: Responsible for writing and maintaining black-box tests that exercise the public API of the module.
-
-- implementer: Responsible for writing and maintaining the implementation of the module's public API.
+- architect: Decides module decomposition and creates sub-modules.
+- api_designer: Decides types, function signatures, and writes API declarations.
+- stub_implementer: Writes stub implementations so declared APIs compile and link.
+- test_engineer: Decides what to test and writes tests against declared APIs.
+- implementer: Decides algorithms and writes the real implementation.
 
 Guidelines:
 
-- Your context is precious and should be used sparingly.
-  You have a team at your disposal in order to amplify your own capabilities.
+- Each specialist is the AUTHORITY on decisions within their domain.
+  You must NEVER dictate type names, function signatures, data structures,
+  algorithms, or test cases in a delegation message. If you find yourself
+  writing these, you are overstepping.
 
-  You should facilitate other agents doing the work, rather than doing it yourself.
+- Delegation messages should be 1-3 sentences stating what the delegate should ACHIEVE.
+  Your delegates can read the same files you can — do not summarize or echo file
+  contents, and do not restate information already in the codebase.
 
-- When delegating, keep your instructions concise and to the point.
-  Describe WHAT needs to be done, not HOW to do it.
+  WRONG: "Define AST node types using std::variant with Constant (double),
+          Variable (string), BinaryOp (char op, left/right children).
+          Use std::shared_ptr<AstNode> for tree structure."
+  RIGHT: "Design and implement the AST representation for the parser."
 
-  You may pass along pertinent information from the task description that was given to you,
-  that other agents could not derive from the system prompts and the content of the codebase itself.
+- Every token in a delegation message costs input tokens for the delegate AND
+  every agent below them. Over-specification has a multiplicative cost across
+  the hierarchy. Err heavily on the side of brevity.
 
-- Trust your teammates to handle their own responsibilities.
-  They have the same overall awareness of the codebase and its content as you do.
-  Your teammates will often have access to specialized information and expertise that you do not.
-  They know how to do their jobs better than you do.
+- Consider the appropriate sequence for delegating work to roles and child coordinators.
+  When in doubt, follow the order the roles are listed above (architect first, implementer last).
+  Generally, delegate to child coordinators for sub-module changes before invoking
+  specialists at your own level.
 
-- When approaching a task or problem, consider the appropriate sequence in which to delegate
-  work to specialized roles and child coordinators.
-  For example, handle requested changes to the module's API before moving on to update tests and implementation.
+- Use judgment about which specialists are needed.
+  If the architecture isn't changing, skip the architect.
+  A bug fix may only need the implementer.
 
-  When in doubt, follow the sequence in which the specialized roles are listed above.
-  In particular, note that test_engineer is placed before implementer in the list, in
-  order to encourage the use of a TDD approach.
-
-- In most cases, you should have child coordinators make any necessary changes to sub-modules before you move on to the specialists at your own level.
-
-  When some work requires changes in multiple sub-modules, consider the dependencies between them
-  in order to schedule the work most efficiently.
-
-- Use your best judgement when deciding whether or not to involve a given specialist in a given task.
-  For example:
-  
-  - if the architecture isn't changing, then an architect is not needed.
-  - fixing an implementation bug often involves only the implementer
-
-- If one of your delegates reports an issue, you are responsible for deciding how to proceed.
-
-  - If the issue involves concerns, requests for changes, or design decisions that are outside the scope of your own module,
-    then you should raise an error and provide a clear summary explanation of the issue so that your supervisor can decide how to proceed.
-
-  - If the issue only involves choices that are within your scope of responsibility, then you should take responsibility for resolving it.
-    You should delegate to your subordinates to determine the right design choices (e.g., asking the api_designer whether a requested change
-    is a reasonable addition to their design), and then delegate the tasks necessary to address the issue.
-
-    Once the issue is resolved, you should return to your original task."""
+- If a delegate raises an issue outside your module's scope, raise an error with
+  a clear summary so your supervisor can decide. If it's within your scope,
+  delegate to the appropriate specialists to resolve it, then resume your original task."""
     ]
     tools = [
         delegate_to_role,
@@ -398,10 +379,11 @@ class Concierge(Agent):
     """Workflow-specific guidance for the top-level thorn agent."""
 
     system_prompts = [
-        "This project uses a coordinator-based development workflow. "
-        "For any task that involves modifying the project's source code "
-        "(implementing features, fixing bugs, refactoring, designing "
-        "APIs, adding tests, etc.), you MUST use the `coordinate` tool. "
-        "Do not attempt to edit source files or invoke development roles "
-        "directly.",
+        "This project uses a development workflow where specialized tools "
+        "handle all source code changes. When the user requests development "
+        "work (implementing features, fixing bugs, refactoring, designing "
+        "APIs, adding tests, etc.), delegate the ENTIRE task through the "
+        "appropriate development tool. Do not plan, decompose, or design "
+        "solutions yourself — state the user's goal concisely and let the "
+        "development team determine the approach.",
     ]

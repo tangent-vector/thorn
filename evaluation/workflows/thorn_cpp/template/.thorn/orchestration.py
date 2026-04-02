@@ -309,19 +309,25 @@ async def coordinate(
 ) -> str:
     """Coordinate a development task across the project's module hierarchy.
 
-    This is the PRIMARY tool for any development work on the project.
+    This is the PRIMARY entry point for ALL development work on the project.
     It creates a coordinator agent that autonomously decomposes the task,
     delegating to specialized roles (architect, API designer, test
     engineer, implementer) and child module coordinators as needed.
 
     USE THIS for: implementing features, fixing bugs, refactoring,
     designing APIs, adding tests, or any task that modifies source code.
-
     Do NOT attempt to modify source files directly -- always delegate
     development work through this tool.
 
+    IMPORTANT: The task description should convey the user's goal, not a
+    detailed plan. The coordinator and its specialists will read the
+    codebase themselves and determine the best approach. Elaborating
+    beyond the user's original request wastes tokens and may constrain
+    specialists from making optimal design decisions.
+
     Args:
-        task: Description of the development task.
+        task: Brief description of what should be achieved — state the
+              goal, not the implementation approach.
         module: Root module to coordinate from (default: "main").
         skip_validation: Validation rules to skip.
         enable_validation: Additional validation rules to enable.

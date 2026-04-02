@@ -101,6 +101,10 @@ def add_module(name: str, parent: str, description: str) -> str:
     include_path = header.relative_to(SOURCE_ROOT).as_posix()
     guard = f"{qualified.upper().replace('.', '_')}_H"
 
+    purpose_lines = "\n".join(
+        f"//   {line}" for line in description.splitlines()
+    )
+
     header.write_text(
         f"""\
 #ifndef {guard}
@@ -111,7 +115,7 @@ def add_module(name: str, parent: str, description: str) -> str:
 // ============================================================================
 //
 // Purpose:
-//   {description}
+{purpose_lines}
 //
 // Responsibilities:
 //   (to be defined by architect)
