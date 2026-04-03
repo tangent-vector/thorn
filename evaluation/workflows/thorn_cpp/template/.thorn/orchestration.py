@@ -126,6 +126,11 @@ async def _run_with_validation(
 
     The agent keeps its conversation history across retries so it can
     see what it did previously and what went wrong.
+
+    When validation passes on the first attempt the original summary is
+    returned as-is.  If one or more retry rounds were needed, the agent
+    is asked for a fresh summary so the coordinator receives a coherent
+    description of the completed work rather than a fix-oriented response.
     """
     messages: list = []
     rules = effective_validation_rules(agent)
@@ -138,7 +143,14 @@ async def _run_with_validation(
     for retry in range(max_retries + 1):
         failures = await _run_validation(rules)
         if not failures:
-            return summary
+            if retry == 0:
+                return summary
+            return await agent.prompt(
+                "Validation now passes. Please provide a brief summary of "
+                "the work you completed (covering the original task, not "
+                "just the fixes).",
+                messages=messages,
+            )
 
         if retry == max_retries:
             error_report = "\n".join(
