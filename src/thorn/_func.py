@@ -32,6 +32,27 @@ T = TypeVar("T")
 # wrap_function — turn any Python function into a tool for an agent
 # ---------------------------------------------------------------------------
 
+def _build_param_coercers(
+    fn: Callable[..., Any],
+) -> dict[str, TypeAdapter[Any]]:
+    """Build a ``TypeAdapter`` for each typed parameter of *fn*.
+
+    Used at call time to coerce raw JSON-parsed dicts/lists into the
+    annotated Python types (dataclasses, Pydantic models, etc.).
+    """
+    from pydantic import TypeAdapter as _TA
+
+    hints = get_type_hints(fn)
+    sig = inspect.signature(fn)
+    coercers: dict[str, TypeAdapter[Any]] = {}
+    for name, param in sig.parameters.items():
+        annotation = hints.get(name, inspect.Parameter.empty)
+        if annotation is inspect.Parameter.empty or annotation is Any:
+            continue
+        coercers[name] = _TA(annotation)
+    return coercers
+
+
 def wrap_function(fn: Callable[..., Any]) -> _WrappedTool:
     """Wrap a Python function so it can be used as a tool by an agent.
 
@@ -42,8 +63,12 @@ def wrap_function(fn: Callable[..., Any]) -> _WrappedTool:
     """
     schema = func_to_tool_schema(fn)
     is_async = asyncio.iscoroutinefunction(fn)
+    coercers = _build_param_coercers(fn)
 
     async def execute(**kwargs: Any) -> str:
+        for name, adapter in coercers.items():
+            if name in kwargs:
+                kwargs[name] = adapter.validate_python(kwargs[name])
         if is_async:
             result = await fn(**kwargs)
         else:

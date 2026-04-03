@@ -4,9 +4,17 @@ from __future__ import annotations
 
 import pytest
 
+from pydantic.dataclasses import dataclass as pydantic_dataclass
+
 from thorn._func import _prepare_tools, prompt, skill, wrap_function
 from thorn._loop import _WrappedTool
 from thorn._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
+
+
+@pydantic_dataclass
+class _TestEdit:
+    old: str
+    new: str
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +58,18 @@ class TestWrapFunction:
         result = await tool.execute()
         import json
         assert json.loads(result) == {"status": "ok", "count": 3}
+
+    async def test_nested_dataclass_coerced_from_dict(self):
+        """Raw dicts (from JSON) are coerced to the annotated dataclass type."""
+        def apply_edits(edits: list[_TestEdit]) -> str:
+            """Apply edits."""
+            return ", ".join(f"{e.old}->{e.new}" for e in edits)
+
+        tool = wrap_function(apply_edits)
+        result = await tool.execute(
+            edits=[{"old": "foo", "new": "bar"}, {"old": "a", "new": "b"}],
+        )
+        assert result == "foo->bar, a->b"
 
 
 # ---------------------------------------------------------------------------
