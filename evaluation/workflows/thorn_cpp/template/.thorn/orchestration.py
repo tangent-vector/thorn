@@ -1,16 +1,16 @@
-"""Coordinator-driven hierarchical delegation with validation enforcement.
+"""Hierarchical delegation with validation enforcement.
 
 Provides the orchestration machinery for the development workflow:
 
-- Per-role validation rules (declared on Agent subclasses via
+- Per-module validation rules (declared on Agent subclasses via
   ``validation_rules``) with explicit enable/disable overrides
   propagated through the delegation chain via ContextVar
-- Delegation tools for coordinators (delegate_to_role, delegate_to_child)
+- A ``delegate_to_child`` tool for developers to delegate sub-module work
 - A top-level ``coordinate`` tool discoverable by the concierge
 
 This module deliberately avoids importing role classes from ``roles.py``.
-It resolves roles at runtime through ``_delegatable_roles`` (populated by
-``roles.py`` via ``register_role``) and the ``Agent`` registry.
+It resolves the ``ModuleDeveloper`` class at runtime through the ``Agent``
+registry.
 """
 
 from __future__ import annotations
@@ -88,26 +88,6 @@ async def _run_validation(rules: frozenset[str]) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Delegatable role registry (populated by roles.py at import time)
-# ---------------------------------------------------------------------------
-
-_delegatable_roles: dict[str, type[Agent]] = {}
-
-
-def register_role(name: str, cls: type[Agent]) -> None:
-    """Register a role class as available for coordinator delegation.
-
-    Called by ``roles.py`` after each concrete workflow role is defined.
-    """
-    _delegatable_roles[name] = cls
-
-
-def available_role_names() -> list[str]:
-    """Return sorted list of registered delegatable role names."""
-    return sorted(_delegatable_roles)
-
-
-# ---------------------------------------------------------------------------
 # Validation retry loop
 # ---------------------------------------------------------------------------
 
@@ -129,7 +109,7 @@ async def _run_with_validation(
 
     When validation passes on the first attempt the original summary is
     returned as-is.  If one or more retry rounds were needed, the agent
-    is asked for a fresh summary so the coordinator receives a coherent
+    is asked for a fresh summary so the caller receives a coherent
     description of the completed work rather than a fix-oriented response.
     """
     messages: list = []
@@ -208,53 +188,24 @@ def _pop_overrides(
     _validation_enabled.reset(en_token)
 
 
-# ---------------------------------------------------------------------------
-# Delegation tools (listed in Coordinator.tools, NOT @tool-decorated)
-# ---------------------------------------------------------------------------
+def _get_developer_cls() -> type[Agent]:
+    """Resolve the ModuleDeveloper class from the Agent registry.
 
-
-async def delegate_to_role(
-    role: str,
-    task: str,
-    skip_validation: list[str] | None = None,
-    enable_validation: list[str] | None = None,
-) -> str:
-    """Delegate a task to a development role at the current module.
-
-    Creates an agent for the specified role, scoped to the coordinator's
-    own module, and runs it with validation enforcement.  The sub-agent
-    receives the task description and returns a summary of what it did.
-
-    If the sub-agent cannot complete the task, the error is reported back
-    to you so you can decide how to proceed.
-
-    Args:
-        role: Role name (e.g. "architect", "api_designer",
-              "test_engineer", "implementer").
-        task: Free-form description of what the role should do.
-        skip_validation: Validation rules to disable for this delegation.
-        enable_validation: Additional validation rules to enable.
+    Raises RuntimeError if the class hasn't been registered (i.e.
+    roles.py hasn't been loaded yet).
     """
-    ctx = get_context()
-    module = ctx.agent.module
-
-    role_cls = _delegatable_roles.get(role)
-    if role_cls is None:
-        available = ", ".join(available_role_names())
-        raise ValueError(
-            f"Unknown role: {role!r}. Available roles: {available}"
-        )
-
-    en_token, dis_token = _push_overrides(skip_validation, enable_validation)
-    try:
-        agent = role_cls(module=module)
-        return await _run_with_validation(agent, task)
-    except SkillError as exc:
+    cls = Agent._registry.get("ModuleDeveloper")
+    if cls is None:
         raise RuntimeError(
-            f"{role}@{module} raised an error: {exc.detail}"
-        ) from None
-    finally:
-        _pop_overrides(en_token, dis_token)
+            "No ModuleDeveloper class registered.  "
+            "Ensure roles.py defines a ModuleDeveloper(Developer) class."
+        )
+    return cls
+
+
+# ---------------------------------------------------------------------------
+# Delegation tool (listed in ModuleDeveloper.tools, NOT @tool-decorated)
+# ---------------------------------------------------------------------------
 
 
 async def delegate_to_child(
@@ -263,13 +214,13 @@ async def delegate_to_child(
     skip_validation: list[str] | None = None,
     enable_validation: list[str] | None = None,
 ) -> str:
-    """Delegate a task to the coordinator of a child module.
+    """Delegate a task to the developer of a child module.
 
-    Creates a coordinator agent for the specified child module and runs
-    it with validation enforcement.  The child must be a direct submodule
+    Creates a developer agent for the specified child module and runs it
+    with validation enforcement.  The child must be a direct submodule
     of the current module (use ``list_submodules`` to discover children).
 
-    If the child coordinator cannot complete the task, the error is
+    If the child developer cannot complete the task, the error is
     reported back to you so you can decide how to proceed.
 
     Args:
@@ -290,18 +241,15 @@ async def delegate_to_child(
         )
 
     qualified_child = qualify(module, child)
-
-    coordinator_cls = Agent._registry.get("Coordinator")
-    if coordinator_cls is None:
-        raise RuntimeError("No Coordinator class registered")
+    developer_cls = _get_developer_cls()
 
     en_token, dis_token = _push_overrides(skip_validation, enable_validation)
     try:
-        agent = coordinator_cls(module=qualified_child)
+        agent = developer_cls(module=qualified_child)
         return await _run_with_validation(agent, task)
     except SkillError as exc:
         raise RuntimeError(
-            f"coordinator@{qualified_child} raised an error: {exc.detail}"
+            f"developer@{qualified_child} raised an error: {exc.detail}"
         ) from None
     finally:
         _pop_overrides(en_token, dis_token)
@@ -322,9 +270,9 @@ async def coordinate(
     """Coordinate a development task across the project's module hierarchy.
 
     This is the PRIMARY entry point for ALL development work on the project.
-    It creates a coordinator agent that autonomously decomposes the task,
-    delegating to specialized roles (architect, API designer, test
-    engineer, implementer) and child module coordinators as needed.
+    It creates a developer agent that autonomously handles the task --
+    designing APIs, writing implementations, creating tests, and delegating
+    sub-module work to child developers as needed.
 
     USE THIS for: implementing features, fixing bugs, refactoring,
     designing APIs, adding tests, or any task that modifies source code.
@@ -332,32 +280,26 @@ async def coordinate(
     development work through this tool.
 
     IMPORTANT: The task description should convey the user's goal, not a
-    detailed plan. The coordinator and its specialists will read the
-    codebase themselves and determine the best approach. Elaborating
-    beyond the user's original request wastes tokens and may constrain
-    specialists from making optimal design decisions.
+    detailed plan. The developer will read the codebase and determine the
+    best approach. Elaborating beyond the user's original request wastes
+    tokens and may constrain the developer from making optimal decisions.
 
     Args:
         task: Brief description of what should be achieved — state the
               goal, not the implementation approach.
-        module: Root module to coordinate from (default: "main").
+        module: Root module to start from (default: "main").
         skip_validation: Validation rules to skip.
         enable_validation: Additional validation rules to enable.
     """
-    coordinator_cls = Agent._registry.get("Coordinator")
-    if coordinator_cls is None:
-        raise RuntimeError(
-            "No Coordinator class registered.  "
-            "Ensure roles.py defines a Coordinator(Developer) class."
-        )
+    developer_cls = _get_developer_cls()
 
     en_token, dis_token = _push_overrides(skip_validation, enable_validation)
     try:
-        agent = coordinator_cls(module=module)
+        agent = developer_cls(module=module)
         return await _run_with_validation(agent, task)
     except SkillError as exc:
         raise RuntimeError(
-            f"coordinator@{module} could not complete the task: {exc.detail}"
+            f"developer@{module} could not complete the task: {exc.detail}"
         ) from None
     finally:
         _pop_overrides(en_token, dis_token)

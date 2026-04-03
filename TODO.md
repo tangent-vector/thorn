@@ -1,3 +1,7 @@
+- Handle triggering of validation steps in response to file writes (or other actions) performed by agents, and automatically providing validation feedback in addition to other tool-call results.
+
+- survey current built-in tools and make sure they are following industry best practices
+
 - `thorn do` instead of `thorn run`, and then rename `thorn.prompt` over to be `thorn.do` (and similarly, `Agent.prompt` becomes `agent.do`)
 
 - In the workflow: a "clarify and then delegate" role/step/tool that the concierge can invoke, that works to explore the project and (optionally) grill the user to get clarification on their intent, before moving on to actually delegating to a `coordinator` agent to get the work done.

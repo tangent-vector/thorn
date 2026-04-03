@@ -3,19 +3,22 @@
 Defines the role hierarchy:
 
 - ``Developer`` (abstract): shared project knowledge and inspection tools
-- ``WorkflowRole`` (abstract): base for delegatable roles scoped to a
-  single module (Architect, APIDesigner, StubImplementer, TestEngineer,
-  Implementer)
-- ``Coordinator``: orchestrates work across a module subtree via delegation
+- ``ModuleDeveloper``: handles the full development lifecycle for a single
+  module (architecture, API design, implementation, testing) and delegates
+  sub-module work to child developers
 - ``Concierge``: injects system prompts into the top-level thorn agent
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from thorn import Agent, FileAccessLevel, FileAccessRule, write_file
 from thorn.tools import FILE_READING
 
+from .build_tools import build, run_tests
 from .module_tools import (
+    PROJECT_DIR,
     add_module,
     dependency_order,
     list_all_modules,
@@ -24,11 +27,7 @@ from .module_tools import (
     module_source_path,
     module_status,
 )
-from .orchestration import (
-    delegate_to_child,
-    delegate_to_role,
-    register_role,
-)
+from .orchestration import delegate_to_child
 
 # ---------------------------------------------------------------------------
 # Shared system prompt fragments
@@ -38,13 +37,21 @@ _FILESYSTEM_CONVENTION = """\
 The code lives under src/, and tests live under tests/.
 
 The project is organized as a hierarchy of modules.
-A module `foo.bar` comprises:
+A top-level module `foo` comprises:
+
+- A header file `src/foo.h`
+- A source file `src/foo.cpp`
+- Optionally, a test file `tests/foo_test.cpp`
+
+A nested module `foo.bar` comprises:
 
 - A header file `src/foo/bar.h`
 - A source file `src/foo/bar.cpp`
-- Optionally, a test file `src/tests/foo/bar_test.cpp`
+- Optionally, a test file `tests/foo/bar_test.cpp`
 
-If `foo.bar` has children, they live in `src/foo/bar/`.
+If a module has children, they live in a subdirectory named after the module.
+For example, children of `foo` live in `src/foo/`, and children of `foo.bar`
+live in `src/foo/bar/`.
 
 As a special case, the root module `main` comprises only the source file `src/main.cpp`.
 
@@ -55,7 +62,7 @@ If in doubt, use the module_header_path and module_source_path tools to resolve 
 """
 
 # ---------------------------------------------------------------------------
-# Abstract bases
+# Abstract base
 # ---------------------------------------------------------------------------
 
 
@@ -64,21 +71,25 @@ class Developer(Agent, abstract=True):
 
     system_prompts = [
         (
-        "You are a specialized agent working in the context of a software project. "
-        "You handle incoming requests in accordance with your assigned role and scope of responsibility. "
-        "You trust your teammates to handle their own responsibilities, and to have the same overall awareness of the codebase and its content as you do. "
+            "You are a specialized agent working in the context of a "
+            "software project. You handle incoming requests in accordance "
+            "with your assigned role and scope of responsibility. You trust "
+            "your teammates to handle their own responsibilities, and to "
+            "have the same overall awareness of the codebase and its "
+            "content as you do. "
         ),
-
         (
-        "You must not attempt to write code or make other changes beyond what your assigned role allows. "
-        "If you cannot complete your task within your allowed scope, without resorting to workarounds, you MUST call "
-        "raise_error with a clear explanation rather than attempting work "
-        "outside your mandate. "
+            "You must not attempt to write code or make other changes "
+            "beyond what your assigned role allows. If you cannot complete "
+            "your task within your allowed scope, without resorting to "
+            "workarounds, you MUST call raise_error with a clear "
+            "explanation rather than attempting work outside your mandate. "
         ),
-
         (
-        "When reporting completion, be concise: just state what you created, modified, or verified. "
-        "Only report information that will be useful to decision-making at higher levels of the project, and that cannot be inferred from the codebase itself. "
+            "When reporting completion, be concise: just state what you "
+            "created, modified, or verified. Only report information that "
+            "will be useful to decision-making at higher levels of the "
+            "project, and that cannot be inferred from the codebase itself. "
         ),
         _FILESYSTEM_CONVENTION,
     ]
@@ -93,281 +104,128 @@ class Developer(Agent, abstract=True):
     ]
 
 
-class WorkflowRole(Developer, abstract=True):
-    """Base for delegatable development roles scoped to a single module."""
-
-    def __str__(self) -> str:
-        return f"{self.role}@{self.module}"
-
-    @property
-    def role(self) -> str:
-        return type(self).__name__.lower()
-
 # ---------------------------------------------------------------------------
-# Delegatable roles
+# Module developer
 # ---------------------------------------------------------------------------
 
 
-class Architect(WorkflowRole):
-    """Decomposes modules into sub-modules, defines structure."""
-
-    system_prompts = ["""
-You are {role}@{module}.
-You are responsible for the high-level architecture description and decomposition of this module.
-
-Your mandate only covers:
-
-- Writing and maintaining the leading comment block of the module's header file (or main.cpp for the root module).
-  You are responsible for ensuring that the comment clearly articulates the purpose, responsibilities, and dependencies of the module.
-
-  You may also use the leading comment to explain large-scale organizational principles, including
-  what the sub-modules of your module are and what their relationships relationships are: how
-  they are supposed to coordinate/communicate.
-
-- Calling the add_module tool to create new child modules of your module
-
-You are only responsible for high-level architecture and decomposition choices,
-and should not involve yourself in writing code, deciding on the names/types/signatures
-of functions/classes/etc.
-
-Guidelines:
-
-- Prefer flat architectures.
-  When decomposing a module, about 3-5 sub-modules is the sweet spot.
-
-- Only create sub-modules when they represent a clear and distinct concern, that would likely take 100+ lines of non-trivial code to implement.
-
-- Clearly describe the purpose, responsibilities, and dependencies of your module for the benefit of other contributors.
-  It is your responsibility to keep this information up to date as the module evolves
-"""
-    ]
-    tools = [write_file, add_module]
-
-    def _instance_file_access(self) -> list[FileAccessRule]:
-        header = module_header_path(self.module)
-        source = module_source_path(self.module)
-        rules = [FileAccessRule(header, FileAccessLevel.WRITE)]
-        if self.module == "main":
-            rules.append(FileAccessRule(source, FileAccessLevel.WRITE))
-        return rules
-
-
-register_role("architect", Architect)
-
-
-class APIDesigner(WorkflowRole):
-    """Designs public API declarations for a module."""
-
-    system_prompts = ["""
-You are {role}@{module}.
-You are responsible for the public API surface area of this module.
-
-Your mandate only covers:
-
-- Writing complete declarations, covering the full API surface area of the module, into its header file.
-
-Guidelines:
-
-- Read the comment block at the start of your module's header file to understand the purpose, responsibilities, and dependencies of the module.
-  Use this information to guide your declarations.
-
-- You are responsible for ensuring that any #include directives needed for your declarations are included in the header.
-
-- You should provide high-quality documentation comments on all declarations.
-  Quality documentation comments are concise, clear, and helpful, stating only the information that is not obvious from the declaration itself.
-
-- You should not write any function bodies or implementations, even for "one-liner" functions.
-"""
-    ]
-    validation_rules = ["build"]
-    tools = [write_file]
-
-    def _instance_file_access(self) -> list[FileAccessRule]:
-        header = module_header_path(self.module)
-        return [FileAccessRule(header, FileAccessLevel.WRITE)]
-
-
-register_role("api_designer", APIDesigner)
-
-
-class StubImplementer(WorkflowRole):
-    """Writes stub implementations so that declared APIs link successfully."""
-
-    system_prompts = ["""
-You are {role}@{module}.
-You are responsible for writing stub implementations for any public API declarations of your module, that are not already implemented.
-
-Your mandate only covers:
-
-- Ensuring that the .cpp source file for your module has stub bodies for declarations that are not already implemented.
-
-Guidelines:
-
-- Stub functions should in general throw a std::runtime_error with a message indicating that the function is not implemented.
-  This applies to all functions, methods, operators, etc. independent of their return type, level of complexity, etc.
-
-  The only narrow exceptions to this rule are:
-  - Stubbed destructors should have an empty body, to avoid undefined behavior
-  - Member-initialization lists may need placeholder values for types that do not have default constructors.
-    The construuctor itself should still throw.
-  - Definitions for global/static variables with non-trivial initialization may need placeholder values for constructor arguments,
-    if the type does not have a default constructor.
-  
-  If you are unable to write a throwing body for a stub definition, then you should leave a comment noting
-  that the definition is an incomplete stub.
-"""
-    ]
-    validation_rules = ["build"]
-    tools = [write_file]
-
-    def _instance_file_access(self) -> list[FileAccessRule]:
-        source = module_source_path(self.module)
-        return [FileAccessRule(source, FileAccessLevel.WRITE)]
-
-
-register_role("stub_implementer", StubImplementer)
-
-
-class TestEngineer(WorkflowRole):
-    """Writes black-box tests against declared APIs."""
-
-    system_prompts = ["""
-You are {role}@{module}.
-You are responsible for writing and maintaining black-box tests that exercise the public API of your module.
-
-Your mandate only covers:
-
-- Writing black-box tests for the public API of your module.
-
-Guidelines:
-
-- Test files should use the doctest framework.
-
-  Test files should define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN before including doctest.h
-
-- Write tests against the declared API of your module only.
-
-- Ensure that the entire API surface area of your module is being tested, based on the documented behavior
-  of the declared types and functions.
-"""
-    ]
-    validation_rules = ["build"]
-    tools = [write_file]
-
-    def _instance_file_access(self) -> list[FileAccessRule]:
-        return [FileAccessRule("tests/**", FileAccessLevel.WRITE)]
-
-
-register_role("test_engineer", TestEngineer)
-
-
-class Implementer(WorkflowRole):
-    """Implements declared APIs in source files."""
-
-    system_prompts = ["""
-You are {role}@{module}.
-You are responsible for writing and maintaining the implementation of your module's API.
-
-Your mandate only covers:
-
-- Writing and maintaining the implementation of the module's declared public API.
-
-- Writing and maintaining any private utility code that is needed to support the implementation of the public API.
-
-Guidelines:
-
-- Write clean, readable, and maintainable code.
-
-- Include comments when they help explain WHY you wrote code the way you did.
-  Make note of any trade-offs you made, and any alternatives you considered.
-
-  Comments are for the benefit of other contributors who may need to maintain your code.
-  They can figure out WHAT the code is doing easily, but the WHY may be lost if you do not write it down.
-"""
-    ]
-    validation_rules = ["build", "test"]
-    tools = [write_file]
-
-    def _instance_file_access(self) -> list[FileAccessRule]:
-        source = module_source_path(self.module)
-        return [FileAccessRule(source, FileAccessLevel.WRITE)]
-
-
-register_role("implementer", Implementer)
-
-
-# ---------------------------------------------------------------------------
-# Coordinator
-# ---------------------------------------------------------------------------
-
-
-class Coordinator(Developer):
-    """Orchestrates development work across a module subtree via delegation."""
+def _rel_path(absolute: str) -> str:
+    """Convert an absolute module path to a project-relative POSIX path."""
+    return Path(absolute).relative_to(PROJECT_DIR).as_posix()
+
+
+def _module_paths_prompt(agent: ModuleDeveloper) -> str:
+    """Callable system prompt that resolves the agent's own file paths."""
+    if agent.module == "main":
+        source = _rel_path(module_source_path("main"))
+        return (
+            f"Your module's source file is `{source}` "
+            f"(the root module has no header)."
+        )
+    header = _rel_path(module_header_path(agent.module))
+    source = _rel_path(module_source_path(agent.module))
+    return (
+        f"Your module's header is at `{header}` "
+        f"and source is at `{source}`."
+    )
+
+
+class ModuleDeveloper(Developer):
+    """Handles the full development lifecycle for a single module."""
 
     validation_rules = ["build", "test"]
 
     def __str__(self) -> str:
-        return f"coordinator@{self.module}"
+        return f"developer@{self.module}"
 
-    system_prompts = ["""
-You are coordinator@{module}.
-You coordinate development work for this module and its subtree by delegating to other agents.
+    system_prompts = [
+        _module_paths_prompt,
+        """\
+You are developer@{module}.
+You are responsible for all development work on this module: architecture,
+API design, implementation, and testing.
 
-Your mandate only covers:
+Your mandate covers:
 
-- Delegating to specialized roles to complete development tasks for your own module.
+- Decomposing your module into sub-modules (via add_module) when warranted
 
-- Delegating to child coordinators, responsible for sub-modules of your own module.
+- Writing and maintaining the module's header file: the leading comment block
+  describing purpose/responsibilities/dependencies, plus all public API
+  declarations (types, function signatures, constants)
 
-- Deciding what to do in response to errors/issues raised by your delegates.
+- Writing and maintaining the module's source file: the implementation of
+  all declared APIs, plus any private utility code
 
-Available Specialized Roles:
+- Writing and maintaining tests for the module's public API
 
-- architect: Decides module decomposition and creates sub-modules.
-- api_designer: Decides types, function signatures, and writes API declarations.
-- stub_implementer: Writes stub implementations so declared APIs compile and link.
-- test_engineer: Decides what to test and writes tests against declared APIs.
-- implementer: Decides algorithms and writes the real implementation.
+- Delegating sub-module work to child developers via delegate_to_child
+
+Recommended workflow:
+
+1. Read the module's header comment to understand purpose and responsibilities.
+   If the module needs sub-modules, create them and delegate their development
+   first (in dependency order).
+
+2. Design the API: write declarations in the header. Build to verify.
+
+3. Write tests against the declared API. Build to verify.
+
+4. Implement: fill in function bodies in the source file. Build and run tests.
+
+This sequence is guidance, not a rigid pipeline. Use judgment -- a bug fix
+may only need a source-file edit; a trivial leaf module may not need
+sub-module decomposition.
 
 Guidelines:
 
-- Each specialist is the AUTHORITY on decisions within their domain.
-  You must NEVER dictate type names, function signatures, data structures,
-  algorithms, or test cases in a delegation message. If you find yourself
-  writing these, you are overstepping.
+- Prefer flat module hierarchies. About 3-5 sub-modules is the sweet spot.
+  Only create sub-modules for distinct concerns likely to take 100+ lines
+  of non-trivial code.
 
-- Delegation messages should be 1-3 sentences stating what the delegate should ACHIEVE.
-  Your delegates can read the same files you can — do not summarize or echo file
-  contents, and do not restate information already in the codebase.
+- Build frequently to catch compilation errors early. Run tests when you
+  believe your implementation is complete -- not after every edit. If a test
+  fails and the cause is not immediately clear from the output, finish your
+  remaining work rather than debugging; validation runs automatically after
+  your task completes and will give you a structured chance to fix failures.
 
-  WRONG: "Define AST node types using std::variant with Constant (double),
-          Variable (string), BinaryOp (char op, left/right children).
-          Use std::shared_ptr<AstNode> for tree structure."
-  RIGHT: "Design and implement the AST representation for the parser."
+- When delegating to child developers, keep the task description to 1-3
+  sentences stating the goal. Child developers can read the codebase
+  themselves -- do not echo file contents or prescribe designs.
 
-- Every token in a delegation message costs input tokens for the delegate AND
-  every agent below them. Over-specification has a multiplicative cost across
-  the hierarchy. Err heavily on the side of brevity.
+- Write clean, readable code with comments that explain WHY, not WHAT.
 
-- Consider the appropriate sequence for delegating work to roles and child coordinators.
-  When in doubt, follow the order the roles are listed above (architect first, implementer last).
-  Generally, delegate to child coordinators for sub-module changes before invoking
-  specialists at your own level.
+- Test files use the doctest framework. Define
+  DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN before including doctest.h.
 
-- Use judgment about which specialists are needed.
-  If the architecture isn't changing, skip the architect.
-  A bug fix may only need the implementer.
-
-- If a delegate raises an issue outside your module's scope, raise an error with
-  a clear summary so your supervisor can decide. If it's within your scope,
-  delegate to the appropriate specialists to resolve it, then resume your original task."""
+- You can only write files for your own module. If you need changes in a
+  parent or sibling module, call raise_error with a clear explanation so
+  your supervisor can address it."""
     ]
     tools = [
-        delegate_to_role,
+        write_file,
+        add_module,
         delegate_to_child,
         dependency_order,
         module_status,
+        build,
+        run_tests,
     ]
+
+    def _instance_file_access(self) -> list[FileAccessRule]:
+        rules: list[FileAccessRule] = []
+        if self.module == "main":
+            rules.append(FileAccessRule(
+                module_source_path(self.module), FileAccessLevel.WRITE,
+            ))
+        else:
+            rules.append(FileAccessRule(
+                module_header_path(self.module), FileAccessLevel.WRITE,
+            ))
+            rules.append(FileAccessRule(
+                module_source_path(self.module), FileAccessLevel.WRITE,
+            ))
+        rules.append(FileAccessRule("tests/**", FileAccessLevel.WRITE))
+        return rules
 
 
 # ---------------------------------------------------------------------------
