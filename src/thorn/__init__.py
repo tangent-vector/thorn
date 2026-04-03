@@ -28,6 +28,7 @@ import asyncio
 from typing import Any, Callable, Coroutine, TypeVar
 
 from thorn._context import (
+    AskUserHandler,
     ConsoleEventSink,
     EventSink,
     ExecutionContext,
@@ -55,8 +56,11 @@ from thorn._tools import (
     FileEdit,
     ask_user,
     create_file,
+    delete_file,
     edit_file,
+    find_files,
     list_directory,
+    move_file,
     read_file,
     search_files,
     write_file,
@@ -92,6 +96,7 @@ __all__ = [
     "discover_tools",
     "bound_retries",
     # Context
+    "AskUserHandler",
     "ExecutionContext",
     "EventSink",
     "NullEventSink",
@@ -117,9 +122,12 @@ __all__ = [
     "read_file",
     "edit_file",
     "create_file",
+    "delete_file",
+    "move_file",
     "write_file",
     "FileEdit",
     "list_directory",
+    "find_files",
     "search_files",
     "ask_user",
     "ALL_BUILTIN_TOOLS",

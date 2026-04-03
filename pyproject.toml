@@ -11,6 +11,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "docstring-parser>=0.16",
     "pathspec>=0.12",
+    "psutil>=5.9",
 ]
 
 [project.scripts]

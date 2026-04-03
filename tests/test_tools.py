@@ -9,6 +9,8 @@ import pytest
 
 from thorn._tools import (
     EDIT_CONTEXT_LINES,
+    MAX_FIND_RESULTS,
+    MAX_LIST_ENTRIES,
     MAX_READ_CHARS,
     MAX_READ_LINES,
     MAX_SEARCH_CHARS,
@@ -17,10 +19,15 @@ from thorn._tools import (
     FileEdit,
     _collect_match_groups,
     _format_lines,
+    ask_user,
     create_file,
+    delete_file,
     edit_file,
+    find_files,
     list_directory,
+    move_file,
     read_file,
+    run_shell,
     search_files,
     write_file,
 )
@@ -398,18 +405,60 @@ class TestCreateFile:
 # ---------------------------------------------------------------------------
 
 class TestListDirectory:
-    async def test_lists_entries(self, tmp_path):
+    async def test_lists_entries_with_dir_markers(self, tmp_path):
         (tmp_path / "alpha.txt").touch()
         (tmp_path / "beta.txt").touch()
         (tmp_path / "gamma").mkdir()
         result = await list_directory(str(tmp_path))
-        assert result == ["alpha.txt", "beta.txt", "gamma"]
+        assert isinstance(result, str)
+        assert "alpha.txt" in result
+        assert "beta.txt" in result
+        assert "gamma/" in result
 
     async def test_not_a_directory_raises(self, tmp_path):
         f = tmp_path / "file.txt"
         f.touch()
         with pytest.raises(NotADirectoryError):
             await list_directory(str(f))
+
+    async def test_empty_directory(self, tmp_path):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        result = await list_directory(str(empty))
+        assert result == "[empty directory]"
+
+    async def test_recursive_listing(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").touch()
+        (tmp_path / "src" / "lib").mkdir()
+        (tmp_path / "src" / "lib" / "util.py").touch()
+        (tmp_path / "README.md").touch()
+        result = await list_directory(str(tmp_path), recursive=True)
+        assert "README.md" in result
+        assert "src/" in result
+        assert "main.py" in result
+        assert "lib/" in result
+        assert "util.py" in result
+
+    async def test_recursive_respects_max_depth(self, tmp_path):
+        d = tmp_path
+        for name in ["a", "b", "c", "d"]:
+            d = d / name
+            d.mkdir()
+            (d / "file.txt").touch()
+        result = await list_directory(str(tmp_path), recursive=True, max_depth=2)
+        assert "a/" in result
+        assert "b/" in result
+        # depth 3 and beyond should be excluded
+        lines = result.split("\n")
+        deep_entries = [l for l in lines if "d/" in l or "d/file.txt" in l]
+        assert not deep_entries
+
+    async def test_recursive_truncation(self, tmp_path):
+        for i in range(MAX_LIST_ENTRIES + 50):
+            (tmp_path / f"file_{i:04d}.txt").touch()
+        result = await list_directory(str(tmp_path), recursive=True)
+        assert f"{MAX_LIST_ENTRIES} entries shown" in result
 
 
 # ---------------------------------------------------------------------------
@@ -591,3 +640,218 @@ class TestSearchFiles:
         p.write_text("data\n", encoding="utf-8")
         with pytest.raises(ValueError, match="Invalid regex"):
             await search_files("[unclosed", str(p), use_regex=True)
+
+    async def test_ignore_case(self, tmp_path):
+        p = tmp_path / "f.txt"
+        p.write_text("Hello World\ngoodbye world\n", encoding="utf-8")
+        result = await search_files("hello", str(p), ignore_case=True)
+        assert "Hello World" in result
+
+    async def test_ignore_case_not_set(self, tmp_path):
+        p = tmp_path / "f.txt"
+        p.write_text("Hello World\ngoodbye world\n", encoding="utf-8")
+        result = await search_files("hello", str(p))
+        assert "No matches" in result
+
+    async def test_glob_matches_relative_path(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "code.py").write_text("needle\n", encoding="utf-8")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test.py").write_text("needle\n", encoding="utf-8")
+        result = await search_files(
+            "needle", str(tmp_path), glob="src/*.py",
+        )
+        assert "code.py" in result
+        assert "test.py" not in result
+
+
+# ---------------------------------------------------------------------------
+# find_files
+# ---------------------------------------------------------------------------
+
+class TestFindFiles:
+    async def test_basic_glob(self, tmp_path):
+        (tmp_path / "foo.py").touch()
+        (tmp_path / "bar.py").touch()
+        (tmp_path / "baz.txt").touch()
+        result = await find_files("*.py", str(tmp_path))
+        assert "foo.py" in result
+        assert "bar.py" in result
+        assert "baz.txt" not in result
+
+    async def test_recursive_glob(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").touch()
+        (tmp_path / "src" / "lib").mkdir()
+        (tmp_path / "src" / "lib" / "util.py").touch()
+        result = await find_files("*.py", str(tmp_path))
+        assert "main.py" in result
+        assert "util.py" in result
+
+    async def test_type_filter_file(self, tmp_path):
+        (tmp_path / "file.py").touch()
+        (tmp_path / "package").mkdir()
+        result = await find_files("*", str(tmp_path), type="file")
+        assert "file.py" in result
+        assert "package" not in result
+
+    async def test_type_filter_directory(self, tmp_path):
+        (tmp_path / "file.py").touch()
+        (tmp_path / "package").mkdir()
+        result = await find_files("*", str(tmp_path), type="directory")
+        assert "package/" in result
+        assert "file.py" not in result
+
+    async def test_no_matches(self, tmp_path):
+        (tmp_path / "file.txt").touch()
+        result = await find_files("*.py", str(tmp_path))
+        assert "No matches" in result
+
+    async def test_not_a_directory_raises(self, tmp_path):
+        f = tmp_path / "file.txt"
+        f.touch()
+        with pytest.raises(NotADirectoryError):
+            await find_files("*", str(f))
+
+    async def test_cap_at_max_results(self, tmp_path):
+        for i in range(MAX_FIND_RESULTS + 50):
+            (tmp_path / f"file_{i:04d}.txt").touch()
+        result = await find_files("*.txt", str(tmp_path))
+        assert f"Results capped at {MAX_FIND_RESULTS}" in result
+
+    async def test_directory_entries_have_trailing_slash(self, tmp_path):
+        (tmp_path / "mydir").mkdir()
+        result = await find_files("mydir", str(tmp_path))
+        assert "mydir/" in result
+
+
+# ---------------------------------------------------------------------------
+# delete_file
+# ---------------------------------------------------------------------------
+
+class TestDeleteFile:
+    async def test_deletes_existing_file(self, tmp_path):
+        p = tmp_path / "doomed.txt"
+        p.write_text("bye", encoding="utf-8")
+        result = await delete_file(str(p))
+        assert "Deleted" in result
+        assert not p.exists()
+
+    async def test_missing_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            await delete_file(str(tmp_path / "nope.txt"))
+
+    async def test_directory_raises(self, tmp_path):
+        d = tmp_path / "mydir"
+        d.mkdir()
+        with pytest.raises(IsADirectoryError):
+            await delete_file(str(d))
+
+
+# ---------------------------------------------------------------------------
+# move_file
+# ---------------------------------------------------------------------------
+
+class TestMoveFile:
+    async def test_moves_file(self, tmp_path):
+        src = tmp_path / "old.txt"
+        src.write_text("content", encoding="utf-8")
+        dst = tmp_path / "new.txt"
+        result = await move_file(str(src), str(dst))
+        assert "Moved" in result
+        assert not src.exists()
+        assert dst.read_text("utf-8") == "content"
+
+    async def test_creates_parent_directories(self, tmp_path):
+        src = tmp_path / "file.txt"
+        src.write_text("data", encoding="utf-8")
+        dst = tmp_path / "a" / "b" / "file.txt"
+        await move_file(str(src), str(dst))
+        assert dst.read_text("utf-8") == "data"
+
+    async def test_source_not_found_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            await move_file(
+                str(tmp_path / "nope.txt"),
+                str(tmp_path / "dest.txt"),
+            )
+
+    async def test_destination_exists_raises(self, tmp_path):
+        src = tmp_path / "src.txt"
+        src.write_text("a", encoding="utf-8")
+        dst = tmp_path / "dst.txt"
+        dst.write_text("b", encoding="utf-8")
+        with pytest.raises(FileExistsError, match="already exists"):
+            await move_file(str(src), str(dst))
+
+
+# ---------------------------------------------------------------------------
+# run_shell
+# ---------------------------------------------------------------------------
+
+class TestRunShell:
+    async def test_basic_command(self, tmp_path):
+        result = await run_shell("echo hello")
+        assert "hello" in result
+
+    async def test_exit_code_reported(self):
+        exit_cmd = "exit /b 42" if os.name == "nt" else "exit 42"
+        result = await run_shell(exit_cmd)
+        assert "[exit code 42]" in result
+
+    async def test_working_directory(self, tmp_path):
+        cwd_cmd = "cd" if os.name == "nt" else "pwd"
+        result = await run_shell(cwd_cmd, working_directory=str(tmp_path))
+        assert tmp_path.name in result
+
+    async def test_timeout_kills_process(self):
+        long_cmd = (
+            "ping -n 60 127.0.0.1 > nul" if os.name == "nt"
+            else "sleep 60"
+        )
+        result = await run_shell(long_cmd, timeout=0.1)
+        assert "timed out" in result
+
+    async def test_output_truncation(self):
+        result = await run_shell(
+            f'python -c "print(\'x\' * {MAX_READ_CHARS + 1000})"',
+        )
+        assert "[output truncated:" in result
+
+
+# ---------------------------------------------------------------------------
+# ask_user
+# ---------------------------------------------------------------------------
+
+class TestAskUser:
+    async def test_raises_without_handler(self):
+        """ask_user raises RuntimeError when no handler is configured."""
+        from thorn._context import ExecutionContext, set_context, reset_context
+        from thorn._provider import MockProvider
+
+        ctx = ExecutionContext(provider=MockProvider())
+        token = set_context(ctx)
+        try:
+            with pytest.raises(RuntimeError, match="not available"):
+                await ask_user("anything")
+        finally:
+            reset_context(token)
+
+    async def test_delegates_to_handler(self):
+        """ask_user delegates to the configured handler."""
+        from thorn._context import ExecutionContext, set_context, reset_context
+        from thorn._provider import MockProvider
+
+        async def fake_handler(question: str) -> str:
+            return f"answer to: {question}"
+
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            ask_user_handler=fake_handler,
+        )
+        token = set_context(ctx)
+        try:
+            result = await ask_user("what?")
+            assert result == "answer to: what?"
+        finally:
+            reset_context(token)

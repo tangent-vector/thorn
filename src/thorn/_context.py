@@ -12,7 +12,7 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from thorn._provider import LLMProvider, ResponseChunk
 
@@ -394,6 +394,21 @@ class ConsoleEventSink(EventSink):
 
 
 # ---------------------------------------------------------------------------
+# User-interaction callback
+# ---------------------------------------------------------------------------
+
+class AskUserHandler(Protocol):
+    """Async callback for the ``ask_user`` tool.
+
+    Implementations receive the agent's question and return the human's
+    answer.  The CLI commands supply a ``rich``-based console handler;
+    library users can provide their own.
+    """
+
+    async def __call__(self, question: str) -> str: ...
+
+
+# ---------------------------------------------------------------------------
 # Usage tracking
 # ---------------------------------------------------------------------------
 
@@ -453,6 +468,7 @@ class ExecutionContext:
     file_access_policy: FileAccessPolicy | None = None
     global_ignores: FileAccessPolicy | None = None
     usage: UsageTracker = field(default_factory=UsageTracker)
+    ask_user_handler: AskUserHandler | None = None
 
     def push_scope(
         self,
@@ -495,6 +511,7 @@ class ExecutionContext:
             file_access_policy=resolved_policy,
             global_ignores=self.global_ignores,
             usage=self.usage,
+            ask_user_handler=self.ask_user_handler,
         )
 
 

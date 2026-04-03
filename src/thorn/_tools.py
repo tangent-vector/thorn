@@ -4,7 +4,8 @@ Each tool is an ordinary Python function.  They are exposed to agents
 via ``wrap_function()`` and can also be called directly from user code.
 
 File-access tools (``read_file``, ``edit_file``, ``create_file``,
-``list_directory``, ``search_files``) enforce the active
+``delete_file``, ``move_file``, ``list_directory``, ``find_files``,
+``search_files``) enforce the active
 ``FileAccessPolicy`` from the current ``ExecutionContext``, when one
 is set.
 """
@@ -13,9 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch as fnmatch_mod
-import os
 import re
+import shutil
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic.dataclasses import dataclass
@@ -86,6 +88,12 @@ MAX_SEARCH_MATCHES: int = 100
 
 MAX_SEARCH_CHARS: int = 50_000
 """Hard ceiling on characters returned by a single ``search_files`` call."""
+
+MAX_FIND_RESULTS: int = 200
+"""Hard ceiling on entries returned by a single ``find_files`` call."""
+
+MAX_LIST_ENTRIES: int = 200
+"""Hard ceiling on entries shown by ``list_directory``."""
 
 
 def _format_lines(
@@ -380,16 +388,61 @@ async def write_file(path: str, content: str) -> str:
     return f"Wrote {len(content)} bytes to {path}"
 
 
-async def list_directory(path: str = ".") -> list[str]:
-    """List entries in a directory.  Returns a list of names."""
-    _enforce_access(path, "READ")
-    p = Path(path)
-    if not p.is_dir():
-        raise NotADirectoryError(f"Not a directory: {path}")
-    entries = sorted(entry.name for entry in p.iterdir())
+async def delete_file(path: str) -> str:
+    """Delete a file at the given path.
 
+    Only regular files can be deleted — directory deletion is not
+    supported.  Raises ``FileNotFoundError`` if the file does not exist.
+
+    Args:
+        path: Filesystem path of the file to delete.
+    """
+    _enforce_access(path, "WRITE")
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    if p.is_dir():
+        raise IsADirectoryError(
+            f"Cannot delete directory: {path}. "
+            f"Only individual files can be deleted."
+        )
+    p.unlink()
+    return f"Deleted {path}."
+
+
+async def move_file(source: str, destination: str) -> str:
+    """Move or rename a file from *source* to *destination*.
+
+    Parent directories for *destination* are created automatically.
+    Raises ``FileExistsError`` if the destination already exists.
+
+    Args:
+        source: Current path of the file to move.
+        destination: New path for the file.
+    """
+    _enforce_access(source, "READ")
+    _enforce_access(destination, "WRITE")
+    src = Path(source)
+    dst = Path(destination)
+    if not src.exists():
+        raise FileNotFoundError(f"Source not found: {source}")
+    if dst.exists():
+        raise FileExistsError(
+            f"Destination already exists: {destination}. "
+            f"Delete it first or choose a different name."
+        )
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    return f"Moved {source} → {destination}."
+
+
+def _apply_listing_filter(entries: list[str], path: str) -> list[str]:
+    """Filter *entries* through the active file-access policy, if any.
+
+    Removes HIDDEN entries so they don't appear in listings.
+    """
     from thorn._context import get_context
-    from thorn._file_access import FileAccessLevel, resolve_for_check
+    from thorn._file_access import resolve_for_check
 
     try:
         ctx = get_context()
@@ -402,6 +455,155 @@ async def list_directory(path: str = ".") -> list[str]:
         return entries
 
     return policy.filter_listing(entries, resolve_for_check(path, workspace))
+
+
+def _list_recursive(
+    root: Path,
+    max_depth: int,
+) -> str:
+    """Build a tree-style listing of *root* up to *max_depth* levels."""
+    lines: list[str] = []
+    truncated = False
+
+    def _walk(dir_path: Path, depth: int, prefix: str) -> None:
+        nonlocal truncated
+        if truncated or depth > max_depth:
+            return
+
+        try:
+            entries = sorted(dir_path.iterdir())
+        except PermissionError:
+            return
+
+        for entry in entries:
+            if truncated:
+                return
+            if not _check_read_access(str(entry)):
+                continue
+            if entry.is_dir():
+                lines.append(f"{prefix}{entry.name}/")
+            else:
+                lines.append(f"{prefix}{entry.name}")
+            if len(lines) >= MAX_LIST_ENTRIES:
+                truncated = True
+                return
+            if entry.is_dir():
+                _walk(entry, depth + 1, prefix + "  ")
+
+    _walk(root, 1, "")
+
+    if not lines:
+        return "[empty directory]"
+    result = "\n".join(lines)
+    if truncated:
+        result += (
+            f"\n[{MAX_LIST_ENTRIES} entries shown."
+            f" Use find_files for pattern-based search.]"
+        )
+    return result
+
+
+async def list_directory(
+    path: str = ".",
+    *,
+    recursive: bool = False,
+    max_depth: int = 3,
+) -> str:
+    """List entries in a directory.
+
+    Returns a formatted listing with directories marked by a trailing
+    ``/``.  Use ``recursive=True`` for a tree-style view with depth
+    capped at *max_depth*.
+
+    Args:
+        path: Directory to list.  Defaults to the current directory.
+        recursive: When ``True``, recurse into subdirectories.
+        max_depth: Maximum recursion depth (only applies when
+            *recursive* is ``True``).  Defaults to 3.
+    """
+    _enforce_access(path, "READ")
+    p = Path(path)
+    if not p.is_dir():
+        raise NotADirectoryError(f"Not a directory: {path}")
+
+    if recursive:
+        return _list_recursive(p, max_depth)
+
+    raw_entries = sorted(p.iterdir())
+    names = [e.name for e in raw_entries]
+    names = _apply_listing_filter(names, path)
+
+    dir_set = {e.name for e in raw_entries if e.is_dir()}
+    formatted = [
+        name + "/" if name in dir_set else name
+        for name in names
+    ]
+
+    if not formatted:
+        return "[empty directory]"
+
+    total = len(formatted)
+    if total > MAX_LIST_ENTRIES:
+        formatted = formatted[:MAX_LIST_ENTRIES]
+        result = "\n".join(formatted)
+        result += (
+            f"\n[{total} entries total, showing first {MAX_LIST_ENTRIES}."
+            f" Use find_files for pattern-based search.]"
+        )
+        return result
+
+    return "\n".join(formatted)
+
+
+async def find_files(
+    pattern: str,
+    path: str = ".",
+    *,
+    type: Literal["file", "directory"] | None = None,
+) -> str:
+    """Find files and directories matching a glob pattern.
+
+    Searches recursively under *path* for entries whose relative path
+    matches *pattern* (using ``Path.rglob``).  Output is capped at
+    ``MAX_FIND_RESULTS`` entries.
+
+    Args:
+        pattern: Glob pattern to match (e.g. ``"*.py"``, ``"test_*"``).
+        path: Directory to search under.  Defaults to the current
+            directory.
+        type: Restrict results to ``"file"`` or ``"directory"``.
+            When ``None`` (the default), both are included.
+    """
+    _enforce_access(path, "READ")
+    p = Path(path)
+    if not p.is_dir():
+        raise NotADirectoryError(f"Not a directory: {path}")
+
+    matches: list[str] = []
+    for entry in sorted(p.rglob(pattern)):
+        if type == "file" and not entry.is_file():
+            continue
+        if type == "directory" and not entry.is_dir():
+            continue
+        if not _check_read_access(str(entry)):
+            continue
+        rel = entry.relative_to(p).as_posix()
+        if entry.is_dir():
+            rel += "/"
+        matches.append(rel)
+        if len(matches) >= MAX_FIND_RESULTS:
+            break
+
+    if not matches:
+        return f'No matches for pattern "{pattern}" in {path}.'
+
+    result = "\n".join(matches)
+    if len(matches) >= MAX_FIND_RESULTS:
+        result += (
+            f"\n[Results capped at {MAX_FIND_RESULTS}."
+            f" Narrow your pattern to see more.]"
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +689,7 @@ async def search_files(
     *,
     glob: str | None = None,
     use_regex: bool = False,
+    ignore_case: bool = False,
     context_lines: int = 0,
 ) -> str:
     """Search file contents for a pattern, returning matching lines.
@@ -501,14 +704,19 @@ async def search_files(
             *use_regex* is True).
         path: File or directory to search.  Defaults to the current
             directory.  Directory searches are recursive.
-        glob: Optional filename filter using fnmatch syntax (e.g.
-            ``"*.py"``).  Only files whose names match are searched.
+        glob: Optional file-path filter using fnmatch syntax (e.g.
+            ``"*.py"`` or ``"src/**/*.py"``).  Matched against the
+            path relative to *path*, not just the filename.
         use_regex: Interpret *pattern* as a Python regular expression.
+        ignore_case: Perform case-insensitive matching.
         context_lines: Number of lines to show before and after each
             match (like ``grep -C``).
     """
+    flags = re.IGNORECASE if ignore_case else 0
     try:
-        compiled = re.compile(pattern if use_regex else re.escape(pattern))
+        compiled = re.compile(
+            pattern if use_regex else re.escape(pattern), flags,
+        )
     except re.error as exc:
         raise ValueError(f"Invalid regex pattern: {exc}") from exc
 
@@ -530,7 +738,7 @@ async def search_files(
         f
         for f in p.rglob("*")
         if f.is_file()
-        and (glob is None or fnmatch_mod.fnmatch(f.name, glob))
+        and (glob is None or fnmatch_mod.fnmatch(f.relative_to(p).as_posix(), glob))
         and _check_read_access(str(f))
     )
 
@@ -584,19 +792,70 @@ async def search_files(
     return body
 
 
-async def run_shell(command: str) -> str:
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and all its descendants.
+
+    Plain ``proc.kill()`` only terminates the immediate process.  When
+    ``create_subprocess_shell`` is used, the immediate process is the
+    shell (e.g. ``cmd.exe``), and child processes survive — keeping
+    pipes open and causing ``communicate()`` to hang.  Walking the tree
+    with ``psutil`` handles this reliably across platforms.
+    """
+    import psutil
+
+    try:
+        parent = psutil.Process(pid)
+        for child in parent.children(recursive=True):
+            child.kill()
+        parent.kill()
+    except psutil.NoSuchProcess:
+        pass
+
+
+async def run_shell(
+    command: str,
+    working_directory: str | None = None,
+    timeout: float = 120,
+) -> str:
     """Run a shell command and return its combined stdout and stderr.
 
     Not included in ``ALL_BUILTIN_TOOLS`` — add it explicitly to
     specific agents or ``prompt()`` calls when needed.
+
+    Args:
+        command: Shell command to execute.
+        working_directory: Directory to run the command in.  When
+            ``None``, uses the current working directory.
+        timeout: Maximum seconds to wait before killing the process.
+            Defaults to 120.
     """
     proc = await asyncio.create_subprocess_shell(
         command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        cwd=working_directory,
     )
-    stdout, _ = await proc.communicate()
+    timed_out = False
+    try:
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        _kill_process_tree(proc.pid)
+        stdout, _ = await proc.communicate()
+        timed_out = True
+
     output = stdout.decode(errors="replace") if stdout else ""
+
+    if len(output) > MAX_READ_CHARS:
+        full_len = len(output)
+        output = (
+            output[:MAX_READ_CHARS]
+            + f"\n[output truncated: {full_len} chars total]"
+        )
+
+    if timed_out:
+        return f"[timed out after {timeout}s]\n{output}"
     if proc.returncode != 0:
         return f"[exit code {proc.returncode}]\n{output}"
     return output
@@ -605,20 +864,40 @@ async def run_shell(command: str) -> str:
 async def ask_user(question: str) -> str:
     """Ask the human user a question and return their response.
 
-    In a non-interactive context this will raise an error.
+    Requires an ``AskUserHandler`` to be configured on the active
+    ``ExecutionContext``.  The CLI commands (``thorn run``,
+    ``thorn chat``) provide a rich-console handler automatically.
+    Raises ``RuntimeError`` if no handler is available.
+
+    Args:
+        question: The question to present to the user.
     """
-    loop = asyncio.get_running_loop()
-    answer = await loop.run_in_executor(None, lambda: input(f"\n? {question}\n> "))
-    return answer
+    from thorn._context import get_context
+
+    ctx = get_context()
+    if ctx.ask_user_handler is None:
+        raise RuntimeError(
+            "ask_user is not available in this context. "
+            "No user-interaction handler has been configured."
+        )
+    return await ctx.ask_user_handler(question)
 
 
 ALL_BUILTIN_TOOLS = [
-    read_file, edit_file, create_file, list_directory, search_files, ask_user,
+    read_file,
+    edit_file,
+    create_file,
+    delete_file,
+    move_file,
+    list_directory,
+    find_files,
+    search_files,
+    ask_user,
 ]
 
 # Pre-packaged toolsets for common capabilities.  These are plain lists
 # that can be nested inside a tools= parameter and will be flattened
 # automatically by _prepare_tools / _collect_tools.
 
-FILE_READING: list = [read_file, list_directory, search_files]
-FILE_WRITING: list = [FILE_READING, edit_file, create_file]
+FILE_READING: list = [read_file, list_directory, find_files, search_files]
+FILE_WRITING: list = [FILE_READING, edit_file, create_file, delete_file, move_file]

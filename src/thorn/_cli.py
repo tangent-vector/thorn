@@ -31,6 +31,14 @@ from thorn.errors import SkillError, ThornError
 console = Console()
 
 
+async def _rich_ask_user(question: str) -> str:
+    """Prompt the user via the rich console, suitable for interactive CLI use."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: console.input(f"\n[yellow]? {question}[/yellow]\n> "),
+    )
+
+
 def _resolve_verbosity(verbose: int, quiet: bool) -> Verbosity:
     """Map ``-v``/``-q`` CLI flags to a :class:`Verbosity` level."""
     if quiet:
@@ -81,6 +89,7 @@ def _build_context(
         event_sink=sink,
         workspace_root=ws_root,
         global_ignores=global_ignores,
+        ask_user_handler=_rich_ask_user,
     )
 
 
