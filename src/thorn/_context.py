@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from thorn._file_access import FileAccessPolicy
+    from thorn._validation_tracker import ValidationTracker
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +458,10 @@ class ExecutionContext:
                         ``.thornignore`` at startup.  Applied as an upper
                         bound on every per-agent policy.
         usage:      Shared accumulator for LLM token counts.
+        validation_tracker: Shared tracker for scan-based validation
+                            status.  ``None`` when no tracker has been
+                            attached.  Propagated by reference across
+                            nested scopes.
     """
 
     provider: LLMProvider
@@ -470,6 +475,7 @@ class ExecutionContext:
     usage: UsageTracker = field(default_factory=UsageTracker)
     ask_user_handler: AskUserHandler | None = None
     context_window: int | None = None
+    validation_tracker: ValidationTracker | None = None
 
     def push_scope(
         self,
@@ -514,6 +520,7 @@ class ExecutionContext:
             usage=self.usage,
             ask_user_handler=self.ask_user_handler,
             context_window=self.context_window,
+            validation_tracker=self.validation_tracker,
         )
 
 

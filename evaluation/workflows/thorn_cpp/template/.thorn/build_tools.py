@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from thorn import tool
+from thorn import get_context, tool
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 BUILD_DIR = PROJECT_DIR / "build"
@@ -250,6 +250,34 @@ def _format_test_summary(results: list[ExecutableResult]) -> str:
     return "\n".join(lines)
 
 
+_ERROR_COUNT_RE = re.compile(r"(\d+)\s+errors?\s+generated", re.IGNORECASE)
+_MSVC_ERROR_COUNT_RE = re.compile(r"Build FAILED.*?(\d+)\s+Error", re.IGNORECASE | re.DOTALL)
+
+
+def _short_build_summary(output: str) -> str:
+    """Extract a compact error count from compiler output."""
+    m = _ERROR_COUNT_RE.search(output)
+    if m:
+        n = int(m.group(1))
+        return f"{n} error{'s' if n != 1 else ''}"
+    m = _MSVC_ERROR_COUNT_RE.search(output)
+    if m:
+        n = int(m.group(1))
+        return f"{n} error{'s' if n != 1 else ''}"
+    return "failing"
+
+
+def _record_validation(target_name: str, *, passed: bool, summary: str | None = None) -> None:
+    """Record a validation result on the active tracker, if any."""
+    try:
+        ctx = get_context()
+        tracker = ctx.validation_tracker
+        if tracker is not None:
+            tracker.record_result(target_name, passed=passed, summary=summary)
+    except RuntimeError:
+        pass
+
+
 @tool
 async def configure() -> str:
     """Run CMake configure step, creating the build directory if needed."""
@@ -265,12 +293,17 @@ async def build() -> str:
     """Build the calc project (always re-configures to pick up new files)."""
     cfg = await configure()
     if "[configure FAILED" in cfg:
+        _record_validation("build", passed=False, summary="configure failed")
         return cfg
 
     rc, output = await _run(f'cmake --build "{BUILD_DIR}"')
     if rc != 0:
-        return f"[build FAILED, exit {rc}]\n{output}"
-    return f"[build OK]\n{output}"
+        result = f"[build FAILED, exit {rc}]\n{output}"
+        _record_validation("build", passed=False, summary=_short_build_summary(output))
+        return result
+    result = f"[build OK]\n{output}"
+    _record_validation("build", passed=True)
+    return result
 
 
 @tool
@@ -297,16 +330,33 @@ async def run_tests() -> str:
     """
     build_result = await build_tests()
     if "[build_tests FAILED" in build_result or "[configure FAILED" in build_result:
+        _record_validation("build", passed=False, summary=_short_build_summary(build_result))
+        _record_validation("test", passed=False, summary="build failed")
         return build_result
 
+    _record_validation("build", passed=True)
     executables = _discover_test_executables()
     if not executables:
+        _record_validation("test", passed=True, summary="no tests found")
         return "[run_tests OK] No test executables found."
 
     results: list[ExecutableResult] = []
     for exe in executables:
         rc, output = await _run(f'"{exe}"')
         results.append(_parse_doctest_output(exe.stem, rc, output))
+
+    all_passed = all(r.passed for r in results)
+    if all_passed:
+        _record_validation("test", passed=True)
+    else:
+        total_failed = sum(r.fail_count for r in results)
+        total_tests = sum(r.test_count for r in results)
+        summary = (
+            f"{total_failed} of {total_tests} failing"
+            if total_tests
+            else "failing"
+        )
+        _record_validation("test", passed=False, summary=summary)
 
     return _format_test_summary(results)
 

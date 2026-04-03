@@ -44,6 +44,7 @@ from thorn._discovery import discover_tools
 from thorn._history import CollapseState, CompactionResult, HistoryTree
 from thorn._module import ModulePath
 from thorn._validation import ValidationRule
+from thorn._validation_tracker import ValidationStatus, ValidationTracker
 from thorn._file_access import FileAccessLevel, FileAccessPolicy, FileAccessRule
 from thorn._func import prompt, skill, tool, wrap_function
 from thorn._retry import bound_retries
@@ -107,6 +108,8 @@ __all__ = [
     "Agent",
     "ModulePath",
     "ValidationRule",
+    "ValidationStatus",
+    "ValidationTracker",
     "prompt",
     "skill",
     "tool",

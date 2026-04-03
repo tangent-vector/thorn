@@ -419,4 +419,17 @@ async def _execute_tool_calls(
             tc.name, duration_s=duration_s, scope=context.scope,
         )
 
+    if results:
+        tracker = context.validation_tracker
+        if tracker is not None:
+            tracker.refresh()
+            status_line = tracker.render_status()
+            if status_line:
+                last = results[-1]
+                results[-1] = ToolResultMessage(
+                    call_id=last.call_id,
+                    content=last.content + "\n\n" + status_line,
+                    is_error=last.is_error,
+                )
+
     return results, captured

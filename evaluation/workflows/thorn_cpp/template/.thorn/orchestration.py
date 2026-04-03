@@ -21,9 +21,10 @@ import logging
 from typing import Any, Callable
 
 from thorn import Agent, get_context, tool
+from thorn._validation_tracker import ValidationTracker
 from thorn.errors import SkillError
 
-from .build_tools import build, run_tests
+from .build_tools import PROJECT_DIR, build, run_tests
 from .module_tools import list_submodules, qualify
 
 logger = logging.getLogger(__name__)
@@ -288,6 +289,17 @@ async def coordinate(
         skip_validation: Validation rules to skip.
         enable_validation: Additional validation rules to enable.
     """
+    ctx = get_context()
+    if ctx.validation_tracker is None:
+        tracker = ValidationTracker(root=PROJECT_DIR)
+        tracker.add_target("build", file_patterns=[
+            "src/**/*.h", "src/**/*.cpp", "CMakeLists.txt",
+        ])
+        tracker.add_target("test", file_patterns=[
+            "src/**/*.h", "src/**/*.cpp", "tests/**/*.cpp",
+        ], depends_on=["build"])
+        ctx.validation_tracker = tracker
+
     developer_cls = _get_developer_cls()
 
     en_token, dis_token = _push_overrides(skip_validation, enable_validation)

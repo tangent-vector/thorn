@@ -8,6 +8,7 @@ from thorn._context import ExecutionContext
 from thorn._func import wrap_function
 from thorn._loop import _WrappedTool, _normalize_tool_name, run_agent_loop
 from thorn._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
+from thorn._validation_tracker import ValidationTracker
 from thorn.errors import LoopLimitError, SkillError
 
 
@@ -231,3 +232,151 @@ class TestToolNameNormalization:
             context=ctx, user_prompt="read x.txt", tools=[tool],
         )
         assert result == "got it"
+
+
+# ---------------------------------------------------------------------------
+# Validation tracker footer
+# ---------------------------------------------------------------------------
+
+class TestValidationFooter:
+    async def test_status_footer_appended_to_last_tool_result(self, tmp_path):
+        """When a ValidationTracker is attached and has status to show,
+        the status line is appended to the last tool result."""
+        from thorn._history import HistoryTree
+
+        (tmp_path / "a.cpp").write_text("code")
+
+        tracker = ValidationTracker(root=tmp_path)
+        tracker.add_target("build", ["*.cpp"])
+
+        async def greet(name: str) -> str:
+            """Say hello."""
+            return f"Hello, {name}!"
+
+        wrapped = wrap_function(greet)
+        provider = MockProvider(canned_responses=[
+            _tool_call_response("c1", "greet", '{"name": "world"}'),
+            _text_response("done"),
+        ])
+        ctx = ExecutionContext(provider=provider, validation_tracker=tracker)
+        history = HistoryTree()
+        result = await run_agent_loop(
+            context=ctx, user_prompt="greet", tools=[wrapped],
+            history=history,
+        )
+        assert result == "done"
+
+        rendered = history.render()
+        tool_results = [m for m in rendered if hasattr(m, "call_id")]
+        assert len(tool_results) == 1
+        assert "[build: stale (1 files changed)]" in tool_results[0].content
+
+    async def test_no_footer_without_tracker(self):
+        """Without a tracker, tool results are unmodified."""
+        from thorn._history import HistoryTree
+
+        async def greet(name: str) -> str:
+            """Say hello."""
+            return f"Hello, {name}!"
+
+        wrapped = wrap_function(greet)
+        provider = MockProvider(canned_responses=[
+            _tool_call_response("c1", "greet", '{"name": "world"}'),
+            _text_response("done"),
+        ])
+        ctx = ExecutionContext(provider=provider)
+        history = HistoryTree()
+        result = await run_agent_loop(
+            context=ctx, user_prompt="greet", tools=[wrapped],
+            history=history,
+        )
+        assert result == "done"
+
+        rendered = history.render()
+        tool_results = [m for m in rendered if hasattr(m, "call_id")]
+        assert len(tool_results) == 1
+        assert tool_results[0].content == "Hello, world!"
+
+    async def test_footer_reflects_passing_after_record(self, tmp_path):
+        """After recording a passing result, the footer shows passing."""
+        from thorn._history import HistoryTree
+
+        (tmp_path / "a.cpp").write_text("code")
+
+        tracker = ValidationTracker(root=tmp_path)
+        tracker.add_target("build", ["*.cpp"])
+        tracker.record_result("build", passed=True)
+
+        async def noop() -> str:
+            """Do nothing."""
+            return "ok"
+
+        wrapped = wrap_function(noop)
+        provider = MockProvider(canned_responses=[
+            _tool_call_response("c1", "noop", "{}"),
+            _text_response("done"),
+        ])
+        ctx = ExecutionContext(provider=provider, validation_tracker=tracker)
+        history = HistoryTree()
+        result = await run_agent_loop(
+            context=ctx, user_prompt="go", tools=[wrapped],
+            history=history,
+        )
+        assert result == "done"
+
+        rendered = history.render()
+        tool_results = [m for m in rendered if hasattr(m, "call_id")]
+        assert len(tool_results) == 1
+        assert "[all validations passing]" in tool_results[0].content
+
+    async def test_footer_only_on_last_result_in_round(self, tmp_path):
+        """When the LLM issues multiple tool calls in one round, only
+        the last tool result gets the footer."""
+        from thorn._history import HistoryTree
+
+        (tmp_path / "a.cpp").write_text("code")
+
+        tracker = ValidationTracker(root=tmp_path)
+        tracker.add_target("build", ["*.cpp"])
+
+        async def t1() -> str:
+            """Tool one."""
+            return "result1"
+
+        async def t2() -> str:
+            """Tool two."""
+            return "result2"
+
+        w1 = wrap_function(t1)
+        w2 = wrap_function(t2)
+        provider = MockProvider(canned_responses=[
+            [
+                ToolCallChunk(call_id="c1", name="t1", arguments="{}"),
+                ToolCallChunk(call_id="c2", name="t2", arguments="{}"),
+                FinishChunk(reason="tool_calls"),
+            ],
+            _text_response("done"),
+        ])
+        ctx = ExecutionContext(provider=provider, validation_tracker=tracker)
+        history = HistoryTree()
+        result = await run_agent_loop(
+            context=ctx, user_prompt="go", tools=[w1, w2],
+            history=history,
+        )
+        assert result == "done"
+
+        rendered = history.render()
+        tool_results = [m for m in rendered if hasattr(m, "call_id")]
+        assert len(tool_results) == 2
+        assert "[build:" not in tool_results[0].content
+        assert "[build: stale" in tool_results[1].content
+
+    async def test_tracker_propagated_via_push_scope(self, tmp_path):
+        """push_scope shares the same tracker by reference."""
+        tracker = ValidationTracker(root=tmp_path)
+        tracker.add_target("build", ["*.cpp"])
+
+        provider = MockProvider()
+        ctx = ExecutionContext(provider=provider, validation_tracker=tracker)
+        child = ctx.push_scope("child-scope")
+        assert child.validation_tracker is tracker
