@@ -14,6 +14,7 @@ from thorn._outline import (
     compute_depths,
     format_outline,
     outline_and_format,
+    spans_for_regions,
     _distribute_evenly,
 )
 
@@ -166,6 +167,82 @@ class TestDistributeEvenly:
         assert 5 in result
         assert 2 in result
         assert result[5] + result[2] == 6
+
+
+# ---------------------------------------------------------------------------
+# spans_for_regions
+# ---------------------------------------------------------------------------
+
+
+class TestSpansForRegions:
+    def test_empty_file(self):
+        assert spans_for_regions(0, [(1, 1)]) == []
+
+    def test_no_regions_collapses_all(self):
+        spans = spans_for_regions(10, [])
+        assert len(spans) == 1
+        assert not spans[0].visible
+        assert spans[0].line_count == 10
+
+    def test_single_region_with_context(self):
+        spans = spans_for_regions(20, [(10, 10)], context_lines=2)
+        visible_spans = [s for s in spans if s.visible]
+        collapsed_spans = [s for s in spans if not s.visible]
+        assert len(visible_spans) == 1
+        assert visible_spans[0].start_line == 8
+        assert visible_spans[0].end_line == 12
+        assert len(collapsed_spans) == 2
+
+    def test_region_at_file_start(self):
+        spans = spans_for_regions(20, [(1, 1)], context_lines=3)
+        assert spans[0].visible
+        assert spans[0].start_line == 1
+        assert spans[0].end_line == 4
+
+    def test_region_at_file_end(self):
+        spans = spans_for_regions(20, [(20, 20)], context_lines=3)
+        visible = [s for s in spans if s.visible]
+        assert visible[-1].end_line == 20
+        assert visible[-1].start_line == 17
+
+    def test_overlapping_regions_merged(self):
+        spans = spans_for_regions(30, [(5, 5), (8, 8)], context_lines=3)
+        visible = [s for s in spans if s.visible]
+        assert len(visible) == 1
+        assert visible[0].start_line == 2
+        assert visible[0].end_line == 11
+
+    def test_distant_regions_stay_separate(self):
+        spans = spans_for_regions(50, [(5, 5), (45, 45)], context_lines=2)
+        visible = [s for s in spans if s.visible]
+        assert len(visible) == 2
+        assert visible[0].end_line < visible[1].start_line
+
+    def test_region_spanning_multiple_lines(self):
+        spans = spans_for_regions(30, [(10, 15)], context_lines=2)
+        visible = [s for s in spans if s.visible]
+        assert len(visible) == 1
+        assert visible[0].start_line == 8
+        assert visible[0].end_line == 17
+
+    def test_unsorted_regions_handled(self):
+        spans_ordered = spans_for_regions(30, [(5, 5), (25, 25)], context_lines=2)
+        spans_reversed = spans_for_regions(30, [(25, 25), (5, 5)], context_lines=2)
+        assert spans_ordered == spans_reversed
+
+    def test_adjacent_regions_merged(self):
+        # Regions with context_lines=2: region (5,5) -> visible 3-7,
+        # region (8,8) -> visible 6-10.  These overlap so should merge.
+        spans = spans_for_regions(20, [(5, 5), (8, 8)], context_lines=2)
+        visible = [s for s in spans if s.visible]
+        assert len(visible) == 1
+
+    def test_whole_file_covered(self):
+        spans = spans_for_regions(5, [(1, 5)], context_lines=0)
+        assert len(spans) == 1
+        assert spans[0].visible
+        assert spans[0].start_line == 1
+        assert spans[0].end_line == 5
 
 
 # ---------------------------------------------------------------------------

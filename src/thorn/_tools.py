@@ -3,9 +3,10 @@
 Each tool is an ordinary Python function.  They are exposed to agents
 via ``wrap_function()`` and can also be called directly from user code.
 
-File-access tools (``read_file``, ``write_file``, ``list_directory``,
-``search_files``) enforce the active ``FileAccessPolicy`` from the
-current ``ExecutionContext``, when one is set.
+File-access tools (``read_file``, ``edit_file``, ``create_file``,
+``list_directory``, ``search_files``) enforce the active
+``FileAccessPolicy`` from the current ``ExecutionContext``, when one
+is set.
 """
 
 from __future__ import annotations
@@ -15,6 +16,9 @@ import fnmatch as fnmatch_mod
 import os
 import re
 from pathlib import Path
+
+from pydantic import Field
+from pydantic.dataclasses import dataclass
 
 
 def _enforce_access(path: str, required_name: str) -> None:
@@ -180,8 +184,195 @@ async def read_file(
     return body
 
 
+EDIT_CONTEXT_LINES: int = 4
+"""Lines of context shown around each edit region in ``edit_file`` results."""
+
+
+@dataclass
+class FileEdit:
+    """A single find-and-replace edit within a file."""
+
+    old_string: str = Field(
+        description=(
+            "Text to find. Must occur exactly once in the file at the "
+            "time this edit is applied. Include enough surrounding "
+            "context to ensure a unique match."
+        ),
+    )
+    new_string: str = Field(
+        description=(
+            "Replacement text. Must include the same surrounding "
+            "context as old_string, plus the desired change. Use an "
+            "empty string to delete the matched text."
+        ),
+    )
+
+
+async def edit_file(path: str, edits: list[FileEdit]) -> str:
+    """Apply one or more find-and-replace edits to an existing file.
+
+    Each edit replaces exactly one occurrence of ``old_string`` with
+    ``new_string``.  Edits are applied sequentially; later edits match
+    against the content resulting from earlier ones.
+
+    Returns a contextual view of the file around each edited region so
+    the caller can verify the changes without a separate ``read_file``.
+
+    Args:
+        path: Filesystem path to the file to edit.
+        edits: Edits to apply in order.  Each edit's ``old_string``
+            must match exactly once in the file at the time it is
+            applied.
+    """
+    _enforce_access(path, "WRITE")
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    if not edits:
+        content = p.read_text(encoding="utf-8")
+        total = len(content.splitlines())
+        return f"No edits to apply. {path} is unchanged ({total} lines)."
+
+    content = p.read_text(encoding="utf-8")
+
+    edit_regions: list[tuple[int, int]] = []
+
+    for i, edit in enumerate(edits):
+        label = f"Edit {i + 1}/{len(edits)}"
+
+        if not edit.old_string:
+            raise ValueError(
+                f"{label}: old_string must not be empty. "
+                f"Use create_file to write to a new or empty file."
+            )
+
+        count = content.count(edit.old_string)
+        if count == 0:
+            raise ValueError(
+                f"{label}: old_string not found in {path}."
+            )
+        if count > 1:
+            raise ValueError(
+                f"{label}: old_string has {count} matches in {path} "
+                f"(must be unique). Add more surrounding context to "
+                f"disambiguate."
+            )
+
+        pos = content.index(edit.old_string)
+        start_line = content[:pos].count("\n") + 1
+        old_newlines = edit.old_string.count("\n")
+
+        content = (
+            content[:pos]
+            + edit.new_string
+            + content[pos + len(edit.old_string) :]
+        )
+
+        if edit.new_string:
+            new_newlines = edit.new_string.count("\n")
+            end_line = start_line + new_newlines
+        else:
+            end_line = start_line
+
+        line_delta = (
+            edit.new_string.count("\n") - old_newlines
+        )
+        if line_delta != 0:
+            edit_end_in_old = start_line + old_newlines
+            for j in range(len(edit_regions)):
+                r_start, r_end = edit_regions[j]
+                if r_start > edit_end_in_old:
+                    edit_regions[j] = (
+                        r_start + line_delta,
+                        r_end + line_delta,
+                    )
+
+        edit_regions.append((start_line, end_line))
+
+    p.write_text(content, encoding="utf-8")
+
+    all_lines = content.splitlines()
+    header = f"Applied {len(edits)} edit(s) to {path}."
+    body = _format_file_result(all_lines, edit_regions)
+    return f"{header}\n{body}"
+
+
+async def create_file(path: str, content: str) -> str:
+    """Create a new file with the given content.
+
+    Parent directories are created automatically.  Raises ``FileExistsError``
+    if the file already exists — use ``edit_file`` to modify existing files.
+
+    Returns a view of the new file's content so the caller can verify
+    what was written without a separate ``read_file``.
+
+    Args:
+        path: Filesystem path for the new file.
+        content: Full text content to write.
+    """
+    _enforce_access(path, "WRITE")
+    p = Path(path)
+    if p.exists():
+        raise FileExistsError(
+            f"File already exists: {path}. "
+            f"Use edit_file to modify existing files."
+        )
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+
+    all_lines = content.splitlines()
+    total = len(all_lines)
+    header = f"Created {path} ({total} lines)."
+
+    if total == 0:
+        return header
+
+    if total <= OUTLINE_THRESHOLD:
+        body = _format_lines(all_lines, 1)
+        return f"{header}\n{body}"
+
+    from thorn._outline import outline_and_format
+
+    body = outline_and_format(
+        all_lines,
+        line_budget=OUTLINE_THRESHOLD,
+        char_budget=MAX_READ_CHARS,
+    )
+    return f"{header}\n{body}"
+
+
+def _format_file_result(
+    lines: list[str],
+    regions: list[tuple[int, int]],
+) -> str:
+    """Format a view of file content highlighting specific regions.
+
+    Shows context lines around each region with the rest collapsed,
+    using the same ``OutputSpan`` / ``format_outline`` pipeline as
+    ``read_file``.
+    """
+    total = len(lines)
+    if total == 0:
+        return "[empty file]"
+
+    from thorn._outline import format_outline, spans_for_regions
+
+    spans = spans_for_regions(
+        total, regions, context_lines=EDIT_CONTEXT_LINES,
+    )
+    return format_outline(lines, spans, char_budget=MAX_READ_CHARS)
+
+
 async def write_file(path: str, content: str) -> str:
-    """Write content to a file, creating parent directories as needed."""
+    """Write content to a file, creating parent directories as needed.
+
+    .. deprecated::
+        Use ``edit_file`` for modifying existing files and
+        ``create_file`` for new files.  ``write_file`` remains
+        available for backward compatibility but is no longer
+        included in the default tool sets.
+    """
     _enforce_access(path, "WRITE")
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -421,11 +612,13 @@ async def ask_user(question: str) -> str:
     return answer
 
 
-ALL_BUILTIN_TOOLS = [read_file, write_file, list_directory, search_files, ask_user]
+ALL_BUILTIN_TOOLS = [
+    read_file, edit_file, create_file, list_directory, search_files, ask_user,
+]
 
 # Pre-packaged toolsets for common capabilities.  These are plain lists
 # that can be nested inside a tools= parameter and will be flattened
 # automatically by _prepare_tools / _collect_tools.
 
 FILE_READING: list = [read_file, list_directory, search_files]
-FILE_WRITING: list = [FILE_READING, write_file]
+FILE_WRITING: list = [FILE_READING, edit_file, create_file]

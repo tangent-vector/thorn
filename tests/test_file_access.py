@@ -367,6 +367,90 @@ class TestToolEnforcement:
         finally:
             reset_context(token)
 
+    async def test_edit_file_denied(self, tmp_path):
+        from thorn._tools import FileEdit, edit_file
+
+        p = tmp_path / "file.txt"
+        p.write_text("hello", encoding="utf-8")
+
+        policy = FileAccessPolicy(
+            [FileAccessRule("**", FileAccessLevel.READ)],
+        )
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            file_access_policy=policy,
+        )
+        token = set_context(ctx)
+        try:
+            with pytest.raises(PermissionError, match="WRITE"):
+                await edit_file(str(p), [
+                    FileEdit(old_string="hello", new_string="bye"),
+                ])
+        finally:
+            reset_context(token)
+
+    async def test_edit_file_allowed(self, tmp_path):
+        from thorn._tools import FileEdit, edit_file
+
+        p = tmp_path / "file.txt"
+        p.write_text("hello", encoding="utf-8")
+
+        policy = FileAccessPolicy(
+            [FileAccessRule("**", FileAccessLevel.WRITE)],
+        )
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            file_access_policy=policy,
+        )
+        token = set_context(ctx)
+        try:
+            result = await edit_file(str(p), [
+                FileEdit(old_string="hello", new_string="bye"),
+            ])
+            assert "Applied" in result
+            assert p.read_text(encoding="utf-8") == "bye"
+        finally:
+            reset_context(token)
+
+    async def test_create_file_denied(self, tmp_path):
+        from thorn._tools import create_file
+
+        policy = FileAccessPolicy(
+            [FileAccessRule("**", FileAccessLevel.READ)],
+        )
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            file_access_policy=policy,
+        )
+        token = set_context(ctx)
+        try:
+            with pytest.raises(PermissionError, match="WRITE"):
+                await create_file(str(tmp_path / "new.txt"), "data")
+        finally:
+            reset_context(token)
+
+    async def test_create_file_allowed(self, tmp_path):
+        from thorn._tools import create_file
+
+        policy = FileAccessPolicy(
+            [FileAccessRule("**", FileAccessLevel.WRITE)],
+        )
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            file_access_policy=policy,
+        )
+        token = set_context(ctx)
+        try:
+            result = await create_file(str(tmp_path / "new.txt"), "data")
+            assert "Created" in result
+            assert (tmp_path / "new.txt").read_text(encoding="utf-8") == "data"
+        finally:
+            reset_context(token)
+
     async def test_list_directory_filters_hidden(self, tmp_path):
         from thorn._tools import list_directory
 

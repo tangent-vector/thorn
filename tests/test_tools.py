@@ -8,13 +8,17 @@ from pathlib import Path
 import pytest
 
 from thorn._tools import (
+    EDIT_CONTEXT_LINES,
     MAX_READ_CHARS,
     MAX_READ_LINES,
     MAX_SEARCH_CHARS,
     MAX_SEARCH_MATCHES,
     OUTLINE_THRESHOLD,
+    FileEdit,
     _collect_match_groups,
     _format_lines,
+    create_file,
+    edit_file,
     list_directory,
     read_file,
     search_files,
@@ -202,6 +206,191 @@ class TestWriteFile:
         p = tmp_path / "a" / "b" / "c.txt"
         await write_file(str(p), "nested")
         assert p.read_text(encoding="utf-8") == "nested"
+
+
+# ---------------------------------------------------------------------------
+# edit_file
+# ---------------------------------------------------------------------------
+
+
+def _write(tmp_path, name: str, content: str):
+    """Helper: write a file and return its string path."""
+    p = tmp_path / name
+    p.write_text(content, encoding="utf-8")
+    return str(p)
+
+
+class TestEditFile:
+    async def test_single_edit(self, tmp_path):
+        path = _write(tmp_path, "f.txt", "hello world\n")
+        result = await edit_file(path, [
+            FileEdit(old_string="hello", new_string="goodbye"),
+        ])
+        assert (tmp_path / "f.txt").read_text("utf-8") == "goodbye world\n"
+        assert "Applied 1 edit(s)" in result
+        assert "goodbye" in result
+
+    async def test_multi_edit_sequential(self, tmp_path):
+        path = _write(tmp_path, "f.txt", "aaa\nbbb\nccc\n")
+        result = await edit_file(path, [
+            FileEdit(old_string="aaa", new_string="AAA"),
+            FileEdit(old_string="ccc", new_string="CCC"),
+        ])
+        assert (tmp_path / "f.txt").read_text("utf-8") == "AAA\nbbb\nCCC\n"
+        assert "Applied 2 edit(s)" in result
+
+    async def test_later_edit_sees_earlier_changes(self, tmp_path):
+        path = _write(tmp_path, "f.txt", "foo bar\n")
+        await edit_file(path, [
+            FileEdit(old_string="foo", new_string="baz"),
+            FileEdit(old_string="baz bar", new_string="done"),
+        ])
+        assert (tmp_path / "f.txt").read_text("utf-8") == "done\n"
+
+    async def test_not_found_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            await edit_file(str(tmp_path / "nope.txt"), [
+                FileEdit(old_string="x", new_string="y"),
+            ])
+
+    async def test_no_match_raises(self, tmp_path):
+        path = _write(tmp_path, "f.txt", "hello\n")
+        with pytest.raises(ValueError, match="not found"):
+            await edit_file(path, [
+                FileEdit(old_string="zzz", new_string="aaa"),
+            ])
+
+    async def test_ambiguous_match_raises(self, tmp_path):
+        path = _write(tmp_path, "f.txt", "aaa\naaa\n")
+        with pytest.raises(ValueError, match="2 matches"):
+            await edit_file(path, [
+                FileEdit(old_string="aaa", new_string="bbb"),
+            ])
+
+    async def test_empty_old_string_raises(self, tmp_path):
+        path = _write(tmp_path, "f.txt", "hello\n")
+        with pytest.raises(ValueError, match="old_string must not be empty"):
+            await edit_file(path, [
+                FileEdit(old_string="", new_string="stuff"),
+            ])
+
+    async def test_deletion_via_empty_new_string(self, tmp_path):
+        path = _write(tmp_path, "f.txt", "keep\nremove\nkeep\n")
+        await edit_file(path, [
+            FileEdit(old_string="remove\n", new_string=""),
+        ])
+        assert (tmp_path / "f.txt").read_text("utf-8") == "keep\nkeep\n"
+
+    async def test_multiline_replacement(self, tmp_path):
+        original = "line1\nline2\nline3\nline4\nline5\n"
+        path = _write(tmp_path, "f.txt", original)
+        await edit_file(path, [
+            FileEdit(
+                old_string="line2\nline3\nline4",
+                new_string="NEW2\nNEW3",
+            ),
+        ])
+        assert (tmp_path / "f.txt").read_text("utf-8") == (
+            "line1\nNEW2\nNEW3\nline5\n"
+        )
+
+    async def test_no_edits_returns_unchanged(self, tmp_path):
+        path = _write(tmp_path, "f.txt", "content\n")
+        result = await edit_file(path, [])
+        assert "unchanged" in result.lower()
+        assert (tmp_path / "f.txt").read_text("utf-8") == "content\n"
+
+    async def test_result_shows_context(self, tmp_path):
+        lines = [f"line {i}" for i in range(1, 21)]
+        path = _write(tmp_path, "f.txt", "\n".join(lines))
+        result = await edit_file(path, [
+            FileEdit(old_string="line 10", new_string="EDITED 10"),
+        ])
+        assert "EDITED 10" in result
+        for nearby in range(
+            max(1, 10 - EDIT_CONTEXT_LINES),
+            min(20, 10 + EDIT_CONTEXT_LINES) + 1,
+        ):
+            assert f"line {nearby}" in result or "EDITED" in result
+
+    async def test_result_collapses_distant_lines(self, tmp_path):
+        lines = [f"line {i}" for i in range(1, 51)]
+        path = _write(tmp_path, "f.txt", "\n".join(lines))
+        result = await edit_file(path, [
+            FileEdit(old_string="line 25", new_string="CHANGED"),
+        ])
+        assert "CHANGED" in result
+        assert "[lines" in result
+
+    async def test_error_label_includes_edit_index(self, tmp_path):
+        path = _write(tmp_path, "f.txt", "abc\n")
+        with pytest.raises(ValueError, match="Edit 1/2"):
+            await edit_file(path, [
+                FileEdit(old_string="zzz", new_string="x"),
+                FileEdit(old_string="abc", new_string="y"),
+            ])
+
+    async def test_multi_edit_region_adjustment(self, tmp_path):
+        """Later edit that adds lines shifts earlier recorded regions."""
+        lines = "\n".join(f"line {i}" for i in range(1, 31))
+        path = _write(tmp_path, "f.txt", lines)
+        result = await edit_file(path, [
+            FileEdit(old_string="line 25", new_string="EDIT_A"),
+            FileEdit(
+                old_string="line 5",
+                new_string="EDIT_B_1\nEDIT_B_2\nEDIT_B_3",
+            ),
+        ])
+        content = (tmp_path / "f.txt").read_text("utf-8")
+        assert "EDIT_A" in content
+        assert "EDIT_B_1" in content
+        assert "Applied 2 edit(s)" in result
+
+
+# ---------------------------------------------------------------------------
+# create_file
+# ---------------------------------------------------------------------------
+
+
+class TestCreateFile:
+    async def test_creates_new_file(self, tmp_path):
+        p = tmp_path / "new.txt"
+        result = await create_file(str(p), "hello\nworld\n")
+        assert p.read_text("utf-8") == "hello\nworld\n"
+        assert "Created" in result
+        assert "hello" in result
+
+    async def test_creates_parent_directories(self, tmp_path):
+        p = tmp_path / "a" / "b" / "c.txt"
+        await create_file(str(p), "nested\n")
+        assert p.read_text("utf-8") == "nested\n"
+
+    async def test_existing_file_raises(self, tmp_path):
+        p = tmp_path / "exists.txt"
+        p.write_text("old", encoding="utf-8")
+        with pytest.raises(FileExistsError, match="already exists"):
+            await create_file(str(p), "new")
+
+    async def test_empty_content(self, tmp_path):
+        p = tmp_path / "empty.txt"
+        result = await create_file(str(p), "")
+        assert p.read_text("utf-8") == ""
+        assert "0 lines" in result
+
+    async def test_small_file_shown_fully(self, tmp_path):
+        p = tmp_path / "small.txt"
+        content = "alpha\nbeta\ngamma\n"
+        result = await create_file(str(p), content)
+        assert "alpha" in result
+        assert "beta" in result
+        assert "gamma" in result
+
+    async def test_large_file_outlined(self, tmp_path):
+        p = tmp_path / "big.txt"
+        lines = [f"line {i}" for i in range(OUTLINE_THRESHOLD + 50)]
+        content = "\n".join(lines)
+        result = await create_file(str(p), content)
+        assert "[Outline:" in result
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from thorn import Agent, FileAccessLevel, FileAccessRule, write_file
+from thorn import Agent, FileAccessLevel, FileAccessRule, create_file, edit_file
 from thorn.tools import FILE_READING
 
 from .build_tools import build, run_tests
@@ -202,7 +202,8 @@ Guidelines:
   your supervisor can address it."""
     ]
     tools = [
-        write_file,
+        edit_file,
+        create_file,
         add_module,
         delegate_to_child,
         dependency_order,

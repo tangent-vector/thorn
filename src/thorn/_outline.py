@@ -402,6 +402,47 @@ def format_outline(
     return "\n".join(parts)
 
 
+def spans_for_regions(
+    total_lines: int,
+    regions: list[tuple[int, int]],
+    context_lines: int = 3,
+) -> list[OutputSpan]:
+    """Build ``OutputSpan`` list showing context around specific line regions.
+
+    Creates visible windows around each *region* (1-based inclusive
+    ``(start, end)`` tuples) padded by *context_lines*, collapses
+    everything else, and merges overlapping or adjacent windows.
+    """
+    if total_lines == 0:
+        return []
+
+    if not regions:
+        return [OutputSpan(1, total_lines, visible=False)]
+
+    sorted_regions = sorted(regions)
+
+    visible: list[tuple[int, int]] = []
+    for start, end in sorted_regions:
+        v_start = max(1, start - context_lines)
+        v_end = min(total_lines, end + context_lines)
+        if visible and v_start <= visible[-1][1] + 1:
+            visible[-1] = (visible[-1][0], max(visible[-1][1], v_end))
+        else:
+            visible.append((v_start, v_end))
+
+    spans: list[OutputSpan] = []
+    cursor = 1
+    for v_start, v_end in visible:
+        if cursor < v_start:
+            spans.append(OutputSpan(cursor, v_start - 1, visible=False))
+        spans.append(OutputSpan(v_start, v_end, visible=True))
+        cursor = v_end + 1
+    if cursor <= total_lines:
+        spans.append(OutputSpan(cursor, total_lines, visible=False))
+
+    return spans
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
