@@ -152,6 +152,7 @@ async def read_file(
             all_lines,
             line_budget=OUTLINE_THRESHOLD,
             char_budget=MAX_READ_CHARS,
+            file_path=path,
         )
 
     start_idx = max(offset - 1, 0)
@@ -346,6 +347,7 @@ async def create_file(path: str, content: str) -> str:
         all_lines,
         line_budget=OUTLINE_THRESHOLD,
         char_budget=MAX_READ_CHARS,
+        file_path=path,
     )
     return f"{header}\n{body}"
 

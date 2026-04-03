@@ -3,8 +3,10 @@
 Provides structural outlines of files that exceed a size budget, showing
 top-level structure with bodies collapsed.  Three layers:
 
-1. **Content Hierarchy** -- a strategy (currently indentation-based) parses
-   lines into a ``ContentNode`` tree reflecting nesting structure.
+1. **Content Hierarchy** -- a pluggable strategy parses lines into a
+   ``ContentNode`` tree reflecting nesting structure.  Indentation-based
+   and Markdown-aware strategies are available; selection is driven by
+   file extension via ``detect_content_format``.
 2. **Collapse Policy** -- a budget-driven algorithm selects which regions
    to show verbatim and which to collapse to summary lines.
 3. **Display Formatting** -- renders the tree and collapse decisions into
@@ -14,6 +16,8 @@ top-level structure with bodies collapsed.  Three layers:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum, auto
+from pathlib import PurePosixPath, PureWindowsPath
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +40,12 @@ class ContentNode:
     """1-based inclusive end."""
 
     depth: int
-    """Minimum indent level of lines in this region (in spaces)."""
+    """Nesting depth of this region.
+
+    Semantics depend on the strategy that built the hierarchy: for
+    indentation-based hierarchies this is the minimum indent level in
+    spaces; for Markdown hierarchies it is the section nesting level.
+    """
 
     children: list[ContentNode] = field(default_factory=list)
 
@@ -444,6 +453,38 @@ def spans_for_regions(
 
 
 # ---------------------------------------------------------------------------
+# Format Detection
+# ---------------------------------------------------------------------------
+
+_MARKDOWN_EXTENSIONS: frozenset[str] = frozenset({".md", ".markdown"})
+
+
+class ContentFormat(Enum):
+    """File-content format used to select a hierarchy-building strategy."""
+
+    INDENTATION = auto()
+    MARKDOWN = auto()
+
+
+def detect_content_format(file_path: str | None) -> ContentFormat:
+    """Choose a hierarchy strategy based on *file_path*.
+
+    Currently only inspects the file extension.  Content-based
+    inference can be added later.
+    """
+    if file_path is not None:
+        # Accept both Windows and POSIX paths.
+        suffix = ""
+        for cls in (PureWindowsPath, PurePosixPath):
+            suffix = cls(file_path).suffix.lower()
+            if suffix:
+                break
+        if suffix in _MARKDOWN_EXTENSIONS:
+            return ContentFormat.MARKDOWN
+    return ContentFormat.INDENTATION
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -453,14 +494,22 @@ def outline_and_format(
     *,
     line_budget: int,
     char_budget: int,
+    file_path: str | None = None,
 ) -> str:
     """Generate a budget-constrained outline of file content.
 
-    Builds a content hierarchy from indentation, selects which regions
-    to show or collapse based on the line and character budgets, and
+    Builds a content hierarchy (strategy chosen from *file_path* when
+    provided, falling back to indentation), selects which regions to
+    show or collapse based on the line and character budgets, and
     formats the result as line-numbered text.
     """
-    depths = compute_depths(lines)
-    root = build_hierarchy(depths)
+    fmt = detect_content_format(file_path)
+    if fmt is ContentFormat.MARKDOWN:
+        from thorn._outline_markdown import build_markdown_hierarchy
+
+        root = build_markdown_hierarchy(lines)
+    else:
+        depths = compute_depths(lines)
+        root = build_hierarchy(depths)
     spans = compute_collapse(root, line_budget=line_budget)
     return format_outline(lines, spans, char_budget=char_budget)

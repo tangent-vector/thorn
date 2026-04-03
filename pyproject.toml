@@ -12,6 +12,7 @@ dependencies = [
     "docstring-parser>=0.16",
     "pathspec>=0.12",
     "psutil>=5.9",
+    "mistletoe>=1.4",
 ]
 
 [project.scripts]

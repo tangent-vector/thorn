@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import textwrap
 
-import pytest
-
 from thorn._outline import (
+    ContentFormat,
     ContentNode,
     OutputSpan,
     build_hierarchy,
     compute_collapse,
     compute_depths,
+    detect_content_format,
     format_outline,
     outline_and_format,
     spans_for_regions,
@@ -460,3 +460,87 @@ class TestOutlineAndFormat:
         # Last line is the footer.
         non_footer = [l for l in content_lines if not l.startswith("[Outline")]
         assert len(non_footer) <= budget
+
+
+# ---------------------------------------------------------------------------
+# Format detection
+# ---------------------------------------------------------------------------
+
+
+class TestDetectContentFormat:
+    def test_none_path(self):
+        assert detect_content_format(None) is ContentFormat.INDENTATION
+
+    def test_python_file(self):
+        assert detect_content_format("src/foo.py") is ContentFormat.INDENTATION
+
+    def test_md_extension(self):
+        assert detect_content_format("docs/README.md") is ContentFormat.MARKDOWN
+
+    def test_markdown_extension(self):
+        assert detect_content_format("notes.markdown") is ContentFormat.MARKDOWN
+
+    def test_case_insensitive(self):
+        assert detect_content_format("FILE.MD") is ContentFormat.MARKDOWN
+        assert detect_content_format("FILE.Markdown") is ContentFormat.MARKDOWN
+
+    def test_no_extension(self):
+        assert detect_content_format("Makefile") is ContentFormat.INDENTATION
+
+    def test_windows_path(self):
+        assert detect_content_format("C:\\docs\\file.md") is ContentFormat.MARKDOWN
+
+    def test_posix_path(self):
+        assert detect_content_format("/home/user/file.md") is ContentFormat.MARKDOWN
+
+
+# ---------------------------------------------------------------------------
+# outline_and_format file_path dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestOutlineAndFormatDispatch:
+    def test_no_path_uses_indentation(self):
+        code = textwrap.dedent("""\
+            def foo():
+                return 1
+            def bar():
+                return 2
+        """).splitlines()
+        result_no_path = outline_and_format(
+            code, line_budget=10, char_budget=50_000,
+        )
+        result_py_path = outline_and_format(
+            code, line_budget=10, char_budget=50_000, file_path="test.py",
+        )
+        assert result_no_path == result_py_path
+
+    def test_md_path_uses_markdown_strategy(self):
+        """Verify .md triggers a different hierarchy than indentation.
+
+        Flat (unindented) content with headings spread through the file:
+        the indentation strategy sees everything at depth 0 and falls
+        back to prefix truncation, while the markdown strategy groups
+        by headings and shows section titles from across the file.
+        """
+        parts: list[str] = ["# Document Title", ""]
+        for i in range(1, 11):
+            parts.append(f"## Section {i}")
+            parts.append("")
+            for j in range(20):
+                parts.append(f"body line {j} of section {i}")
+            parts.append("")
+        md = parts
+        result_indent = outline_and_format(
+            md, line_budget=30, char_budget=50_000,
+        )
+        result_md = outline_and_format(
+            md, line_budget=30, char_budget=50_000, file_path="doc.md",
+        )
+        # Indentation strategy treats everything as flat (depth 0) so
+        # it shows a prefix; the markdown strategy collapses section
+        # bodies and can show headings from deeper in the file.
+        assert result_indent != result_md
+        # The markdown outline should mention later sections that the
+        # flat prefix truncation cannot reach.
+        assert "## Section 1" in result_md
