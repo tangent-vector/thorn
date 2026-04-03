@@ -41,6 +41,7 @@ from thorn._context import (
 )
 from thorn._agent import Agent
 from thorn._discovery import discover_tools
+from thorn._history import CollapseState, CompactionResult, HistoryTree
 from thorn._module import ModulePath
 from thorn._validation import ValidationRule
 from thorn._file_access import FileAccessLevel, FileAccessPolicy, FileAccessRule
@@ -82,6 +83,24 @@ except ImportError:
     pass
 
 T = TypeVar("T")
+
+
+def _effective_context_window(
+    provider_context_window: int | None,
+    user_context_window: int | None,
+) -> int | None:
+    """Compute the effective context window budget.
+
+    Uses ``min(provider, user)`` when both are available, or whichever
+    one is non-None.  Returns ``None`` (no compaction) when neither is
+    set.
+    """
+    if provider_context_window is not None and user_context_window is not None:
+        return min(provider_context_window, user_context_window)
+    if provider_context_window is not None:
+        return provider_context_window
+    return user_context_window
+
 
 __all__ = [
     # Core API
@@ -133,6 +152,10 @@ __all__ = [
     "ALL_BUILTIN_TOOLS",
     "FILE_READING",
     "FILE_WRITING",
+    # History / compaction
+    "HistoryTree",
+    "CompactionResult",
+    "CollapseState",
     # Errors
     "ThornError",
     "SkillError",
@@ -155,6 +178,7 @@ def run(
     event_sink: EventSink | None = None,
     system: str | None = None,
     workspace: str | None = None,
+    context_window: int | None = None,
 ) -> T:
     """Run an async workflow with a thorn execution context.
 
@@ -184,12 +208,17 @@ def run(
     if system:
         system_prompts.append(system)
 
+    effective_cw = _effective_context_window(
+        provider.context_window, context_window,
+    )
+
     ctx = ExecutionContext(
         provider=provider,
         event_sink=event_sink,
         system_prompts=system_prompts,
         workspace_root=ws_root,
         global_ignores=global_ignores,
+        context_window=effective_cw,
     )
 
     async def _run_with_context() -> T:

@@ -469,6 +469,7 @@ class ExecutionContext:
     global_ignores: FileAccessPolicy | None = None
     usage: UsageTracker = field(default_factory=UsageTracker)
     ask_user_handler: AskUserHandler | None = None
+    context_window: int | None = None
 
     def push_scope(
         self,
@@ -512,6 +513,7 @@ class ExecutionContext:
             global_ignores=self.global_ignores,
             usage=self.usage,
             ask_user_handler=self.ask_user_handler,
+            context_window=self.context_window,
         )
 
 

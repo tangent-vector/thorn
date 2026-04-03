@@ -88,6 +88,15 @@ class LLMProvider(ABC):
     the full message history on every call.
     """
 
+    @property
+    def context_window(self) -> int | None:
+        """The model's maximum context window in tokens, if known.
+
+        Subclasses should override to report the model's actual limit.
+        Returns ``None`` when the limit is unknown.
+        """
+        return None
+
     @abstractmethod
     async def complete(
         self,
@@ -113,10 +122,17 @@ class MockProvider(LLMProvider):
     def __init__(
         self,
         canned_responses: list[list[ResponseChunk]] | None = None,
+        *,
+        context_window: int | None = None,
     ) -> None:
         self.canned_responses: list[list[ResponseChunk]] = (
             list(canned_responses) if canned_responses else []
         )
+        self._context_window = context_window
+
+    @property
+    def context_window(self) -> int | None:
+        return self._context_window
 
     async def complete(
         self,

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from thorn._file_access import FileAccessRule
-    from thorn._messages import Message
+    from thorn._history import HistoryTree
 
 
 class _SafeDict(dict):
@@ -57,7 +57,8 @@ class Agent:
             Agent._registry[cls.__name__] = cls
 
     def __init__(self, **kwargs: Any) -> None:
-        self._messages: list[Message] = []
+        from thorn._history import HistoryTree
+        self._history: HistoryTree = HistoryTree()
         for k, v in kwargs.items():
             setattr(self, k, v)
 
@@ -260,7 +261,7 @@ async def _run_agent_prompt(
 ) -> Any:
     """Shared implementation for agent prompt calls.
 
-    Conversation history accumulates on ``agent._messages`` across
+    Conversation history accumulates on ``agent._history`` across
     calls, enabling multi-turn patterns where the same agent retains
     context (e.g. write code, then fix build errors).
     """
@@ -308,7 +309,7 @@ async def _run_agent_prompt(
             tools=prepared,
             system_prompts=sys_prompts,
             result_type=result_type,
-            messages=agent._messages,
+            history=agent._history,
         )
     finally:
         duration_s = time.monotonic() - t0

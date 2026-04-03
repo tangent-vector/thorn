@@ -1,8 +1,8 @@
 """Tests for conversation history accumulation.
 
 Verifies that:
-- ``run_agent_loop`` accumulates history on a provided list.
-- ``agent.prompt()`` accumulates history on the agent's internal list,
+- ``run_agent_loop`` accumulates history on a provided ``HistoryTree``.
+- ``agent.prompt()`` accumulates history on the agent's internal tree,
   enabling multi-turn patterns without external list management.
 """
 
@@ -13,6 +13,7 @@ import pytest
 from thorn._agent import Agent
 from thorn._context import ExecutionContext, get_context, reset_context, set_context
 from thorn._func import wrap_function
+from thorn._history import HistoryTree, TurnNode, UserPromptNode
 from thorn._loop import run_agent_loop
 from thorn._messages import AssistantMessage, Message, ToolResultMessage, UserMessage
 from thorn._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
@@ -30,60 +31,59 @@ def _tool_call_response(call_id: str, name: str, arguments: str):
 
 
 # ---------------------------------------------------------------------------
-# run_agent_loop: messages parameter
+# run_agent_loop: history parameter
 # ---------------------------------------------------------------------------
 
 
-class TestRunAgentLoopMessages:
-    async def test_none_is_backwards_compatible(self):
-        """When messages=None, behaviour is identical to before."""
+class TestRunAgentLoopHistory:
+    async def test_none_creates_internal_tree(self):
+        """When history=None, a fresh tree is created internally."""
         provider = MockProvider(canned_responses=[_text_response("hi")])
         ctx = ExecutionContext(provider=provider)
         result = await run_agent_loop(
-            context=ctx, user_prompt="hello", tools=[], messages=None,
+            context=ctx, user_prompt="hello", tools=[], history=None,
         )
         assert result == "hi"
 
-    async def test_provided_list_accumulates_history(self):
-        """A provided list should contain the user message and assistant
-        response after the call."""
+    async def test_provided_tree_accumulates_history(self):
+        """A provided tree should contain nodes after the call."""
         provider = MockProvider(canned_responses=[_text_response("reply")])
         ctx = ExecutionContext(provider=provider)
-        history: list[Message] = []
+        tree = HistoryTree()
 
         result = await run_agent_loop(
-            context=ctx, user_prompt="hello", tools=[], messages=history,
+            context=ctx, user_prompt="hello", tools=[], history=tree,
         )
         assert result == "reply"
-        assert len(history) == 2
-        assert isinstance(history[0], UserMessage)
-        assert history[0].content == "hello"
-        assert isinstance(history[1], AssistantMessage)
-        assert history[1].content == "reply"
+        assert len(tree.nodes) == 2
+        assert isinstance(tree.nodes[0], UserPromptNode)
+        assert tree.nodes[0].message.content == "hello"
+        assert isinstance(tree.nodes[1], TurnNode)
+        assert tree.nodes[1].assistant_content == "reply"
 
     async def test_multi_turn_accumulation(self):
-        """Calling run_agent_loop twice with the same list accumulates
+        """Calling run_agent_loop twice with the same tree accumulates
         both turns."""
         provider = MockProvider(canned_responses=[
             _text_response("first reply"),
             _text_response("second reply"),
         ])
         ctx = ExecutionContext(provider=provider)
-        history: list[Message] = []
+        tree = HistoryTree()
 
         await run_agent_loop(
-            context=ctx, user_prompt="turn 1", tools=[], messages=history,
+            context=ctx, user_prompt="turn 1", tools=[], history=tree,
         )
-        assert len(history) == 2
+        assert len(tree.nodes) == 2
 
         await run_agent_loop(
-            context=ctx, user_prompt="turn 2", tools=[], messages=history,
+            context=ctx, user_prompt="turn 2", tools=[], history=tree,
         )
-        assert len(history) == 4
-        assert isinstance(history[2], UserMessage)
-        assert history[2].content == "turn 2"
-        assert isinstance(history[3], AssistantMessage)
-        assert history[3].content == "second reply"
+        assert len(tree.nodes) == 4
+        assert isinstance(tree.nodes[2], UserPromptNode)
+        assert tree.nodes[2].message.content == "turn 2"
+        assert isinstance(tree.nodes[3], TurnNode)
+        assert tree.nodes[3].assistant_content == "second reply"
 
     async def test_tool_calls_appear_in_history(self):
         """Tool call rounds should be visible in the accumulated history."""
@@ -97,20 +97,19 @@ class TestRunAgentLoopMessages:
             _text_response("result is 10"),
         ])
         ctx = ExecutionContext(provider=provider)
-        history: list[Message] = []
+        tree = HistoryTree()
 
         await run_agent_loop(
             context=ctx, user_prompt="double 5", tools=[tool],
-            messages=history,
+            history=tree,
         )
 
-        assert isinstance(history[0], UserMessage)
-        assert isinstance(history[1], AssistantMessage)
-        assert len(history[1].tool_calls) == 1
-        assert isinstance(history[2], ToolResultMessage)
-        assert history[2].content == "10"
-        assert isinstance(history[3], AssistantMessage)
-        assert history[3].content == "result is 10"
+        assert isinstance(tree.nodes[0], UserPromptNode)
+        assert isinstance(tree.nodes[1], TurnNode)
+        assert len(tree.nodes[1].tool_call_nodes) == 1
+        assert tree.nodes[1].tool_call_nodes[0].result.content == "10"
+        assert isinstance(tree.nodes[2], TurnNode)
+        assert tree.nodes[2].assistant_content == "result is 10"
 
     async def test_prior_history_is_seen_by_provider(self):
         """The provider should see earlier messages when history is reused."""
@@ -127,35 +126,33 @@ class TestRunAgentLoopMessages:
             _text_response("second"),
         ])
         ctx = ExecutionContext(provider=provider)
-        history: list[Message] = []
+        tree = HistoryTree()
 
         await run_agent_loop(
-            context=ctx, user_prompt="msg1", tools=[], messages=history,
+            context=ctx, user_prompt="msg1", tools=[], history=tree,
         )
         await run_agent_loop(
-            context=ctx, user_prompt="msg2", tools=[], messages=history,
+            context=ctx, user_prompt="msg2", tools=[], history=tree,
         )
 
         # First call: provider sees [UserMessage("msg1")]
         assert len(seen_messages[0]) == 1
         assert seen_messages[0][0].content == "msg1"
 
-        # Second call: provider sees all 4 messages (2 from first turn + user + ...)
-        # At the point of the second completion call, history has:
-        # [user:msg1, assistant:first, user:msg2]
+        # Second call: provider sees all prior history plus new prompt
         assert len(seen_messages[1]) == 3
         assert seen_messages[1][0].content == "msg1"
         assert seen_messages[1][2].content == "msg2"
 
 
 # ---------------------------------------------------------------------------
-# agent.prompt: messages parameter
+# agent.prompt: history accumulation
 # ---------------------------------------------------------------------------
 
 
 class TestAgentPromptMessages:
     async def test_text_mode_accumulates_on_agent(self):
-        """Consecutive prompt() calls accumulate history on agent._messages."""
+        """Consecutive prompt() calls accumulate history on agent._history."""
         provider = MockProvider(canned_responses=[
             _text_response("wrote code"),
             _text_response("fixed errors"),
@@ -166,12 +163,12 @@ class TestAgentPromptMessages:
             agent = Agent()
 
             await agent.prompt("write code")
-            assert len(agent._messages) == 2
+            assert len(agent._history.nodes) == 2
 
             await agent.prompt("fix build errors")
-            assert len(agent._messages) == 4
-            assert isinstance(agent._messages[2], UserMessage)
-            assert agent._messages[2].content == "fix build errors"
+            assert len(agent._history.nodes) == 4
+            assert isinstance(agent._history.nodes[2], UserPromptNode)
+            assert agent._history.nodes[2].message.content == "fix build errors"
         finally:
             reset_context(token)
 
@@ -199,12 +196,12 @@ class TestAgentPromptMessages:
 
             r1 = await agent.prompt[int]("count things")
             assert r1 == 42
-            first_turn_len = len(agent._messages)
-            assert first_turn_len >= 2  # at least user + assistant
+            first_turn_len = len(agent._history.nodes)
+            assert first_turn_len >= 2
 
             r2 = await agent.prompt[int]("count more")
             assert r2 == 99
-            assert len(agent._messages) > first_turn_len
+            assert len(agent._history.nodes) > first_turn_len
         finally:
             reset_context(token)
 
@@ -214,10 +211,10 @@ class TestAgentPromptMessages:
         token = set_context(ctx)
         try:
             agent = Agent()
-            assert len(agent._messages) == 0
+            assert len(agent._history.nodes) == 0
             result = await agent.prompt("hello")
             assert result == "ok"
-            assert len(agent._messages) == 2
+            assert len(agent._history.nodes) == 2
         finally:
             reset_context(token)
 
@@ -236,10 +233,10 @@ class TestAgentPromptMessages:
             await agent_a.prompt("hello A")
             await agent_b.prompt("hello B")
 
-            assert len(agent_a._messages) == 2
-            assert len(agent_b._messages) == 2
-            assert agent_a._messages[0].content == "hello A"
-            assert agent_b._messages[0].content == "hello B"
+            assert len(agent_a._history.nodes) == 2
+            assert len(agent_b._history.nodes) == 2
+            assert agent_a._history.nodes[0].message.content == "hello A"
+            assert agent_b._history.nodes[0].message.content == "hello B"
         finally:
             reset_context(token)
 

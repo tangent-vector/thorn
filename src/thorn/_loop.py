@@ -19,6 +19,12 @@ import time
 from typing import Any
 
 from thorn._context import ExecutionContext, Scope
+from thorn._history import (
+    DEFAULT_HIGH_WATERMARK,
+    DEFAULT_LOW_WATERMARK,
+    HistoryTree,
+    estimate_tokens,
+)
 from thorn._messages import (
     AssistantMessage,
     Message,
@@ -75,18 +81,18 @@ async def run_agent_loop(
     result_type: type | None = None,
     max_tool_rounds: int = 50,
     max_failures: int = 5,
-    messages: list[Message] | None = None,
+    history: HistoryTree | None = None,
 ) -> Any:
     """Drive the request -> tool-call -> response cycle.
 
     Returns a ``str`` in text mode or a validated value of *result_type*
     in structured mode.
 
-    If *messages* is provided, the new ``UserMessage`` is appended to it
-    and the full list is used as conversation history.  The list is
-    mutated in place, so the caller retains the accumulated history
-    after the call returns (enabling multi-turn patterns).  If *messages*
-    is ``None`` (the default), a fresh list is created internally.
+    If *history* is provided, the new user prompt is appended to it and
+    the tree is used as conversation history.  The tree is mutated in
+    place, so the caller retains the accumulated history after the call
+    returns (enabling multi-turn patterns).  If *history* is ``None``
+    (the default), a fresh tree is created internally.
     """
     structured = result_type is not None and result_type is not str
 
@@ -119,19 +125,24 @@ async def run_agent_loop(
             "If you cannot fulfil the request, call `raise_error` instead."
         )
 
-    # -- conversation history ----------------------------------------------
-    if messages is None:
-        messages = []
-    messages.append(UserMessage(content=user_prompt))
+    # -- conversation history (tree) ---------------------------------------
+    if history is None:
+        history = HistoryTree()
+    history.append_user_prompt(user_prompt)
+
+    # -- compaction configuration ------------------------------------------
+    context_window = context.context_window
+    overhead_tokens = _estimate_overhead(prompts, all_schemas) if context_window else 0
 
     consecutive_failures = 0
 
     for round_num in range(max_tool_rounds):
+        rendered = history.render()
         text, tool_calls, _finish, usage = await _request_completion(
             context=context,
             system_prompts=prompts,
             tool_schemas=all_schemas,
-            messages=messages,
+            messages=rendered,
             consecutive_failures=consecutive_failures,
             max_failures=max_failures,
         )
@@ -144,22 +155,15 @@ async def run_agent_loop(
                 usage.get("total_tokens", 0),
             )
 
-        assistant_msg = AssistantMessage(content=text, tool_calls=tool_calls)
-        messages.append(assistant_msg)
-
         # -- no tool calls: either done (text mode) or nudge (structured) --
         if not tool_calls:
+            history.append_turn(AssistantMessage(content=text), [])
             if not structured:
                 return text
-            # In structured mode the agent must use a tool. Nudge it.
-            messages.append(
-                UserMessage(
-                    content=(
-                        "You must call the `return_result` tool with your "
-                        "answer, or `raise_error` if you cannot proceed.  "
-                        "Do not reply with plain text."
-                    ),
-                )
+            history.append_user_prompt(
+                "You must call the `return_result` tool with your "
+                "answer, or `raise_error` if you cannot proceed.  "
+                "Do not reply with plain text."
             )
             continue
 
@@ -170,8 +174,29 @@ async def run_agent_loop(
             context=context,
             result_type=result_type if structured else None,
         )
-        for rm in result_msgs:
-            messages.append(rm)
+
+        history.append_turn(
+            AssistantMessage(content=text, tool_calls=tool_calls),
+            result_msgs,
+        )
+
+        # -- compaction check ----------------------------------------------
+        if context_window is not None and usage is not None:
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            if prompt_tokens > context_window * DEFAULT_HIGH_WATERMARK:
+                compact_result = history.compact(
+                    context_budget=context_window,
+                    overhead_tokens=overhead_tokens,
+                    actual_prompt_tokens=prompt_tokens,
+                )
+                if compact_result.estimated_savings > 0:
+                    await context.event_sink.on_status(
+                        f"compaction: collapsed {compact_result.nodes_collapsed} nodes, "
+                        f"{compact_result.tool_calls_detail_collapsed} tool calls detail-collapsed, "
+                        f"~{compact_result.estimated_savings} est. tokens saved "
+                        f"({compact_result.tokens_before} -> {compact_result.tokens_after})",
+                        scope=context.scope,
+                    )
 
         if captured is not _RESULT_SENTINEL:
             return captured
@@ -179,6 +204,27 @@ async def run_agent_loop(
     raise LoopLimitError(
         f"agent loop exceeded {max_tool_rounds} rounds", max_tool_rounds,
     )
+
+
+# ---------------------------------------------------------------------------
+# Overhead estimation
+# ---------------------------------------------------------------------------
+
+def _estimate_overhead(
+    prompts: list[str],
+    schemas: list[dict[str, Any]],
+) -> int:
+    """Rough token estimate for everything outside the history.
+
+    Covers system prompts and tool schemas.  Used only for the compaction
+    target computation; absolute trigger checks use real provider usage.
+    """
+    total = 0
+    for p in prompts:
+        total += estimate_tokens(p)
+    for schema in schemas:
+        total += estimate_tokens(json.dumps(schema))
+    return total
 
 
 # ---------------------------------------------------------------------------
