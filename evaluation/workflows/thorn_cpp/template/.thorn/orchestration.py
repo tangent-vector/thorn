@@ -112,10 +112,9 @@ async def _run_with_validation(
     is asked for a fresh summary so the caller receives a coherent
     description of the completed work rather than a fix-oriented response.
     """
-    messages: list = []
     rules = effective_validation_rules(agent)
 
-    summary = await agent.prompt(task, messages=messages)
+    summary = await agent.prompt(task)
 
     if not rules:
         return summary
@@ -129,7 +128,6 @@ async def _run_with_validation(
                 "Validation now passes. Please provide a brief summary of "
                 "the work you completed (covering the original task, not "
                 "just the fixes).",
-                messages=messages,
             )
 
         if retry == max_retries:
@@ -152,7 +150,6 @@ async def _run_with_validation(
         summary = await agent.prompt(
             f"Validation failed after your changes:\n{error_report}\n\n"
             "Please fix the issues and try again.",
-            messages=messages,
         )
 
     return summary  # pragma: no cover

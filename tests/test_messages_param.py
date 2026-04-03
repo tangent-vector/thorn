@@ -1,7 +1,9 @@
-"""Tests for the ``messages`` parameter on run_agent_loop and agent.prompt.
+"""Tests for conversation history accumulation.
 
-Verifies that conversation history accumulates across calls when a mutable
-list is passed, and that the default (None) remains backwards-compatible.
+Verifies that:
+- ``run_agent_loop`` accumulates history on a provided list.
+- ``agent.prompt()`` accumulates history on the agent's internal list,
+  enabling multi-turn patterns without external list management.
 """
 
 from __future__ import annotations
@@ -152,7 +154,8 @@ class TestRunAgentLoopMessages:
 
 
 class TestAgentPromptMessages:
-    async def test_text_mode_accumulates(self):
+    async def test_text_mode_accumulates_on_agent(self):
+        """Consecutive prompt() calls accumulate history on agent._messages."""
         provider = MockProvider(canned_responses=[
             _text_response("wrote code"),
             _text_response("fixed errors"),
@@ -161,19 +164,18 @@ class TestAgentPromptMessages:
         token = set_context(ctx)
         try:
             agent = Agent()
-            history: list[Message] = []
 
-            await agent.prompt("write code", messages=history)
-            assert len(history) == 2
+            await agent.prompt("write code")
+            assert len(agent._messages) == 2
 
-            await agent.prompt("fix build errors", messages=history)
-            assert len(history) == 4
-            assert isinstance(history[2], UserMessage)
-            assert history[2].content == "fix build errors"
+            await agent.prompt("fix build errors")
+            assert len(agent._messages) == 4
+            assert isinstance(agent._messages[2], UserMessage)
+            assert agent._messages[2].content == "fix build errors"
         finally:
             reset_context(token)
 
-    async def test_structured_mode_accumulates(self):
+    async def test_structured_mode_accumulates_on_agent(self):
         provider = MockProvider(canned_responses=[
             [
                 ToolCallChunk(
@@ -194,35 +196,55 @@ class TestAgentPromptMessages:
         token = set_context(ctx)
         try:
             agent = Agent()
-            history: list[Message] = []
 
-            r1 = await agent.prompt[int]("count things", messages=history)
+            r1 = await agent.prompt[int]("count things")
             assert r1 == 42
-            first_turn_len = len(history)
+            first_turn_len = len(agent._messages)
             assert first_turn_len >= 2  # at least user + assistant
 
-            r2 = await agent.prompt[int]("count more", messages=history)
+            r2 = await agent.prompt[int]("count more")
             assert r2 == 99
-            assert len(history) > first_turn_len
+            assert len(agent._messages) > first_turn_len
         finally:
             reset_context(token)
 
-    async def test_none_is_backwards_compatible(self):
+    async def test_fresh_agent_starts_with_empty_history(self):
         provider = MockProvider(canned_responses=[_text_response("ok")])
         ctx = ExecutionContext(provider=provider)
         token = set_context(ctx)
         try:
             agent = Agent()
-            result = await agent.prompt("hello", messages=None)
+            assert len(agent._messages) == 0
+            result = await agent.prompt("hello")
             assert result == "ok"
-
-            result2 = await agent.prompt("hello again")
-            assert isinstance(result2, str)
+            assert len(agent._messages) == 2
         finally:
             reset_context(token)
 
-    async def test_agent_context_set_with_messages(self):
-        """get_context().agent should still be set correctly when using messages."""
+    async def test_separate_agents_have_independent_history(self):
+        """Two agent instances don't share history."""
+        provider = MockProvider(canned_responses=[
+            _text_response("reply A"),
+            _text_response("reply B"),
+        ])
+        ctx = ExecutionContext(provider=provider)
+        token = set_context(ctx)
+        try:
+            agent_a = Agent()
+            agent_b = Agent()
+
+            await agent_a.prompt("hello A")
+            await agent_b.prompt("hello B")
+
+            assert len(agent_a._messages) == 2
+            assert len(agent_b._messages) == 2
+            assert agent_a._messages[0].content == "hello A"
+            assert agent_b._messages[0].content == "hello B"
+        finally:
+            reset_context(token)
+
+    async def test_agent_context_set_correctly(self):
+        """get_context().agent should be set correctly during agent.prompt()."""
         captured: list = []
 
         async def capture() -> str:
@@ -242,11 +264,44 @@ class TestAgentPromptMessages:
         token = set_context(ctx)
         try:
             agent = MyRole(module="parser")
-            history: list[Message] = []
-            await agent.prompt("do it", messages=history)
+            await agent.prompt("do it")
 
             assert len(captured) == 1
             assert captured[0] is agent
             assert captured[0].module == "parser"
+        finally:
+            reset_context(token)
+
+    async def test_provider_sees_prior_history(self):
+        """On the second prompt() call, the provider should see messages
+        from the first call."""
+        seen_messages: list[list[Message]] = []
+
+        class CapturingProvider(MockProvider):
+            async def complete(self, system_prompts, tools, messages):
+                seen_messages.append(list(messages))
+                async for chunk in super().complete(system_prompts, tools, messages):
+                    yield chunk
+
+        provider = CapturingProvider(canned_responses=[
+            _text_response("first"),
+            _text_response("second"),
+        ])
+        ctx = ExecutionContext(provider=provider)
+        token = set_context(ctx)
+        try:
+            agent = Agent()
+
+            await agent.prompt("msg1")
+            await agent.prompt("msg2")
+
+            # First call: provider sees [UserMessage("msg1")]
+            assert len(seen_messages[0]) == 1
+            assert seen_messages[0][0].content == "msg1"
+
+            # Second call: provider sees all prior history plus new prompt
+            assert len(seen_messages[1]) == 3
+            assert seen_messages[1][0].content == "msg1"
+            assert seen_messages[1][2].content == "msg2"
         finally:
             reset_context(token)

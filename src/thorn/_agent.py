@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from thorn._file_access import FileAccessRule
+    from thorn._messages import Message
 
 
 class _SafeDict(dict):
@@ -56,6 +57,7 @@ class Agent:
             Agent._registry[cls.__name__] = cls
 
     def __init__(self, **kwargs: Any) -> None:
+        self._messages: list[Message] = []
         for k, v in kwargs.items():
             setattr(self, k, v)
 
@@ -209,7 +211,6 @@ class _AgentPromptAccessor:
         tools: list[Any] | None = None,
         system: str | None = None,
         file_access: list[FileAccessRule] | None = None,
-        messages: list | None = None,
     ) -> str:
         return await _run_agent_prompt(
             agent=self._agent,
@@ -218,7 +219,6 @@ class _AgentPromptAccessor:
             extra_tools=tools,
             extra_system=system,
             extra_file_access=file_access,
-            messages=messages,
         )
 
 
@@ -238,7 +238,6 @@ class _TypedAgentPrompt:
         tools: list[Any] | None = None,
         system: str | None = None,
         file_access: list[FileAccessRule] | None = None,
-        messages: list | None = None,
     ) -> Any:
         return await _run_agent_prompt(
             agent=self._agent,
@@ -247,7 +246,6 @@ class _TypedAgentPrompt:
             extra_tools=tools,
             extra_system=system,
             extra_file_access=file_access,
-            messages=messages,
         )
 
 
@@ -259,13 +257,12 @@ async def _run_agent_prompt(
     extra_tools: list[Any] | None = None,
     extra_system: str | None = None,
     extra_file_access: list[FileAccessRule] | None = None,
-    messages: list | None = None,
 ) -> Any:
     """Shared implementation for agent prompt calls.
 
-    If *messages* is provided, the conversation history accumulates
-    across calls — enabling multi-turn patterns where the same agent
-    retains context (e.g. write code, then fix build errors).
+    Conversation history accumulates on ``agent._messages`` across
+    calls, enabling multi-turn patterns where the same agent retains
+    context (e.g. write code, then fix build errors).
     """
     import time
 
@@ -311,7 +308,7 @@ async def _run_agent_prompt(
             tools=prepared,
             system_prompts=sys_prompts,
             result_type=result_type,
-            messages=messages,
+            messages=agent._messages,
         )
     finally:
         duration_s = time.monotonic() - t0
