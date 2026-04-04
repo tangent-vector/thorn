@@ -83,7 +83,7 @@ class _WrappedTool:
 async def run_agent_loop(
     *,
     context: ExecutionContext,
-    user_prompt: str,
+    user_prompt: str | None,
     tools: list[_WrappedTool],
     system_prompts: list[str] | None = None,
     result_type: type | None = None,
@@ -96,11 +96,14 @@ async def run_agent_loop(
     Returns a ``str`` in text mode or a validated value of *result_type*
     in structured mode.
 
-    If *history* is provided, the new user prompt is appended to it and
-    the tree is used as conversation history.  The tree is mutated in
-    place, so the caller retains the accumulated history after the call
-    returns (enabling multi-turn patterns).  If *history* is ``None``
-    (the default), a fresh tree is created internally.
+    If *history* is provided and *user_prompt* is not ``None``, the
+    prompt is appended to the tree before the loop begins.  When
+    *user_prompt* is ``None``, the caller is responsible for having
+    already populated the history (e.g. after context injection).
+    The tree is mutated in place, so the caller retains the accumulated
+    history after the call returns (enabling multi-turn patterns).
+    If *history* is ``None`` (the default), a fresh tree is created
+    internally.
     """
     structured = result_type is not None and result_type is not str
 
@@ -136,7 +139,8 @@ async def run_agent_loop(
     # -- conversation history (tree) ---------------------------------------
     if history is None:
         history = HistoryTree()
-    history.append_user_prompt(user_prompt)
+    if user_prompt is not None:
+        history.append_user_prompt(user_prompt)
 
     # -- compaction configuration ------------------------------------------
     context_window = context.context_window

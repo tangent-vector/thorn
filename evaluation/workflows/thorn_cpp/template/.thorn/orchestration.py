@@ -244,6 +244,7 @@ async def delegate_to_child(
     en_token, dis_token = _push_overrides(skip_validation, enable_validation)
     try:
         agent = developer_cls(module=qualified_child)
+        agent._parent = ctx.agent
         return await _run_with_validation(agent, task)
     except SkillError as exc:
         raise RuntimeError(

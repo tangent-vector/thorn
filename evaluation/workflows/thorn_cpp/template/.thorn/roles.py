@@ -11,10 +11,16 @@ Defines the role hierarchy:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from thorn import Agent, FileAccessLevel, FileAccessRule, create_file, edit_file
 from thorn.tools import FILE_READING
+
+if TYPE_CHECKING:
+    from thorn._context_injection import SeedContent
+    from thorn._history import HistoryTree
 
 from .build_tools import build, run_tests
 from .module_tools import (
@@ -112,6 +118,23 @@ class Developer(Agent, abstract=True):
 def _rel_path(absolute: str) -> str:
     """Convert an absolute module path to a project-relative POSIX path."""
     return Path(absolute).relative_to(PROJECT_DIR).as_posix()
+
+
+def _test_file_path(module: str) -> Path:
+    """Return the conventional test file path for a module."""
+    test_dir = PROJECT_DIR / "tests"
+    parts = module.split(".")
+    if len(parts) == 1:
+        return test_dir / f"{parts[0]}_test.cpp"
+    return test_dir / "/".join(parts[:-1]) / f"{parts[-1]}_test.cpp"
+
+
+def _children_dir(module: str) -> Path:
+    """Return the directory where children of *module* would live."""
+    source_root = PROJECT_DIR / "src"
+    if module == "main":
+        return source_root
+    return source_root / module.replace(".", "/")
 
 
 def _module_paths_prompt(agent: ModuleDeveloper) -> str:
@@ -227,6 +250,76 @@ Guidelines:
             ))
         rules.append(FileAccessRule("tests/**", FileAccessLevel.WRITE))
         return rules
+
+    def context_seed_items(self) -> dict[SeedContent, float]:
+        from thorn._context_injection import DirectorySeed, FileSeed
+
+        seeds: dict[SeedContent, float] = {}
+
+        if self.module == "main":
+            seeds[FileSeed(path=module_source_path("main"))] = 1.0
+        else:
+            seeds[FileSeed(path=module_header_path(self.module))] = 1.0
+            seeds[FileSeed(path=module_source_path(self.module))] = 1.0
+
+        test_path = _test_file_path(self.module)
+        if test_path.exists():
+            seeds[FileSeed(path=str(test_path))] = 0.5
+
+        if self.module != "main" and "." in self.module:
+            parent_module = self.module.rsplit(".", 1)[0]
+            seeds[FileSeed(path=module_header_path(parent_module))] = 0.5
+
+        subdir = _children_dir(self.module)
+        if subdir.is_dir():
+            seeds[DirectorySeed(path=str(subdir))] = 0.5
+
+        return seeds
+
+    def extract_salient_items_from_history(
+        self,
+        history: HistoryTree,
+    ) -> dict[SeedContent, float]:
+        from thorn._context_injection import DirectorySeed, FileSeed
+        from thorn._history import (
+            CollapseState,
+            DirectoryListCallNode,
+            FileReadCallNode,
+            TurnNode,
+        )
+
+        seeds: dict[SeedContent, float] = {}
+
+        turn_nodes = [
+            n for n in history.nodes if isinstance(n, TurnNode)
+        ]
+        total_turns = len(turn_nodes)
+        if total_turns == 0:
+            return seeds
+
+        for i, turn in enumerate(turn_nodes):
+            if turn.collapse_state == CollapseState.COLLAPSED:
+                continue
+            recency = (i + 1) / total_turns
+            for tcn in turn.tool_call_nodes:
+                if tcn.detail_collapsed:
+                    continue
+                try:
+                    args = json.loads(tcn.tool_call.arguments)
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+
+                if isinstance(tcn, FileReadCallNode):
+                    path = args.get("path")
+                    if path:
+                        key = FileSeed(path=path)
+                        seeds[key] = max(seeds.get(key, 0.0), recency)
+                elif isinstance(tcn, DirectoryListCallNode):
+                    path = args.get("path", ".")
+                    key = DirectorySeed(path=path)
+                    seeds[key] = max(seeds.get(key, 0.0), recency)
+
+        return seeds
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ from thorn._context import (
     set_context,
 )
 from thorn._agent import Agent
+from thorn._context_injection import DirectorySeed, FileSeed, SearchSeed, SeedContent
 from thorn._discovery import discover_tools
 from thorn._history import CollapseState, CompactionResult, HistoryTree
 from thorn._module import ModulePath
@@ -159,6 +160,11 @@ __all__ = [
     "HistoryTree",
     "CompactionResult",
     "CollapseState",
+    # Context injection
+    "SeedContent",
+    "FileSeed",
+    "DirectorySeed",
+    "SearchSeed",
     # Errors
     "ThornError",
     "SkillError",
