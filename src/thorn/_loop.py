@@ -126,6 +126,8 @@ async def run_agent_loop(
 
     # -- assemble system prompts -------------------------------------------
     prompts = list(context.system_prompts)
+    if context.workspace_instructions:
+        prompts.append(context.workspace_instructions)
     if system_prompts:
         prompts.extend(system_prompts)
 

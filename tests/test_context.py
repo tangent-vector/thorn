@@ -88,6 +88,19 @@ class TestExecutionContextPushScope:
         child = ctx.push_scope("x", tag="foo")
         assert child.scope.metadata == {"tag": "foo"}
 
+    def test_push_propagates_workspace_instructions(self):
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_instructions="Be concise.",
+        )
+        child = ctx.push_scope("x")
+        assert child.workspace_instructions == "Be concise."
+
+    def test_push_propagates_none_workspace_instructions(self):
+        ctx = ExecutionContext(provider=MockProvider())
+        child = ctx.push_scope("x")
+        assert child.workspace_instructions is None
+
 
 # ---------------------------------------------------------------------------
 # ContextVar management

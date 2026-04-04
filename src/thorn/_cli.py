@@ -68,6 +68,7 @@ def _build_context(
 
     from thorn import infer_workspace_root
     from thorn._context import EventSink
+    from thorn._discovery import load_workspace_instructions
     from thorn._file_access import load_global_ignores
 
     provider = load_provider_from_env()
@@ -88,6 +89,7 @@ def _build_context(
         provider=provider,
         event_sink=sink,
         workspace_root=ws_root,
+        workspace_instructions=load_workspace_instructions(ws_root),
         global_ignores=global_ignores,
         ask_user_handler=_rich_ask_user,
     )

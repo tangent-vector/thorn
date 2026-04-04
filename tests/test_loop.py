@@ -380,3 +380,69 @@ class TestValidationFooter:
         ctx = ExecutionContext(provider=provider, validation_tracker=tracker)
         child = ctx.push_scope("child-scope")
         assert child.validation_tracker is tracker
+
+
+# ---------------------------------------------------------------------------
+# Workspace instructions ordering
+# ---------------------------------------------------------------------------
+
+class TestWorkspaceInstructionsOrdering:
+    """Verify that workspace_instructions appear between context prompts
+    and agent-level prompts in the assembled system prompt list."""
+
+    async def test_workspace_instructions_between_context_and_agent_prompts(self):
+        captured: list[list[str]] = []
+
+        class CapturingProvider(MockProvider):
+            async def complete(self, system_prompts, tools, messages):
+                captured.append(list(system_prompts))
+                async for chunk in super().complete(system_prompts, tools, messages):
+                    yield chunk
+
+        provider = CapturingProvider(
+            canned_responses=[_text_response("ok")],
+        )
+        ctx = ExecutionContext(
+            provider=provider,
+            system_prompts=["universal"],
+            workspace_instructions="workspace rules",
+        )
+        await run_agent_loop(
+            context=ctx,
+            user_prompt="hi",
+            tools=[],
+            system_prompts=["agent-class", "agent-instance"],
+        )
+        assert len(captured) == 1
+        prompts = captured[0]
+        assert prompts == [
+            "universal",
+            "workspace rules",
+            "agent-class",
+            "agent-instance",
+        ]
+
+    async def test_no_workspace_instructions_when_none(self):
+        captured: list[list[str]] = []
+
+        class CapturingProvider(MockProvider):
+            async def complete(self, system_prompts, tools, messages):
+                captured.append(list(system_prompts))
+                async for chunk in super().complete(system_prompts, tools, messages):
+                    yield chunk
+
+        provider = CapturingProvider(
+            canned_responses=[_text_response("ok")],
+        )
+        ctx = ExecutionContext(
+            provider=provider,
+            system_prompts=["universal"],
+        )
+        await run_agent_loop(
+            context=ctx,
+            user_prompt="hi",
+            tools=[],
+            system_prompts=["agent-level"],
+        )
+        assert len(captured) == 1
+        assert captured[0] == ["universal", "agent-level"]

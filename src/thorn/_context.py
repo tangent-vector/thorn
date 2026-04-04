@@ -451,6 +451,11 @@ class ExecutionContext:
         agent:      The current ``Agent`` instance, if running inside one.
         workspace_root: Resolved absolute path to the workspace directory.
                         File access patterns are matched relative to this.
+        workspace_instructions: Contents of the workspace ``AGENTS.md``
+                               file, or ``None`` when no such file was
+                               found.  Injected into every agent's
+                               system prompt between context-level and
+                               agent-level prompts.
         file_access_policy: Active file-access policy for the current
                             agent scope.  ``None`` only at the root
                             context before any agent scope is pushed.
@@ -470,6 +475,7 @@ class ExecutionContext:
     system_prompts: list[str] = field(default_factory=list)
     agent: Any = None
     workspace_root: Path | None = None
+    workspace_instructions: str | None = None
     file_access_policy: FileAccessPolicy | None = None
     global_ignores: FileAccessPolicy | None = None
     usage: UsageTracker = field(default_factory=UsageTracker)
@@ -515,6 +521,7 @@ class ExecutionContext:
             system_prompts=list(self.system_prompts),
             agent=resolved_agent,
             workspace_root=self.workspace_root,
+            workspace_instructions=self.workspace_instructions,
             file_access_policy=resolved_policy,
             global_ignores=self.global_ignores,
             usage=self.usage,

@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from thorn._discovery import discover_tools, find_thorn_dirs, load_module_tools
+from thorn._discovery import (
+    discover_tools,
+    find_thorn_dirs,
+    load_module_tools,
+    load_workspace_instructions,
+)
 from thorn._func import tool
 
 
@@ -97,6 +102,29 @@ class TestFindThornDirs:
         result = find_thorn_dirs(start=tmp_path)
         for d in result:
             assert not str(d).startswith(str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# load_workspace_instructions
+# ---------------------------------------------------------------------------
+
+class TestLoadWorkspaceInstructions:
+    def test_returns_content_when_file_exists(self, tmp_path: Path):
+        agents_md = tmp_path / "AGENTS.md"
+        agents_md.write_text("Follow these rules.", encoding="utf-8")
+        assert load_workspace_instructions(tmp_path) == "Follow these rules."
+
+    def test_returns_none_when_absent(self, tmp_path: Path):
+        assert load_workspace_instructions(tmp_path) is None
+
+    def test_returns_none_when_agents_md_is_directory(self, tmp_path: Path):
+        (tmp_path / "AGENTS.md").mkdir()
+        assert load_workspace_instructions(tmp_path) is None
+
+    def test_preserves_multiline_content(self, tmp_path: Path):
+        content = "# Rules\n\n- Be concise\n- Use types\n"
+        (tmp_path / "AGENTS.md").write_text(content, encoding="utf-8")
+        assert load_workspace_instructions(tmp_path) == content
 
 
 # ---------------------------------------------------------------------------

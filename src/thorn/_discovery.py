@@ -61,6 +61,22 @@ def find_thorn_dirs(start: Path | None = None) -> list[Path]:
     return found
 
 
+def load_workspace_instructions(workspace_root: Path) -> str | None:
+    """Read ``AGENTS.md`` from *workspace_root*, if it exists.
+
+    Returns the file contents as a string, or ``None`` when the file is
+    absent or unreadable.
+    """
+    agents_md = workspace_root / "AGENTS.md"
+    if not agents_md.is_file():
+        return None
+    try:
+        return agents_md.read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("failed to read %s", agents_md, exc_info=True)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Synthetic package management for .thorn/ directories
 # ---------------------------------------------------------------------------
