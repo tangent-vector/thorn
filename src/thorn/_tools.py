@@ -885,6 +885,15 @@ async def ask_user(question: str) -> str:
     return await ctx.ask_user_handler(question)
 
 
+# Register ToolCallNode subclasses on built-in tools so that
+# HistoryTree records typed nodes, enabling isinstance-based
+# identification (e.g. in context injection).
+from thorn._history import DirectoryListCallNode, FileReadCallNode
+
+read_file._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
+list_directory._thorn_call_node_class = DirectoryListCallNode  # type: ignore[attr-defined]
+
+
 ALL_BUILTIN_TOOLS = [
     read_file,
     edit_file,

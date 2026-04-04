@@ -1,4 +1,4 @@
-"""Tests for thorn._func — prompt, @skill, wrap_function, _prepare_tools."""
+"""Tests for thorn._func — prompt, @skill, @tool, wrap_function, _prepare_tools."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import pytest
 
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
-from thorn._func import _prepare_tools, prompt, skill, wrap_function
+from thorn._func import _prepare_tools, prompt, skill, tool, wrap_function
+from thorn._history import DirectoryListCallNode, FileReadCallNode, ToolCallNode
 from thorn._loop import _WrappedTool
 from thorn._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
 
@@ -179,6 +180,99 @@ class TestPrepareTools:
         result = _prepare_tools([[fn_a], wrapped_b])
         assert len(result) == 2
         assert result[1] is wrapped_b
+
+
+# ---------------------------------------------------------------------------
+# @tool decorator
+# ---------------------------------------------------------------------------
+
+class TestToolDecorator:
+    def test_bare_decorator_sets_marker(self):
+        @tool
+        def my_tool() -> str:
+            """Do something."""
+            return "done"
+
+        assert my_tool._thorn_tool is True
+
+    def test_bare_decorator_no_call_node_class(self):
+        @tool
+        def my_tool() -> str:
+            """Do something."""
+            return "done"
+
+        assert not hasattr(my_tool, "_thorn_call_node_class")
+
+    def test_parameterized_sets_marker_and_class(self):
+        @tool(call_node_class=FileReadCallNode)
+        def my_reader(path: str) -> str:
+            """Read something."""
+            return "content"
+
+        assert my_reader._thorn_tool is True
+        assert my_reader._thorn_call_node_class is FileReadCallNode
+
+    def test_parameterized_no_class_sets_marker_only(self):
+        @tool()
+        def my_tool() -> str:
+            """Do something."""
+            return "done"
+
+        assert my_tool._thorn_tool is True
+        assert not hasattr(my_tool, "_thorn_call_node_class")
+
+    def test_preserves_function_identity(self):
+        @tool(call_node_class=FileReadCallNode)
+        def my_fn() -> str:
+            """Test."""
+            return "x"
+
+        assert my_fn() == "x"
+        assert my_fn.__name__ == "my_fn"
+
+
+# ---------------------------------------------------------------------------
+# wrap_function — call_node_class threading
+# ---------------------------------------------------------------------------
+
+class TestWrapFunctionCallNodeClass:
+    def test_reads_call_node_class_attribute(self):
+        def my_reader(path: str) -> str:
+            """Read a file."""
+            return "content"
+        my_reader._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
+
+        wrapped = wrap_function(my_reader)
+        assert wrapped.call_node_class is FileReadCallNode
+
+    def test_no_attribute_defaults_to_none(self):
+        def plain(x: int) -> int:
+            """Double."""
+            return x * 2
+
+        wrapped = wrap_function(plain)
+        assert wrapped.call_node_class is None
+
+    def test_prepare_tools_preserves_call_node_class(self):
+        def my_reader(path: str) -> str:
+            """Read a file."""
+            return "content"
+        my_reader._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
+
+        result = _prepare_tools([my_reader])
+        assert len(result) == 1
+        assert result[0].call_node_class is FileReadCallNode
+
+    def test_prepare_tools_passthrough_preserves_class(self):
+        def my_reader(path: str) -> str:
+            """Read a file."""
+            return "content"
+        my_reader._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
+
+        already_wrapped = wrap_function(my_reader)
+        result = _prepare_tools([already_wrapped])
+        assert result[0] is already_wrapped
+        assert result[0].call_node_class is FileReadCallNode
 
 
 # ---------------------------------------------------------------------------

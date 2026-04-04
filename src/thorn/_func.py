@@ -19,7 +19,10 @@ import inspect
 import json
 import time
 from collections.abc import Iterable
-from typing import Any, Callable, Generic, TypeVar, get_type_hints, overload
+from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar, get_type_hints, overload
+
+if TYPE_CHECKING:
+    from thorn._history import ToolCallNode
 
 from thorn._context import ExecutionContext, get_context, reset_context, set_context
 from thorn._loop import _WrappedTool, run_agent_loop
@@ -60,6 +63,11 @@ def wrap_function(fn: Callable[..., Any]) -> _WrappedTool:
     to produce an OpenAI-style tool schema.  At invocation time the JSON
     arguments from the model are deserialized and passed to the function,
     and the return value is serialized back to a string.
+
+    If *fn* has a ``_thorn_call_node_class`` attribute (set by
+    ``@tool(call_node_class=...)``), it is forwarded to the wrapped
+    tool so that history recording uses the correct ``ToolCallNode``
+    subclass.
     """
     schema = func_to_tool_schema(fn)
     is_async = asyncio.iscoroutinefunction(fn)
@@ -75,7 +83,10 @@ def wrap_function(fn: Callable[..., Any]) -> _WrappedTool:
             result = fn(**kwargs)
         return serialize_for_tool_result(result)
 
-    return _WrappedTool(schema=schema, execute=execute)
+    call_node_class = getattr(fn, "_thorn_call_node_class", None)
+    return _WrappedTool(
+        schema=schema, execute=execute, call_node_class=call_node_class,
+    )
 
 
 def _flatten_tools(items: Iterable[Any]) -> Iterable[Any]:
@@ -392,17 +403,41 @@ def skill(
 # @tool — marker decorator for auto-discovery
 # ---------------------------------------------------------------------------
 
-def tool(fn: Callable[..., Any]) -> Callable[..., Any]:
+def tool(
+    fn: Callable[..., Any] | None = None,
+    *,
+    call_node_class: type[ToolCallNode] | None = None,
+) -> Any:
     """Mark a Python function as a discoverable thorn tool.
 
     Unlike ``@skill``, this does **not** replace the function body.
     The function keeps its original implementation and is simply tagged
-    so that ``.thorn/`` directory discovery can find it::
+    so that ``.thorn/`` directory discovery can find it.
+
+    Supports both bare and parameterized forms::
 
         @tool
         async def grep_codebase(pattern: str, path: str = ".") -> str:
             \"\"\"Search for *pattern* in files under *path*.\"\"\"
             ...
+
+        @tool(call_node_class=FileReadCallNode)
+        async def read_file(path: str) -> str:
+            \"\"\"Read a file.\"\"\"
+            ...
+
+    When *call_node_class* is provided, the class is stored on the
+    function and threaded through ``_WrappedTool`` so that
+    ``HistoryTree.append_turn`` constructs that subclass instead of
+    the base ``ToolCallNode``.
     """
-    fn._thorn_tool = True  # type: ignore[attr-defined]
-    return fn
+
+    def decorator(f: Callable[..., Any]) -> Callable[..., Any]:
+        f._thorn_tool = True  # type: ignore[attr-defined]
+        if call_node_class is not None:
+            f._thorn_call_node_class = call_node_class  # type: ignore[attr-defined]
+        return f
+
+    if fn is not None:
+        return decorator(fn)
+    return decorator

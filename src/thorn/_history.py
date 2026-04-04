@@ -330,6 +330,27 @@ class ToolCallNode:
         return self.result
 
 
+class FileReadCallNode(ToolCallNode):
+    """ToolCallNode for file-read operations (``read_file``).
+
+    Enables ``isinstance``-based identification without hardcoding tool
+    names, e.g. when extracting salient file reads from a parent agent's
+    history.
+    """
+
+    __slots__ = ()
+
+
+class DirectoryListCallNode(ToolCallNode):
+    """ToolCallNode for directory-listing operations (``list_directory``).
+
+    Enables ``isinstance``-based identification without hardcoding tool
+    names.
+    """
+
+    __slots__ = ()
+
+
 class UserPromptNode:
     """A user prompt in the history.
 
@@ -560,19 +581,29 @@ class HistoryTree:
         tool_results: list[ToolResultMessage],
         *,
         intrinsic_salience: float = DEFAULT_INTRINSIC_SALIENCE,
+        call_node_classes: dict[str, type[ToolCallNode]] | None = None,
     ) -> TurnNode:
         """Append an assistant turn (message + tool results) and return the node.
 
         Tool results are matched to tool calls by ``call_id``.  Tool
         calls with no matching result are silently skipped (this can
         happen if ``raise_error`` aborted before producing a result).
+
+        When *call_node_classes* is provided, it maps ``call_id`` to a
+        ``ToolCallNode`` subclass.  Nodes for matching tool calls are
+        constructed using that subclass instead of the base
+        ``ToolCallNode``, enabling ``isinstance``-based identification
+        in downstream code (e.g. context injection).
         """
         result_by_id = {r.call_id: r for r in tool_results}
         tool_call_nodes: list[ToolCallNode] = []
         for tc in assistant_msg.tool_calls:
             result = result_by_id.get(tc.call_id)
             if result is not None:
-                tool_call_nodes.append(ToolCallNode(tc, result))
+                node_cls = ToolCallNode
+                if call_node_classes is not None:
+                    node_cls = call_node_classes.get(tc.call_id, ToolCallNode)
+                tool_call_nodes.append(node_cls(tc, result))
 
         node = TurnNode(
             assistant_content=assistant_msg.content,

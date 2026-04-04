@@ -23,6 +23,7 @@ from thorn._history import (
     DEFAULT_HIGH_WATERMARK,
     DEFAULT_LOW_WATERMARK,
     HistoryTree,
+    ToolCallNode,
     estimate_tokens,
 )
 from thorn._messages import (
@@ -59,17 +60,24 @@ _RESULT_SENTINEL = object()
 
 
 class _WrappedTool:
-    """Lightweight wrapper that pairs a tool schema with an execute callback."""
+    """Lightweight wrapper that pairs a tool schema with an execute callback.
 
-    __slots__ = ("schema", "execute")
+    When *call_node_class* is set, ``HistoryTree.append_turn`` will
+    construct that ``ToolCallNode`` subclass instead of the base class,
+    enabling ``isinstance``-based identification in downstream code.
+    """
+
+    __slots__ = ("schema", "execute", "call_node_class")
 
     def __init__(
         self,
         schema: dict[str, Any],
         execute: Any,  # async callable(**kwargs) -> str
+        call_node_class: type[ToolCallNode] | None = None,
     ) -> None:
         self.schema = schema
         self.execute = execute
+        self.call_node_class = call_node_class
 
 
 async def run_agent_loop(
@@ -168,7 +176,7 @@ async def run_agent_loop(
             continue
 
         # -- dispatch tool calls -------------------------------------------
-        result_msgs, captured = await _execute_tool_calls(
+        result_msgs, call_node_classes, captured = await _execute_tool_calls(
             tool_calls=tool_calls,
             tool_dispatch=tool_dispatch,
             context=context,
@@ -178,6 +186,7 @@ async def run_agent_loop(
         history.append_turn(
             AssistantMessage(content=text, tool_calls=tool_calls),
             result_msgs,
+            call_node_classes=call_node_classes or None,
         )
 
         # -- compaction check ----------------------------------------------
@@ -324,13 +333,18 @@ async def _execute_tool_calls(
     tool_dispatch: dict[str, _WrappedTool],
     context: ExecutionContext,
     result_type: type | None,
-) -> tuple[list[ToolResultMessage], Any]:
-    """Execute tool calls and return (result_messages, captured_value).
+) -> tuple[list[ToolResultMessage], dict[str, type[ToolCallNode]], Any]:
+    """Execute tool calls and return (result_messages, call_node_classes, captured_value).
+
+    *call_node_classes* maps ``call_id`` to the ``ToolCallNode``
+    subclass registered on the resolved tool (if any).  Only entries
+    with a non-``None`` class are included.
 
     *captured_value* is ``_RESULT_SENTINEL`` unless a ``return_result``
     call was processed (in structured mode).
     """
     results: list[ToolResultMessage] = []
+    call_node_classes: dict[str, type[ToolCallNode]] = {}
     captured: Any = _RESULT_SENTINEL
 
     for tc in tool_calls:
@@ -386,6 +400,9 @@ async def _execute_tool_calls(
             )
             continue
 
+        if tool.call_node_class is not None:
+            call_node_classes[tc.call_id] = tool.call_node_class
+
         # -- execute -------------------------------------------------------
         await context.event_sink.on_tool_start(
             tc.name, kwargs, scope=context.scope,
@@ -432,4 +449,4 @@ async def _execute_tool_calls(
                     is_error=last.is_error,
                 )
 
-    return results, captured
+    return results, call_node_classes, captured

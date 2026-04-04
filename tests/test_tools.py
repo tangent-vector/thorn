@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from thorn._history import DirectoryListCallNode, FileReadCallNode
 from thorn._tools import (
     EDIT_CONTEXT_LINES,
     MAX_FIND_RESULTS,
@@ -31,6 +32,24 @@ from thorn._tools import (
     search_files,
     write_file,
 )
+
+
+# ---------------------------------------------------------------------------
+# call_node_class registration on built-in tools
+# ---------------------------------------------------------------------------
+
+class TestBuiltinToolCallNodeClass:
+    def test_read_file_has_file_read_class(self):
+        assert getattr(read_file, "_thorn_call_node_class", None) is FileReadCallNode
+
+    def test_list_directory_has_directory_list_class(self):
+        assert getattr(list_directory, "_thorn_call_node_class", None) is DirectoryListCallNode
+
+    def test_other_tools_have_no_class(self):
+        for fn in [edit_file, create_file, delete_file, move_file, find_files, search_files]:
+            assert not hasattr(fn, "_thorn_call_node_class"), (
+                f"{fn.__name__} should not have _thorn_call_node_class"
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-- Handle triggering of validation steps in response to file writes (or other actions) performed by agents, and automatically providing validation feedback in addition to other tool-call results.
+- Validation feedback is appended to tool results via `ValidationTracker`, but validation is only triggered when workflow tools explicitly record results. Consider whether validation should be triggered automatically in response to file writes (or other actions), rather than requiring explicit opt-in from each tool.
 
 - survey current built-in tools and make sure they are following industry best practices
 
@@ -8,11 +8,9 @@
 
 - Consider splitting `@skill` so that there's a distinction between "a function whose implementation is a prompt" and the exposure of such a function to the rest of the system
 
-- Tools or other support to allow querying the human user as part of a workflow (and making sure those queries are surfaced in a way that makes them fit in naturally during a `thorn chat` or `thorn run` session... and that they fail if stdin doesn't appear to be a tty).
+- The `ask_user` tool should fail gracefully (or be unavailable) when stdin is not a tty, so that non-interactive `thorn run` sessions don't hang waiting for input that will never come.
 
 - Some sort of POR around how to fit approval into all this, by having a notion of tools that should require approval (or maybe have filters/predicates to decide when they need approval)
-
-- Ensure convenience in accessing MCP-based skills from within Python
 
 - Consume typical definitions of skills, slash commands and personas (e.g., like in `.claude/`)
 
@@ -22,13 +20,7 @@
 
 - Make it easier to expose tools that don't require writing Python (e.g., stuff that should just amount to running a command line or shell script)
 
-- Allow `tools=` to support iterables of tools in the list alongside individual tools, so that users can easily write a shorthand for a list/set of tools. Thorn should probably expose basic `file_reading` (read files, list directories, grep, globbing search), `file_manipulation` (`file_reading` plus the ability to write files and create directories), `web_research` (web searches via something like duckduckgo, plus beautifulsoup or similar for extracting the content).
-
-- Provide a centralized mechanism for file permissions management, so that agents roles can include explicit opt-in or opt-out access to specific files, directories, etc. (probably using notation similar to `.gitignore`). All file access through Thorn's built-in file toolset should check for permissions according to those rules.
-
-  Note that having read-write *permissions* to a file path doesn't mean writing is automatically possible, since an agent also needs access to the `write_file` tool.
-
-  The default `Agent` class should probably provide a default of write access to `.` (meaning the "workspace" directory, whatever that should be). (The concept of the "workspace" directory for Thorn should probably default to the CWD at the time `thorn` was launched, but its also possible it should support defaulting to the deepest enclosing directory with a `.thorn/` directory under it)
+- Expose additional predefined tool sets beyond the existing `FILE_READING` and `FILE_WRITING`: a `file_manipulation` set (reading plus writing/creating directories), and a `web_research` set (web searches via something like duckduckgo, plus beautifulsoup or similar for extracting content).
 
 - Thorn should probably read and respect any `AGENTS.md` file(s) that are set up in a project, using the conventions established by other tools. The content of those files should be piped into `thorn`s agents as additional system-prompt content.
 
@@ -52,7 +44,7 @@
 
 - Rich `Tree` rendering for a post-run execution summary (the full agent/tool call tree printed after the run completes)
 
-- Cost/token tracking per agent and in aggregate, sourced from the provider's response metadata (token usage fields in the OpenAI streaming API)
+- Per-agent cost/token tracking breakdown (aggregate tracking already works via `UsageTracker`), and monetary cost estimation
 
 - Collapsible terminal output using ANSI folding sequences (the same mechanism GitHub Actions uses for grouped log lines), so tool call details can be expanded on demand
 
@@ -61,6 +53,4 @@
 - The LLM provider (`_provider.py`) does not set `max_tokens` on API requests, so a degenerate model response can produce unbounded output. The agent loop (`_loop.py`) also has no repetition detection. Together these allow a stuck LLM to spin forever repeating tokens. Short-term: add a configurable `max_tokens` to `OpenAIProvider.complete`. Longer-term: add repetition/loop detection in the agent loop itself.
 
 - Terminal output from `thorn run` can be truncated when the process completes, making it hard to diagnose issues from the log alone. Consider flushing/syncing output before exit, or writing a separate structured trace log.
-
-- Validation is currently skipped for non-implementer roles (architect, api_designer, test_engineer) as a pragmatic workaround. Longer-term options: (a) an `implement_stubs` tool for the api_designer so the build can pass after API design, (b) context-dependent validation decisions made by coordinators, (c) a general mechanism for coordinators to specify which validation rules apply per-delegation.
 

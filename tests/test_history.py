@@ -16,6 +16,8 @@ from thorn._history import (
     TRUNCATED_PREFIX_CHARS,
     CollapseState,
     CompactionResult,
+    DirectoryListCallNode,
+    FileReadCallNode,
     HistoryTree,
     ToolCallNode,
     TurnNode,
@@ -252,6 +254,56 @@ class TestToolCallNode:
 
 
 # ---------------------------------------------------------------------------
+# ToolCallNode subclasses
+# ---------------------------------------------------------------------------
+
+
+class TestToolCallNodeSubclasses:
+    def test_file_read_is_subclass(self):
+        assert issubclass(FileReadCallNode, ToolCallNode)
+
+    def test_directory_list_is_subclass(self):
+        assert issubclass(DirectoryListCallNode, ToolCallNode)
+
+    def test_file_read_isinstance(self):
+        tc = _tc("c1", "read_file", {"path": "x.py"})
+        result = _result("c1", "file content")
+        node = FileReadCallNode(tc, result)
+        assert isinstance(node, ToolCallNode)
+        assert isinstance(node, FileReadCallNode)
+        assert not isinstance(node, DirectoryListCallNode)
+
+    def test_directory_list_isinstance(self):
+        tc = _tc("c1", "list_directory", {"path": "."})
+        result = _result("c1", "file1\nfile2")
+        node = DirectoryListCallNode(tc, result)
+        assert isinstance(node, ToolCallNode)
+        assert isinstance(node, DirectoryListCallNode)
+        assert not isinstance(node, FileReadCallNode)
+
+    def test_subclass_inherits_full_behavior(self):
+        tc = _tc("c1", "read_file", {"path": "big.py"})
+        result = _result("c1", "a" * 5000)
+        node = FileReadCallNode(tc, result)
+
+        assert node.summary() is not None
+        assert node.expanded_token_cost() > 0
+        assert node.savings_if_detail_collapsed() > 0
+        assert node.is_collapsible
+
+        node.detail_collapsed = True
+        rendered = node.render_result()
+        assert "read_file" in rendered.content
+
+    def test_base_is_not_subclass_instance(self):
+        tc = _tc("c1", "read_file", {"path": "x.py"})
+        result = _result("c1", "content")
+        node = ToolCallNode(tc, result)
+        assert not isinstance(node, FileReadCallNode)
+        assert not isinstance(node, DirectoryListCallNode)
+
+
+# ---------------------------------------------------------------------------
 # UserPromptNode
 # ---------------------------------------------------------------------------
 
@@ -421,6 +473,97 @@ class TestHistoryTree:
         tree.append_user_prompt("a" * 10000)
         large = tree.estimated_tokens()
         assert large > small
+
+
+# ---------------------------------------------------------------------------
+# HistoryTree — call_node_classes in append_turn
+# ---------------------------------------------------------------------------
+
+
+class TestAppendTurnCallNodeClasses:
+    def test_uses_registered_subclass(self):
+        tree = HistoryTree()
+        tc = _tc("c1", "read_file", {"path": "x.py"})
+        msg = AssistantMessage(content="reading", tool_calls=[tc])
+        result = _result("c1", "file content")
+
+        node = tree.append_turn(
+            msg, [result],
+            call_node_classes={"c1": FileReadCallNode},
+        )
+
+        assert len(node.tool_call_nodes) == 1
+        assert isinstance(node.tool_call_nodes[0], FileReadCallNode)
+
+    def test_falls_back_to_base_without_mapping(self):
+        tree = HistoryTree()
+        tc = _tc("c1", "read_file", {"path": "x.py"})
+        msg = AssistantMessage(content="reading", tool_calls=[tc])
+        result = _result("c1", "file content")
+
+        node = tree.append_turn(msg, [result])
+
+        assert len(node.tool_call_nodes) == 1
+        assert type(node.tool_call_nodes[0]) is ToolCallNode
+
+    def test_falls_back_for_unregistered_call_id(self):
+        tree = HistoryTree()
+        tc1 = _tc("c1", "read_file", {"path": "x.py"})
+        tc2 = _tc("c2", "custom_tool", {"arg": "val"})
+        msg = AssistantMessage(content="working", tool_calls=[tc1, tc2])
+        r1 = _result("c1", "file content")
+        r2 = _result("c2", "tool result")
+
+        node = tree.append_turn(
+            msg, [r1, r2],
+            call_node_classes={"c1": FileReadCallNode},
+        )
+
+        assert len(node.tool_call_nodes) == 2
+        assert isinstance(node.tool_call_nodes[0], FileReadCallNode)
+        assert type(node.tool_call_nodes[1]) is ToolCallNode
+
+    def test_multiple_different_subclasses(self):
+        tree = HistoryTree()
+        tc1 = _tc("c1", "read_file", {"path": "x.py"})
+        tc2 = _tc("c2", "list_directory", {"path": "."})
+        msg = AssistantMessage(content="exploring", tool_calls=[tc1, tc2])
+        r1 = _result("c1", "file content")
+        r2 = _result("c2", "dir listing")
+
+        node = tree.append_turn(
+            msg, [r1, r2],
+            call_node_classes={
+                "c1": FileReadCallNode,
+                "c2": DirectoryListCallNode,
+            },
+        )
+
+        assert len(node.tool_call_nodes) == 2
+        assert isinstance(node.tool_call_nodes[0], FileReadCallNode)
+        assert isinstance(node.tool_call_nodes[1], DirectoryListCallNode)
+
+    def test_isinstance_on_recorded_history(self):
+        """Full roundtrip: nodes in the tree are identifiable via isinstance."""
+        tree = HistoryTree()
+        tree.append_user_prompt("read some files")
+
+        tc = _tc("c1", "read_file", {"path": "main.py"})
+        msg = AssistantMessage(content="reading", tool_calls=[tc])
+        result = _result("c1", "def main(): pass")
+        tree.append_turn(
+            msg, [result],
+            call_node_classes={"c1": FileReadCallNode},
+        )
+
+        turn = tree.nodes[1]
+        assert isinstance(turn, TurnNode)
+        file_reads = [
+            tcn for tcn in turn.tool_call_nodes
+            if isinstance(tcn, FileReadCallNode)
+        ]
+        assert len(file_reads) == 1
+        assert file_reads[0].tool_call.name == "read_file"
 
 
 # ---------------------------------------------------------------------------
@@ -829,3 +972,111 @@ class TestCompactionIntegration:
             assert len(compaction_msgs) > 0
         finally:
             reset_context(token)
+
+
+# ---------------------------------------------------------------------------
+# Integration: call_node_class through agent loop
+# ---------------------------------------------------------------------------
+
+
+class TestCallNodeClassIntegration:
+    async def test_tool_with_call_node_class_records_subclass_in_history(self):
+        """When a tool has call_node_class set, the agent loop records the
+        correct subclass in the history tree."""
+        async def my_reader(path: str) -> str:
+            """Read a file."""
+            return "file contents here"
+
+        my_reader._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
+
+        wrapped = wrap_function(my_reader)
+        provider = MockProvider(canned_responses=[
+            _tool_call_response("c1", "my_reader", '{"path": "x.py"}'),
+            _text_response("done reading"),
+        ])
+        ctx = ExecutionContext(provider=provider)
+        history = HistoryTree()
+
+        result = await run_agent_loop(
+            context=ctx,
+            user_prompt="read the file",
+            tools=[wrapped],
+            history=history,
+        )
+        assert result == "done reading"
+
+        turn_nodes = [n for n in history.nodes if isinstance(n, TurnNode)]
+        assert len(turn_nodes) == 2  # tool-call turn + final text turn
+        tool_turn = turn_nodes[0]
+        assert len(tool_turn.tool_call_nodes) == 1
+        assert isinstance(tool_turn.tool_call_nodes[0], FileReadCallNode)
+
+    async def test_tool_without_call_node_class_records_base(self):
+        """Tools without call_node_class use the base ToolCallNode."""
+        async def plain_tool() -> str:
+            """Do something."""
+            return "result"
+
+        wrapped = wrap_function(plain_tool)
+        provider = MockProvider(canned_responses=[
+            _tool_call_response("c1", "plain_tool", "{}"),
+            _text_response("finished"),
+        ])
+        ctx = ExecutionContext(provider=provider)
+        history = HistoryTree()
+
+        await run_agent_loop(
+            context=ctx,
+            user_prompt="go",
+            tools=[wrapped],
+            history=history,
+        )
+
+        turn_nodes = [n for n in history.nodes if isinstance(n, TurnNode)]
+        tool_turn = turn_nodes[0]
+        assert len(tool_turn.tool_call_nodes) == 1
+        assert type(tool_turn.tool_call_nodes[0]) is ToolCallNode
+
+    async def test_mixed_tools_record_correct_types(self):
+        """Mix of tools with and without call_node_class."""
+        async def reader(path: str) -> str:
+            """Read."""
+            return "content"
+
+        reader._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
+
+        async def lister(path: str) -> str:
+            """List."""
+            return "a\nb\nc"
+
+        lister._thorn_call_node_class = DirectoryListCallNode  # type: ignore[attr-defined]
+
+        async def plain() -> str:
+            """Plain."""
+            return "ok"
+
+        provider = MockProvider(canned_responses=[
+            [
+                ToolCallChunk(call_id="c1", name="reader", arguments='{"path": "x.py"}'),
+                ToolCallChunk(call_id="c2", name="lister", arguments='{"path": "."}'),
+                ToolCallChunk(call_id="c3", name="plain", arguments="{}"),
+                FinishChunk(reason="tool_calls"),
+            ],
+            _text_response("all done"),
+        ])
+        ctx = ExecutionContext(provider=provider)
+        history = HistoryTree()
+
+        await run_agent_loop(
+            context=ctx,
+            user_prompt="explore",
+            tools=[wrap_function(reader), wrap_function(lister), wrap_function(plain)],
+            history=history,
+        )
+
+        turn_nodes = [n for n in history.nodes if isinstance(n, TurnNode)]
+        tool_turn = turn_nodes[0]
+        assert len(tool_turn.tool_call_nodes) == 3
+        assert isinstance(tool_turn.tool_call_nodes[0], FileReadCallNode)
+        assert isinstance(tool_turn.tool_call_nodes[1], DirectoryListCallNode)
+        assert type(tool_turn.tool_call_nodes[2]) is ToolCallNode
