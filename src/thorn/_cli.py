@@ -15,6 +15,7 @@ from rich.console import Console
 
 from thorn.core._context import (
     ConsoleEventSink,
+    EventSink,
     ExecutionContext,
     Verbosity,
     set_context,
@@ -27,6 +28,7 @@ from thorn.core._loop import run_agent_loop, _WrappedTool
 from thorn.core._provider import load_provider_from_env
 from thorn.core._tools import ALL_BUILTIN_TOOLS
 from thorn.core.errors import SkillError, ThornError
+from thorn.runtime import Runtime
 
 console = Console()
 
@@ -50,12 +52,12 @@ def _resolve_verbosity(verbose: int, quiet: bool) -> Verbosity:
     return Verbosity.NORMAL
 
 
-def _build_context(
+def _build_runtime(
     verbosity: Verbosity = Verbosity.NORMAL,
     trace_file: Any | None = None,
     workspace: str | None = None,
-) -> ExecutionContext:
-    """Create an execution context from environment variables.
+) -> Runtime:
+    """Create a ``Runtime`` from environment variables.
 
     When *trace_file* is an open file handle, a :class:`JsonLinesSink`
     is composed alongside the console sink so that a structured JSONL
@@ -67,7 +69,6 @@ def _build_context(
     from pathlib import Path
 
     from thorn import infer_workspace_root
-    from thorn.core._context import EventSink
     from thorn.core._discovery import load_workspace_instructions
     from thorn.core._file_access import load_global_ignores
 
@@ -83,14 +84,13 @@ def _build_context(
         sink = console_sink
 
     ws_root = Path(workspace).resolve() if workspace else infer_workspace_root()
-    global_ignores = load_global_ignores(ws_root)
 
-    return ExecutionContext(
+    return Runtime(
         provider=provider,
         event_sink=sink,
         workspace_root=ws_root,
         workspace_instructions=load_workspace_instructions(ws_root),
-        global_ignores=global_ignores,
+        global_ignores=load_global_ignores(ws_root),
         ask_user_handler=_rich_ask_user,
     )
 
@@ -294,7 +294,7 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
     """Execute a single prompt and print the result."""
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        ctx = _build_context(_resolve_verbosity(verbose, quiet), trace_file=trace_file, workspace=workspace_path)
+        runtime = _build_runtime(_resolve_verbosity(verbose, quiet), trace_file=trace_file, workspace=workspace_path)
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         if trace_file:
@@ -304,6 +304,8 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
                 Path(result_file_path), "agent_error", 0.0, None, str(exc), trace_path,
             )
         sys.exit(1)
+
+    ctx = runtime.create_context()
 
     async def _run() -> str:
         token = set_context(ctx)
@@ -394,13 +396,14 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
     """Start an interactive chat session."""
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        ctx = _build_context(_resolve_verbosity(verbose, quiet), trace_file=trace_file, workspace=workspace_path)
+        runtime = _build_runtime(_resolve_verbosity(verbose, quiet), trace_file=trace_file, workspace=workspace_path)
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         if trace_file:
             trace_file.close()
         sys.exit(1)
 
+    ctx = runtime.create_context()
     ctx.system_prompts.append(
         "You are in an interactive chat session with a human user. "
         "You may ask clarifying questions and suggest next steps."

@@ -57,15 +57,26 @@ class Agent:
         if not abstract:
             Agent._registry[cls.__name__] = cls
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         from thorn.core._history import HistoryTree
         self._history: HistoryTree = HistoryTree()
         self._parent: Agent | None = None
+        self.name: str | None = name
+        self.metadata: dict[str, Any] = metadata if metadata is not None else {}
         for k, v in kwargs.items():
             setattr(self, k, v)
 
     def __str__(self) -> str:
-        return type(self).__name__
+        cls_name = type(self).__name__
+        if self.name:
+            return f"{cls_name}({self.name!r})"
+        return cls_name
 
     @classmethod
     def get_subclasses(cls, base: type[Agent] | None = None) -> dict[str, type[Agent]]:
