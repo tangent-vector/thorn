@@ -310,7 +310,11 @@ async def create_merge_request(
     client = get_client()
     info = await asyncio.to_thread(
         client.create_merge_request,
-        project_id, source_branch, title, target_branch, description,
+        project_id=project_id,
+        source_branch=source_branch,
+        title=title,
+        target_branch=target_branch,
+        description=description,
     )
     return (
         f"Created MR !{info['iid']}: {info['title']}\n"

@@ -87,8 +87,15 @@ def _make_mock_mr(**overrides: Any) -> MagicMock:
 
 @pytest.fixture()
 def mock_client() -> GitLabClient:
-    """Build a GitLabClient with a mocked python-gitlab backend."""
-    with patch("thorn.tools.gitlab._gitlab_lib") as mock_gl_mod:
+    """Build a GitLabClient with a mocked python-gitlab backend.
+
+    Patches both ``_gitlab_lib`` and ``_HAS_GITLAB`` so that tests
+    work regardless of whether ``python-gitlab`` is installed.
+    """
+    with (
+        patch("thorn.tools.gitlab._gitlab_lib") as mock_gl_mod,
+        patch("thorn.tools.gitlab._HAS_GITLAB", True),
+    ):
         mock_gl_instance = MagicMock()
         mock_gl_mod.Gitlab.return_value = mock_gl_instance
 
