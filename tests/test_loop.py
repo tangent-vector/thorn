@@ -1,4 +1,4 @@
-"""Tests for thorn._loop — the agent loop in text and structured modes."""
+"""Tests for thorn.core._loop — the agent loop in text and structured modes."""
 
 from __future__ import annotations
 

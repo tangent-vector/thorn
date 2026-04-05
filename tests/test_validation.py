@@ -1,4 +1,4 @@
-"""Tests for thorn._validation — ValidationRule type."""
+"""Tests for thorn.core._validation — ValidationRule type."""
 
 from __future__ import annotations
 

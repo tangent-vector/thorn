@@ -1,4 +1,4 @@
-"""Tests for thorn._context_injection — salience-based context injection."""
+"""Tests for thorn.core._context_injection — salience-based context injection."""
 
 from __future__ import annotations
 

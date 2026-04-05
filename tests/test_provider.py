@@ -1,4 +1,4 @@
-"""Tests for thorn._provider — MockProvider, message conversion, SSE parsing."""
+"""Tests for thorn.core._provider — MockProvider, message conversion, SSE parsing."""
 
 from __future__ import annotations
 

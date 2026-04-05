@@ -1,4 +1,4 @@
-"""Tests for thorn._discovery and the @tool decorator."""
+"""Tests for thorn.core._discovery and the @tool decorator."""
 
 from __future__ import annotations
 

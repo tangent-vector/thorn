@@ -1,4 +1,4 @@
-"""Tests for thorn._outline_markdown — Markdown-aware content hierarchy."""
+"""Tests for thorn.core._outline_markdown — Markdown-aware content hierarchy."""
 
 from __future__ import annotations
 

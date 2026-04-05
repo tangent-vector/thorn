@@ -1,4 +1,4 @@
-"""Tests for thorn._outline — content-aware file outlining."""
+"""Tests for thorn.core._outline — content-aware file outlining."""
 
 from __future__ import annotations
 

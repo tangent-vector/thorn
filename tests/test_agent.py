@@ -1,4 +1,4 @@
-"""Tests for thorn._agent — Agent base class, MRO collection, prompt accessor."""
+"""Tests for thorn.core._agent — Agent base class, MRO collection, prompt accessor."""
 
 from __future__ import annotations
 

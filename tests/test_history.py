@@ -1,4 +1,4 @@
-"""Tests for thorn._history — hierarchical history and compaction."""
+"""Tests for thorn.core._history — hierarchical history and compaction."""
 
 from __future__ import annotations
 

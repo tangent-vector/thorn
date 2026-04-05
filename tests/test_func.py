@@ -1,4 +1,4 @@
-"""Tests for thorn._func — prompt, @skill, @tool, wrap_function, _prepare_tools."""
+"""Tests for thorn.core._func — prompt, @skill, @tool, wrap_function, _prepare_tools."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Tests for thorn._schema — type→schema conversion, validation, serialization."""
+"""Tests for thorn.core._schema — type→schema conversion, validation, serialization."""
 
 from __future__ import annotations
 

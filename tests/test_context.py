@@ -1,4 +1,4 @@
-"""Tests for thorn._context — scope chain, ExecutionContext, contextvar management."""
+"""Tests for thorn.core._context — scope chain, ExecutionContext, contextvar management."""
 
 from __future__ import annotations
 

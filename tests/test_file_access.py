@@ -1,4 +1,4 @@
-"""Tests for thorn._file_access — file access control system."""
+"""Tests for thorn.core._file_access — file access control system."""
 
 from __future__ import annotations
 

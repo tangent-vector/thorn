@@ -1,4 +1,4 @@
-"""Tests for thorn._module — ModulePath type."""
+"""Tests for thorn.core._module — ModulePath type."""
 
 from __future__ import annotations
 

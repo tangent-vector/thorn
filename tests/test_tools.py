@@ -1,4 +1,4 @@
-"""Tests for thorn._tools — built-in file/shell tools."""
+"""Tests for thorn.core._tools — built-in file/shell tools."""
 
 from __future__ import annotations
 

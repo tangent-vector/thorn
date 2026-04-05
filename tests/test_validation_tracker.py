@@ -1,4 +1,4 @@
-"""Tests for thorn._validation_tracker — scan-based validation tracking."""
+"""Tests for thorn.core._validation_tracker — scan-based validation tracking."""
 
 from __future__ import annotations
 

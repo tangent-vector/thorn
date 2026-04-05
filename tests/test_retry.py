@@ -1,4 +1,4 @@
-"""Tests for thorn._retry — bounded retry utilities."""
+"""Tests for thorn.core._retry — bounded retry utilities."""
 
 from __future__ import annotations
 

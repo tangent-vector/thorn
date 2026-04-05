@@ -1,4 +1,4 @@
-"""Tests for thorn._mcp (MCP integration)."""
+"""Tests for thorn.core._mcp (MCP integration)."""
 
 from __future__ import annotations
 

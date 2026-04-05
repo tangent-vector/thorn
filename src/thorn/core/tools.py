@@ -6,12 +6,12 @@ Usage::
     from thorn import tools  # then tools.read_file, etc.
 
 ``run_shell`` is intentionally omitted from the default exports.
-Import it explicitly from ``thorn._tools`` if you need it::
+Import it explicitly from ``thorn.core._tools`` if you need it::
 
     from thorn.core._tools import run_shell
 
 ``write_file`` is deprecated in favour of ``edit_file`` + ``create_file``
-but remains importable from ``thorn._tools`` for backward compatibility.
+but remains importable from ``thorn.core._tools`` for backward compatibility.
 """
 
 from thorn.core._tools import (
