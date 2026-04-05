@@ -54,3 +54,20 @@
 
 - Terminal output from `thorn run` can be truncated when the process completes, making it hard to diagnose issues from the log alone. Consider flushing/syncing output before exit, or writing a separate structured trace log.
 
+- Allow a Python module to be used in a `tools=[...]` list, akin to how we allow iterables of tools. A Python module in such a list would stand in for the list of `@tool` functions in the `__all__` of that module.
+
+- The `ls`-equivalent tool provided by Thorn (which should probably be a glob-like tool, in practice) should support giving compact "preview" information on files/directories, using file-format-specific policies (perhaps eventually pluggable, but let's not worry about that yet).
+  One concrete example would be surfacing the title of a Markdown document, when available (a leading level-1 heading). We can imagine that listing the contents of `docs/` might yield:
+
+  ```
+  docs/
+    README.md       "The Foo Project"
+    conventions.md  "Coding Conventions"
+    guide/          "Foo User's Guide"
+  ```
+
+  In the above example, the tool automatically scraped the leading heading from `README.md` and `conventions.md` to intuit their titles, and then also identified that `docs/guide/` contained its own `README.md`, and applied a policy  to infer an appropriate hint/title for the `guide/` directory from that.
+
+  As a possibly-questionable extension/abuse of that concept, we could make it so that when the tool sees a `SKILL.md` file it extracts the `description:` from the YAML front-matter and uses that as the hint text intead of trying to scrape for a title in the Markdown content. With that kind of subtle policy tweak, a simple `ls`-like tool call on `.agents/skills/` directory would "automatically" yield a listing of available skills and their descriptions.
+
+
