@@ -1,9 +1,19 @@
-"""Public re-export of built-in agent tools.
+"""Toolset bundles for thorn agents.
 
-Usage::
+This package provides both the built-in file/search tools (re-exported from
+``thorn.core._tools``) and domain-specific toolsets as submodules:
+
+- ``thorn.tools.git``    -- Git subprocess operations
+- ``thorn.tools.gitlab`` -- GitLab API operations (requires ``thorn[gitlab]``)
+
+Built-in tools are available directly::
 
     from thorn.tools import read_file, edit_file, create_file, list_directory
-    from thorn import tools  # then tools.read_file, etc.
+
+Domain-specific toolsets are imported as submodules::
+
+    from thorn.tools import git
+    from thorn.tools import gitlab   # requires python-gitlab
 
 ``run_shell`` is intentionally omitted from the default exports.
 Import it explicitly from ``thorn.core._tools`` if you need it::

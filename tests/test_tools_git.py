@@ -1,0 +1,269 @@
+"""Tests for thorn.tools.git -- Git subprocess tools."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+from thorn.tools.git import (
+    GIT_TOOLS,
+    GitError,
+    _run_git,
+    git_branch,
+    git_clone,
+    git_commit,
+    git_diff,
+    git_log,
+    git_push,
+    git_status,
+    git_worktree_add,
+    git_worktree_remove,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def git_repo(tmp_path: Path) -> Path:
+    """Create a minimal git repository with one commit."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=repo, check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=repo, check=True, capture_output=True,
+    )
+    (repo / "README.md").write_text("# Test\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=repo, check=True, capture_output=True,
+    )
+    return repo
+
+
+@pytest.fixture()
+def bare_repo(tmp_path: Path, git_repo: Path) -> Path:
+    """Clone the git_repo as a bare repository."""
+    import subprocess
+
+    bare = tmp_path / "bare.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(git_repo), str(bare)],
+        check=True, capture_output=True,
+    )
+    return bare
+
+
+# ---------------------------------------------------------------------------
+# _run_git helper
+# ---------------------------------------------------------------------------
+
+
+class TestRunGit:
+    async def test_successful_command(self, git_repo: Path) -> None:
+        code, output = await _run_git("status", cwd=str(git_repo))
+        assert code == 0
+
+    async def test_failure_raises_git_error(self, tmp_path: Path) -> None:
+        with pytest.raises(GitError) as exc_info:
+            await _run_git("log", cwd=str(tmp_path))
+        assert exc_info.value.returncode != 0
+
+    async def test_check_false_returns_nonzero(self, tmp_path: Path) -> None:
+        code, _ = await _run_git("log", cwd=str(tmp_path), check=False)
+        assert code != 0
+
+
+# ---------------------------------------------------------------------------
+# git_status
+# ---------------------------------------------------------------------------
+
+
+class TestGitStatus:
+    async def test_clean_repo(self, git_repo: Path) -> None:
+        result = await git_status(str(git_repo))
+        assert "clean" in result.lower()
+
+    async def test_dirty_repo(self, git_repo: Path) -> None:
+        (git_repo / "new_file.txt").write_text("hello\n")
+        result = await git_status(str(git_repo))
+        assert "new_file.txt" in result
+
+
+# ---------------------------------------------------------------------------
+# git_diff
+# ---------------------------------------------------------------------------
+
+
+class TestGitDiff:
+    async def test_no_changes(self, git_repo: Path) -> None:
+        result = await git_diff(str(git_repo))
+        assert "no" in result.lower() and "changes" in result.lower()
+
+    async def test_unstaged_changes(self, git_repo: Path) -> None:
+        (git_repo / "README.md").write_text("# Updated\n")
+        result = await git_diff(str(git_repo))
+        assert "Updated" in result
+
+    async def test_staged_changes(self, git_repo: Path) -> None:
+        import subprocess
+
+        (git_repo / "README.md").write_text("# Staged\n")
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=git_repo,
+            check=True, capture_output=True,
+        )
+        result = await git_diff(str(git_repo), staged=True)
+        assert "Staged" in result
+
+
+# ---------------------------------------------------------------------------
+# git_branch
+# ---------------------------------------------------------------------------
+
+
+class TestGitBranch:
+    async def test_create_branch(self, git_repo: Path) -> None:
+        result = await git_branch(str(git_repo), "feature-x")
+        assert "feature-x" in result
+
+    async def test_duplicate_branch_fails(self, git_repo: Path) -> None:
+        await git_branch(str(git_repo), "feature-y")
+        with pytest.raises(GitError):
+            await git_branch(str(git_repo), "feature-y")
+
+
+# ---------------------------------------------------------------------------
+# git_commit
+# ---------------------------------------------------------------------------
+
+
+class TestGitCommit:
+    async def test_commit_new_file(self, git_repo: Path) -> None:
+        (git_repo / "new.txt").write_text("content\n")
+        result = await git_commit(str(git_repo), "add new file")
+        assert "new file" in result.lower() or "add new" in result.lower()
+
+    async def test_nothing_to_commit_fails(self, git_repo: Path) -> None:
+        with pytest.raises(GitError):
+            await git_commit(str(git_repo), "empty")
+
+
+# ---------------------------------------------------------------------------
+# git_log
+# ---------------------------------------------------------------------------
+
+
+class TestGitLog:
+    async def test_shows_initial_commit(self, git_repo: Path) -> None:
+        result = await git_log(str(git_repo))
+        assert "initial" in result
+
+    async def test_max_count(self, git_repo: Path) -> None:
+        (git_repo / "a.txt").write_text("a\n")
+        await git_commit(str(git_repo), "second commit")
+        result = await git_log(str(git_repo), max_count=1)
+        assert "second" in result
+        assert "initial" not in result
+
+
+# ---------------------------------------------------------------------------
+# git_clone
+# ---------------------------------------------------------------------------
+
+
+class TestGitClone:
+    async def test_clone_bare(self, git_repo: Path, tmp_path: Path) -> None:
+        dest = str(tmp_path / "clone.git")
+        result = await git_clone(str(git_repo), dest)
+        assert "Cloned" in result
+        assert os.path.isdir(dest)
+
+    async def test_fetch_existing(self, git_repo: Path, tmp_path: Path) -> None:
+        dest = str(tmp_path / "clone.git")
+        await git_clone(str(git_repo), dest)
+        result = await git_clone(str(git_repo), dest)
+        assert "Fetched" in result
+
+
+# ---------------------------------------------------------------------------
+# git_push
+# ---------------------------------------------------------------------------
+
+
+class TestGitPush:
+    async def test_push_to_local_remote(
+        self, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        import subprocess
+
+        remote_bare = tmp_path / "remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(remote_bare)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "remote", "add", "origin", str(remote_bare)],
+            cwd=git_repo, check=True, capture_output=True,
+        )
+        (git_repo / "push_test.txt").write_text("push me\n")
+        await git_commit(str(git_repo), "for push test")
+
+        current_branch_proc = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=git_repo, check=True, capture_output=True, text=True,
+        )
+        branch = current_branch_proc.stdout.strip()
+        result = await git_push(str(git_repo), branch)
+        assert "Pushed" in result
+
+
+# ---------------------------------------------------------------------------
+# git_worktree_add / git_worktree_remove
+# ---------------------------------------------------------------------------
+
+
+class TestGitWorktree:
+    async def test_add_and_remove(
+        self, bare_repo: Path, tmp_path: Path,
+    ) -> None:
+        wt = str(tmp_path / "worktree")
+        result = await git_worktree_add(
+            str(bare_repo), wt, "wt-branch",
+            start_point="HEAD",
+        )
+        assert "Created worktree" in result
+        assert os.path.isdir(wt)
+        assert os.path.isfile(os.path.join(wt, "README.md"))
+
+        result = await git_worktree_remove(str(bare_repo), wt)
+        assert "Removed" in result
+        assert not os.path.isdir(wt)
+
+
+# ---------------------------------------------------------------------------
+# GIT_TOOLS list
+# ---------------------------------------------------------------------------
+
+
+class TestGitToolsList:
+    def test_all_tools_have_thorn_tool_marker(self) -> None:
+        for fn in GIT_TOOLS:
+            assert getattr(fn, "_thorn_tool", False), (
+                f"{fn.__name__} is missing the @tool decorator"  # type: ignore[union-attr]
+            )
+
+    def test_expected_count(self) -> None:
+        assert len(GIT_TOOLS) == 9
