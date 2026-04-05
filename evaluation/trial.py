@@ -24,6 +24,15 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
+from scenario import (
+    ScenarioConfig,
+    ScenarioName,
+    bootstrap_scenario,
+    load_effective_prompt,
+    overlay_template,
+    resolve_inheritance_chain,
+)
+
 EVALUATION_DIR = Path(__file__).resolve().parent
 WORKFLOWS_DIR = EVALUATION_DIR / "workflows"
 SCENARIOS_DIR = EVALUATION_DIR / "scenarios"
@@ -51,51 +60,14 @@ def _resolve_workflow(name: str) -> Path:
     return workflow_dir
 
 
-def _resolve_scenario(name: str) -> Path:
-    """Return the scenario directory, raising if it doesn't exist."""
-    scenario_dir = SCENARIOS_DIR / name
-    if not scenario_dir.is_dir():
-        available = [p.name for p in SCENARIOS_DIR.iterdir() if p.is_dir()]
-        raise FileNotFoundError(
-            f"Scenario {name!r} not found at {scenario_dir}. "
-            f"Available: {available}"
-        )
-    return scenario_dir
-
-
-def _load_prompt(scenario_dir: Path) -> str:
-    """Read the scenario's prompt.md file."""
-    prompt_path = scenario_dir / "prompt.md"
-    if not prompt_path.exists():
-        raise FileNotFoundError(
-            f"No prompt.md found in scenario directory {scenario_dir}"
-        )
-    return prompt_path.read_text(encoding="utf-8").strip()
-
-
-def _overlay_template(template_dir: Path, target: Path) -> None:
-    """Copy all files from *template_dir* into *target*, preserving structure."""
-    if not template_dir.is_dir():
-        return
-    for src_path in template_dir.rglob("*"):
-        if src_path.is_file():
-            rel = src_path.relative_to(template_dir)
-            dst = target / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_path, dst)
-
-
 def _bootstrap(
-    scenario_dir: Path,
+    scenario_chain: list[ScenarioConfig],
     workflow_dir: Path,
     target: Path,
 ) -> None:
     """Populate the workspace by layering scenario then workflow templates."""
-    scenario_template = scenario_dir / "template"
-    workflow_template = workflow_dir / "template"
-
-    _overlay_template(scenario_template, target)
-    _overlay_template(workflow_template, target)
+    bootstrap_scenario(scenario_chain, target)
+    overlay_template(workflow_dir / "template", target)
 
 
 def run_trial(
@@ -108,10 +80,13 @@ def run_trial(
 ) -> Path:
     """Run a single trial and write results.  Returns the result directory."""
     workflow_dir = _resolve_workflow(workflow)
-    scenario_dir = _resolve_scenario(scenario)
+    scenario_chain = resolve_inheritance_chain(
+        ScenarioName(scenario), SCENARIOS_DIR,
+    )
+    scenario_dir = scenario_chain[-1].scenario_dir
 
     if task is None:
-        task = _load_prompt(scenario_dir)
+        task = load_effective_prompt(scenario_chain)
 
     if trial_id is None:
         trial_id = _trial_id_now()
@@ -124,7 +99,7 @@ def run_trial(
         shutil.rmtree(work_dir)
     work_dir.mkdir()
 
-    _bootstrap(scenario_dir, workflow_dir, work_dir)
+    _bootstrap(scenario_chain, workflow_dir, work_dir)
 
     workflow_result_file = result_dir / "workflow_result.json"
     eval_result_file = result_dir / "eval_result.json"
