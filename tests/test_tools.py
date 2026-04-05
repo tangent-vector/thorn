@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from thorn._history import DirectoryListCallNode, FileReadCallNode
-from thorn._tools import (
+from thorn.core._history import DirectoryListCallNode, FileReadCallNode
+from thorn.core._tools import (
     EDIT_CONTEXT_LINES,
     MAX_FIND_RESULTS,
     MAX_LIST_ENTRIES,
@@ -845,8 +845,8 @@ class TestRunShell:
 class TestAskUser:
     async def test_raises_without_handler(self):
         """ask_user raises RuntimeError when no handler is configured."""
-        from thorn._context import ExecutionContext, set_context, reset_context
-        from thorn._provider import MockProvider
+        from thorn.core._context import ExecutionContext, set_context, reset_context
+        from thorn.core._provider import MockProvider
 
         ctx = ExecutionContext(provider=MockProvider())
         token = set_context(ctx)
@@ -858,8 +858,8 @@ class TestAskUser:
 
     async def test_delegates_to_handler(self):
         """ask_user delegates to the configured handler."""
-        from thorn._context import ExecutionContext, set_context, reset_context
-        from thorn._provider import MockProvider
+        from thorn.core._context import ExecutionContext, set_context, reset_context
+        from thorn.core._provider import MockProvider
 
         async def fake_handler(question: str) -> str:
             return f"answer to: {question}"

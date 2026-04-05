@@ -12,12 +12,12 @@ from unittest.mock import patch
 
 import pytest
 
-from thorn._agent import Agent
-from thorn._context import ExecutionContext, reset_context, set_context
-from thorn._discovery import _ensure_package, _load_thorn_module
-from thorn._messages import UserMessage
-from thorn._provider import FinishChunk, MockProvider, TextChunk
-from thorn.errors import SkillError
+from thorn.core._agent import Agent
+from thorn.core._context import ExecutionContext, reset_context, set_context
+from thorn.core._discovery import _ensure_package, _load_thorn_module
+from thorn.core._messages import UserMessage
+from thorn.core._provider import FinishChunk, MockProvider, TextChunk
+from thorn.core.errors import SkillError
 
 # ---------------------------------------------------------------------------
 # Load the orchestration module via the same synthetic-package mechanism

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import textwrap
 
-from thorn._outline import (
+from thorn.core._outline import (
     ContentFormat,
     ContentNode,
     OutputSpan,

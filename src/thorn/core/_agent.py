@@ -12,9 +12,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
-    from thorn._context_injection import SeedContent
-    from thorn._file_access import FileAccessRule
-    from thorn._history import HistoryTree
+    from thorn.core._context_injection import SeedContent
+    from thorn.core._file_access import FileAccessRule
+    from thorn.core._history import HistoryTree
 
 
 class _SafeDict(dict):
@@ -58,7 +58,7 @@ class Agent:
             Agent._registry[cls.__name__] = cls
 
     def __init__(self, **kwargs: Any) -> None:
-        from thorn._history import HistoryTree
+        from thorn.core._history import HistoryTree
         self._history: HistoryTree = HistoryTree()
         self._parent: Agent | None = None
         for k, v in kwargs.items():
@@ -104,7 +104,7 @@ class Agent:
         Nested iterables (e.g. toolset constants like ``FILE_READING``)
         are flattened before deduplication.
         """
-        from thorn._func import _flatten_tools
+        from thorn.core._func import _flatten_tools
 
         collected: list[Any] = []
         seen_names: set[str] = set()
@@ -138,7 +138,7 @@ class Agent:
         policy (write within workspace, ``.thorn/`` read-only) is
         returned.
         """
-        from thorn._file_access import FileAccessLevel, FileAccessRule as _FAR  # noqa: F811
+        from thorn.core._file_access import FileAccessLevel, FileAccessRule as _FAR  # noqa: F811
 
         collected: list[_FAR] = []
         found_any = False
@@ -209,7 +209,7 @@ class Agent:
 
 def _default_file_access() -> list[FileAccessRule]:
     """The fallback file-access rules when no class in the MRO defines any."""
-    from thorn._file_access import FileAccessLevel, FileAccessRule
+    from thorn.core._file_access import FileAccessLevel, FileAccessRule
     return [
         FileAccessRule("**", FileAccessLevel.WRITE),
         FileAccessRule(".thorn", FileAccessLevel.READ),
@@ -290,10 +290,10 @@ async def _run_agent_prompt(
     """
     import time
 
-    from thorn._context import get_context, reset_context, set_context
-    from thorn._file_access import FileAccessLevel, FileAccessPolicy
-    from thorn._func import _prepare_tools, _type_label
-    from thorn._loop import run_agent_loop
+    from thorn.core._context import get_context, reset_context, set_context
+    from thorn.core._file_access import FileAccessLevel, FileAccessPolicy
+    from thorn.core._func import _prepare_tools, _type_label
+    from thorn.core._loop import run_agent_loop
 
     sys_prompts = agent._render_system_prompts()
     if extra_system:
@@ -378,7 +378,7 @@ async def _inject_context(
     """
     import logging
 
-    from thorn._context_injection import (
+    from thorn.core._context_injection import (
         assemble_briefing,
         extract_seeds_from_prompt,
         injection_budget,

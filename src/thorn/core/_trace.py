@@ -10,8 +10,8 @@ import json
 from datetime import datetime, timezone
 from typing import IO, Any
 
-from thorn._context import EventSink, Scope
-from thorn._provider import ResponseChunk
+from thorn.core._context import EventSink, Scope
+from thorn.core._provider import ResponseChunk
 
 
 class CompositeEventSink(EventSink):
@@ -96,7 +96,7 @@ class JsonLinesSink(EventSink):
     async def on_response_chunk(
         self, chunk: ResponseChunk, scope: Scope | None = None,
     ) -> None:
-        from thorn._provider import (
+        from thorn.core._provider import (
             FinishChunk, TextChunk, ToolCallChunk, UsageChunk,
         )
 

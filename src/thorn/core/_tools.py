@@ -30,8 +30,8 @@ def _enforce_access(path: str, required_name: str) -> None:
     contexts where no ``ExecutionContext`` is active (e.g. direct
     scripting use of ``read_file``).
     """
-    from thorn._context import get_context
-    from thorn._file_access import FileAccessLevel, check_access
+    from thorn.core._context import get_context
+    from thorn.core._file_access import FileAccessLevel, check_access
 
     try:
         ctx = get_context()
@@ -53,8 +53,8 @@ def _check_read_access(path: str) -> bool:
     Returns ``True`` when no context or policy is active, matching the
     permissive default of ``_enforce_access``.
     """
-    from thorn._context import get_context
-    from thorn._file_access import FileAccessLevel, resolve_for_check
+    from thorn.core._context import get_context
+    from thorn.core._file_access import FileAccessLevel, resolve_for_check
 
     try:
         ctx = get_context()
@@ -146,7 +146,7 @@ async def read_file(
     total_lines = len(all_lines)
 
     if offset == 1 and limit is None and total_lines > OUTLINE_THRESHOLD:
-        from thorn._outline import outline_and_format
+        from thorn.core._outline import outline_and_format
 
         return outline_and_format(
             all_lines,
@@ -341,7 +341,7 @@ async def create_file(path: str, content: str) -> str:
         body = _format_lines(all_lines, 1)
         return f"{header}\n{body}"
 
-    from thorn._outline import outline_and_format
+    from thorn.core._outline import outline_and_format
 
     body = outline_and_format(
         all_lines,
@@ -366,7 +366,7 @@ def _format_file_result(
     if total == 0:
         return "[empty file]"
 
-    from thorn._outline import format_outline, spans_for_regions
+    from thorn.core._outline import format_outline, spans_for_regions
 
     spans = spans_for_regions(
         total, regions, context_lines=EDIT_CONTEXT_LINES,
@@ -443,8 +443,8 @@ def _apply_listing_filter(entries: list[str], path: str) -> list[str]:
 
     Removes HIDDEN entries so they don't appear in listings.
     """
-    from thorn._context import get_context
-    from thorn._file_access import resolve_for_check
+    from thorn.core._context import get_context
+    from thorn.core._file_access import resolve_for_check
 
     try:
         ctx = get_context()
@@ -874,7 +874,7 @@ async def ask_user(question: str) -> str:
     Args:
         question: The question to present to the user.
     """
-    from thorn._context import get_context
+    from thorn.core._context import get_context
 
     ctx = get_context()
     if ctx.ask_user_handler is None:
@@ -888,7 +888,7 @@ async def ask_user(question: str) -> str:
 # Register ToolCallNode subclasses on built-in tools so that
 # HistoryTree records typed nodes, enabling isinstance-based
 # identification (e.g. in context injection).
-from thorn._history import DirectoryListCallNode, FileReadCallNode
+from thorn.core._history import DirectoryListCallNode, FileReadCallNode
 
 read_file._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
 list_directory._thorn_call_node_class = DirectoryListCallNode  # type: ignore[attr-defined]

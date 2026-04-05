@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
 
-from thorn._messages import (
+from thorn.core._messages import (
     AssistantMessage,
     Message,
     ToolCall,

@@ -21,8 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from thorn._loop import _WrappedTool
-from thorn._schema import serialize_for_tool_result
+from thorn.core._loop import _WrappedTool
+from thorn.core._schema import serialize_for_tool_result
 
 logger = logging.getLogger(__name__)
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from thorn._validation_tracker import (
+from thorn.core._validation_tracker import (
     FileSnapshot,
     ValidationStatus,
     ValidationTracker,

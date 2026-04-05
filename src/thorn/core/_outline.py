@@ -505,7 +505,7 @@ def outline_and_format(
     """
     fmt = detect_content_format(file_path)
     if fmt is ContentFormat.MARKDOWN:
-        from thorn._outline_markdown import build_markdown_hierarchy
+        from thorn.core._outline_markdown import build_markdown_hierarchy
 
         root = build_markdown_hierarchy(lines)
     else:

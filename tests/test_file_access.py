@@ -6,9 +6,9 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from thorn._agent import Agent, _default_file_access
-from thorn._context import ExecutionContext, reset_context, set_context
-from thorn._file_access import (
+from thorn.core._agent import Agent, _default_file_access
+from thorn.core._context import ExecutionContext, reset_context, set_context
+from thorn.core._file_access import (
     FileAccessLevel,
     FileAccessPolicy,
     FileAccessRule,
@@ -17,7 +17,7 @@ from thorn._file_access import (
     load_ignore_file,
     resolve_for_check,
 )
-from thorn._provider import MockProvider
+from thorn.core._provider import MockProvider
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +310,7 @@ class TestMROFileAccess:
 
 class TestToolEnforcement:
     async def test_read_file_denied(self, tmp_path):
-        from thorn._tools import read_file
+        from thorn.core._tools import read_file
 
         p = tmp_path / "secret.txt"
         p.write_text("secret data", encoding="utf-8")
@@ -331,7 +331,7 @@ class TestToolEnforcement:
             reset_context(token)
 
     async def test_write_file_denied(self, tmp_path):
-        from thorn._tools import write_file
+        from thorn.core._tools import write_file
 
         policy = FileAccessPolicy(
             [FileAccessRule("**", FileAccessLevel.READ)],
@@ -349,7 +349,7 @@ class TestToolEnforcement:
             reset_context(token)
 
     async def test_write_file_allowed(self, tmp_path):
-        from thorn._tools import write_file
+        from thorn.core._tools import write_file
 
         policy = FileAccessPolicy(
             [FileAccessRule("**", FileAccessLevel.WRITE)],
@@ -368,7 +368,7 @@ class TestToolEnforcement:
             reset_context(token)
 
     async def test_edit_file_denied(self, tmp_path):
-        from thorn._tools import FileEdit, edit_file
+        from thorn.core._tools import FileEdit, edit_file
 
         p = tmp_path / "file.txt"
         p.write_text("hello", encoding="utf-8")
@@ -391,7 +391,7 @@ class TestToolEnforcement:
             reset_context(token)
 
     async def test_edit_file_allowed(self, tmp_path):
-        from thorn._tools import FileEdit, edit_file
+        from thorn.core._tools import FileEdit, edit_file
 
         p = tmp_path / "file.txt"
         p.write_text("hello", encoding="utf-8")
@@ -415,7 +415,7 @@ class TestToolEnforcement:
             reset_context(token)
 
     async def test_create_file_denied(self, tmp_path):
-        from thorn._tools import create_file
+        from thorn.core._tools import create_file
 
         policy = FileAccessPolicy(
             [FileAccessRule("**", FileAccessLevel.READ)],
@@ -433,7 +433,7 @@ class TestToolEnforcement:
             reset_context(token)
 
     async def test_create_file_allowed(self, tmp_path):
-        from thorn._tools import create_file
+        from thorn.core._tools import create_file
 
         policy = FileAccessPolicy(
             [FileAccessRule("**", FileAccessLevel.WRITE)],
@@ -452,7 +452,7 @@ class TestToolEnforcement:
             reset_context(token)
 
     async def test_list_directory_filters_hidden(self, tmp_path):
-        from thorn._tools import list_directory
+        from thorn.core._tools import list_directory
 
         (tmp_path / "visible.txt").touch()
         (tmp_path / ".thorn").mkdir()
@@ -478,7 +478,7 @@ class TestToolEnforcement:
 
     async def test_no_policy_allows_all(self, tmp_path):
         """When no policy is set, tools should work without restriction."""
-        from thorn._tools import read_file
+        from thorn.core._tools import read_file
 
         p = tmp_path / "open.txt"
         p.write_text("open data", encoding="utf-8")
@@ -492,7 +492,7 @@ class TestToolEnforcement:
             reset_context(token)
 
     async def test_search_files_denied_single_file(self, tmp_path):
-        from thorn._tools import search_files
+        from thorn.core._tools import search_files
 
         p = tmp_path / "secret.txt"
         p.write_text("needle in secret", encoding="utf-8")
@@ -514,7 +514,7 @@ class TestToolEnforcement:
 
     async def test_search_files_hidden_excluded(self, tmp_path):
         """HIDDEN files must not appear in directory search results."""
-        from thorn._tools import search_files
+        from thorn.core._tools import search_files
 
         (tmp_path / "visible.txt").write_text("needle\n", encoding="utf-8")
         (tmp_path / "secret.txt").write_text("needle\n", encoding="utf-8")
@@ -538,7 +538,7 @@ class TestToolEnforcement:
 
     async def test_search_files_none_excluded(self, tmp_path):
         """Files with NONE access must not leak content in search results."""
-        from thorn._tools import search_files
+        from thorn.core._tools import search_files
 
         (tmp_path / "public.txt").write_text("needle\n", encoding="utf-8")
         (tmp_path / "private.txt").write_text("needle\n", encoding="utf-8")
@@ -613,12 +613,12 @@ class TestGlobalIgnores:
 
 class TestRunShellRemoval:
     def test_not_in_all_builtin_tools(self):
-        from thorn._tools import ALL_BUILTIN_TOOLS
+        from thorn.core._tools import ALL_BUILTIN_TOOLS
 
         names = [getattr(t, "__name__", str(t)) for t in ALL_BUILTIN_TOOLS]
         assert "run_shell" not in names
 
     def test_still_importable(self):
-        from thorn._tools import run_shell
+        from thorn.core._tools import run_shell
 
         assert callable(run_shell)

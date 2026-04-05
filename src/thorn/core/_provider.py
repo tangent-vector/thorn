@@ -17,14 +17,14 @@ from typing import Any
 
 import httpx
 
-from thorn._messages import (
+from thorn.core._messages import (
     AssistantMessage,
     Message,
     ToolCall,
     ToolResultMessage,
     UserMessage,
 )
-from thorn.errors import ProviderError, RateLimitError
+from thorn.core.errors import ProviderError, RateLimitError
 
 logger = logging.getLogger(__name__)
 

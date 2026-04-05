@@ -7,13 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from thorn._discovery import (
+from thorn.core._discovery import (
     discover_tools,
     find_thorn_dirs,
     load_module_tools,
     load_workspace_instructions,
 )
-from thorn._func import tool
+from thorn.core._func import tool
 
 
 # ---------------------------------------------------------------------------

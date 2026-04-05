@@ -6,10 +6,10 @@ import pytest
 
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
-from thorn._func import _prepare_tools, prompt, skill, tool, wrap_function
-from thorn._history import DirectoryListCallNode, FileReadCallNode, ToolCallNode
-from thorn._loop import _WrappedTool
-from thorn._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
+from thorn.core._func import _prepare_tools, prompt, skill, tool, wrap_function
+from thorn.core._history import DirectoryListCallNode, FileReadCallNode, ToolCallNode
+from thorn.core._loop import _WrappedTool
+from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
 
 
 @pydantic_dataclass
@@ -309,7 +309,7 @@ class TestPromptStructuredMode:
             ToolCallChunk(call_id="c1", name="return_result", arguments='{"value": false}'),
             FinishChunk(reason="stop"),
         ]])
-        from thorn._context import ExecutionContext, set_context, reset_context
+        from thorn.core._context import ExecutionContext, set_context, reset_context
         ctx = ExecutionContext(provider=provider)
         token = set_context(ctx)
         try:
@@ -326,7 +326,7 @@ class TestPromptStructuredMode:
             ),
             FinishChunk(reason="stop"),
         ]])
-        from thorn._context import ExecutionContext, set_context, reset_context
+        from thorn.core._context import ExecutionContext, set_context, reset_context
         ctx = ExecutionContext(provider=provider)
         token = set_context(ctx)
         try:
@@ -348,7 +348,7 @@ class TestSkillDecorator:
             """Say hello to {name}."""
 
         provider = MockProvider()
-        from thorn._context import ExecutionContext, set_context, reset_context
+        from thorn.core._context import ExecutionContext, set_context, reset_context
         ctx = ExecutionContext(provider=provider)
         token = set_context(ctx)
         try:
@@ -370,7 +370,7 @@ class TestSkillDecorator:
             ),
             FinishChunk(reason="stop"),
         ]])
-        from thorn._context import ExecutionContext, set_context, reset_context
+        from thorn.core._context import ExecutionContext, set_context, reset_context
         ctx = ExecutionContext(provider=provider)
         token = set_context(ctx)
         try:
@@ -390,7 +390,7 @@ class TestSkillDecorator:
             """Compute something with {n}."""
 
         provider = MockProvider()
-        from thorn._context import ExecutionContext, set_context, reset_context
+        from thorn.core._context import ExecutionContext, set_context, reset_context
         ctx = ExecutionContext(provider=provider)
         token = set_context(ctx)
         try:
@@ -421,7 +421,7 @@ class TestSkillDecorator:
 
 class TestPromptWithRole:
     async def test_text_mode_with_role_class(self, ctx):
-        from thorn._agent import Agent
+        from thorn.core._agent import Agent
 
         class Helper(Agent):
             system_prompts = ["You are helpful."]
@@ -430,7 +430,7 @@ class TestPromptWithRole:
         assert isinstance(result, str)
 
     async def test_text_mode_with_role_instance(self, ctx):
-        from thorn._agent import Agent
+        from thorn.core._agent import Agent
 
         class Helper(Agent):
             system_prompts = ["Working on {module}."]
@@ -440,8 +440,8 @@ class TestPromptWithRole:
         assert isinstance(result, str)
 
     async def test_structured_mode_with_role(self):
-        from thorn._agent import Agent
-        from thorn._context import ExecutionContext, set_context, reset_context
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext, set_context, reset_context
 
         class Helper(Agent):
             system_prompts = ["You count things."]
@@ -462,7 +462,7 @@ class TestPromptWithRole:
             reset_context(token)
 
     async def test_role_with_extra_tools(self, ctx):
-        from thorn._agent import Agent
+        from thorn.core._agent import Agent
 
         async def extra() -> str:
             """Extra tool."""
@@ -475,7 +475,7 @@ class TestPromptWithRole:
         assert isinstance(result, str)
 
     async def test_role_with_extra_system(self, ctx):
-        from thorn._agent import Agent
+        from thorn.core._agent import Agent
 
         class Helper(Agent):
             system_prompts = ["Base prompt."]

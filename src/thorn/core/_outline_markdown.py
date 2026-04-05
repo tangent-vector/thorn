@@ -21,7 +21,7 @@ from mistletoe.block_token import (
 )
 from mistletoe.block_token import List as MdList
 
-from thorn._outline import ContentNode
+from thorn.core._outline import ContentNode
 
 _HEADING_TYPES: tuple[type, ...] = (MdHeading, MdSetextHeading)
 

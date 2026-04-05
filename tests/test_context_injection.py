@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from thorn._agent import Agent
-from thorn._context import ExecutionContext, reset_context, set_context
-from thorn._context_injection import (
+from thorn.core._agent import Agent
+from thorn.core._context import ExecutionContext, reset_context, set_context
+from thorn.core._context_injection import (
     BRIEFING_ASSISTANT_CONTENT,
     INJECTION_BUDGET_FRACTION,
     LOW_INJECTION_SALIENCE,
@@ -24,7 +24,7 @@ from thorn._context_injection import (
     merge_sources,
     normalize_scores,
 )
-from thorn._history import (
+from thorn.core._history import (
     CollapseState,
     DirectoryListCallNode,
     FileReadCallNode,
@@ -33,12 +33,12 @@ from thorn._history import (
     TurnNode,
     UserPromptNode,
 )
-from thorn._messages import (
+from thorn.core._messages import (
     AssistantMessage,
     ToolCall,
     ToolResultMessage,
 )
-from thorn._provider import MockProvider
+from thorn.core._provider import MockProvider
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +430,7 @@ class TestExtractSalientItemsFromHistory:
             def extract_salient_items_from_history(
                 self, history: HistoryTree,
             ) -> dict:
-                from thorn._context_injection import DirectorySeed, FileSeed
+                from thorn.core._context_injection import DirectorySeed, FileSeed
 
                 seeds: dict = {}
                 turn_nodes = [
@@ -585,7 +585,7 @@ class TestInjectionTrigger:
 
         class SeedAgent(Agent):
             def context_seed_items(self):
-                from thorn._context_injection import FileSeed
+                from thorn.core._context_injection import FileSeed
                 return {FileSeed(path=str(test_file)): 1.0}
 
         provider = MockProvider()
@@ -620,7 +620,7 @@ class TestInjectionTrigger:
             def context_seed_items(self):
                 nonlocal call_count
                 call_count += 1
-                from thorn._context_injection import FileSeed
+                from thorn.core._context_injection import FileSeed
                 return {FileSeed(path=str(test_file)): 1.0}
 
         provider = MockProvider()
@@ -650,7 +650,7 @@ class TestInjectionTrigger:
 
         class TrackingAgent(Agent):
             def context_seed_items(self):
-                from thorn._context_injection import FileSeed
+                from thorn.core._context_injection import FileSeed
                 return {FileSeed(path=str(test_file)): 1.0}
 
             def extract_salient_items_from_history(self, history):
@@ -687,7 +687,7 @@ class TestInjectionTrigger:
 
         class SeedAgent(Agent):
             def context_seed_items(self):
-                from thorn._context_injection import FileSeed
+                from thorn.core._context_injection import FileSeed
                 return {FileSeed(path=str(test_file)): 1.0}
 
         provider = MockProvider()

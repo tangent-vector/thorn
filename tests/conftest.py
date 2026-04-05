@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from thorn._context import ExecutionContext, reset_context, set_context
-from thorn._provider import MockProvider
+from thorn.core._context import ExecutionContext, reset_context, set_context
+from thorn.core._provider import MockProvider
 
 
 @pytest.fixture

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from thorn._retry import bound_retries
-from thorn.errors import LoopLimitError
+from thorn.core._retry import bound_retries
+from thorn.core.errors import LoopLimitError
 
 
 class TestBoundRetries:

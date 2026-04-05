@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Callable, Coroutine, TypeVar
 
-from thorn._context import (
+from thorn.core import (
     AskUserHandler,
     ConsoleEventSink,
     EventSink,
@@ -38,21 +38,32 @@ from thorn._context import (
     Verbosity,
     get_context,
     set_context,
-)
-from thorn._agent import Agent
-from thorn._context_injection import DirectorySeed, FileSeed, SearchSeed, SeedContent
-from thorn._discovery import discover_tools
-from thorn._history import CollapseState, CompactionResult, HistoryTree
-from thorn._module import ModulePath
-from thorn._validation import ValidationRule
-from thorn._validation_tracker import ValidationStatus, ValidationTracker
-from thorn._file_access import FileAccessLevel, FileAccessPolicy, FileAccessRule
-from thorn._func import prompt, skill, tool, wrap_function
-from thorn._retry import bound_retries
-from thorn._loop import _WrappedTool
-from thorn._provider import LLMProvider, MockProvider, UsageChunk, load_provider_from_env
-from thorn import tools
-from thorn._tools import (
+    Agent,
+    DirectorySeed,
+    FileSeed,
+    SearchSeed,
+    SeedContent,
+    discover_tools,
+    CollapseState,
+    CompactionResult,
+    HistoryTree,
+    ModulePath,
+    ValidationRule,
+    ValidationStatus,
+    ValidationTracker,
+    FileAccessLevel,
+    FileAccessPolicy,
+    FileAccessRule,
+    prompt,
+    skill,
+    tool,
+    wrap_function,
+    bound_retries,
+    _WrappedTool,
+    LLMProvider,
+    MockProvider,
+    UsageChunk,
+    load_provider_from_env,
     ALL_BUILTIN_TOOLS,
     FILE_READING,
     FILE_WRITING,
@@ -67,20 +78,20 @@ from thorn._tools import (
     read_file,
     search_files,
     write_file,
-)
-from thorn.errors import (
     AgentFailureError,
     LoopLimitError,
     ProviderError,
     RateLimitError,
     SkillError,
     ThornError,
+    CompositeEventSink,
+    JsonLinesSink,
 )
 
-from thorn._trace import CompositeEventSink, JsonLinesSink
+from thorn import tools
 
 try:
-    from thorn._mcp import MCPServerConfig, MCPToolSource, load_mcp_configs, serve_tools
+    from thorn.core import MCPServerConfig, MCPToolSource, load_mcp_configs, serve_tools
 except ImportError:
     pass
 
@@ -203,8 +214,9 @@ def run(
     """
     from pathlib import Path
 
-    from thorn._discovery import load_workspace_instructions
-    from thorn._file_access import load_global_ignores
+    from thorn.core._discovery import load_workspace_instructions
+    from thorn.core._file_access import load_global_ignores
+    from thorn.core._context import reset_context
 
     if provider is None:
         provider = load_provider_from_env()
@@ -237,13 +249,12 @@ def run(
         try:
             return await coro
         finally:
-            from thorn._context import reset_context
             reset_context(token)
 
     return asyncio.run(_run_with_context())
 
 
-def infer_workspace_root() -> Path:
+def infer_workspace_root() -> "Path":
     """Determine the workspace root using the .thorn/ heuristic.
 
     Precedence:
@@ -252,7 +263,7 @@ def infer_workspace_root() -> Path:
     """
     from pathlib import Path
 
-    from thorn._discovery import find_thorn_dirs
+    from thorn.core._discovery import find_thorn_dirs
 
     thorn_dirs = find_thorn_dirs()
     if thorn_dirs:

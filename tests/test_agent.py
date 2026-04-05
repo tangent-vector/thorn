@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from thorn._agent import Agent, _SafeDict
-from thorn._context import (
+from thorn.core._agent import Agent, _SafeDict
+from thorn.core._context import (
     ExecutionContext,
     get_context,
     reset_context,
     set_context,
 )
-from thorn._func import skill
-from thorn._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
+from thorn.core._func import skill
+from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
 
 
 # ---------------------------------------------------------------------------

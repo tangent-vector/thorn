@@ -13,20 +13,20 @@ from typing import Any
 import click
 from rich.console import Console
 
-from thorn._context import (
+from thorn.core._context import (
     ConsoleEventSink,
     ExecutionContext,
     Verbosity,
     set_context,
     reset_context,
 )
-from thorn._agent import Agent
-from thorn._discovery import discover_tools, find_thorn_dirs
-from thorn._func import _prepare_tools, prompt
-from thorn._loop import run_agent_loop, _WrappedTool
-from thorn._provider import load_provider_from_env
-from thorn._tools import ALL_BUILTIN_TOOLS
-from thorn.errors import SkillError, ThornError
+from thorn.core._agent import Agent
+from thorn.core._discovery import discover_tools, find_thorn_dirs
+from thorn.core._func import _prepare_tools, prompt
+from thorn.core._loop import run_agent_loop, _WrappedTool
+from thorn.core._provider import load_provider_from_env
+from thorn.core._tools import ALL_BUILTIN_TOOLS
+from thorn.core.errors import SkillError, ThornError
 
 console = Console()
 
@@ -67,15 +67,15 @@ def _build_context(
     from pathlib import Path
 
     from thorn import infer_workspace_root
-    from thorn._context import EventSink
-    from thorn._discovery import load_workspace_instructions
-    from thorn._file_access import load_global_ignores
+    from thorn.core._context import EventSink
+    from thorn.core._discovery import load_workspace_instructions
+    from thorn.core._file_access import load_global_ignores
 
     provider = load_provider_from_env()
     console_sink: EventSink = ConsoleEventSink(verbosity=verbosity)
 
     if trace_file is not None:
-        from thorn._trace import CompositeEventSink, JsonLinesSink
+        from thorn.core._trace import CompositeEventSink, JsonLinesSink
         sink: EventSink = CompositeEventSink([
             console_sink, JsonLinesSink(trace_file),
         ])
@@ -128,7 +128,7 @@ async def _collect_all_tools(
 
     if not no_mcp:
         try:
-            from thorn._mcp import MCPToolSource, load_mcp_configs
+            from thorn.core._mcp import MCPToolSource, load_mcp_configs
 
             configs = load_mcp_configs(thorn_dirs)
             if configs:
@@ -410,9 +410,9 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
     console.print("[bold]thorn[/bold] interactive chat  (Ctrl+C to exit)\n")
 
     async def _chat() -> None:
-        from thorn._messages import UserMessage, AssistantMessage, ToolResultMessage
-        from thorn._loop import _request_completion, _execute_tool_calls, _RESULT_SENTINEL
-        from thorn._provider import TextChunk, ToolCallChunk, FinishChunk
+        from thorn.core._messages import UserMessage, AssistantMessage, ToolResultMessage
+        from thorn.core._loop import _request_completion, _execute_tool_calls, _RESULT_SENTINEL
+        from thorn.core._provider import TextChunk, ToolCallChunk, FinishChunk
 
         token = set_context(ctx)
         try:
@@ -529,7 +529,7 @@ def serve(
 ) -> None:
     """Start an MCP server exposing thorn tools and skills."""
     try:
-        from thorn._mcp import serve_tools
+        from thorn.core._mcp import serve_tools
     except ImportError:
         console.print(
             "[red]Error:[/red] MCP support requires the 'mcp' package. "

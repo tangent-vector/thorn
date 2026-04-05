@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
-from thorn._schema import (
+from thorn.core._schema import (
     func_to_tool_schema,
     make_return_result_schema,
     serialize_for_tool_result,

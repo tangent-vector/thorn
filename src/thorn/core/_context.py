@@ -14,13 +14,13 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
-from thorn._provider import LLMProvider, ResponseChunk
+from thorn.core._provider import LLMProvider, ResponseChunk
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from thorn._file_access import FileAccessPolicy
-    from thorn._validation_tracker import ValidationTracker
+    from thorn.core._file_access import FileAccessPolicy
+    from thorn.core._validation_tracker import ValidationTracker
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +284,7 @@ class ConsoleEventSink(EventSink):
         chunk: ResponseChunk,
         scope: Scope | None = None,
     ) -> None:
-        from thorn._provider import TextChunk, ToolCallChunk, FinishChunk
+        from thorn.core._provider import TextChunk, ToolCallChunk, FinishChunk
 
         match chunk:
             case TextChunk():

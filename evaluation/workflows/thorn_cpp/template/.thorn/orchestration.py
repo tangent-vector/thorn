@@ -21,7 +21,7 @@ import logging
 from typing import Any, Callable
 
 from thorn import Agent, get_context, tool
-from thorn._validation_tracker import ValidationTracker
+from thorn.core._validation_tracker import ValidationTracker
 from thorn.errors import SkillError
 
 from .build_tools import PROJECT_DIR, build, run_tests

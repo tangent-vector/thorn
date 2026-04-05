@@ -8,13 +8,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from thorn._messages import (
+from thorn.core._messages import (
     AssistantMessage,
     ToolCall,
     ToolResultMessage,
     UserMessage,
 )
-from thorn._provider import (
+from thorn.core._provider import (
     FinishChunk,
     MockProvider,
     TextChunk,
@@ -23,7 +23,7 @@ from thorn._provider import (
     _message_to_openai,
     load_provider_from_env,
 )
-from thorn.errors import ProviderError
+from thorn.core.errors import ProviderError
 
 
 # ---------------------------------------------------------------------------

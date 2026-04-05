@@ -18,29 +18,29 @@ import random
 import time
 from typing import Any
 
-from thorn._context import ExecutionContext, Scope
-from thorn._history import (
+from thorn.core._context import ExecutionContext, Scope
+from thorn.core._history import (
     DEFAULT_HIGH_WATERMARK,
     DEFAULT_LOW_WATERMARK,
     HistoryTree,
     ToolCallNode,
     estimate_tokens,
 )
-from thorn._messages import (
+from thorn.core._messages import (
     AssistantMessage,
     Message,
     ToolCall,
     ToolResultMessage,
     UserMessage,
 )
-from thorn._provider import FinishChunk, TextChunk, ToolCallChunk, UsageChunk
-from thorn._schema import (
+from thorn.core._provider import FinishChunk, TextChunk, ToolCallChunk, UsageChunk
+from thorn.core._schema import (
     RAISE_ERROR_SCHEMA,
     make_return_result_schema,
     serialize_for_tool_result,
     validate_result,
 )
-from thorn.errors import (
+from thorn.core.errors import (
     AgentFailureError,
     LoopLimitError,
     ProviderError,

@@ -19,8 +19,8 @@ from thorn import Agent, FileAccessLevel, FileAccessRule, create_file, edit_file
 from thorn.tools import FILE_READING
 
 if TYPE_CHECKING:
-    from thorn._context_injection import SeedContent
-    from thorn._history import HistoryTree
+    from thorn.core._context_injection import SeedContent
+    from thorn.core._history import HistoryTree
 
 from .build_tools import build, run_tests
 from .module_tools import (
@@ -252,7 +252,7 @@ Guidelines:
         return rules
 
     def context_seed_items(self) -> dict[SeedContent, float]:
-        from thorn._context_injection import DirectorySeed, FileSeed
+        from thorn.core._context_injection import DirectorySeed, FileSeed
 
         seeds: dict[SeedContent, float] = {}
 
@@ -280,8 +280,8 @@ Guidelines:
         self,
         history: HistoryTree,
     ) -> dict[SeedContent, float]:
-        from thorn._context_injection import DirectorySeed, FileSeed
-        from thorn._history import (
+        from thorn.core._context_injection import DirectorySeed, FileSeed
+        from thorn.core._history import (
             CollapseState,
             DirectoryListCallNode,
             FileReadCallNode,

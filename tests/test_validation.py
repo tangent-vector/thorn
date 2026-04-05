@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from thorn._validation import ValidationRule
+from thorn.core._validation import ValidationRule
 
 
 @pytest.fixture(autouse=True)

@@ -24,13 +24,13 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from thorn._history import (
+from thorn.core._history import (
     DirectoryListCallNode,
     FileReadCallNode,
     ToolCallNode,
     TurnNode,
 )
-from thorn._messages import (
+from thorn.core._messages import (
     ToolCall,
     ToolResultMessage,
 )
@@ -300,7 +300,7 @@ async def _source_seed_item(
     ``isinstance``-based identification) or ``None`` if the tool call
     failed.
     """
-    from thorn._tools import list_directory, read_file, search_files
+    from thorn.core._tools import list_directory, read_file, search_files
 
     try:
         if isinstance(seed, FileSeed):

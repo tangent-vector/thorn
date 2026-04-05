@@ -22,11 +22,11 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar, get_type_hints, overload
 
 if TYPE_CHECKING:
-    from thorn._history import ToolCallNode
+    from thorn.core._history import ToolCallNode
 
-from thorn._context import ExecutionContext, get_context, reset_context, set_context
-from thorn._loop import _WrappedTool, run_agent_loop
-from thorn._schema import func_to_tool_schema, serialize_for_tool_result
+from thorn.core._context import ExecutionContext, get_context, reset_context, set_context
+from thorn.core._loop import _WrappedTool, run_agent_loop
+from thorn.core._schema import func_to_tool_schema, serialize_for_tool_result
 
 T = TypeVar("T")
 
@@ -148,8 +148,8 @@ def _push_bare_prompt_scope(
     ``.thorn/`` read-only) so that bare ``prompt()`` calls don't get
     more permissions than an explicit ``Agent()``.
     """
-    from thorn._agent import Agent
-    from thorn._file_access import FileAccessLevel, FileAccessPolicy
+    from thorn.core._agent import Agent
+    from thorn.core._file_access import FileAccessLevel, FileAccessPolicy
 
     rules = list(Agent._collect_file_access())
     if extra_file_access:
@@ -184,7 +184,7 @@ class _TypedPrompt:
         file_access: list[Any] | None = None,
     ) -> Any:
         if role is not None:
-            from thorn._agent import Agent, _run_agent_prompt
+            from thorn.core._agent import Agent, _run_agent_prompt
             agent = role() if isinstance(role, type) else role
             return await _run_agent_prompt(
                 agent=agent,
@@ -247,7 +247,7 @@ class _PromptAccessor:
     ) -> str:
         """Execute a prompt and return the assistant's text response."""
         if role is not None:
-            from thorn._agent import Agent, _run_agent_prompt
+            from thorn.core._agent import Agent, _run_agent_prompt
             agent = role() if isinstance(role, type) else role
             return await _run_agent_prompt(
                 agent=agent,

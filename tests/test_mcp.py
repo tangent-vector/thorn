@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from thorn._mcp import (
+from thorn.core._mcp import (
     MCPServerConfig,
     _mcp_result_to_string,
     _mcp_tool_to_openai_schema,

@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import pytest
 
-from thorn._agent import Agent
-from thorn._context import ExecutionContext, get_context, reset_context, set_context
-from thorn._func import wrap_function
-from thorn._history import HistoryTree, TurnNode, UserPromptNode
-from thorn._loop import run_agent_loop
-from thorn._messages import AssistantMessage, Message, ToolResultMessage, UserMessage
-from thorn._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
+from thorn.core._agent import Agent
+from thorn.core._context import ExecutionContext, get_context, reset_context, set_context
+from thorn.core._func import wrap_function
+from thorn.core._history import HistoryTree, TurnNode, UserPromptNode
+from thorn.core._loop import run_agent_loop
+from thorn.core._messages import AssistantMessage, Message, ToolResultMessage, UserMessage
+from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
 
 
 def _text_response(text: str):

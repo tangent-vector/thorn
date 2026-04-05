@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from thorn._context import (
+from thorn.core._context import (
     ExecutionContext,
     NullEventSink,
     Scope,
@@ -12,7 +12,7 @@ from thorn._context import (
     reset_context,
     set_context,
 )
-from thorn._provider import MockProvider
+from thorn.core._provider import MockProvider
 
 
 # ---------------------------------------------------------------------------

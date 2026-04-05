@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from thorn._context import ExecutionContext
-from thorn._func import wrap_function
-from thorn._loop import _WrappedTool, _normalize_tool_name, run_agent_loop
-from thorn._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
-from thorn._validation_tracker import ValidationTracker
-from thorn.errors import LoopLimitError, SkillError
+from thorn.core._context import ExecutionContext
+from thorn.core._func import wrap_function
+from thorn.core._loop import _WrappedTool, _normalize_tool_name, run_agent_loop
+from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
+from thorn.core._validation_tracker import ValidationTracker
+from thorn.core.errors import LoopLimitError, SkillError
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +242,7 @@ class TestValidationFooter:
     async def test_status_footer_appended_to_last_tool_result(self, tmp_path):
         """When a ValidationTracker is attached and has status to show,
         the status line is appended to the last tool result."""
-        from thorn._history import HistoryTree
+        from thorn.core._history import HistoryTree
 
         (tmp_path / "a.cpp").write_text("code")
 
@@ -273,7 +273,7 @@ class TestValidationFooter:
 
     async def test_no_footer_without_tracker(self):
         """Without a tracker, tool results are unmodified."""
-        from thorn._history import HistoryTree
+        from thorn.core._history import HistoryTree
 
         async def greet(name: str) -> str:
             """Say hello."""
@@ -299,7 +299,7 @@ class TestValidationFooter:
 
     async def test_footer_reflects_passing_after_record(self, tmp_path):
         """After recording a passing result, the footer shows passing."""
-        from thorn._history import HistoryTree
+        from thorn.core._history import HistoryTree
 
         (tmp_path / "a.cpp").write_text("code")
 
@@ -332,7 +332,7 @@ class TestValidationFooter:
     async def test_footer_only_on_last_result_in_round(self, tmp_path):
         """When the LLM issues multiple tool calls in one round, only
         the last tool result gets the footer."""
-        from thorn._history import HistoryTree
+        from thorn.core._history import HistoryTree
 
         (tmp_path / "a.cpp").write_text("code")
 

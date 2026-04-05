@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from thorn._context import ExecutionContext, set_context, reset_context
-from thorn._history import (
+from thorn.core._context import ExecutionContext, set_context, reset_context
+from thorn.core._history import (
     ABBREVIATED_ARG_VALUE_MAX_LEN,
     CHARS_PER_TOKEN,
     DEFAULT_HIGH_WATERMARK,
@@ -27,22 +27,22 @@ from thorn._history import (
     _truncate_content,
     estimate_tokens,
 )
-from thorn._loop import run_agent_loop
-from thorn._messages import (
+from thorn.core._loop import run_agent_loop
+from thorn.core._messages import (
     AssistantMessage,
     Message,
     ToolCall,
     ToolResultMessage,
     UserMessage,
 )
-from thorn._provider import (
+from thorn.core._provider import (
     FinishChunk,
     MockProvider,
     TextChunk,
     ToolCallChunk,
     UsageChunk,
 )
-from thorn._func import wrap_function
+from thorn.core._func import wrap_function
 
 
 # ---------------------------------------------------------------------------
@@ -836,7 +836,7 @@ class TestCompactionIntegration:
         """When prompt_tokens exceed the high watermark, compaction runs."""
         status_messages: list[str] = []
 
-        from thorn._context import EventSink, Scope, NullEventSink
+        from thorn.core._context import EventSink, Scope, NullEventSink
 
         class CaptureSink(NullEventSink):
             async def on_status(self, message, scope=None):
@@ -893,7 +893,7 @@ class TestCompactionIntegration:
         """When context_window is None, compaction never triggers."""
         status_messages: list[str] = []
 
-        from thorn._context import NullEventSink
+        from thorn.core._context import NullEventSink
 
         class CaptureSink(NullEventSink):
             async def on_status(self, message, scope=None):
@@ -922,11 +922,11 @@ class TestCompactionIntegration:
 
     async def test_agent_compaction_with_context_window(self):
         """Agent.prompt() triggers compaction when context_window is set."""
-        from thorn._agent import Agent
+        from thorn.core._agent import Agent
 
         status_messages: list[str] = []
 
-        from thorn._context import NullEventSink
+        from thorn.core._context import NullEventSink
 
         class CaptureSink(NullEventSink):
             async def on_status(self, message, scope=None):

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import textwrap
 
-from thorn._outline import (
+from thorn.core._outline import (
     ContentNode,
     compute_collapse,
     format_outline,
     outline_and_format,
 )
-from thorn._outline_markdown import build_markdown_hierarchy
+from thorn.core._outline_markdown import build_markdown_hierarchy
 
 
 def _lines(text: str) -> list[str]:

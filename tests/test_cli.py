@@ -8,7 +8,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from thorn._cli import main as cli_main
-from thorn._provider import (
+from thorn.core._provider import (
     FinishChunk,
     MockProvider,
     TextChunk,

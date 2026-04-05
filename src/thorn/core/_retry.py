@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from thorn.errors import LoopLimitError
+from thorn.core.errors import LoopLimitError
 
 
 def bound_retries(max_attempts: int = 3) -> Iterator[int]:

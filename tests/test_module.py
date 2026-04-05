@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from thorn._module import ModulePath
+from thorn.core._module import ModulePath
 
 
 class TestConstruction:
