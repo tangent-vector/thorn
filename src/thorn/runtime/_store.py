@@ -1,6 +1,6 @@
 """Filesystem-backed session store.
 
-The ``SessionStore`` manages a directory of persisted sessions, one
+The ``SessionStore`` manages a directory of persisted agents, one
 subdirectory per session key.  Serialization is delegated to a
 pluggable ``SessionSerializer`` (defaulting to ``JsonSessionSerializer``).
 
@@ -19,14 +19,15 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+from thorn.core._agent import Agent
 from thorn.runtime._serializer import JsonSessionSerializer, SessionSerializer
-from thorn.runtime._session import Session, SessionKey
+from thorn.runtime._session import SessionKey
 
 
 class SessionStore:
     """Filesystem-backed store for agent sessions.
 
-    Each session is persisted in its own subdirectory under *root*,
+    Each agent is persisted in its own subdirectory under *root*,
     named after its ``SessionKey``.
     """
 
@@ -45,16 +46,21 @@ class SessionStore:
     def _session_dir(self, key: SessionKey) -> Path:
         return self._root / str(key)
 
-    def save(self, session: Session) -> None:
-        """Persist *session* to disk, creating directories as needed."""
-        directory = self._session_dir(session.key)
+    def save(self, agent: Agent) -> None:
+        """Persist *agent* to disk, creating directories as needed.
+
+        The agent must have a non-None ``key``.
+        """
+        if agent.key is None:
+            raise ValueError("Cannot save an agent without a key")
+        directory = self._session_dir(agent.key)
         directory.mkdir(parents=True, exist_ok=True)
-        self._serializer.save(session, directory)
+        self._serializer.save(agent, directory)
 
-    def load(self, key: SessionKey | str) -> Session:
-        """Load a previously persisted session.
+    def load(self, key: SessionKey | str) -> Agent:
+        """Load a previously persisted agent.
 
-        Raises ``KeyError`` if no session with the given key exists.
+        Raises ``KeyError`` if no agent with the given key exists.
         """
         if not isinstance(key, SessionKey):
             key = SessionKey(key)
@@ -64,7 +70,7 @@ class SessionStore:
         return self._serializer.load(directory)
 
     def exists(self, key: SessionKey | str) -> bool:
-        """Check whether a session with the given key has been persisted."""
+        """Check whether an agent with the given key has been persisted."""
         if not isinstance(key, SessionKey):
             key = SessionKey(key)
         return self._session_dir(key).is_dir()
@@ -80,7 +86,7 @@ class SessionStore:
         )
 
     def delete(self, key: SessionKey | str) -> None:
-        """Remove a persisted session and its directory.
+        """Remove a persisted agent and its directory.
 
         No-op if the session does not exist.
         """

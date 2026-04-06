@@ -1,4 +1,4 @@
-"""Tests for thorn.runtime -- Session, SessionStore, serialization, and Runtime."""
+"""Tests for thorn.runtime -- Agent persistence, SessionStore, serialization, and Runtime."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from thorn.core._agent import Agent
-from thorn.core._context import ExecutionContext
+from thorn.core._context import ExecutionContext, get_context
 from thorn.core._history import (
     CollapseState,
     HistoryTree,
@@ -28,7 +28,6 @@ from thorn.core._provider import MockProvider
 from thorn.runtime import (
     JsonSessionSerializer,
     Runtime,
-    Session,
     SessionKey,
     SessionStore,
     deserialize_history,
@@ -37,7 +36,7 @@ from thorn.runtime import (
 
 
 # ---------------------------------------------------------------------------
-# Agent.name and Agent.metadata (Phase 3 additions)
+# Agent persistence fields (key, created_at, last_active, touch)
 # ---------------------------------------------------------------------------
 
 
@@ -86,6 +85,63 @@ class TestAgentFields:
         rendered = agent._render_system_prompts()
         assert rendered == ["Hello, world!"]
 
+    def test_default_key_is_none(self):
+        agent = Agent()
+        assert agent.key is None
+
+    def test_explicit_key(self):
+        key = SessionKey("gitlab:issue:42")
+        agent = Agent(key=key)
+        assert agent.key == key
+        assert isinstance(agent.key, SessionKey)
+
+    def test_default_created_at_is_none(self):
+        agent = Agent()
+        assert agent.created_at is None
+
+    def test_explicit_created_at(self):
+        ts = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        agent = Agent(created_at=ts)
+        assert agent.created_at == ts
+
+    def test_default_last_active_is_none(self):
+        agent = Agent()
+        assert agent.last_active is None
+
+    def test_explicit_last_active(self):
+        ts = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        agent = Agent(last_active=ts)
+        assert agent.last_active == ts
+
+    def test_touch_sets_last_active(self):
+        agent = Agent()
+        assert agent.last_active is None
+        agent.touch()
+        assert agent.last_active is not None
+        assert isinstance(agent.last_active, datetime)
+
+    def test_touch_updates_last_active(self):
+        ts = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        agent = Agent(last_active=ts)
+        agent.touch()
+        assert agent.last_active > ts
+
+    def test_all_persistence_fields_together(self):
+        key = SessionKey("test-key")
+        ts = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        agent = Agent(
+            name="reviewer",
+            key=key,
+            created_at=ts,
+            last_active=ts,
+            metadata={"role": "code-review"},
+        )
+        assert agent.name == "reviewer"
+        assert agent.key == key
+        assert agent.created_at == ts
+        assert agent.last_active == ts
+        assert agent.metadata == {"role": "code-review"}
+
 
 # ---------------------------------------------------------------------------
 # SessionKey
@@ -111,45 +167,6 @@ class TestSessionKey:
         key = SessionKey("k1")
         d: dict[SessionKey, int] = {key: 1}
         assert d[SessionKey("k1")] == 1
-
-
-# ---------------------------------------------------------------------------
-# Session
-# ---------------------------------------------------------------------------
-
-
-class TestSession:
-    def test_creation_with_defaults(self):
-        agent = Agent(name="test")
-        session = Session(key=SessionKey("s1"), agent=agent)
-        assert session.key == "s1"
-        assert session.agent is agent
-        assert session.metadata == {}
-        assert isinstance(session.created_at, datetime)
-        assert isinstance(session.last_active, datetime)
-
-    def test_creation_with_metadata(self):
-        agent = Agent()
-        session = Session(
-            key=SessionKey("s2"),
-            agent=agent,
-            metadata={"issue_iid": 42},
-        )
-        assert session.metadata == {"issue_iid": 42}
-
-    def test_touch_updates_last_active(self):
-        agent = Agent()
-        session = Session(key=SessionKey("s3"), agent=agent)
-        old_ts = session.last_active
-        import time
-        time.sleep(0.01)
-        session.touch()
-        assert session.last_active > old_ts
-
-    def test_timestamps_are_utc(self):
-        session = Session(key=SessionKey("s4"), agent=Agent())
-        assert session.created_at.tzinfo is not None
-        assert session.last_active.tzinfo is not None
 
 
 # ---------------------------------------------------------------------------
@@ -203,11 +220,9 @@ def _make_history_with_tool_calls() -> HistoryTree:
 def _make_history_with_collapsed_nodes() -> HistoryTree:
     """Build a history with some nodes in collapsed state."""
     tree = _make_history_with_tool_calls()
-    # Collapse the first turn
     turn = tree.nodes[1]
     assert isinstance(turn, TurnNode)
     turn.collapse_state = CollapseState.COLLAPSED
-    # Detail-collapse the tool call
     if turn.tool_call_nodes:
         turn.tool_call_nodes[0].detail_collapsed = True
     return tree
@@ -369,23 +384,23 @@ class TestHistorySerialization:
 
 
 # ---------------------------------------------------------------------------
-# JsonSessionSerializer
+# JsonSessionSerializer (now saves/loads Agent directly)
 # ---------------------------------------------------------------------------
 
 
 class TestJsonSessionSerializer:
     def test_save_and_load_roundtrip(self, tmp_path: Path):
-        agent = Agent(name="test-agent", metadata={"role": "coder"})
+        agent = Agent(
+            name="test-agent",
+            metadata={"role": "coder"},
+            key=SessionKey("test-key"),
+            created_at=datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
+            last_active=datetime(2025, 6, 15, 13, 0, 0, tzinfo=timezone.utc),
+        )
         agent._history = _make_history_with_tool_calls()
 
-        session = Session(
-            key=SessionKey("test-key"),
-            agent=agent,
-            metadata={"project_id": 123},
-        )
-
         serializer = JsonSessionSerializer()
-        serializer.save(session, tmp_path)
+        serializer.save(agent, tmp_path)
 
         assert (tmp_path / "session.json").exists()
         assert (tmp_path / "history.json").exists()
@@ -393,31 +408,29 @@ class TestJsonSessionSerializer:
         restored = serializer.load(tmp_path)
         assert restored.key == SessionKey("test-key")
         assert isinstance(restored.key, SessionKey)
-        assert restored.agent.name == "test-agent"
-        assert restored.agent.metadata == {"role": "coder"}
-        assert restored.metadata == {"project_id": 123}
-        assert len(restored.agent._history.nodes) == 3
+        assert restored.name == "test-agent"
+        assert restored.metadata == {"role": "coder"}
+        assert len(restored._history.nodes) == 3
 
     def test_timestamps_preserved(self, tmp_path: Path):
         ts = datetime(2025, 6, 15, 12, 30, 0, tzinfo=timezone.utc)
-        session = Session(
+        agent = Agent(
             key=SessionKey("ts-test"),
-            agent=Agent(),
             created_at=ts,
             last_active=ts,
         )
 
         serializer = JsonSessionSerializer()
-        serializer.save(session, tmp_path)
+        serializer.save(agent, tmp_path)
         restored = serializer.load(tmp_path)
 
         assert restored.created_at == ts
         assert restored.last_active == ts
 
     def test_session_json_is_human_readable(self, tmp_path: Path):
-        session = Session(key=SessionKey("readable"), agent=Agent(name="bot"))
+        agent = Agent(name="bot", key=SessionKey("readable"))
         serializer = JsonSessionSerializer()
-        serializer.save(session, tmp_path)
+        serializer.save(agent, tmp_path)
 
         content = (tmp_path / "session.json").read_text(encoding="utf-8")
         assert "\n" in content
@@ -426,12 +439,11 @@ class TestJsonSessionSerializer:
         assert parsed["agent_name"] == "bot"
 
     def test_history_json_is_human_readable(self, tmp_path: Path):
-        agent = Agent()
+        agent = Agent(key=SessionKey("hist"))
         agent._history = _make_simple_history()
-        session = Session(key=SessionKey("hist"), agent=agent)
 
         serializer = JsonSessionSerializer()
-        serializer.save(session, tmp_path)
+        serializer.save(agent, tmp_path)
 
         content = (tmp_path / "history.json").read_text(encoding="utf-8")
         assert "\n" in content
@@ -440,23 +452,20 @@ class TestJsonSessionSerializer:
         assert len(parsed) == 2
 
     def test_empty_history(self, tmp_path: Path):
-        session = Session(key=SessionKey("empty"), agent=Agent())
+        agent = Agent(key=SessionKey("empty"))
         serializer = JsonSessionSerializer()
-        serializer.save(session, tmp_path)
+        serializer.save(agent, tmp_path)
         restored = serializer.load(tmp_path)
-        assert len(restored.agent._history.nodes) == 0
+        assert len(restored._history.nodes) == 0
 
     def test_agent_class_name_stored(self, tmp_path: Path):
         class CustomAgent(Agent):
             pass
 
-        session = Session(
-            key=SessionKey("cls"),
-            agent=CustomAgent(name="custom"),
-        )
+        agent = CustomAgent(name="custom", key=SessionKey("cls"))
 
         serializer = JsonSessionSerializer()
-        serializer.save(session, tmp_path)
+        serializer.save(agent, tmp_path)
 
         content = json.loads(
             (tmp_path / "session.json").read_text(encoding="utf-8")
@@ -467,21 +476,18 @@ class TestJsonSessionSerializer:
         class ResolvableAgent(Agent):
             pass
 
-        session = Session(
-            key=SessionKey("resolve"),
-            agent=ResolvableAgent(name="r"),
-        )
+        agent = ResolvableAgent(name="r", key=SessionKey("resolve"))
         serializer = JsonSessionSerializer()
-        serializer.save(session, tmp_path)
+        serializer.save(agent, tmp_path)
 
         restored = serializer.load(tmp_path)
-        assert type(restored.agent).__name__ == "ResolvableAgent"
-        assert isinstance(restored.agent, ResolvableAgent)
+        assert type(restored).__name__ == "ResolvableAgent"
+        assert isinstance(restored, ResolvableAgent)
 
     def test_unknown_agent_class_falls_back_to_base(self, tmp_path: Path):
-        session = Session(key=SessionKey("fallback"), agent=Agent(name="fb"))
+        agent = Agent(name="fb", key=SessionKey("fallback"))
         serializer = JsonSessionSerializer()
-        serializer.save(session, tmp_path)
+        serializer.save(agent, tmp_path)
 
         session_path = tmp_path / "session.json"
         data = json.loads(session_path.read_text(encoding="utf-8"))
@@ -491,17 +497,36 @@ class TestJsonSessionSerializer:
         )
 
         restored = serializer.load(tmp_path)
-        assert type(restored.agent) is Agent
-        assert restored.agent.name == "fb"
+        assert type(restored) is Agent
+        assert restored.name == "fb"
 
     def test_missing_history_file(self, tmp_path: Path):
-        session = Session(key=SessionKey("no-hist"), agent=Agent())
+        agent = Agent(key=SessionKey("no-hist"))
         serializer = JsonSessionSerializer()
-        serializer.save(session, tmp_path)
+        serializer.save(agent, tmp_path)
         (tmp_path / "history.json").unlink()
 
         restored = serializer.load(tmp_path)
-        assert len(restored.agent._history.nodes) == 0
+        assert len(restored._history.nodes) == 0
+
+    def test_none_timestamps_roundtrip(self, tmp_path: Path):
+        agent = Agent(key=SessionKey("no-ts"))
+        assert agent.created_at is None
+        assert agent.last_active is None
+
+        serializer = JsonSessionSerializer()
+        serializer.save(agent, tmp_path)
+        restored = serializer.load(tmp_path)
+        assert restored.created_at is None
+        assert restored.last_active is None
+
+    def test_none_key_roundtrip(self, tmp_path: Path):
+        agent = Agent(name="keyless")
+        serializer = JsonSessionSerializer()
+        serializer.save(agent, tmp_path)
+        restored = serializer.load(tmp_path)
+        assert restored.key is None
+        assert restored.name == "keyless"
 
 
 # ---------------------------------------------------------------------------
@@ -512,17 +537,16 @@ class TestJsonSessionSerializer:
 class TestSessionStore:
     def test_save_and_load(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        agent = Agent(name="stored")
+        agent = Agent(name="stored", key=SessionKey("k1"))
         agent._history = _make_simple_history()
-        session = Session(key=SessionKey("k1"), agent=agent)
 
-        store.save(session)
+        store.save(agent)
         assert store.exists("k1")
 
         loaded = store.load("k1")
         assert loaded.key == "k1"
-        assert loaded.agent.name == "stored"
-        assert len(loaded.agent._history.nodes) == 2
+        assert loaded.name == "stored"
+        assert len(loaded._history.nodes) == 2
 
     def test_exists_returns_false_for_missing(self, tmp_path: Path):
         store = SessionStore(tmp_path)
@@ -533,6 +557,12 @@ class TestSessionStore:
         with pytest.raises(KeyError, match="nonexistent"):
             store.load("nonexistent")
 
+    def test_save_without_key_raises(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        agent = Agent(name="no-key")
+        with pytest.raises(ValueError, match="without a key"):
+            store.save(agent)
+
     def test_list_keys_empty(self, tmp_path: Path):
         store = SessionStore(tmp_path)
         assert store.list_keys() == []
@@ -540,7 +570,7 @@ class TestSessionStore:
     def test_list_keys_returns_sorted(self, tmp_path: Path):
         store = SessionStore(tmp_path)
         for name in ["charlie", "alice", "bob"]:
-            store.save(Session(key=SessionKey(name), agent=Agent()))
+            store.save(Agent(key=SessionKey(name)))
 
         keys = store.list_keys()
         assert keys == [
@@ -551,7 +581,7 @@ class TestSessionStore:
 
     def test_delete_removes_session(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        store.save(Session(key=SessionKey("del-me"), agent=Agent()))
+        store.save(Agent(key=SessionKey("del-me")))
         assert store.exists("del-me")
 
         store.delete("del-me")
@@ -563,14 +593,10 @@ class TestSessionStore:
 
     def test_overwrite_existing_session(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        store.save(
-            Session(key=SessionKey("ow"), agent=Agent(name="v1")),
-        )
-        store.save(
-            Session(key=SessionKey("ow"), agent=Agent(name="v2")),
-        )
+        store.save(Agent(name="v1", key=SessionKey("ow")))
+        store.save(Agent(name="v2", key=SessionKey("ow")))
         loaded = store.load("ow")
-        assert loaded.agent.name == "v2"
+        assert loaded.name == "v2"
 
     def test_list_keys_on_nonexistent_root(self, tmp_path: Path):
         store = SessionStore(tmp_path / "no-such-dir")
@@ -578,7 +604,7 @@ class TestSessionStore:
 
     def test_session_key_type_preserved(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        store.save(Session(key=SessionKey("typed"), agent=Agent()))
+        store.save(Agent(key=SessionKey("typed")))
         keys = store.list_keys()
         assert all(isinstance(k, SessionKey) for k in keys)
 
@@ -586,16 +612,16 @@ class TestSessionStore:
         call_log: list[str] = []
 
         class TrackingSerializer:
-            def save(self, session: Session, directory: Path) -> None:
-                call_log.append(f"save:{session.key}")
+            def save(self, agent: Agent, directory: Path) -> None:
+                call_log.append(f"save:{agent.key}")
                 (directory / "marker.txt").write_text("saved", encoding="utf-8")
 
-            def load(self, directory: Path) -> Session:
+            def load(self, directory: Path) -> Agent:
                 call_log.append("load")
-                return Session(key=SessionKey("custom"), agent=Agent())
+                return Agent(key=SessionKey("custom"))
 
         store = SessionStore(tmp_path, serializer=TrackingSerializer())
-        store.save(Session(key=SessionKey("cs"), agent=Agent()))
+        store.save(Agent(key=SessionKey("cs")))
         store.load("cs")
 
         assert "save:cs" in call_log
@@ -652,61 +678,62 @@ class TestRuntime:
         ctx = rt.create_context()
         assert ctx.ask_user_handler is handler
 
-    def test_create_session_with_auto_key(self, tmp_path: Path):
+    def test_create_agent_with_auto_key(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        session = rt.create_session()
+        agent = rt.create_agent()
 
-        assert isinstance(session.key, SessionKey)
-        assert len(session.key) > 0
-        assert session.agent.name == str(session.key)
+        assert isinstance(agent.key, SessionKey)
+        assert len(agent.key) > 0
+        assert agent.name == str(agent.key)
+        assert agent.created_at is not None
+        assert agent.last_active is not None
 
-    def test_create_session_with_explicit_key(self, tmp_path: Path):
+    def test_create_agent_with_explicit_key(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        session = rt.create_session("my-key")
+        agent = rt.create_agent("my-key")
 
-        assert session.key == SessionKey("my-key")
+        assert agent.key == SessionKey("my-key")
 
-    def test_create_session_with_str_key_becomes_session_key(self, tmp_path: Path):
+    def test_create_agent_with_str_key_becomes_session_key(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        session = rt.create_session("str-key")
-        assert isinstance(session.key, SessionKey)
+        agent = rt.create_agent("str-key")
+        assert isinstance(agent.key, SessionKey)
 
-    def test_create_session_with_custom_agent(self, tmp_path: Path):
+    def test_create_agent_with_custom_name(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        agent = Agent(name="custom")
-        session = rt.create_session("s1", agent=agent)
+        agent = rt.create_agent("s1", name="reviewer")
+        assert agent.name == "reviewer"
+        assert agent.key == SessionKey("s1")
 
-        assert session.agent is agent
-
-    def test_create_session_with_metadata(self, tmp_path: Path):
+    def test_create_agent_with_metadata(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        session = rt.create_session("s1", metadata={"issue": 42})
-        assert session.metadata == {"issue": 42}
+        agent = rt.create_agent("s1", metadata={"issue": 42})
+        assert agent.metadata == {"issue": 42}
 
-    def test_save_and_get_or_create_session(self, tmp_path: Path):
+    def test_save_and_get_or_create_agent(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        session = rt.create_session("persistent")
-        session.agent._history = _make_simple_history()
-        rt.save_session(session)
+        agent = rt.create_agent("persistent")
+        agent._history = _make_simple_history()
+        rt.save_agent(agent)
 
-        retrieved = rt.get_or_create_session("persistent")
+        retrieved = rt.get_or_create_agent("persistent")
         assert retrieved.key == "persistent"
-        assert len(retrieved.agent._history.nodes) == 2
+        assert len(retrieved._history.nodes) == 2
 
     def test_get_or_create_creates_when_missing(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        session = rt.get_or_create_session("new-key")
-        assert session.key == "new-key"
-        assert len(session.agent._history.nodes) == 0
+        agent = rt.get_or_create_agent("new-key")
+        assert agent.key == "new-key"
+        assert len(agent._history.nodes) == 0
 
-    def test_save_session_updates_last_active(self, tmp_path: Path):
+    def test_save_agent_updates_last_active(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        session = rt.create_session("ts-test")
-        old_ts = session.last_active
+        agent = rt.create_agent("ts-test")
+        old_ts = agent.last_active
         import time
         time.sleep(0.01)
-        rt.save_session(session)
-        assert session.last_active > old_ts
+        rt.save_agent(agent)
+        assert agent.last_active > old_ts
 
     def test_create_context_system_prompts_are_independent(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
@@ -717,27 +744,87 @@ class TestRuntime:
 
 
 # ---------------------------------------------------------------------------
+# Runtime as async context manager
+# ---------------------------------------------------------------------------
+
+
+class TestRuntimeContextManager:
+    def _make_runtime(self, tmp_path: Path, **kwargs: Any) -> Runtime:
+        return Runtime(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_sets_ambient_context(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        async with rt:
+            ctx = get_context()
+            assert ctx is rt.context
+            assert ctx.provider is rt.provider
+            assert ctx.workspace_root == tmp_path
+
+    @pytest.mark.asyncio
+    async def test_clears_context_on_exit(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        async with rt:
+            pass
+
+        with pytest.raises(RuntimeError):
+            rt.context
+
+    @pytest.mark.asyncio
+    async def test_context_property_outside_block_raises(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        with pytest.raises(RuntimeError, match="only available inside"):
+            rt.context
+
+    @pytest.mark.asyncio
+    async def test_returns_self(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        async with rt as entered:
+            assert entered is rt
+
+    @pytest.mark.asyncio
+    async def test_context_cleaned_up_on_exception(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        with pytest.raises(ValueError):
+            async with rt:
+                raise ValueError("boom")
+
+        with pytest.raises(RuntimeError):
+            rt.context
+
+
+# ---------------------------------------------------------------------------
 # Top-level re-exports
 # ---------------------------------------------------------------------------
 
 
 class TestReExports:
     def test_runtime_importable_from_thorn(self):
-        from thorn import Runtime, Session, SessionKey
+        from thorn import Runtime, SessionKey
         assert Runtime is not None
-        assert Session is not None
         assert SessionKey is not None
+
+    def test_session_not_importable_from_thorn(self):
+        import thorn
+        assert not hasattr(thorn, "Session")
 
     def test_runtime_importable_from_thorn_runtime(self):
         from thorn.runtime import (
             Runtime,
-            Session,
             SessionKey,
             SessionStore,
             SessionSerializer,
             JsonSessionSerializer,
         )
         assert all(cls is not None for cls in [
-            Runtime, Session, SessionKey, SessionStore,
+            Runtime, SessionKey, SessionStore,
             SessionSerializer, JsonSessionSerializer,
         ])
+
+    def test_session_not_importable_from_thorn_runtime(self):
+        import thorn.runtime
+        assert not hasattr(thorn.runtime, "Session")

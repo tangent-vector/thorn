@@ -9,12 +9,14 @@ calls with the role's context.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from thorn.core._context_injection import SeedContent
     from thorn.core._file_access import FileAccessRule
     from thorn.core._history import HistoryTree
+    from thorn.runtime._session import SessionKey
 
 
 class _SafeDict(dict):
@@ -62,6 +64,9 @@ class Agent:
         *,
         name: str | None = None,
         metadata: dict[str, Any] | None = None,
+        key: SessionKey | None = None,
+        created_at: datetime | None = None,
+        last_active: datetime | None = None,
         **kwargs: Any,
     ) -> None:
         from thorn.core._history import HistoryTree
@@ -69,8 +74,15 @@ class Agent:
         self._parent: Agent | None = None
         self.name: str | None = name
         self.metadata: dict[str, Any] = metadata if metadata is not None else {}
+        self.key: SessionKey | None = key
+        self.created_at: datetime | None = created_at
+        self.last_active: datetime | None = last_active
         for k, v in kwargs.items():
             setattr(self, k, v)
+
+    def touch(self) -> None:
+        """Update ``last_active`` to the current UTC time."""
+        self.last_active = datetime.now(timezone.utc)
 
     def __str__(self) -> str:
         cls_name = type(self).__name__

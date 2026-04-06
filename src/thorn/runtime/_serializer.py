@@ -1,6 +1,6 @@
 """Session serialization: protocol and JSON implementation.
 
-The ``SessionSerializer`` protocol defines how sessions are persisted
+The ``SessionSerializer`` protocol defines how agents are persisted
 to and restored from a directory on disk.  The protocol is designed to
 accommodate future serialization formats (notably, a Markdown-based
 format where agents can read and self-edit their own history for
@@ -14,7 +14,7 @@ JSON serializer should set the same expectation.
 File layout within a session directory::
 
     <session-dir>/
-        session.json      -- session + agent metadata
+        session.json      -- agent metadata and persistence fields
         history.json      -- conversation history (HistoryTree nodes)
 """
 
@@ -39,7 +39,7 @@ from thorn.core._messages import (
     ToolResultMessage,
     UserMessage,
 )
-from thorn.runtime._session import Session, SessionKey
+from thorn.runtime._session import SessionKey
 
 
 _SESSION_FILE = "session.json"
@@ -52,7 +52,7 @@ _HISTORY_FILE = "history.json"
 
 @runtime_checkable
 class SessionSerializer(Protocol):
-    """Pluggable strategy for persisting and restoring sessions.
+    """Pluggable strategy for persisting and restoring agents.
 
     Implementations write to / read from a directory that the
     ``SessionStore`` manages.  The directory is guaranteed to exist
@@ -62,17 +62,17 @@ class SessionSerializer(Protocol):
     (constraint from the future Markdown serializer goal).
     """
 
-    def save(self, session: Session, directory: Path) -> None:
-        """Persist *session* into *directory*."""
+    def save(self, agent: Agent, directory: Path) -> None:
+        """Persist *agent* into *directory*."""
         ...
 
-    def load(self, directory: Path) -> Session:
-        """Restore a session from *directory*."""
+    def load(self, directory: Path) -> Agent:
+        """Restore an agent from *directory*."""
         ...
 
 
 # ---------------------------------------------------------------------------
-# HistoryTree ↔ JSON helpers
+# HistoryTree <-> JSON helpers
 # ---------------------------------------------------------------------------
 
 def _serialize_tool_call_node(node: ToolCallNode) -> dict[str, Any]:
@@ -189,23 +189,22 @@ def _resolve_agent_class(class_name: str) -> type[Agent]:
 # ---------------------------------------------------------------------------
 
 class JsonSessionSerializer:
-    """Persists sessions as formatted, human-readable JSON files.
+    """Persists agents as formatted, human-readable JSON files.
 
     Produces two files in the session directory:
 
-    - ``session.json``: session metadata and agent identity
+    - ``session.json``: agent metadata and persistence fields
     - ``history.json``: the full conversation history tree
     """
 
-    def save(self, session: Session, directory: Path) -> None:
-        session_data = {
-            "key": str(session.key),
-            "agent_class": type(session.agent).__name__,
-            "agent_name": session.agent.name,
-            "agent_metadata": session.agent.metadata,
-            "session_metadata": session.metadata,
-            "created_at": session.created_at.isoformat(),
-            "last_active": session.last_active.isoformat(),
+    def save(self, agent: Agent, directory: Path) -> None:
+        session_data: dict[str, Any] = {
+            "key": str(agent.key) if agent.key is not None else None,
+            "agent_class": type(agent).__name__,
+            "agent_name": agent.name,
+            "agent_metadata": agent.metadata,
+            "created_at": agent.created_at.isoformat() if agent.created_at else None,
+            "last_active": agent.last_active.isoformat() if agent.last_active else None,
         }
         session_path = directory / _SESSION_FILE
         session_path.write_text(
@@ -213,21 +212,34 @@ class JsonSessionSerializer:
             encoding="utf-8",
         )
 
-        history_data = serialize_history(session.agent._history)
+        history_data = serialize_history(agent._history)
         history_path = directory / _HISTORY_FILE
         history_path.write_text(
             json.dumps(history_data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
 
-    def load(self, directory: Path) -> Session:
+    def load(self, directory: Path) -> Agent:
         session_path = directory / _SESSION_FILE
         session_data = json.loads(session_path.read_text(encoding="utf-8"))
 
         agent_cls = _resolve_agent_class(session_data.get("agent_class", "Agent"))
+
+        key_raw = session_data.get("key")
+        key = SessionKey(key_raw) if key_raw is not None else None
+
+        created_raw = session_data.get("created_at")
+        created_at = datetime.fromisoformat(created_raw) if created_raw else None
+
+        last_raw = session_data.get("last_active")
+        last_active = datetime.fromisoformat(last_raw) if last_raw else None
+
         agent = agent_cls(
             name=session_data.get("agent_name"),
             metadata=session_data.get("agent_metadata"),
+            key=key,
+            created_at=created_at,
+            last_active=last_active,
         )
 
         history_path = directory / _HISTORY_FILE
@@ -235,17 +247,7 @@ class JsonSessionSerializer:
             history_data = json.loads(history_path.read_text(encoding="utf-8"))
             agent._history = deserialize_history(history_data)
 
-        key = SessionKey(session_data["key"])
-        created_at = datetime.fromisoformat(session_data["created_at"])
-        last_active = datetime.fromisoformat(session_data["last_active"])
-
-        return Session(
-            key=key,
-            agent=agent,
-            metadata=session_data.get("session_metadata", {}),
-            created_at=created_at,
-            last_active=last_active,
-        )
+        return agent
 
 
 __all__ = [

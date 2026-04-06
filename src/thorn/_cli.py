@@ -18,8 +18,6 @@ from thorn.core._context import (
     EventSink,
     ExecutionContext,
     Verbosity,
-    set_context,
-    reset_context,
 )
 from thorn.core._agent import Agent
 from thorn.core._discovery import discover_tools, find_thorn_dirs
@@ -305,11 +303,11 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
             )
         sys.exit(1)
 
-    ctx = runtime.create_context()
+    ctx_holder: list[ExecutionContext] = []
 
     async def _run() -> str:
-        token = set_context(ctx)
-        try:
+        async with runtime:
+            ctx_holder.append(runtime.context)
             async with AsyncExitStack() as stack:
                 tools = await _collect_all_tools(
                     stack,
@@ -324,13 +322,11 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
                 ]
                 sys_prompts.extend(_collect_concierge_prompts())
                 return await run_agent_loop(
-                    context=ctx,
+                    context=runtime.context,
                     user_prompt=prompt_text,
                     tools=tools,
                     system_prompts=sys_prompts,
                 )
-        finally:
-            reset_context(token)
 
     outcome = "success"
     error_msg: str | None = None
@@ -356,9 +352,10 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
         if trace_file:
             trace_file.close()
         if result_file_path:
+            ctx = ctx_holder[0] if ctx_holder else None
             _write_result_file(
                 Path(result_file_path), outcome, duration_s,
-                ctx.usage, error_msg, trace_path,
+                ctx.usage if ctx else None, error_msg, trace_path,
             )
 
     if exit_code:
@@ -403,11 +400,6 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
             trace_file.close()
         sys.exit(1)
 
-    ctx = runtime.create_context()
-    ctx.system_prompts.append(
-        "You are in an interactive chat session with a human user. "
-        "You may ask clarifying questions and suggest next steps."
-    )
     messages: list = []
 
     console.print("[bold]thorn[/bold] interactive chat  (Ctrl+C to exit)\n")
@@ -417,8 +409,12 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
         from thorn.core._loop import _request_completion, _execute_tool_calls, _RESULT_SENTINEL
         from thorn.core._provider import TextChunk, ToolCallChunk, FinishChunk
 
-        token = set_context(ctx)
-        try:
+        async with runtime:
+            ctx = runtime.context
+            ctx.system_prompts.append(
+                "You are in an interactive chat session with a human user. "
+                "You may ask clarifying questions and suggest next steps."
+            )
             async with AsyncExitStack() as stack:
                 tools = await _collect_all_tools(
                     stack,
@@ -480,9 +476,6 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
                             messages.append(rm)
 
                     console.print()
-
-        finally:
-            reset_context(token)
 
     try:
         asyncio.run(_chat())
