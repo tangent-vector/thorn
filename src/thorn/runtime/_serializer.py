@@ -21,7 +21,7 @@ File layout within a session directory::
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -44,7 +44,6 @@ from thorn.runtime._session import Session, SessionKey
 
 _SESSION_FILE = "session.json"
 _HISTORY_FILE = "history.json"
-_DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
 
 
 # ---------------------------------------------------------------------------
