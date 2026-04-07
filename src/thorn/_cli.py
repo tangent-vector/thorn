@@ -169,6 +169,11 @@ def _collect_concierge_prompts() -> list[str]:
 @click.group()
 def main() -> None:
     """Thorn — a lightweight agent harness."""
+    try:
+        from dotenv import find_dotenv, load_dotenv
+        load_dotenv(find_dotenv(usecwd=True))
+    except ImportError:
+        pass
 
 
 # ---------------------------------------------------------------------------

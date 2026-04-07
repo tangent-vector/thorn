@@ -343,15 +343,10 @@ def load_provider_from_env() -> LLMProvider:
     """Create an ``OpenAIProvider`` from environment variables.
 
     Reads ``OPENAI_API_URL``, ``OPENAI_API_KEY``, and
-    ``OPENAI_API_MODEL_NAME``.  Loads a ``.env`` file if
-    ``python-dotenv`` is installed.
+    ``OPENAI_API_MODEL_NAME``.  The caller is responsible for
+    loading ``.env`` files beforehand (the CLI does this in its
+    ``main()`` group callback).
     """
-    try:
-        from dotenv import load_dotenv as _load_dotenv
-        _load_dotenv()
-    except ImportError:
-        pass
-
     api_url = os.environ.get("OPENAI_API_URL")
     api_key = os.environ.get("OPENAI_API_KEY")
     model_name = os.environ.get("OPENAI_API_MODEL_NAME")
