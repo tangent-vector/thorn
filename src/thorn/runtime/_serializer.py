@@ -1,7 +1,7 @@
 """Session serialization: protocol and JSON implementation.
 
-The ``SessionSerializer`` protocol defines how agents are persisted
-to and restored from a directory on disk.  The protocol is designed to
+The ``SessionSerializer`` protocol defines how agents and sessions are
+persisted to and restored from disk.  The protocol is designed to
 accommodate future serialization formats (notably, a Markdown-based
 format where agents can read and self-edit their own history for
 compaction/summarization).
@@ -11,10 +11,11 @@ JSON -- not minified single-line output -- because the Markdown
 serializer constraint requires that output be agent-editable, and the
 JSON serializer should set the same expectation.
 
-File layout within a session directory::
+Agent identity is stored separately from session data:
 
+    <agent-id>.json       -- agent class, name, metadata, id
     <session-dir>/
-        session.json      -- agent metadata and persistence fields
+        session.json      -- session timestamps, metadata
         history.json      -- conversation history (HistoryTree nodes)
 """
 
@@ -39,7 +40,8 @@ from thorn.core._messages import (
     ToolResultMessage,
     UserMessage,
 )
-from thorn.runtime._session import SessionKey
+from thorn.core._session import Session
+from thorn.runtime._session import AgentID, SessionKey
 
 
 _SESSION_FILE = "session.json"
@@ -52,22 +54,30 @@ _HISTORY_FILE = "history.json"
 
 @runtime_checkable
 class SessionSerializer(Protocol):
-    """Pluggable strategy for persisting and restoring agents.
+    """Pluggable strategy for persisting and restoring agents and sessions.
 
-    Implementations write to / read from a directory that the
-    ``SessionStore`` manages.  The directory is guaranteed to exist
-    before ``save`` is called.
+    Implementations write to / read from paths and directories that the
+    ``SessionStore`` manages.  Directories are guaranteed to exist
+    before ``save_session`` is called.
 
     The format must produce human-readable, agent-editable output
     (constraint from the future Markdown serializer goal).
     """
 
-    def save(self, agent: Agent, directory: Path) -> None:
-        """Persist *agent* into *directory*."""
+    def save_agent(self, agent: Agent, path: Path) -> None:
+        """Persist agent identity to a JSON file at *path*."""
         ...
 
-    def load(self, directory: Path) -> Agent:
-        """Restore an agent from *directory*."""
+    def load_agent(self, path: Path) -> Agent:
+        """Restore agent identity from *path*."""
+        ...
+
+    def save_session(self, session: Session, directory: Path) -> None:
+        """Persist *session* into *directory*."""
+        ...
+
+    def load_session(self, directory: Path, agent: Agent) -> Session:
+        """Restore a session from *directory*, owned by *agent*."""
         ...
 
 
@@ -189,22 +199,49 @@ def _resolve_agent_class(class_name: str) -> type[Agent]:
 # ---------------------------------------------------------------------------
 
 class JsonSessionSerializer:
-    """Persists agents as formatted, human-readable JSON files.
+    """Persists agents and sessions as formatted, human-readable JSON files.
 
-    Produces two files in the session directory:
-
-    - ``session.json``: agent metadata and persistence fields
-    - ``history.json``: the full conversation history tree
+    Agent identity is stored as a single JSON file (agent class, name,
+    metadata, ID).  Session data is stored in a directory with two files
+    (``session.json`` for timestamps/metadata, ``history.json`` for the
+    conversation history tree).
     """
 
-    def save(self, agent: Agent, directory: Path) -> None:
-        session_data: dict[str, Any] = {
-            "key": str(agent.key) if agent.key is not None else None,
+    def save_agent(self, agent: Agent, path: Path) -> None:
+        agent_data: dict[str, Any] = {
+            "id": str(agent.id) if agent.id is not None else None,
             "agent_class": type(agent).__name__,
-            "agent_name": agent.name,
-            "agent_metadata": agent.metadata,
-            "created_at": agent.created_at.isoformat() if agent.created_at else None,
-            "last_active": agent.last_active.isoformat() if agent.last_active else None,
+            "name": agent.name,
+            "metadata": agent.metadata,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(agent_data, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def load_agent(self, path: Path) -> Agent:
+        agent_data = json.loads(path.read_text(encoding="utf-8"))
+
+        agent_cls = _resolve_agent_class(agent_data.get("agent_class", "Agent"))
+
+        id_raw = agent_data.get("id")
+        agent_id = AgentID(id_raw) if id_raw is not None else None
+
+        return agent_cls(
+            id=agent_id,
+            name=agent_data.get("name"),
+            metadata=agent_data.get("metadata"),
+        )
+
+    def save_session(self, session: Session, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+
+        session_data: dict[str, Any] = {
+            "key": str(session.key) if session.key is not None else None,
+            "created_at": session.created_at.isoformat() if session.created_at else None,
+            "last_active": session.last_active.isoformat() if session.last_active else None,
+            "metadata": session.metadata,
         }
         session_path = directory / _SESSION_FILE
         session_path.write_text(
@@ -212,18 +249,16 @@ class JsonSessionSerializer:
             encoding="utf-8",
         )
 
-        history_data = serialize_history(agent._history)
+        history_data = serialize_history(session._history)
         history_path = directory / _HISTORY_FILE
         history_path.write_text(
             json.dumps(history_data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
 
-    def load(self, directory: Path) -> Agent:
+    def load_session(self, directory: Path, agent: Agent) -> Session:
         session_path = directory / _SESSION_FILE
         session_data = json.loads(session_path.read_text(encoding="utf-8"))
-
-        agent_cls = _resolve_agent_class(session_data.get("agent_class", "Agent"))
 
         key_raw = session_data.get("key")
         key = SessionKey(key_raw) if key_raw is not None else None
@@ -234,20 +269,20 @@ class JsonSessionSerializer:
         last_raw = session_data.get("last_active")
         last_active = datetime.fromisoformat(last_raw) if last_raw else None
 
-        agent = agent_cls(
-            name=session_data.get("agent_name"),
-            metadata=session_data.get("agent_metadata"),
+        session = Session(
+            agent=agent,
             key=key,
             created_at=created_at,
             last_active=last_active,
+            metadata=session_data.get("metadata", {}),
         )
 
         history_path = directory / _HISTORY_FILE
         if history_path.exists():
             history_data = json.loads(history_path.read_text(encoding="utf-8"))
-            agent._history = deserialize_history(history_data)
+            session._history = deserialize_history(history_data)
 
-        return agent
+        return session
 
 
 __all__ = [

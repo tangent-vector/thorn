@@ -25,6 +25,7 @@ from thorn.core._context import (
     set_context,
 )
 from thorn.core._agent import Agent
+from thorn.core._session import Session
 from thorn.core._context_injection import DirectorySeed, FileSeed, SearchSeed, SeedContent
 from thorn.core._discovery import discover_tools
 from thorn.core._history import CollapseState, CompactionResult, HistoryTree
@@ -68,8 +69,9 @@ except ImportError:
     pass
 
 __all__ = [
-    # Agent
+    # Agent / Session
     "Agent",
+    "Session",
     # Context
     "AskUserHandler",
     "ConsoleEventSink",

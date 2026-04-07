@@ -6,15 +6,17 @@ This package sits between ``thorn.core`` (agent primitives) and
 - ``Runtime``: the persistent execution environment that every Thorn
   deployment creates.  Owns the ambient ``ExecutionContext`` (via
   async context manager) and the session store.
+- ``AgentID``: typed identifier for agent instances within a runtime.
 - ``SessionKey``: typed identifier for persistent agent sessions.
-- ``SessionStore``: filesystem-backed store for persisting agents.
+- ``SessionStore``: filesystem-backed store for persisting agents and
+  sessions.
 - ``SessionSerializer`` / ``JsonSessionSerializer``: pluggable
   serialization strategy (JSON initial implementation; future Markdown
   implementation planned).
 """
 
 from thorn.runtime._runtime import Runtime
-from thorn.runtime._session import SessionKey
+from thorn.runtime._session import AgentID, SessionKey
 from thorn.runtime._store import SessionStore
 from thorn.runtime._serializer import (
     JsonSessionSerializer,
@@ -24,6 +26,7 @@ from thorn.runtime._serializer import (
 )
 
 __all__ = [
+    "AgentID",
     "Runtime",
     "SessionKey",
     "SessionStore",

@@ -4,10 +4,10 @@ The ``Gateway`` owns a :class:`~thorn.runtime.Runtime`, a list of
 :class:`EventSource` instances, and a tool list.  It is the top-level
 object that ``thorn serve`` creates to run the agent daemon.
 
-The gateway's only job is to find/create the right agent for each
-incoming event, prompt it with a description of what happened, and
-save the agent afterward.  The *agent* decides what actions to take
-using its tools.
+The gateway's job is to resolve the right agent for each incoming event,
+find or create a session under that agent, prompt it with a description
+of what happened, and save the session afterward.  The *agent* decides
+what actions to take using its tools.
 """
 
 from __future__ import annotations
@@ -19,10 +19,13 @@ import signal
 import sys
 from typing import Any
 
+from thorn.core._agent import Agent
 from thorn.gateway._event import EventSource, IncomingEvent
-from thorn.runtime import Runtime
+from thorn.runtime import AgentID, Runtime
 
 log = logging.getLogger(__name__)
+
+_DEFAULT_AGENT_ID = AgentID("default")
 
 
 class Gateway:
@@ -31,7 +34,7 @@ class Gateway:
     Parameters:
         runtime: The persistent execution environment.
         sources: Event sources to poll / listen on.
-        tools: Tools passed to ``agent.prompt(..., tools=...)``
+        tools: Tools passed to ``session.prompt(..., tools=...)``
             for every event.  Typically the GitLab tool list.
     """
 
@@ -81,15 +84,26 @@ class Gateway:
             finally:
                 await self.shutdown()
 
+    def _resolve_agent(self, event: IncomingEvent) -> Agent:
+        """Map an event to the agent instance that should handle it.
+
+        For the current single-agent gateway, this returns (or creates)
+        a single default agent.  Future multi-project support would look
+        up or create a project-scoped agent instance based on the event.
+        """
+        agent_id = event.agent_id or _DEFAULT_AGENT_ID
+        return self._runtime.get_or_create_agent(agent_id)
+
     async def _handle_event(self, event: IncomingEvent) -> None:
-        """Route a single event to the appropriate agent."""
+        """Route a single event to the appropriate agent and session."""
         log.info(
             "Handling event from %s (session=%s)",
             event.source, event.session_key,
         )
-        agent = self._runtime.get_or_create_agent(event.session_key)
+        agent = self._resolve_agent(event)
+        session = self._runtime.get_or_create_session(agent, event.session_key)
         try:
-            await agent.prompt(event.content, tools=self._tools)
+            await session.prompt(event.content, tools=self._tools)
         except Exception:
             log.exception(
                 "Agent failed for event (source=%s, session=%s)",
@@ -97,7 +111,7 @@ class Gateway:
             )
             return
 
-        self._runtime.save_agent(agent)
+        self._runtime.save_session(session)
         log.info(
             "Event handled (source=%s, session=%s)",
             event.source, event.session_key,

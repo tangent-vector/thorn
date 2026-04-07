@@ -89,7 +89,7 @@ from thorn.core import (
 )
 
 from thorn import tools
-from thorn.runtime import Runtime, SessionKey
+from thorn.runtime import AgentID, Runtime, SessionKey
 
 try:
     from thorn.core import MCPServerConfig, MCPToolSource, load_mcp_configs, serve_tools
@@ -178,6 +178,7 @@ __all__ = [
     "DirectorySeed",
     "SearchSeed",
     # Runtime
+    "AgentID",
     "Runtime",
     "SessionKey",
     # Errors

@@ -299,11 +299,11 @@ class TestInjectionTrigger:
             agent = SeedAgent()
             await agent.prompt("do something")
 
-            assert len(agent._history.nodes) >= 3
-            assert isinstance(agent._history.nodes[0], UserPromptNode)
-            assert agent._history.nodes[0].message.content == "do something"
-            assert isinstance(agent._history.nodes[1], TurnNode)
-            briefing = agent._history.nodes[1]
+            assert len(agent._default_session._history.nodes) >= 3
+            assert isinstance(agent._default_session._history.nodes[0], UserPromptNode)
+            assert agent._default_session._history.nodes[0].message.content == "do something"
+            assert isinstance(agent._default_session._history.nodes[1], TurnNode)
+            briefing = agent._default_session._history.nodes[1]
             assert len(briefing.tool_call_nodes) >= 1
             assert briefing.tool_call_nodes[0].tool_call.call_id.startswith("seed_")
         finally:
@@ -360,7 +360,7 @@ class TestInjectionTrigger:
             agent = SeedAgent()
             await agent.prompt("hello")
             injection_turns = [
-                n for n in agent._history.nodes
+                n for n in agent._default_session._history.nodes
                 if isinstance(n, TurnNode) and len(n.tool_call_nodes) > 0
                 and n.tool_call_nodes[0].tool_call.call_id.startswith("seed_")
             ]
@@ -379,7 +379,7 @@ class TestInjectionTrigger:
         try:
             agent = Agent()
             await agent.prompt("hello")
-            for node in agent._history.nodes:
+            for node in agent._default_session._history.nodes:
                 if isinstance(node, TurnNode):
                     for tcn in node.tool_call_nodes:
                         assert not tcn.tool_call.call_id.startswith("seed_")
@@ -413,7 +413,7 @@ class TestRecommendedContext:
             )
 
             briefing_turns = [
-                n for n in agent._history.nodes
+                n for n in agent._default_session._history.nodes
                 if isinstance(n, TurnNode) and len(n.tool_call_nodes) > 0
                 and n.tool_call_nodes[0].tool_call.call_id.startswith("seed_")
             ]
@@ -448,7 +448,7 @@ class TestRecommendedContext:
             )
 
             briefing_turns = [
-                n for n in agent._history.nodes
+                n for n in agent._default_session._history.nodes
                 if isinstance(n, TurnNode) and len(n.tool_call_nodes) > 0
                 and n.tool_call_nodes[0].tool_call.call_id.startswith("seed_")
             ]
@@ -484,7 +484,7 @@ class TestRecommendedContext:
             )
 
             briefing_turns = [
-                n for n in agent._history.nodes
+                n for n in agent._default_session._history.nodes
                 if isinstance(n, TurnNode) and len(n.tool_call_nodes) > 0
                 and n.tool_call_nodes[0].tool_call.call_id.startswith("seed_")
             ]
@@ -514,7 +514,7 @@ class TestRecommendedContext:
             await agent.prompt("do it", recommended_context=[])
 
             briefing_turns = [
-                n for n in agent._history.nodes
+                n for n in agent._default_session._history.nodes
                 if isinstance(n, TurnNode) and len(n.tool_call_nodes) > 0
                 and n.tool_call_nodes[0].tool_call.call_id.startswith("seed_")
             ]
@@ -549,7 +549,7 @@ class TestRecommendedContext:
             await agent.prompt("do it")
 
             briefing_turns = [
-                n for n in agent._history.nodes
+                n for n in agent._default_session._history.nodes
                 if isinstance(n, TurnNode) and len(n.tool_call_nodes) > 0
                 and n.tool_call_nodes[0].tool_call.call_id.startswith("seed_")
             ]

@@ -1,4 +1,4 @@
-"""Tests for thorn.runtime -- Agent persistence, SessionStore, serialization, and Runtime."""
+"""Tests for thorn.runtime -- Agent/Session persistence, SessionStore, serialization, and Runtime."""
 
 from __future__ import annotations
 
@@ -25,7 +25,9 @@ from thorn.core._messages import (
     UserMessage,
 )
 from thorn.core._provider import MockProvider
+from thorn.core._session import Session
 from thorn.runtime import (
+    AgentID,
     JsonSessionSerializer,
     Runtime,
     SessionKey,
@@ -36,7 +38,7 @@ from thorn.runtime import (
 
 
 # ---------------------------------------------------------------------------
-# Agent persistence fields (key, created_at, last_active, touch)
+# Agent identity fields (id, workspace, name, metadata)
 # ---------------------------------------------------------------------------
 
 
@@ -85,62 +87,121 @@ class TestAgentFields:
         rendered = agent._render_system_prompts()
         assert rendered == ["Hello, world!"]
 
-    def test_default_key_is_none(self):
+    def test_default_id_is_none(self):
         agent = Agent()
-        assert agent.key is None
+        assert agent.id is None
+
+    def test_explicit_id(self):
+        aid = AgentID("agent-42")
+        agent = Agent(id=aid)
+        assert agent.id == aid
+        assert isinstance(agent.id, AgentID)
+
+    def test_default_workspace_is_none(self):
+        agent = Agent()
+        assert agent._workspace is None
+
+    def test_explicit_workspace(self, tmp_path: Path):
+        agent = Agent(workspace=tmp_path)
+        assert agent.workspace == tmp_path
+
+    def test_all_identity_fields_together(self):
+        aid = AgentID("test-id")
+        agent = Agent(
+            id=aid,
+            name="reviewer",
+            metadata={"role": "code-review"},
+        )
+        assert agent.id == aid
+        assert agent.name == "reviewer"
+        assert agent.metadata == {"role": "code-review"}
+
+
+# ---------------------------------------------------------------------------
+# Session fields (key, created_at, last_active, touch, metadata)
+# ---------------------------------------------------------------------------
+
+
+class TestSessionFields:
+    def _make_agent(self) -> Agent:
+        return Agent(id=AgentID("test-agent"), name="test")
+
+    def test_default_key_is_none(self):
+        session = Session(agent=self._make_agent())
+        assert session.key is None
 
     def test_explicit_key(self):
         key = SessionKey("gitlab:issue:42")
-        agent = Agent(key=key)
-        assert agent.key == key
-        assert isinstance(agent.key, SessionKey)
+        session = Session(agent=self._make_agent(), key=key)
+        assert session.key == key
+        assert isinstance(session.key, SessionKey)
 
     def test_default_created_at_is_none(self):
-        agent = Agent()
-        assert agent.created_at is None
+        session = Session(agent=self._make_agent())
+        assert session.created_at is None
 
     def test_explicit_created_at(self):
         ts = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
-        agent = Agent(created_at=ts)
-        assert agent.created_at == ts
+        session = Session(agent=self._make_agent(), created_at=ts)
+        assert session.created_at == ts
 
     def test_default_last_active_is_none(self):
-        agent = Agent()
-        assert agent.last_active is None
+        session = Session(agent=self._make_agent())
+        assert session.last_active is None
 
     def test_explicit_last_active(self):
         ts = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
-        agent = Agent(last_active=ts)
-        assert agent.last_active == ts
+        session = Session(agent=self._make_agent(), last_active=ts)
+        assert session.last_active == ts
 
     def test_touch_sets_last_active(self):
-        agent = Agent()
-        assert agent.last_active is None
-        agent.touch()
-        assert agent.last_active is not None
-        assert isinstance(agent.last_active, datetime)
+        session = Session(agent=self._make_agent())
+        assert session.last_active is None
+        session.touch()
+        assert session.last_active is not None
+        assert isinstance(session.last_active, datetime)
 
     def test_touch_updates_last_active(self):
         ts = datetime(2020, 1, 1, tzinfo=timezone.utc)
-        agent = Agent(last_active=ts)
-        agent.touch()
-        assert agent.last_active > ts
+        session = Session(agent=self._make_agent(), last_active=ts)
+        session.touch()
+        assert session.last_active > ts
 
-    def test_all_persistence_fields_together(self):
+    def test_default_metadata_is_empty(self):
+        session = Session(agent=self._make_agent())
+        assert session.metadata == {}
+
+    def test_explicit_metadata(self):
+        session = Session(
+            agent=self._make_agent(), metadata={"context": "issue-42"},
+        )
+        assert session.metadata == {"context": "issue-42"}
+
+    def test_session_references_agent(self):
+        agent = self._make_agent()
+        session = Session(agent=agent)
+        assert session.agent is agent
+
+    def test_empty_history_on_creation(self):
+        session = Session(agent=self._make_agent())
+        assert len(session._history.nodes) == 0
+
+    def test_all_session_fields_together(self):
+        agent = self._make_agent()
         key = SessionKey("test-key")
         ts = datetime(2025, 1, 1, tzinfo=timezone.utc)
-        agent = Agent(
-            name="reviewer",
+        session = Session(
+            agent=agent,
             key=key,
             created_at=ts,
             last_active=ts,
             metadata={"role": "code-review"},
         )
-        assert agent.name == "reviewer"
-        assert agent.key == key
-        assert agent.created_at == ts
-        assert agent.last_active == ts
-        assert agent.metadata == {"role": "code-review"}
+        assert session.agent is agent
+        assert session.key == key
+        assert session.created_at == ts
+        assert session.last_active == ts
+        assert session.metadata == {"role": "code-review"}
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +228,32 @@ class TestSessionKey:
         key = SessionKey("k1")
         d: dict[SessionKey, int] = {key: 1}
         assert d[SessionKey("k1")] == 1
+
+
+# ---------------------------------------------------------------------------
+# AgentID
+# ---------------------------------------------------------------------------
+
+
+class TestAgentID:
+    def test_is_str_subclass(self):
+        aid = AgentID("my-agent")
+        assert isinstance(aid, str)
+        assert isinstance(aid, AgentID)
+
+    def test_str_operations(self):
+        aid = AgentID("dev:agent:1")
+        assert aid.startswith("dev:")
+        assert "agent" in aid
+
+    def test_equality_with_str(self):
+        aid = AgentID("abc")
+        assert aid == "abc"
+
+    def test_as_dict_key(self):
+        aid = AgentID("a1")
+        d: dict[AgentID, int] = {aid: 1}
+        assert d[AgentID("a1")] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -384,248 +471,433 @@ class TestHistorySerialization:
 
 
 # ---------------------------------------------------------------------------
-# JsonSessionSerializer (now saves/loads Agent directly)
+# JsonSessionSerializer -- agent identity (save_agent / load_agent)
 # ---------------------------------------------------------------------------
 
 
-class TestJsonSessionSerializer:
-    def test_save_and_load_roundtrip(self, tmp_path: Path):
+class TestJsonSessionSerializerAgent:
+    def test_save_and_load_agent_roundtrip(self, tmp_path: Path):
         agent = Agent(
-            name="test-agent",
+            id=AgentID("test-agent"),
+            name="bot",
             metadata={"role": "coder"},
-            key=SessionKey("test-key"),
-            created_at=datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
-            last_active=datetime(2025, 6, 15, 13, 0, 0, tzinfo=timezone.utc),
         )
-        agent._history = _make_history_with_tool_calls()
 
         serializer = JsonSessionSerializer()
-        serializer.save(agent, tmp_path)
+        agent_path = tmp_path / "agent.json"
+        serializer.save_agent(agent, agent_path)
 
-        assert (tmp_path / "session.json").exists()
-        assert (tmp_path / "history.json").exists()
+        assert agent_path.exists()
 
-        restored = serializer.load(tmp_path)
-        assert restored.key == SessionKey("test-key")
-        assert isinstance(restored.key, SessionKey)
-        assert restored.name == "test-agent"
+        restored = serializer.load_agent(agent_path)
+        assert restored.id == AgentID("test-agent")
+        assert isinstance(restored.id, AgentID)
+        assert restored.name == "bot"
         assert restored.metadata == {"role": "coder"}
-        assert len(restored._history.nodes) == 3
 
-    def test_timestamps_preserved(self, tmp_path: Path):
-        ts = datetime(2025, 6, 15, 12, 30, 0, tzinfo=timezone.utc)
-        agent = Agent(
-            key=SessionKey("ts-test"),
-            created_at=ts,
-            last_active=ts,
-        )
-
+    def test_agent_json_is_human_readable(self, tmp_path: Path):
+        agent = Agent(id=AgentID("readable"), name="bot")
         serializer = JsonSessionSerializer()
-        serializer.save(agent, tmp_path)
-        restored = serializer.load(tmp_path)
+        agent_path = tmp_path / "agent.json"
+        serializer.save_agent(agent, agent_path)
 
-        assert restored.created_at == ts
-        assert restored.last_active == ts
-
-    def test_session_json_is_human_readable(self, tmp_path: Path):
-        agent = Agent(name="bot", key=SessionKey("readable"))
-        serializer = JsonSessionSerializer()
-        serializer.save(agent, tmp_path)
-
-        content = (tmp_path / "session.json").read_text(encoding="utf-8")
+        content = agent_path.read_text(encoding="utf-8")
         assert "\n" in content
         parsed = json.loads(content)
-        assert parsed["key"] == "readable"
-        assert parsed["agent_name"] == "bot"
-
-    def test_history_json_is_human_readable(self, tmp_path: Path):
-        agent = Agent(key=SessionKey("hist"))
-        agent._history = _make_simple_history()
-
-        serializer = JsonSessionSerializer()
-        serializer.save(agent, tmp_path)
-
-        content = (tmp_path / "history.json").read_text(encoding="utf-8")
-        assert "\n" in content
-        parsed = json.loads(content)
-        assert isinstance(parsed, list)
-        assert len(parsed) == 2
-
-    def test_empty_history(self, tmp_path: Path):
-        agent = Agent(key=SessionKey("empty"))
-        serializer = JsonSessionSerializer()
-        serializer.save(agent, tmp_path)
-        restored = serializer.load(tmp_path)
-        assert len(restored._history.nodes) == 0
+        assert parsed["id"] == "readable"
+        assert parsed["name"] == "bot"
 
     def test_agent_class_name_stored(self, tmp_path: Path):
         class CustomAgent(Agent):
             pass
 
-        agent = CustomAgent(name="custom", key=SessionKey("cls"))
-
+        agent = CustomAgent(id=AgentID("cls"), name="custom")
         serializer = JsonSessionSerializer()
-        serializer.save(agent, tmp_path)
+        agent_path = tmp_path / "agent.json"
+        serializer.save_agent(agent, agent_path)
 
-        content = json.loads(
-            (tmp_path / "session.json").read_text(encoding="utf-8")
-        )
+        content = json.loads(agent_path.read_text(encoding="utf-8"))
         assert content["agent_class"] == "CustomAgent"
 
     def test_agent_class_resolved_on_load(self, tmp_path: Path):
         class ResolvableAgent(Agent):
             pass
 
-        agent = ResolvableAgent(name="r", key=SessionKey("resolve"))
+        agent = ResolvableAgent(id=AgentID("resolve"), name="r")
         serializer = JsonSessionSerializer()
-        serializer.save(agent, tmp_path)
+        agent_path = tmp_path / "agent.json"
+        serializer.save_agent(agent, agent_path)
 
-        restored = serializer.load(tmp_path)
+        restored = serializer.load_agent(agent_path)
         assert type(restored).__name__ == "ResolvableAgent"
         assert isinstance(restored, ResolvableAgent)
 
     def test_unknown_agent_class_falls_back_to_base(self, tmp_path: Path):
-        agent = Agent(name="fb", key=SessionKey("fallback"))
+        agent = Agent(id=AgentID("fallback"), name="fb")
         serializer = JsonSessionSerializer()
-        serializer.save(agent, tmp_path)
+        agent_path = tmp_path / "agent.json"
+        serializer.save_agent(agent, agent_path)
 
-        session_path = tmp_path / "session.json"
-        data = json.loads(session_path.read_text(encoding="utf-8"))
+        data = json.loads(agent_path.read_text(encoding="utf-8"))
         data["agent_class"] = "NoSuchAgent"
-        session_path.write_text(
+        agent_path.write_text(
             json.dumps(data, indent=2), encoding="utf-8",
         )
 
-        restored = serializer.load(tmp_path)
+        restored = serializer.load_agent(agent_path)
         assert type(restored) is Agent
         assert restored.name == "fb"
 
-    def test_missing_history_file(self, tmp_path: Path):
-        agent = Agent(key=SessionKey("no-hist"))
+    def test_none_id_roundtrip(self, tmp_path: Path):
+        agent = Agent(name="no-id")
         serializer = JsonSessionSerializer()
-        serializer.save(agent, tmp_path)
-        (tmp_path / "history.json").unlink()
+        agent_path = tmp_path / "agent.json"
+        serializer.save_agent(agent, agent_path)
+        restored = serializer.load_agent(agent_path)
+        assert restored.id is None
+        assert restored.name == "no-id"
 
-        restored = serializer.load(tmp_path)
+
+# ---------------------------------------------------------------------------
+# JsonSessionSerializer -- session data (save_session / load_session)
+# ---------------------------------------------------------------------------
+
+
+class TestJsonSessionSerializerSession:
+    def _make_agent(self) -> Agent:
+        return Agent(id=AgentID("test-agent"), name="test")
+
+    def test_save_and_load_session_roundtrip(self, tmp_path: Path):
+        agent = self._make_agent()
+        session = Session(
+            agent=agent,
+            key=SessionKey("test-key"),
+            created_at=datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
+            last_active=datetime(2025, 6, 15, 13, 0, 0, tzinfo=timezone.utc),
+            metadata={"context": "issue-42"},
+        )
+        session._history = _make_history_with_tool_calls()
+
+        serializer = JsonSessionSerializer()
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+
+        assert (session_dir / "session.json").exists()
+        assert (session_dir / "history.json").exists()
+
+        restored = serializer.load_session(session_dir, agent)
+        assert restored.key == SessionKey("test-key")
+        assert isinstance(restored.key, SessionKey)
+        assert restored.agent is agent
+        assert restored.metadata == {"context": "issue-42"}
+        assert len(restored._history.nodes) == 3
+
+    def test_timestamps_preserved(self, tmp_path: Path):
+        agent = self._make_agent()
+        ts = datetime(2025, 6, 15, 12, 30, 0, tzinfo=timezone.utc)
+        session = Session(
+            agent=agent,
+            key=SessionKey("ts-test"),
+            created_at=ts,
+            last_active=ts,
+        )
+
+        serializer = JsonSessionSerializer()
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+        restored = serializer.load_session(session_dir, agent)
+
+        assert restored.created_at == ts
+        assert restored.last_active == ts
+
+    def test_session_json_is_human_readable(self, tmp_path: Path):
+        agent = self._make_agent()
+        session = Session(agent=agent, key=SessionKey("readable"))
+        serializer = JsonSessionSerializer()
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+
+        content = (session_dir / "session.json").read_text(encoding="utf-8")
+        assert "\n" in content
+        parsed = json.loads(content)
+        assert parsed["key"] == "readable"
+
+    def test_history_json_is_human_readable(self, tmp_path: Path):
+        agent = self._make_agent()
+        session = Session(agent=agent, key=SessionKey("hist"))
+        session._history = _make_simple_history()
+
+        serializer = JsonSessionSerializer()
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+
+        content = (session_dir / "history.json").read_text(encoding="utf-8")
+        assert "\n" in content
+        parsed = json.loads(content)
+        assert isinstance(parsed, list)
+        assert len(parsed) == 2
+
+    def test_empty_history(self, tmp_path: Path):
+        agent = self._make_agent()
+        session = Session(agent=agent, key=SessionKey("empty"))
+        serializer = JsonSessionSerializer()
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+        restored = serializer.load_session(session_dir, agent)
+        assert len(restored._history.nodes) == 0
+
+    def test_missing_history_file(self, tmp_path: Path):
+        agent = self._make_agent()
+        session = Session(agent=agent, key=SessionKey("no-hist"))
+        serializer = JsonSessionSerializer()
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+        (session_dir / "history.json").unlink()
+
+        restored = serializer.load_session(session_dir, agent)
         assert len(restored._history.nodes) == 0
 
     def test_none_timestamps_roundtrip(self, tmp_path: Path):
-        agent = Agent(key=SessionKey("no-ts"))
-        assert agent.created_at is None
-        assert agent.last_active is None
+        agent = self._make_agent()
+        session = Session(agent=agent, key=SessionKey("no-ts"))
+        assert session.created_at is None
+        assert session.last_active is None
 
         serializer = JsonSessionSerializer()
-        serializer.save(agent, tmp_path)
-        restored = serializer.load(tmp_path)
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+        restored = serializer.load_session(session_dir, agent)
         assert restored.created_at is None
         assert restored.last_active is None
 
     def test_none_key_roundtrip(self, tmp_path: Path):
-        agent = Agent(name="keyless")
+        agent = self._make_agent()
+        session = Session(agent=agent)
         serializer = JsonSessionSerializer()
-        serializer.save(agent, tmp_path)
-        restored = serializer.load(tmp_path)
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+        restored = serializer.load_session(session_dir, agent)
         assert restored.key is None
-        assert restored.name == "keyless"
 
 
 # ---------------------------------------------------------------------------
-# SessionStore
+# SessionStore -- agent identity operations
 # ---------------------------------------------------------------------------
 
 
-class TestSessionStore:
-    def test_save_and_load(self, tmp_path: Path):
+class TestSessionStoreAgent:
+    def test_save_and_load_agent(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        agent = Agent(name="stored", key=SessionKey("k1"))
-        agent._history = _make_simple_history()
+        agent = Agent(id=AgentID("a1"), name="stored")
 
-        store.save(agent)
-        assert store.exists("k1")
+        store.save_agent(agent)
+        assert store.agent_exists("a1")
 
-        loaded = store.load("k1")
-        assert loaded.key == "k1"
+        loaded = store.load_agent("a1")
+        assert loaded.id == AgentID("a1")
         assert loaded.name == "stored"
-        assert len(loaded._history.nodes) == 2
 
-    def test_exists_returns_false_for_missing(self, tmp_path: Path):
+    def test_agent_exists_returns_false_for_missing(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        assert not store.exists("nonexistent")
+        assert not store.agent_exists("nonexistent")
 
-    def test_load_missing_raises_key_error(self, tmp_path: Path):
+    def test_load_missing_agent_raises_key_error(self, tmp_path: Path):
         store = SessionStore(tmp_path)
         with pytest.raises(KeyError, match="nonexistent"):
-            store.load("nonexistent")
+            store.load_agent("nonexistent")
 
-    def test_save_without_key_raises(self, tmp_path: Path):
+    def test_save_agent_without_id_raises(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        agent = Agent(name="no-key")
-        with pytest.raises(ValueError, match="without a key"):
-            store.save(agent)
+        agent = Agent(name="no-id")
+        with pytest.raises(ValueError, match="without an id"):
+            store.save_agent(agent)
 
-    def test_list_keys_empty(self, tmp_path: Path):
+    def test_list_agent_ids_empty(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        assert store.list_keys() == []
+        assert store.list_agent_ids() == []
 
-    def test_list_keys_returns_sorted(self, tmp_path: Path):
+    def test_list_agent_ids_returns_sorted(self, tmp_path: Path):
         store = SessionStore(tmp_path)
         for name in ["charlie", "alice", "bob"]:
-            store.save(Agent(key=SessionKey(name)))
+            store.save_agent(Agent(id=AgentID(name), name=name))
 
-        keys = store.list_keys()
+        ids = store.list_agent_ids()
+        assert ids == [AgentID("alice"), AgentID("bob"), AgentID("charlie")]
+
+    def test_delete_agent_removes_identity(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        store.save_agent(Agent(id=AgentID("del-me"), name="doomed"))
+        assert store.agent_exists("del-me")
+
+        store.delete_agent("del-me")
+        assert not store.agent_exists("del-me")
+
+    def test_delete_nonexistent_agent_is_noop(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        store.delete_agent("ghost")
+
+    def test_overwrite_existing_agent(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        store.save_agent(Agent(id=AgentID("ow"), name="v1"))
+        store.save_agent(Agent(id=AgentID("ow"), name="v2"))
+        loaded = store.load_agent("ow")
+        assert loaded.name == "v2"
+
+    def test_list_agent_ids_on_nonexistent_root(self, tmp_path: Path):
+        store = SessionStore(tmp_path / "no-such-dir")
+        assert store.list_agent_ids() == []
+
+    def test_agent_id_type_preserved(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        store.save_agent(Agent(id=AgentID("typed"), name="t"))
+        ids = store.list_agent_ids()
+        assert all(isinstance(i, AgentID) for i in ids)
+
+
+# ---------------------------------------------------------------------------
+# SessionStore -- session operations
+# ---------------------------------------------------------------------------
+
+
+class TestSessionStoreSession:
+    def _make_agent(self, agent_id: str = "a1") -> Agent:
+        return Agent(id=AgentID(agent_id), name="test")
+
+    def test_save_and_load_session(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        agent = self._make_agent()
+        session = Session(
+            agent=agent,
+            key=SessionKey("s1"),
+            created_at=datetime(2025, 6, 15, tzinfo=timezone.utc),
+            last_active=datetime(2025, 6, 15, tzinfo=timezone.utc),
+        )
+        session._history = _make_simple_history()
+
+        store.save_session(session)
+        assert store.session_exists(agent.id, "s1")
+
+        loaded = store.load_session(agent, "s1")
+        assert loaded.key == SessionKey("s1")
+        assert loaded.agent is agent
+        assert len(loaded._history.nodes) == 2
+
+    def test_session_exists_returns_false_for_missing(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        assert not store.session_exists("a1", "nonexistent")
+
+    def test_load_missing_session_raises_key_error(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        agent = self._make_agent()
+        with pytest.raises(KeyError, match="nonexistent"):
+            store.load_session(agent, "nonexistent")
+
+    def test_save_session_without_key_raises(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        agent = self._make_agent()
+        session = Session(agent=agent)
+        with pytest.raises(ValueError, match="without a key"):
+            store.save_session(session)
+
+    def test_save_session_without_agent_id_raises(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        agent = Agent(name="no-id")
+        session = Session(agent=agent, key=SessionKey("s1"))
+        with pytest.raises(ValueError, match="without an id"):
+            store.save_session(session)
+
+    def test_list_session_keys_empty(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        assert store.list_session_keys("a1") == []
+
+    def test_list_session_keys_returns_sorted(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        agent = self._make_agent()
+        for name in ["charlie", "alice", "bob"]:
+            session = Session(agent=agent, key=SessionKey(name))
+            store.save_session(session)
+
+        keys = store.list_session_keys(agent.id)
         assert keys == [
             SessionKey("alice"),
             SessionKey("bob"),
             SessionKey("charlie"),
         ]
 
-    def test_delete_removes_session(self, tmp_path: Path):
+    def test_delete_session(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        store.save(Agent(key=SessionKey("del-me")))
-        assert store.exists("del-me")
+        agent = self._make_agent()
+        store.save_session(Session(agent=agent, key=SessionKey("del-me")))
+        assert store.session_exists(agent.id, "del-me")
 
-        store.delete("del-me")
-        assert not store.exists("del-me")
+        store.delete_session(agent.id, "del-me")
+        assert not store.session_exists(agent.id, "del-me")
 
-    def test_delete_nonexistent_is_noop(self, tmp_path: Path):
+    def test_delete_nonexistent_session_is_noop(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        store.delete("ghost")
+        store.delete_session("a1", "ghost")
 
     def test_overwrite_existing_session(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        store.save(Agent(name="v1", key=SessionKey("ow")))
-        store.save(Agent(name="v2", key=SessionKey("ow")))
-        loaded = store.load("ow")
-        assert loaded.name == "v2"
+        agent = self._make_agent()
 
-    def test_list_keys_on_nonexistent_root(self, tmp_path: Path):
-        store = SessionStore(tmp_path / "no-such-dir")
-        assert store.list_keys() == []
+        s1 = Session(
+            agent=agent,
+            key=SessionKey("ow"),
+            metadata={"version": "v1"},
+        )
+        store.save_session(s1)
+
+        s2 = Session(
+            agent=agent,
+            key=SessionKey("ow"),
+            metadata={"version": "v2"},
+        )
+        store.save_session(s2)
+
+        loaded = store.load_session(agent, "ow")
+        assert loaded.metadata == {"version": "v2"}
 
     def test_session_key_type_preserved(self, tmp_path: Path):
         store = SessionStore(tmp_path)
-        store.save(Agent(key=SessionKey("typed")))
-        keys = store.list_keys()
+        agent = self._make_agent()
+        store.save_session(Session(agent=agent, key=SessionKey("typed")))
+        keys = store.list_session_keys(agent.id)
         assert all(isinstance(k, SessionKey) for k in keys)
 
     def test_custom_serializer(self, tmp_path: Path):
         call_log: list[str] = []
 
         class TrackingSerializer:
-            def save(self, agent: Agent, directory: Path) -> None:
-                call_log.append(f"save:{agent.key}")
+            def save_agent(self, agent: Agent, path: Path) -> None:
+                call_log.append(f"save_agent:{agent.id}")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}", encoding="utf-8")
+
+            def load_agent(self, path: Path) -> Agent:
+                call_log.append("load_agent")
+                return Agent(id=AgentID("custom"), name="custom")
+
+            def save_session(self, session: Session, directory: Path) -> None:
+                call_log.append(f"save_session:{session.key}")
                 (directory / "marker.txt").write_text("saved", encoding="utf-8")
 
-            def load(self, directory: Path) -> Agent:
-                call_log.append("load")
-                return Agent(key=SessionKey("custom"))
+            def load_session(self, directory: Path, agent: Agent) -> Session:
+                call_log.append("load_session")
+                return Session(agent=agent, key=SessionKey("custom"))
 
         store = SessionStore(tmp_path, serializer=TrackingSerializer())
-        store.save(Agent(key=SessionKey("cs")))
-        store.load("cs")
+        agent = Agent(id=AgentID("cs"), name="cs")
+        store.save_agent(agent)
+        store.load_agent("cs")
+        session = Session(agent=agent, key=SessionKey("sk"))
+        store.save_session(session)
+        store.load_session(agent, "sk")
 
-        assert "save:cs" in call_log
-        assert "load" in call_log
+        assert "save_agent:cs" in call_log
+        assert "load_agent" in call_log
+        assert "save_session:sk" in call_log
+        assert "load_session" in call_log
 
 
 # ---------------------------------------------------------------------------
@@ -649,11 +921,11 @@ class TestRuntime:
 
     def test_default_session_store_location(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        expected = tmp_path / ".thorn" / "sessions"
+        expected = tmp_path / ".thorn" / "agents"
         assert rt.sessions.root == expected
 
     def test_custom_session_store(self, tmp_path: Path):
-        custom_store = SessionStore(tmp_path / "custom-sessions")
+        custom_store = SessionStore(tmp_path / "custom-agents")
         rt = self._make_runtime(tmp_path, session_store=custom_store)
         assert rt.sessions is custom_store
 
@@ -678,62 +950,90 @@ class TestRuntime:
         ctx = rt.create_context()
         assert ctx.ask_user_handler is handler
 
-    def test_create_agent_with_auto_key(self, tmp_path: Path):
+    def test_create_agent_with_auto_id(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
         agent = rt.create_agent()
 
-        assert isinstance(agent.key, SessionKey)
-        assert len(agent.key) > 0
-        assert agent.name == str(agent.key)
-        assert agent.created_at is not None
-        assert agent.last_active is not None
+        assert isinstance(agent.id, AgentID)
+        assert len(agent.id) > 0
+        assert agent.name == str(agent.id)
 
-    def test_create_agent_with_explicit_key(self, tmp_path: Path):
+    def test_create_agent_with_explicit_id(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        agent = rt.create_agent("my-key")
+        agent = rt.create_agent(id="my-id")
 
-        assert agent.key == SessionKey("my-key")
+        assert agent.id == AgentID("my-id")
+        assert isinstance(agent.id, AgentID)
 
-    def test_create_agent_with_str_key_becomes_session_key(self, tmp_path: Path):
+    def test_create_agent_with_str_id_becomes_agent_id(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        agent = rt.create_agent("str-key")
-        assert isinstance(agent.key, SessionKey)
+        agent = rt.create_agent(id="str-id")
+        assert isinstance(agent.id, AgentID)
 
     def test_create_agent_with_custom_name(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        agent = rt.create_agent("s1", name="reviewer")
+        agent = rt.create_agent(id="a1", name="reviewer")
         assert agent.name == "reviewer"
-        assert agent.key == SessionKey("s1")
+        assert agent.id == AgentID("a1")
 
     def test_create_agent_with_metadata(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        agent = rt.create_agent("s1", metadata={"issue": 42})
+        agent = rt.create_agent(id="a1", metadata={"issue": 42})
         assert agent.metadata == {"issue": 42}
+
+    def test_create_agent_assigns_workspace(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        agent = rt.create_agent(id="a1")
+        assert agent.workspace is not None
 
     def test_save_and_get_or_create_agent(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        agent = rt.create_agent("persistent")
-        agent._history = _make_simple_history()
+        agent = rt.create_agent(id="persistent", name="bot")
         rt.save_agent(agent)
 
         retrieved = rt.get_or_create_agent("persistent")
-        assert retrieved.key == "persistent"
-        assert len(retrieved._history.nodes) == 2
+        assert retrieved.id == AgentID("persistent")
+        assert retrieved.name == "bot"
 
     def test_get_or_create_creates_when_missing(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        agent = rt.get_or_create_agent("new-key")
-        assert agent.key == "new-key"
-        assert len(agent._history.nodes) == 0
+        agent = rt.get_or_create_agent("new-id")
+        assert agent.id == AgentID("new-id")
 
-    def test_save_agent_updates_last_active(self, tmp_path: Path):
+    def test_get_or_create_session(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
-        agent = rt.create_agent("ts-test")
-        old_ts = agent.last_active
-        import time
-        time.sleep(0.01)
-        rt.save_agent(agent)
-        assert agent.last_active > old_ts
+        agent = rt.create_agent(id="a1")
+        session = rt.get_or_create_session(agent, "s1")
+        assert session.key == SessionKey("s1")
+        assert session.agent is agent
+        assert session.created_at is not None
+        assert session.last_active is not None
+
+    def test_get_or_create_session_loads_existing(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        agent = rt.create_agent(id="a1")
+
+        session = rt.get_or_create_session(agent, "s1")
+        session._history = _make_simple_history()
+        rt.save_session(session)
+
+        reloaded = rt.get_or_create_session(agent, "s1")
+        assert reloaded.key == SessionKey("s1")
+        assert len(reloaded._history.nodes) == 2
+
+    def test_save_session_updates_last_active(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        agent = rt.create_agent(id="a1")
+        ts = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        session = Session(agent=agent, key=SessionKey("s1"), last_active=ts)
+        rt.save_session(session)
+        assert session.last_active > ts
+
+    def test_get_or_create_session_without_agent_id_raises(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        agent = Agent(name="no-id")
+        with pytest.raises(ValueError, match="without an id"):
+            rt.get_or_create_session(agent, "s1")
 
     def test_create_context_system_prompts_are_independent(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
@@ -804,9 +1104,10 @@ class TestRuntimeContextManager:
 
 class TestReExports:
     def test_runtime_importable_from_thorn(self):
-        from thorn import Runtime, SessionKey
+        from thorn import AgentID, Runtime, SessionKey
         assert Runtime is not None
         assert SessionKey is not None
+        assert AgentID is not None
 
     def test_session_not_importable_from_thorn(self):
         import thorn
@@ -814,6 +1115,7 @@ class TestReExports:
 
     def test_runtime_importable_from_thorn_runtime(self):
         from thorn.runtime import (
+            AgentID,
             Runtime,
             SessionKey,
             SessionStore,
@@ -821,10 +1123,18 @@ class TestReExports:
             JsonSessionSerializer,
         )
         assert all(cls is not None for cls in [
-            Runtime, SessionKey, SessionStore,
+            AgentID, Runtime, SessionKey, SessionStore,
             SessionSerializer, JsonSessionSerializer,
         ])
 
     def test_session_not_importable_from_thorn_runtime(self):
         import thorn.runtime
         assert not hasattr(thorn.runtime, "Session")
+
+    def test_agent_id_importable_from_thorn_runtime(self):
+        from thorn.runtime import AgentID
+        assert AgentID is not None
+
+    def test_session_importable_from_thorn_core(self):
+        from thorn.core import Session
+        assert Session is not None

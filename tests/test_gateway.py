@@ -6,15 +6,16 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from thorn.core._agent import Agent
 from thorn.core._provider import MockProvider
+from thorn.core._session import Session, _SessionPromptAccessor
 from thorn.gateway._event import EventSource, IncomingEvent
 from thorn.gateway._gateway import Gateway
-from thorn.runtime import Runtime, SessionKey
+from thorn.runtime import AgentID, Runtime, SessionKey
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +52,23 @@ class TestIncomingEvent:
             content="hi",
         )
         assert event.metadata == {}
+
+    def test_agent_id_defaults_to_none(self):
+        event = IncomingEvent(
+            source="test",
+            session_key=SessionKey("k"),
+            content="hi",
+        )
+        assert event.agent_id is None
+
+    def test_agent_id_set(self):
+        event = IncomingEvent(
+            source="test",
+            session_key=SessionKey("k"),
+            content="hi",
+            agent_id=AgentID("my-agent"),
+        )
+        assert event.agent_id == AgentID("my-agent")
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +149,7 @@ class TestGateway:
         assert handled[0].session_key == SessionKey("test_1")
 
     @pytest.mark.asyncio
-    async def test_creates_agent_for_event(self, tmp_path: Path):
+    async def test_creates_agent_and_session_for_event(self, tmp_path: Path):
         runtime = self._make_runtime(tmp_path)
         event = IncomingEvent(
             source="test",
@@ -142,9 +160,14 @@ class TestGateway:
         gateway = Gateway(runtime=runtime, sources=[], tools=[])
 
         async with runtime:
-            agent = runtime.get_or_create_agent(event.session_key)
-            assert agent.key == SessionKey("agent_key")
+            agent = runtime.get_or_create_agent(AgentID("default"))
+            assert agent.id == AgentID("default")
             assert isinstance(agent, Agent)
+
+            session = runtime.get_or_create_session(agent, event.session_key)
+            assert session.key == SessionKey("agent_key")
+            assert session.agent is agent
+            assert isinstance(session, Session)
 
     @pytest.mark.asyncio
     async def test_shutdown_stops_sources(self, tmp_path: Path):
@@ -166,8 +189,8 @@ class TestGateway:
         assert source._stop.is_set()
 
     @pytest.mark.asyncio
-    async def test_error_in_agent_prompt_does_not_crash(self, tmp_path: Path):
-        """If agent.prompt() fails, the gateway logs and continues."""
+    async def test_error_in_session_prompt_does_not_crash(self, tmp_path: Path):
+        """If session.prompt() fails, the gateway logs and continues."""
         event = IncomingEvent(
             source="test",
             session_key=SessionKey("err_key"),
@@ -178,13 +201,12 @@ class TestGateway:
         gateway = Gateway(runtime=runtime, sources=[source], tools=[])
 
         with patch.object(
-            Agent, "prompt", new_callable=lambda: property(
-                lambda self: _FailingPrompt()
-            ),
+            _SessionPromptAccessor, "__call__",
+            side_effect=RuntimeError("Agent failed"),
         ):
             await gateway.run()
 
-        assert not runtime.sessions.exists("err_key")
+        assert not runtime.sessions.session_exists(AgentID("default"), "err_key")
 
     @pytest.mark.asyncio
     async def test_multiple_sources(self, tmp_path: Path):
@@ -209,13 +231,6 @@ class TestGateway:
 
         assert SessionKey("k1") in handled
         assert SessionKey("k2") in handled
-
-
-class _FailingPrompt:
-    """Stand-in for agent.prompt that raises on call."""
-
-    async def __call__(self, *args: Any, **kwargs: Any) -> str:
-        raise RuntimeError("Agent failed")
 
 
 # ---------------------------------------------------------------------------
@@ -497,65 +512,76 @@ class TestSessionStoreSafeDirnames:
     def test_safe_dirname_passthrough(self):
         from thorn.runtime._store import _safe_dirname
 
-        key = SessionKey("gitlab_123_Issue_42")
-        assert _safe_dirname(key) == "gitlab_123_Issue_42"
+        assert _safe_dirname("gitlab_123_Issue_42") == "gitlab_123_Issue_42"
 
     def test_safe_dirname_encodes_colon(self):
         from thorn.runtime._store import _safe_dirname
 
-        key = SessionKey("gitlab:org/repo:Issue:42")
-        encoded = _safe_dirname(key)
+        encoded = _safe_dirname("gitlab:org/repo:Issue:42")
         assert ":" not in encoded
         assert "/" not in encoded
 
     def test_unsafe_dirname_roundtrip(self):
         from thorn.runtime._store import _safe_dirname, _unsafe_dirname
 
-        key = SessionKey("gitlab:org/repo:Issue:42")
-        encoded = _safe_dirname(key)
+        original = "gitlab:org/repo:Issue:42"
+        encoded = _safe_dirname(original)
         recovered = _unsafe_dirname(encoded)
-        assert recovered == key
-        assert isinstance(recovered, SessionKey)
+        assert recovered == original
 
-    def test_store_save_load_with_special_chars(self, tmp_path: Path):
+    def test_store_save_load_agent_with_special_chars(self, tmp_path: Path):
         from thorn.runtime._store import SessionStore
 
         store = SessionStore(tmp_path)
-        agent = Agent(key=SessionKey("a:b/c"), name="special")
-        store.save(agent)
+        agent = Agent(id=AgentID("a:b/c"), name="special")
+        store.save_agent(agent)
 
-        assert store.exists(SessionKey("a:b/c"))
-        loaded = store.load(SessionKey("a:b/c"))
+        assert store.agent_exists(AgentID("a:b/c"))
+        loaded = store.load_agent(AgentID("a:b/c"))
         assert loaded.name == "special"
 
-    def test_store_list_keys_decodes(self, tmp_path: Path):
+    def test_store_list_agent_ids_decodes(self, tmp_path: Path):
         from thorn.runtime._store import SessionStore
 
         store = SessionStore(tmp_path)
-        store.save(Agent(key=SessionKey("x:y")))
-        store.save(Agent(key=SessionKey("simple")))
+        store.save_agent(Agent(id=AgentID("x:y"), name="xy"))
+        store.save_agent(Agent(id=AgentID("simple"), name="simple"))
 
-        keys = store.list_keys()
-        assert SessionKey("simple") in keys
-        assert SessionKey("x:y") in keys
+        ids = store.list_agent_ids()
+        assert AgentID("simple") in ids
+        assert AgentID("x:y") in ids
 
-    def test_store_delete_with_special_chars(self, tmp_path: Path):
+    def test_store_delete_agent_with_special_chars(self, tmp_path: Path):
         from thorn.runtime._store import SessionStore
 
         store = SessionStore(tmp_path)
-        store.save(Agent(key=SessionKey("del:me/now")))
-        assert store.exists("del:me/now")
-        store.delete("del:me/now")
-        assert not store.exists("del:me/now")
+        store.save_agent(Agent(id=AgentID("del:me/now"), name="del"))
+        assert store.agent_exists(AgentID("del:me/now"))
+        store.delete_agent(AgentID("del:me/now"))
+        assert not store.agent_exists(AgentID("del:me/now"))
 
-    def test_clean_keys_unchanged(self, tmp_path: Path):
+    def test_clean_agent_ids_unchanged(self, tmp_path: Path):
         from thorn.runtime._store import SessionStore
 
         store = SessionStore(tmp_path)
-        store.save(Agent(key=SessionKey("gitlab_123_Issue_42")))
+        store.save_agent(Agent(id=AgentID("gitlab_123_Issue_42"), name="test"))
 
-        dir_names = [d.name for d in tmp_path.iterdir() if d.is_dir()]
-        assert "gitlab_123_Issue_42" in dir_names
+        file_names = [f.stem for f in tmp_path.iterdir() if f.is_file()]
+        assert "gitlab_123_Issue_42" in file_names
+
+    def test_store_session_with_special_chars(self, tmp_path: Path):
+        from thorn.runtime._store import SessionStore
+
+        store = SessionStore(tmp_path)
+        agent = Agent(id=AgentID("test_agent"), name="test")
+        store.save_agent(agent)
+
+        session = Session(agent=agent, key=SessionKey("a:b/c"))
+        store.save_session(session)
+
+        assert store.session_exists(AgentID("test_agent"), SessionKey("a:b/c"))
+        loaded = store.load_session(agent, SessionKey("a:b/c"))
+        assert loaded.key == SessionKey("a:b/c")
 
 
 # ---------------------------------------------------------------------------

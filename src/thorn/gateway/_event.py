@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from thorn.runtime._session import SessionKey
+from thorn.runtime._session import AgentID, SessionKey
 
 
 @dataclass(frozen=True)
@@ -24,13 +24,17 @@ class IncomingEvent:
     """Pure-data description of an external event.
 
     The gateway routes each event to the appropriate agent based on
-    ``session_key``.  The ``content`` field is the formatted prompt
-    that the agent will receive.
+    ``agent_id`` (optional) and ``session_key``.  The ``content`` field
+    is the formatted prompt that the agent will receive.
 
     Attributes:
         source: Identifies the originating system (e.g. ``"gitlab"``).
-        session_key: Determines which agent session handles this event.
+        session_key: Determines which session handles this event,
+            scoped under the resolved agent.
         content: Human-readable prompt describing what happened.
+        agent_id: Optional identifier for the agent that should handle
+            this event.  When ``None``, the gateway's default routing
+            logic applies.
         metadata: Source-specific data (project IDs, TODO IDs, etc.)
             for use by tools or diagnostics.
     """
@@ -38,6 +42,7 @@ class IncomingEvent:
     source: str
     session_key: SessionKey
     content: str
+    agent_id: AgentID | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

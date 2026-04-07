@@ -152,7 +152,7 @@ class TestRunAgentLoopHistory:
 
 class TestAgentPromptMessages:
     async def test_text_mode_accumulates_on_agent(self):
-        """Consecutive prompt() calls accumulate history on agent._history."""
+        """Consecutive prompt() calls accumulate history on agent._default_session._history."""
         provider = MockProvider(canned_responses=[
             _text_response("wrote code"),
             _text_response("fixed errors"),
@@ -163,12 +163,12 @@ class TestAgentPromptMessages:
             agent = Agent()
 
             await agent.prompt("write code")
-            assert len(agent._history.nodes) == 2
+            assert len(agent._default_session._history.nodes) == 2
 
             await agent.prompt("fix build errors")
-            assert len(agent._history.nodes) == 4
-            assert isinstance(agent._history.nodes[2], UserPromptNode)
-            assert agent._history.nodes[2].message.content == "fix build errors"
+            assert len(agent._default_session._history.nodes) == 4
+            assert isinstance(agent._default_session._history.nodes[2], UserPromptNode)
+            assert agent._default_session._history.nodes[2].message.content == "fix build errors"
         finally:
             reset_context(token)
 
@@ -196,12 +196,12 @@ class TestAgentPromptMessages:
 
             r1 = await agent.prompt[int]("count things")
             assert r1 == 42
-            first_turn_len = len(agent._history.nodes)
+            first_turn_len = len(agent._default_session._history.nodes)
             assert first_turn_len >= 2
 
             r2 = await agent.prompt[int]("count more")
             assert r2 == 99
-            assert len(agent._history.nodes) > first_turn_len
+            assert len(agent._default_session._history.nodes) > first_turn_len
         finally:
             reset_context(token)
 
@@ -211,10 +211,10 @@ class TestAgentPromptMessages:
         token = set_context(ctx)
         try:
             agent = Agent()
-            assert len(agent._history.nodes) == 0
+            assert len(agent._default_session._history.nodes) == 0
             result = await agent.prompt("hello")
             assert result == "ok"
-            assert len(agent._history.nodes) == 2
+            assert len(agent._default_session._history.nodes) == 2
         finally:
             reset_context(token)
 
@@ -233,10 +233,10 @@ class TestAgentPromptMessages:
             await agent_a.prompt("hello A")
             await agent_b.prompt("hello B")
 
-            assert len(agent_a._history.nodes) == 2
-            assert len(agent_b._history.nodes) == 2
-            assert agent_a._history.nodes[0].message.content == "hello A"
-            assert agent_b._history.nodes[0].message.content == "hello B"
+            assert len(agent_a._default_session._history.nodes) == 2
+            assert len(agent_b._default_session._history.nodes) == 2
+            assert agent_a._default_session._history.nodes[0].message.content == "hello A"
+            assert agent_b._default_session._history.nodes[0].message.content == "hello B"
         finally:
             reset_context(token)
 

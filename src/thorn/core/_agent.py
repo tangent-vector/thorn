@@ -9,13 +9,16 @@ calls with the role's context.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
+    from thorn.core._context import ExecutionContext
     from thorn.core._context_injection import SeedContent
     from thorn.core._file_access import FileAccessRule
-    from thorn.runtime._session import SessionKey
+    from thorn.core._session import Session, _SessionPromptAccessor
+    from thorn.runtime._session import AgentID
 
 
 class _SafeDict(dict):
@@ -52,35 +55,52 @@ class Agent:
     file_access: ClassVar[list[FileAccessRule]]
     validation_rules: ClassVar[list[str]] = []
 
-    def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        cls._abstract = abstract
-        if not abstract:
-            Agent._registry[cls.__name__] = cls
-
     def __init__(
         self,
         *,
         name: str | None = None,
         metadata: dict[str, Any] | None = None,
-        key: SessionKey | None = None,
-        created_at: datetime | None = None,
-        last_active: datetime | None = None,
+        id: AgentID | None = None,
+        workspace: Path | None = None,
         **kwargs: Any,
     ) -> None:
-        from thorn.core._history import HistoryTree
-        self._history: HistoryTree = HistoryTree()
         self.name: str | None = name
         self.metadata: dict[str, Any] = metadata if metadata is not None else {}
-        self.key: SessionKey | None = key
-        self.created_at: datetime | None = created_at
-        self.last_active: datetime | None = last_active
+        self.id: AgentID | None = id
+        self._workspace: Path | None = workspace
+        self._workspace_resolved: bool = workspace is not None
         for k, v in kwargs.items():
             setattr(self, k, v)
 
-    def touch(self) -> None:
-        """Update ``last_active`` to the current UTC time."""
-        self.last_active = datetime.now(timezone.utc)
+    @property
+    def workspace(self) -> Path | None:
+        """The agent's workspace directory.
+
+        Resolved lazily: if not explicitly provided at construction,
+        inherited from the ambient ``ExecutionContext.workspace_root``
+        on first access.  Once resolved, the value is fixed for the
+        lifetime of the instance.
+        """
+        if not self._workspace_resolved:
+            self._workspace_resolved = True
+            try:
+                from thorn.core._context import get_context
+                self._workspace = get_context().workspace_root
+            except RuntimeError:
+                pass
+        return self._workspace
+
+    @property
+    def _default_session(self) -> Session:
+        """Lazily-created default session for the simple API.
+
+        Enables ``agent.prompt("...")`` without explicitly constructing
+        a ``Session``.  Multi-turn conversations reuse the same session.
+        """
+        if self.__dict__.get("_default_session_obj") is None:
+            from thorn.core._session import Session
+            self._default_session_obj = Session(agent=self)
+        return self._default_session_obj
 
     def __str__(self) -> str:
         cls_name = type(self).__name__
@@ -103,6 +123,12 @@ class Agent:
             for name, klass in Agent._registry.items()
             if issubclass(klass, filter_base)
         }
+
+    def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        cls._abstract = abstract
+        if not abstract:
+            Agent._registry[cls.__name__] = cls
 
     @classmethod
     def _collect_system_prompts(cls) -> list[Any]:
@@ -211,9 +237,15 @@ class Agent:
         return {}
 
     @property
-    def prompt(self) -> _AgentPromptAccessor:
-        """Accessor for ``agent.prompt("...")`` and ``agent.prompt[T]("...")``."""
-        return _AgentPromptAccessor(self)
+    def prompt(self) -> _SessionPromptAccessor:
+        """Accessor for ``agent.prompt("...")`` and ``agent.prompt[T]("...")``.
+
+        Delegates to a lazily-created default ``Session`` so that the
+        simple ``agent.prompt("...")`` API continues to work without
+        requiring an explicit ``Session`` or ``Runtime``.
+        """
+        from thorn.core._session import _SessionPromptAccessor
+        return _SessionPromptAccessor(self._default_session)
 
 
 def _default_file_access() -> list[FileAccessRule]:
@@ -226,69 +258,9 @@ def _default_file_access() -> list[FileAccessRule]:
     ]
 
 
-class _AgentPromptAccessor:
-    """Provides ``agent.prompt("...")`` (text) and ``agent.prompt[T]("...")`` (structured)."""
-
-    __slots__ = ("_agent",)
-
-    def __init__(self, agent: Agent) -> None:
-        self._agent = agent
-
-    def __getitem__(self, result_type: type) -> _TypedAgentPrompt:
-        return _TypedAgentPrompt(self._agent, result_type)
-
-    async def __call__(
-        self,
-        text: str,
-        *,
-        tools: list[Any] | None = None,
-        system: str | None = None,
-        file_access: list[FileAccessRule] | None = None,
-        recommended_context: list[SeedContent] | None = None,
-    ) -> str:
-        return await _run_agent_prompt(
-            agent=self._agent,
-            text=text,
-            result_type=str,
-            extra_tools=tools,
-            extra_system=system,
-            extra_file_access=file_access,
-            recommended_context=recommended_context,
-        )
-
-
-class _TypedAgentPrompt:
-    """Callable returned by ``agent.prompt[T]`` for structured results."""
-
-    __slots__ = ("_agent", "_result_type")
-
-    def __init__(self, agent: Agent, result_type: type) -> None:
-        self._agent = agent
-        self._result_type = result_type
-
-    async def __call__(
-        self,
-        text: str,
-        *,
-        tools: list[Any] | None = None,
-        system: str | None = None,
-        file_access: list[FileAccessRule] | None = None,
-        recommended_context: list[SeedContent] | None = None,
-    ) -> Any:
-        return await _run_agent_prompt(
-            agent=self._agent,
-            text=text,
-            result_type=self._result_type,
-            extra_tools=tools,
-            extra_system=system,
-            extra_file_access=file_access,
-            recommended_context=recommended_context,
-        )
-
-
-async def _run_agent_prompt(
+async def _run_session_prompt(
     *,
-    agent: Agent,
+    session: Session,
     text: str,
     result_type: type,
     extra_tools: list[Any] | None = None,
@@ -296,10 +268,10 @@ async def _run_agent_prompt(
     extra_file_access: list[FileAccessRule] | None = None,
     recommended_context: list[SeedContent] | None = None,
 ) -> Any:
-    """Shared implementation for agent prompt calls.
+    """Shared implementation for session prompt calls.
 
-    Conversation history accumulates on ``agent._history`` across
-    calls, enabling multi-turn patterns where the same agent retains
+    Conversation history accumulates on ``session._history`` across
+    calls, enabling multi-turn patterns where the same session retains
     context (e.g. write code, then fix build errors).
     """
     import time
@@ -308,6 +280,8 @@ async def _run_agent_prompt(
     from thorn.core._file_access import FileAccessLevel, FileAccessPolicy
     from thorn.core._func import _prepare_tools, _type_label
     from thorn.core._loop import run_agent_loop
+
+    agent = session.agent
 
     sys_prompts = agent._render_system_prompts()
     if extra_system:
@@ -319,13 +293,15 @@ async def _run_agent_prompt(
 
     ctx = get_context()
 
+    workspace = agent.workspace if agent.workspace is not None else ctx.workspace_root
+
     rules = type(agent)._collect_file_access()
     rules = list(rules)
     rules.extend(agent._instance_file_access())
     if extra_file_access:
         rules.extend(extra_file_access)
     policy = FileAccessPolicy(
-        rules, default=FileAccessLevel.NONE, workspace=ctx.workspace_root,
+        rules, default=FileAccessLevel.NONE, workspace=workspace,
     )
 
     if ctx.global_ignores is not None:
@@ -336,11 +312,17 @@ async def _run_agent_prompt(
         scope_label += f"[{_type_label(result_type)}]"
     child = ctx.push_scope(scope_label, agent=agent, file_access_policy=policy)
 
+    # Override workspace_root when the agent has its own workspace,
+    # so file tools, AGENTS.md loading, and policies operate within
+    # the agent's scope rather than the parent context's.
+    if workspace is not None:
+        child.workspace_root = workspace
+
     await child.event_sink.on_scope_enter(child.scope)
     t0 = time.monotonic()
     token = set_context(child)
     try:
-        # Context injection: pre-populate the agent's history with
+        # Context injection: pre-populate the session's history with
         # relevant content so it doesn't waste turns re-discovering
         # project structure.  This MUST run after set_context(child)
         # because the tool functions we call (read_file, etc.) use
@@ -349,9 +331,9 @@ async def _run_agent_prompt(
         # assistant turn follows it naturally; run_agent_loop is then
         # called with user_prompt=None to avoid a duplicate.
         user_prompt_for_loop: str | None = text
-        if not agent._history.nodes:
+        if not session._history.nodes:
             injected = await _inject_context(
-                agent, text, child, recommended_context,
+                session, text, child, recommended_context,
             )
             if injected:
                 user_prompt_for_loop = None
@@ -362,7 +344,7 @@ async def _run_agent_prompt(
             tools=prepared,
             system_prompts=sys_prompts,
             result_type=result_type,
-            history=agent._history,
+            history=session._history,
         )
     finally:
         duration_s = time.monotonic() - t0
@@ -373,12 +355,12 @@ async def _run_agent_prompt(
 
 
 async def _inject_context(
-    agent: Agent,
+    session: Session,
     text: str,
     ctx: ExecutionContext,
     recommended_context: list[SeedContent] | None = None,
 ) -> bool:
-    """Pre-populate *agent*'s history with relevant context.
+    """Pre-populate *session*'s history with relevant context.
 
     Appends the user prompt followed by a synthetic assistant turn
     containing tool calls for workspace content.  Returns ``True`` if
@@ -404,6 +386,8 @@ async def _inject_context(
     if budget <= 0:
         return False
 
+    agent = session.agent
+
     seen: set[SeedContent] = set()
     ordered: list[SeedContent] = []
 
@@ -427,8 +411,8 @@ async def _inject_context(
         briefing = await assemble_briefing(ordered, budget, ctx.workspace_root)
         if briefing is None:
             return False
-        agent._history.append_user_prompt(text)
-        agent._history.nodes.append(briefing)
+        session._history.append_user_prompt(text)
+        session._history.nodes.append(briefing)
         return True
     except Exception:
         logging.getLogger(__name__).debug(

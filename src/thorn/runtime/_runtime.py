@@ -1,10 +1,9 @@
 """Runtime: the persistent execution environment for Thorn.
 
-The ``Runtime`` is the central service object that replaces the ad-hoc
-``ExecutionContext`` construction scattered across CLI commands.  It
-holds the provider, event sink, workspace configuration, and a session
-store, and can produce ``ExecutionContext`` instances for individual
-operations.
+The ``Runtime`` is the central service object that manages the provider,
+event sink, workspace configuration, and a session store.  It produces
+``ExecutionContext`` instances for individual operations and manages the
+lifecycle of agent instances and their sessions.
 
 Used as an async context manager, it sets up the ambient
 ``ExecutionContext`` so that ``agent.prompt()`` works automatically::
@@ -12,7 +11,7 @@ Used as an async context manager, it sets up the ambient
     async with runtime:
         result = await agent.prompt("do something")
 
-Every Thorn deployment -- ``thorn run``, ``thorn chat``, or a future
+Every Thorn deployment -- ``thorn run``, ``thorn chat``, or the
 gateway daemon -- creates a ``Runtime``.  For one-shot ``thorn run``
 the overhead is negligible: it is essentially what the CLI does today,
 just structured through a uniform abstraction.
@@ -36,7 +35,8 @@ from thorn.core._context import (
     set_context,
 )
 from thorn.core._provider import LLMProvider
-from thorn.runtime._session import SessionKey
+from thorn.core._session import Session
+from thorn.runtime._session import AgentID, SessionKey
 from thorn.runtime._store import SessionStore
 
 if TYPE_CHECKING:
@@ -49,26 +49,14 @@ class Runtime:
 
     Manages provider configuration, event sinks, workspace settings,
     and a session store.  Acts as a factory for ``ExecutionContext``
-    instances used by the agent loop.
+    instances used by the agent loop, and manages the lifecycle of
+    agent instances and their sessions.
 
     Use as an async context manager to set the ambient
     ``ExecutionContext`` for the duration of the block::
 
         async with runtime:
             result = await agent.prompt("hello")
-
-    Attributes:
-        provider: LLM provider for completion requests.
-        event_sink: Sink that receives streaming execution events.
-        workspace_root: Resolved absolute path to the workspace.
-        workspace_instructions: Contents of the workspace ``AGENTS.md``
-            file, if any.
-        global_ignores: Ceiling policy from ``.aiignore`` /
-            ``.thornignore``.
-        sessions: Filesystem-backed session store.
-        ask_user_handler: Callback for the ``ask_user`` tool.
-        context_window: Effective context window budget in tokens.
-        validation_tracker: Shared validation status tracker.
     """
 
     def __init__(
@@ -94,8 +82,8 @@ class Runtime:
         self.validation_tracker = validation_tracker
 
         if session_store is None:
-            sessions_root = workspace_root / ".thorn" / "sessions"
-            session_store = SessionStore(sessions_root)
+            agents_root = workspace_root / ".thorn" / "agents"
+            session_store = SessionStore(agents_root)
         self.sessions = session_store
 
         self._context: ExecutionContext | None = None
@@ -159,48 +147,83 @@ class Runtime:
 
     def create_agent(
         self,
-        key: SessionKey | str | None = None,
+        agent_class: type[Agent] = Agent,
         *,
+        id: AgentID | str | None = None,
         name: str | None = None,
+        workspace: Path | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Agent:
-        """Create a new agent with persistence fields populated.
+        """Create a new agent instance with identity fields populated.
 
-        When *key* is ``None``, a UUID-based key is generated.
-        When *name* is ``None``, the key is used as the display name.
+        When *id* is ``None``, a UUID-based ID is generated.
+        When *name* is ``None``, the ID is used as the display name.
+        When *workspace* is ``None``, a directory under the runtime's
+        agents root is used.
         """
-        if key is None:
-            key = SessionKey(str(uuid.uuid4()))
-        elif not isinstance(key, SessionKey):
-            key = SessionKey(key)
+        if id is None:
+            id = AgentID(str(uuid.uuid4()))
+        elif not isinstance(id, AgentID):
+            id = AgentID(id)
 
-        now = datetime.now(timezone.utc)
-        return Agent(
-            key=key,
-            name=name if name is not None else str(key),
+        if workspace is None:
+            workspace = self.sessions.root / str(id)
+
+        return agent_class(
+            id=id,
+            name=name if name is not None else str(id),
+            workspace=workspace,
             metadata=metadata or {},
-            created_at=now,
-            last_active=now,
         )
 
     def get_or_create_agent(
         self,
-        key: SessionKey | str,
+        id: AgentID | str,
+        agent_class: type[Agent] = Agent,
         *,
         name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Agent:
         """Retrieve a persisted agent, or create a new one if not found."""
-        if not isinstance(key, SessionKey):
-            key = SessionKey(key)
-        if self.sessions.exists(key):
-            return self.sessions.load(key)
-        return self.create_agent(key, name=name, metadata=metadata)
+        if not isinstance(id, AgentID):
+            id = AgentID(id)
+        if self.sessions.agent_exists(id):
+            return self.sessions.load_agent(id)
+        return self.create_agent(agent_class, id=id, name=name, metadata=metadata)
 
     def save_agent(self, agent: Agent) -> None:
-        """Persist an agent, updating its ``last_active`` timestamp."""
-        agent.touch()
-        self.sessions.save(agent)
+        """Persist agent identity to disk."""
+        self.sessions.save_agent(agent)
+
+    # -- Session lifecycle --------------------------------------------------
+
+    def get_or_create_session(
+        self,
+        agent: Agent,
+        key: SessionKey | str,
+    ) -> Session:
+        """Retrieve a persisted session, or create a new one if not found.
+
+        The session is scoped under the given agent instance.
+        """
+        if not isinstance(key, SessionKey):
+            key = SessionKey(key)
+        if agent.id is None:
+            raise ValueError("Cannot manage sessions for an agent without an id")
+        if self.sessions.session_exists(agent.id, key):
+            return self.sessions.load_session(agent, key)
+        now = datetime.now(timezone.utc)
+        return Session(
+            agent=agent,
+            key=key,
+            created_at=now,
+            last_active=now,
+        )
+
+    def save_session(self, session: Session) -> None:
+        """Persist a session, updating its ``last_active`` timestamp."""
+        session.touch()
+        self.sessions.save_session(session)
 
 
 __all__ = [

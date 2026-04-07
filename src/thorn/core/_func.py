@@ -184,10 +184,10 @@ class _TypedPrompt:
         file_access: list[Any] | None = None,
     ) -> Any:
         if role is not None:
-            from thorn.core._agent import Agent, _run_agent_prompt
+            from thorn.core._agent import _run_session_prompt
             agent = role() if isinstance(role, type) else role
-            return await _run_agent_prompt(
-                agent=agent,
+            return await _run_session_prompt(
+                session=agent._default_session,
                 text=text,
                 result_type=self._result_type,
                 extra_tools=tools,
@@ -247,10 +247,10 @@ class _PromptAccessor:
     ) -> str:
         """Execute a prompt and return the assistant's text response."""
         if role is not None:
-            from thorn.core._agent import Agent, _run_agent_prompt
+            from thorn.core._agent import _run_session_prompt
             agent = role() if isinstance(role, type) else role
-            return await _run_agent_prompt(
-                agent=agent,
+            return await _run_session_prompt(
+                session=agent._default_session,
                 text=text,
                 result_type=str,
                 extra_tools=tools,
