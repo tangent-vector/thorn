@@ -753,6 +753,14 @@ class TestSessionStoreAgent:
         ids = store.list_agent_ids()
         assert all(isinstance(i, AgentID) for i in ids)
 
+    def test_loaded_agent_has_workspace_from_convention(self, tmp_path: Path):
+        store = SessionStore(tmp_path)
+        agent = Agent(id=AgentID("dev-1"), name="Dev")
+        store.save_agent(agent)
+
+        loaded = store.load_agent(AgentID("dev-1"))
+        assert loaded.workspace == tmp_path / "dev-1"
+
 
 # ---------------------------------------------------------------------------
 # SessionStore -- session operations
@@ -994,6 +1002,16 @@ class TestRuntime:
         retrieved = rt.get_or_create_agent("persistent")
         assert retrieved.id == AgentID("persistent")
         assert retrieved.name == "bot"
+
+    def test_loaded_agent_has_workspace(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        agent = rt.create_agent(id="a1")
+        original_workspace = agent.workspace
+        rt.save_agent(agent)
+
+        loaded = rt.get_or_create_agent("a1")
+        assert loaded.workspace is not None
+        assert loaded.workspace == original_workspace
 
     def test_get_or_create_creates_when_missing(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)

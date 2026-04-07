@@ -209,6 +209,26 @@ class TestGateway:
         assert not runtime.sessions.session_exists(AgentID("default"), "err_key")
 
     @pytest.mark.asyncio
+    async def test_handle_event_persists_agent(self, tmp_path: Path):
+        """_handle_event saves the agent so it survives gateway restarts."""
+        event = IncomingEvent(
+            source="test",
+            session_key=SessionKey("k1"),
+            content="Hello",
+        )
+        source = StubSource([event])
+        runtime = self._make_runtime(tmp_path)
+        gateway = Gateway(runtime=runtime, sources=[source], tools=[])
+
+        with patch.object(
+            _SessionPromptAccessor, "__call__",
+            return_value="ok",
+        ):
+            await gateway.run()
+
+        assert runtime.sessions.agent_exists(AgentID("default"))
+
+    @pytest.mark.asyncio
     async def test_multiple_sources(self, tmp_path: Path):
         event1 = IncomingEvent(
             source="a", session_key=SessionKey("k1"), content="from a",

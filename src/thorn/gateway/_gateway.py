@@ -101,6 +101,7 @@ class Gateway:
             event.source, event.session_key,
         )
         agent = self._resolve_agent(event)
+        self._runtime.save_agent(agent)
         session = self._runtime.get_or_create_session(agent, event.session_key)
         try:
             await session.prompt(event.content, tools=self._tools)
