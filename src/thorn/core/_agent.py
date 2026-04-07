@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any, ClassVar
 if TYPE_CHECKING:
     from thorn.core._context_injection import SeedContent
     from thorn.core._file_access import FileAccessRule
-    from thorn.core._history import HistoryTree
     from thorn.runtime._session import SessionKey
 
 
@@ -71,7 +70,6 @@ class Agent:
     ) -> None:
         from thorn.core._history import HistoryTree
         self._history: HistoryTree = HistoryTree()
-        self._parent: Agent | None = None
         self.name: str | None = name
         self.metadata: dict[str, Any] = metadata if metadata is not None else {}
         self.key: SessionKey | None = key
@@ -212,18 +210,6 @@ class Agent:
         """
         return {}
 
-    def extract_salient_items_from_history(
-        self,
-        history: HistoryTree,
-    ) -> dict[SeedContent, float]:
-        """Extract salient items from a parent agent's history.
-
-        Subclasses override this to inspect the parent's ``HistoryTree``
-        for relevant tool calls and produce ``SeedContent`` items ranked
-        by salience.  The default implementation returns nothing.
-        """
-        return {}
-
     @property
     def prompt(self) -> _AgentPromptAccessor:
         """Accessor for ``agent.prompt("...")`` and ``agent.prompt[T]("...")``."""
@@ -258,6 +244,7 @@ class _AgentPromptAccessor:
         tools: list[Any] | None = None,
         system: str | None = None,
         file_access: list[FileAccessRule] | None = None,
+        recommended_context: list[SeedContent] | None = None,
     ) -> str:
         return await _run_agent_prompt(
             agent=self._agent,
@@ -266,6 +253,7 @@ class _AgentPromptAccessor:
             extra_tools=tools,
             extra_system=system,
             extra_file_access=file_access,
+            recommended_context=recommended_context,
         )
 
 
@@ -285,6 +273,7 @@ class _TypedAgentPrompt:
         tools: list[Any] | None = None,
         system: str | None = None,
         file_access: list[FileAccessRule] | None = None,
+        recommended_context: list[SeedContent] | None = None,
     ) -> Any:
         return await _run_agent_prompt(
             agent=self._agent,
@@ -293,6 +282,7 @@ class _TypedAgentPrompt:
             extra_tools=tools,
             extra_system=system,
             extra_file_access=file_access,
+            recommended_context=recommended_context,
         )
 
 
@@ -304,6 +294,7 @@ async def _run_agent_prompt(
     extra_tools: list[Any] | None = None,
     extra_system: str | None = None,
     extra_file_access: list[FileAccessRule] | None = None,
+    recommended_context: list[SeedContent] | None = None,
 ) -> Any:
     """Shared implementation for agent prompt calls.
 
@@ -349,17 +340,19 @@ async def _run_agent_prompt(
     t0 = time.monotonic()
     token = set_context(child)
     try:
-        # Context injection: pre-populate the child's history with
-        # salient content so it doesn't waste turns re-discovering
+        # Context injection: pre-populate the agent's history with
+        # relevant content so it doesn't waste turns re-discovering
         # project structure.  This MUST run after set_context(child)
         # because the tool functions we call (read_file, etc.) use
-        # get_context() internally to enforce the child's file-access
+        # get_context() internally to enforce the agent's file-access
         # policy.  The user prompt is appended first so the injected
         # assistant turn follows it naturally; run_agent_loop is then
         # called with user_prompt=None to avoid a duplicate.
         user_prompt_for_loop: str | None = text
         if not agent._history.nodes:
-            injected = await _inject_context(agent, text, child)
+            injected = await _inject_context(
+                agent, text, child, recommended_context,
+            )
             if injected:
                 user_prompt_for_loop = None
 
@@ -383,58 +376,55 @@ async def _inject_context(
     agent: Agent,
     text: str,
     ctx: ExecutionContext,
+    recommended_context: list[SeedContent] | None = None,
 ) -> bool:
-    """Pre-populate *agent*'s history with salient context.
+    """Pre-populate *agent*'s history with relevant context.
 
     Appends the user prompt followed by a synthetic assistant turn
-    containing tool calls for salient workspace content.  Returns
-    ``True`` if injection occurred (meaning the user prompt is already
-    in the history and the caller should not append it again).
+    containing tool calls for workspace content.  Returns ``True`` if
+    injection occurred (meaning the user prompt is already in the
+    history and the caller should not append it again).
 
-    Collects seed items from up to three sources (agent seeds, prompt
-    text analysis, parent history), merges and scores them, then
-    assembles a synthetic briefing within the injection token budget.
+    Builds a priority-ordered list of seed items from two sources:
 
-    Source 2 (prompt analysis) and Source 3 (parent history) are only
-    active when the agent has a parent, i.e. was spawned via delegation
-    rather than being a root-level agent.
+    1. *recommended_context* from the caller (preserves given order).
+    2. Role-declared seeds from ``agent.context_seed_items()`` (sorted
+       by descending salience, deduplicated against #1).
+
+    Items are greedily packed into the injection token budget.
     """
     import logging
 
     from thorn.core._context_injection import (
         assemble_briefing,
-        extract_seeds_from_prompt,
         injection_budget,
-        merge_sources,
     )
 
-    sources: list[tuple[dict[SeedContent, float], float]] = []
-
-    seed_items = agent.context_seed_items()
-    if seed_items:
-        sources.append((seed_items, 1.0))
-
-    if agent._parent is not None:
-        prompt_items = extract_seeds_from_prompt(text, ctx.workspace_root)
-        if prompt_items:
-            sources.append((prompt_items, 0.5))
-
-        parent_items = agent.extract_salient_items_from_history(
-            agent._parent._history,
-        )
-        if parent_items:
-            sources.append((parent_items, 0.1))
-
-    if not sources:
+    budget = injection_budget(ctx.context_window)
+    if budget <= 0:
         return False
 
-    merged = merge_sources(sources)
-    budget = injection_budget(ctx.context_window)
-    if budget <= 0 or not merged:
+    seen: set[SeedContent] = set()
+    ordered: list[SeedContent] = []
+
+    for item in (recommended_context or []):
+        if item not in seen:
+            ordered.append(item)
+            seen.add(item)
+
+    role_seeds = agent.context_seed_items()
+    for item, _salience in sorted(
+        role_seeds.items(), key=lambda kv: kv[1], reverse=True,
+    ):
+        if item not in seen:
+            ordered.append(item)
+            seen.add(item)
+
+    if not ordered:
         return False
 
     try:
-        briefing = await assemble_briefing(merged, budget, ctx.workspace_root)
+        briefing = await assemble_briefing(ordered, budget, ctx.workspace_root)
         if briefing is None:
             return False
         agent._history.append_user_prompt(text)

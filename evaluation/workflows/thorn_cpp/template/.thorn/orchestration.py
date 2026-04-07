@@ -18,9 +18,12 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from thorn import Agent, get_context, tool
+
+if TYPE_CHECKING:
+    from thorn.core._context_injection import SeedContent
 from thorn.core._validation_tracker import ValidationTracker
 from thorn.errors import SkillError
 
@@ -97,6 +100,7 @@ async def _run_with_validation(
     agent: Agent,
     task: str,
     max_retries: int = MAX_VALIDATION_RETRIES,
+    recommended_context: list[SeedContent] | None = None,
 ) -> str:
     """Run an agent on a task, then validate and retry on failure.
 
@@ -115,7 +119,9 @@ async def _run_with_validation(
     """
     rules = effective_validation_rules(agent)
 
-    summary = await agent.prompt(task)
+    summary = await agent.prompt(
+        task, recommended_context=recommended_context,
+    )
 
     if not rules:
         return summary
@@ -209,6 +215,7 @@ def _get_developer_cls() -> type[Agent]:
 async def delegate_to_child(
     child: str,
     task: str,
+    recommended_files: list[str] | None = None,
     skip_validation: list[str] | None = None,
     enable_validation: list[str] | None = None,
 ) -> str:
@@ -224,9 +231,14 @@ async def delegate_to_child(
     Args:
         child: Unqualified name of the child module.
         task: Free-form description of what should be done.
+        recommended_files: File paths the child should read for context,
+            in priority order.  These supplement the child's own
+            structurally-declared seeds.
         skip_validation: Validation rules to disable for this delegation.
         enable_validation: Additional validation rules to enable.
     """
+    from thorn.core._context_injection import FileSeed
+
     ctx = get_context()
     module = ctx.agent.module
 
@@ -241,11 +253,18 @@ async def delegate_to_child(
     qualified_child = qualify(module, child)
     developer_cls = _get_developer_cls()
 
+    recommended_context = (
+        [FileSeed(path=p) for p in recommended_files]
+        if recommended_files
+        else None
+    )
+
     en_token, dis_token = _push_overrides(skip_validation, enable_validation)
     try:
         agent = developer_cls(module=qualified_child)
-        agent._parent = ctx.agent
-        return await _run_with_validation(agent, task)
+        return await _run_with_validation(
+            agent, task, recommended_context=recommended_context,
+        )
     except SkillError as exc:
         raise RuntimeError(
             f"developer@{qualified_child} raised an error: {exc.detail}"

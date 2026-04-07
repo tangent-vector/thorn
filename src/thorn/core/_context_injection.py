@@ -1,27 +1,24 @@
-"""Salience-based context injection for sub-agent spawning.
+"""Context injection for agent bootstrapping.
 
-Pre-populates a child agent's HistoryTree with synthetic tool-call entries
-ranked by salience and packed into a token budget, eliminating the bootstrap
-cost of re-discovering project structure.
+Pre-populates an agent's HistoryTree with synthetic tool-call entries
+packed into a token budget, eliminating the bootstrap cost of
+re-discovering project structure.
 
-Three salience sources contribute scored seed items:
+Two sources contribute seed items, in priority order:
 
-- **Source 1** (weight 1.0): agent-declared structural seeds via
-  ``context_seed_items()``.
-- **Source 2** (weight 0.5): heuristic path/identifier extraction from the
-  task prompt text.  Only active for sub-agents.
-- **Source 3** (weight 0.1): typed ``ToolCallNode`` instances found in the
-  parent agent's history.  Only active for sub-agents.
+1. **Recommended context** passed explicitly by the caller (e.g. a parent
+   agent delegating work).  Items preserve the caller's ordering.
+2. **Role-declared seeds** via ``Agent.context_seed_items()``, sorted by
+   declared salience.
 
-Scoring proceeds via per-source normalization, cross-source weighted sum,
-threshold cutoff, and greedy budget packing.
+Items from both sources are deduplicated and greedily packed into the
+injection token budget.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from thorn.core._history import (
@@ -46,8 +43,8 @@ logger = logging.getLogger(__name__)
 class SeedContent:
     """Base for hashable context seed content descriptors.
 
-    Frozen so instances can be used as dict keys and merged across
-    salience sources.
+    Frozen so instances can be used as dict keys and deduplicated
+    across sources.
     """
 
 
@@ -67,138 +64,6 @@ class DirectorySeed(SeedContent):
 class SearchSeed(SeedContent):
     """Seed requesting a codebase search."""
     query: str
-
-
-# ---------------------------------------------------------------------------
-# Prompt text analysis (Source 2)
-# ---------------------------------------------------------------------------
-
-_BACKTICK_RE = re.compile(r"`([^`]+)`")
-_QUOTED_RE = re.compile(r'"([^"]+)"')
-
-_FILE_EXT_RE = re.compile(
-    r"(?<!\w)"
-    r"([\w./\\-]+\.(?:h|cpp|c|py|txt|md|json|yaml|yml|toml|cfg|rs|go|java|ts|js))"
-    r"(?!\w)",
-)
-
-_SLASH_PATH_RE = re.compile(
-    r"(?<!\w)"
-    r"([\w][\w./-]*(?:/|\\)[\w./-]*[\w])"
-    r"(?!\w)",
-)
-
-
-def _looks_like_path(token: str) -> bool:
-    """Heuristic: does *token* look like a filesystem path?"""
-    if "/" in token or "\\" in token:
-        return True
-    extensions = (
-        ".h", ".cpp", ".c", ".py", ".txt", ".md", ".json",
-        ".yaml", ".yml", ".toml", ".cfg", ".rs", ".go",
-        ".java", ".ts", ".js",
-    )
-    return any(token.endswith(ext) for ext in extensions)
-
-
-def _classify_token(
-    token: str,
-    workspace: Path | None,
-) -> SeedContent | None:
-    """Classify a text token as a FileSeed, DirectorySeed, or SearchSeed.
-
-    Tries resolving against the workspace first so that tokens matching
-    real filesystem entries are correctly classified even when they lack
-    obvious path syntax (e.g. a directory name without slashes).
-    """
-    if workspace is not None:
-        resolved = workspace / token
-        if resolved.is_file():
-            return FileSeed(path=str(resolved))
-        if resolved.is_dir():
-            return DirectorySeed(path=str(resolved))
-
-    if _looks_like_path(token):
-        return FileSeed(path=token)
-
-    if len(token) >= 2:
-        return SearchSeed(query=token)
-
-    return None
-
-
-def extract_seeds_from_prompt(
-    text: str,
-    workspace: Path | None,
-) -> dict[SeedContent, float]:
-    """Extract path references and identifiers from a task prompt.
-
-    Scans backtick-delimited content, double-quoted strings, and bare
-    path-like substrings.  Returns ``FileSeed`` for paths (salience 1.0)
-    and ``SearchSeed`` for other identifiers (salience 0.5).
-    """
-    seeds: dict[SeedContent, float] = {}
-    seen: set[str] = set()
-
-    for pattern in (_BACKTICK_RE, _QUOTED_RE, _FILE_EXT_RE, _SLASH_PATH_RE):
-        for match in pattern.finditer(text):
-            token = match.group(1).strip()
-            if not token or token in seen:
-                continue
-            seen.add(token)
-            seed = _classify_token(token, workspace)
-            if seed is None:
-                continue
-            salience = 1.0 if isinstance(seed, (FileSeed, DirectorySeed)) else 0.5
-            seeds.setdefault(seed, salience)
-
-    return seeds
-
-
-# ---------------------------------------------------------------------------
-# Scoring
-# ---------------------------------------------------------------------------
-
-SCORE_THRESHOLD: float = 0.09
-"""Minimum composite score for inclusion.
-
-Set just below the Source 3 weight (0.1) so items sourced *only*
-from parent state almost never pass on their own.
-"""
-
-
-def normalize_scores(
-    scores: dict[SeedContent, float],
-) -> dict[SeedContent, float]:
-    """Normalize values to sum to 1.0.
-
-    Returns an empty dict if the input is empty or all-zero.
-    """
-    total = sum(scores.values())
-    if total <= 0:
-        return {}
-    return {k: v / total for k, v in scores.items()}
-
-
-def merge_sources(
-    sources: list[tuple[dict[SeedContent, float], float]],
-) -> dict[SeedContent, float]:
-    """Compute per-item weighted sum across sources with threshold cutoff.
-
-    Each entry in *sources* is ``(per_source_scores, source_weight)``.
-    Per-source scores are normalized to sum to 1.0, then multiplied by
-    the weight and summed across sources.  Items appearing in multiple
-    sources naturally get boosted.  Items below ``SCORE_THRESHOLD`` are
-    excluded.
-    """
-    merged: dict[SeedContent, float] = {}
-
-    for raw_scores, weight in sources:
-        normalized = normalize_scores(raw_scores)
-        for item, score in normalized.items():
-            merged[item] = merged.get(item, 0.0) + score * weight
-
-    return {k: v for k, v in merged.items() if v >= SCORE_THRESHOLD}
 
 
 # ---------------------------------------------------------------------------
@@ -236,33 +101,29 @@ injected content once the agent has produced its own history.
 
 
 async def assemble_briefing(
-    ranked_items: dict[SeedContent, float],
+    items: list[SeedContent],
     token_budget: int,
     workspace: Path | None = None,
 ) -> TurnNode | None:
-    """Build a synthetic assistant turn from scored seed items.
+    """Build a synthetic assistant turn from an ordered list of seed items.
 
-    For each item in descending score order, calls the appropriate tool
-    function to source content (respecting the active file-access
-    policy).  Failed tool calls are silently dropped.  Stops when the
-    token budget is exhausted.
+    Items are processed in the given order (caller controls priority).
+    For each item, calls the appropriate tool function to source content
+    (respecting the active file-access policy).  Failed tool calls are
+    silently dropped.  Stops when the token budget is exhausted.
 
     Returns a ``TurnNode`` containing all successful ``ToolCallNode``
     instances, marked with low intrinsic salience.  The caller is
     responsible for placing the actual user prompt node before this
     turn in the history.  Returns ``None`` if no items could be sourced.
     """
-    if not ranked_items or token_budget <= 0:
+    if not items or token_budget <= 0:
         return None
-
-    sorted_items = sorted(
-        ranked_items.items(), key=lambda kv: kv[1], reverse=True,
-    )
 
     tool_call_nodes: list[ToolCallNode] = []
     tokens_used = 0
 
-    for idx, (seed, _score) in enumerate(sorted_items):
+    for idx, seed in enumerate(items):
         if tokens_used >= token_budget:
             break
 

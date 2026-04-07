@@ -11,7 +11,6 @@ Defines the role hierarchy:
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,7 +19,6 @@ from thorn.tools import FILE_READING
 
 if TYPE_CHECKING:
     from thorn.core._context_injection import SeedContent
-    from thorn.core._history import HistoryTree
 
 from .build_tools import build, run_tests
 from .module_tools import (
@@ -276,50 +274,6 @@ Guidelines:
 
         return seeds
 
-    def extract_salient_items_from_history(
-        self,
-        history: HistoryTree,
-    ) -> dict[SeedContent, float]:
-        from thorn.core._context_injection import DirectorySeed, FileSeed
-        from thorn.core._history import (
-            CollapseState,
-            DirectoryListCallNode,
-            FileReadCallNode,
-            TurnNode,
-        )
-
-        seeds: dict[SeedContent, float] = {}
-
-        turn_nodes = [
-            n for n in history.nodes if isinstance(n, TurnNode)
-        ]
-        total_turns = len(turn_nodes)
-        if total_turns == 0:
-            return seeds
-
-        for i, turn in enumerate(turn_nodes):
-            if turn.collapse_state == CollapseState.COLLAPSED:
-                continue
-            recency = (i + 1) / total_turns
-            for tcn in turn.tool_call_nodes:
-                if tcn.detail_collapsed:
-                    continue
-                try:
-                    args = json.loads(tcn.tool_call.arguments)
-                except (json.JSONDecodeError, AttributeError):
-                    continue
-
-                if isinstance(tcn, FileReadCallNode):
-                    path = args.get("path")
-                    if path:
-                        key = FileSeed(path=path)
-                        seeds[key] = max(seeds.get(key, 0.0), recency)
-                elif isinstance(tcn, DirectoryListCallNode):
-                    path = args.get("path", ".")
-                    key = DirectorySeed(path=path)
-                    seeds[key] = max(seeds.get(key, 0.0), recency)
-
-        return seeds
 
 
 # ---------------------------------------------------------------------------
