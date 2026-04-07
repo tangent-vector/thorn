@@ -17,6 +17,7 @@ from thorn.tools.gitlab import (
     create_merge_request,
     get_client,
     get_merge_request,
+    gitlab_mark_todo_done,
     list_merge_requests,
     post_comment,
     read_issue,
@@ -261,4 +262,4 @@ class TestGitLabToolsList:
             )
 
     def test_expected_count(self) -> None:
-        assert len(GITLAB_TOOLS) == 5
+        assert len(GITLAB_TOOLS) == 6

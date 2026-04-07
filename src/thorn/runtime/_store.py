@@ -12,11 +12,17 @@ Storage convention::
             history.json
         <session-key-2>/
             ...
+
+Directory names are URL-encoded via :func:`_safe_dirname` so that
+arbitrary session keys (including ones with ``/``, ``:``, etc.) map
+to valid filesystem paths.  Well-behaved keys that stick to
+alphanumerics, ``_``, ``-``, and ``.`` pass through unchanged.
 """
 
 from __future__ import annotations
 
 import shutil
+import urllib.parse
 from pathlib import Path
 
 from thorn.core._agent import Agent
@@ -24,11 +30,21 @@ from thorn.runtime._serializer import JsonSessionSerializer, SessionSerializer
 from thorn.runtime._session import SessionKey
 
 
+def _safe_dirname(key: SessionKey) -> str:
+    """Encode a session key into a filesystem-safe directory name."""
+    return urllib.parse.quote(str(key), safe="_-.")
+
+
+def _unsafe_dirname(dirname: str) -> SessionKey:
+    """Recover the original session key from an encoded directory name."""
+    return SessionKey(urllib.parse.unquote(dirname))
+
+
 class SessionStore:
     """Filesystem-backed store for agent sessions.
 
     Each agent is persisted in its own subdirectory under *root*,
-    named after its ``SessionKey``.
+    named after its ``SessionKey`` (URL-encoded for filesystem safety).
     """
 
     def __init__(
@@ -44,7 +60,7 @@ class SessionStore:
         return self._root
 
     def _session_dir(self, key: SessionKey) -> Path:
-        return self._root / str(key)
+        return self._root / _safe_dirname(key)
 
     def save(self, agent: Agent) -> None:
         """Persist *agent* to disk, creating directories as needed.
@@ -80,7 +96,7 @@ class SessionStore:
         if not self._root.exists():
             return []
         return sorted(
-            SessionKey(d.name)
+            _unsafe_dirname(d.name)
             for d in self._root.iterdir()
             if d.is_dir()
         )

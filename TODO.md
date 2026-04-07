@@ -70,4 +70,4 @@
 
   As a possibly-questionable extension/abuse of that concept, we could make it so that when the tool sees a `SKILL.md` file it extracts the `description:` from the YAML front-matter and uses that as the hint text intead of trying to scrape for a title in the Markdown content. With that kind of subtle policy tweak, a simple `ls`-like tool call on `.agents/skills/` directory would "automatically" yield a listing of available skills and their descriptions.
 
-
+- Some kind of config file under `.thorn/` that can be used to specify options even for sub-tools (like the gateway server).

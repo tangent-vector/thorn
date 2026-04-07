@@ -490,10 +490,120 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
 
 
 # ---------------------------------------------------------------------------
-# thorn serve
+# thorn serve (group: default=gateway, mcp=MCP server)
 # ---------------------------------------------------------------------------
 
-@main.command()
+@main.group(invoke_without_command=True)
+@click.option("-v", "--verbose", count=True, help="Increase output detail (-v, -vv).")
+@click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except errors.")
+@click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
+@click.option("--workspace", "workspace_path", type=click.Path(exists=True, file_okay=False), default=None, help="Override workspace root directory.")
+@click.option("--poll-interval", type=int, default=None, help="Override GitLab poll interval (seconds).")
+@click.option("--gitlab-username", default=None, help="Override GitLab bot username.")
+@click.pass_context
+def serve(
+    ctx: click.Context,
+    verbose: int,
+    quiet: bool,
+    trace_path: str | None,
+    workspace_path: str | None,
+    poll_interval: int | None,
+    gitlab_username: str | None,
+) -> None:
+    """Start the Thorn gateway daemon (or an MCP server via 'thorn serve mcp')."""
+    ctx.ensure_object(dict)
+    ctx.obj["verbose"] = verbose
+    ctx.obj["quiet"] = quiet
+    ctx.obj["trace_path"] = trace_path
+    ctx.obj["workspace_path"] = workspace_path
+    ctx.obj["poll_interval"] = poll_interval
+    ctx.obj["gitlab_username"] = gitlab_username
+
+    if ctx.invoked_subcommand is not None:
+        return
+
+    _serve_gateway(
+        verbose=verbose,
+        quiet=quiet,
+        trace_path=trace_path,
+        workspace_path=workspace_path,
+        poll_interval=poll_interval,
+        gitlab_username=gitlab_username,
+    )
+
+
+def _serve_gateway(
+    *,
+    verbose: int,
+    quiet: bool,
+    trace_path: str | None,
+    workspace_path: str | None,
+    poll_interval: int | None,
+    gitlab_username: str | None,
+) -> None:
+    """Run the gateway daemon (called when ``thorn serve`` has no subcommand)."""
+    import logging
+    from rich.logging import RichHandler
+
+    from thorn.gateway import Gateway
+    from thorn.gateway.sources import GitLabSourceConfig, GitLabTODOsSource
+    from thorn.tools.gitlab import GITLAB_TOOLS
+
+    verbosity = _resolve_verbosity(verbose, quiet)
+
+    log_level = logging.DEBUG if verbose >= 2 else (logging.WARNING if quiet else logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(rich_tracebacks=True)],
+    )
+
+    try:
+        gl_config = GitLabSourceConfig.from_env()
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+
+    if poll_interval is not None:
+        gl_config = gl_config.model_copy(update={"poll_interval": poll_interval})
+    if gitlab_username is not None:
+        gl_config = gl_config.model_copy(update={"username": gitlab_username})
+
+    trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
+    try:
+        runtime = _build_runtime(verbosity, trace_file=trace_file, workspace=workspace_path)
+    except ThornError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        if trace_file:
+            trace_file.close()
+        sys.exit(1)
+
+    source = GitLabTODOsSource(gl_config)
+    gateway = Gateway(
+        runtime=runtime,
+        sources=[source],
+        tools=GITLAB_TOOLS,
+    )
+
+    console.print(
+        f"[bold]thorn serve[/bold]  GitLab: {gl_config.url}  "
+        f"poll: {gl_config.poll_interval}s  user: {gl_config.username}"
+    )
+
+    try:
+        asyncio.run(gateway.run())
+    except KeyboardInterrupt:
+        console.print("\n[dim]Gateway stopped.[/dim]")
+    except ThornError as exc:
+        console.print(f"\n[red]Error:[/red] {exc}")
+        sys.exit(1)
+    finally:
+        if trace_file:
+            trace_file.close()
+
+
+@serve.command("mcp")
 @click.option(
     "--transport",
     type=click.Choice(["stdio", "streamable-http"]),
@@ -515,7 +625,7 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
     help="Skip .thorn/ directory discovery.",
 )
 @click.option("--name", default="thorn", help="Server name reported to MCP clients.")
-def serve(
+def serve_mcp(
     transport: str,
     host: str,
     port: int,

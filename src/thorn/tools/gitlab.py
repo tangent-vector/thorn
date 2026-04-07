@@ -220,6 +220,14 @@ class GitLabClient:
             for mr in mrs
         ]
 
+    def mark_todo_done(self, todo_id: int) -> None:
+        """Mark a GitLab TODO as done by its numeric ID.
+
+        Uses the raw HTTP API because ``python-gitlab``'s
+        ``TodoManager`` does not support ``.get()`` by ID.
+        """
+        self._gl.http_post(f"/todos/{todo_id}/mark_as_done")
+
 
 # ---------------------------------------------------------------------------
 # Module-level client accessor
@@ -369,12 +377,26 @@ async def list_merge_requests(
     return "\n".join([header, *lines])
 
 
+@tool
+async def gitlab_mark_todo_done(todo_id: int) -> str:
+    """Mark a GitLab TODO item as done.
+
+    *todo_id* is the numeric ID of the TODO (not the issue/MR number).
+    This is a GitLab-specific operation -- it marks one of your
+    GitLab TODO notifications as resolved.
+    """
+    client = get_client()
+    await asyncio.to_thread(client.mark_todo_done, todo_id)
+    return f"Marked GitLab TODO {todo_id} as done."
+
+
 GITLAB_TOOLS: list[object] = [
     read_issue,
     post_comment,
     create_merge_request,
     get_merge_request,
     list_merge_requests,
+    gitlab_mark_todo_done,
 ]
 """All GitLab tools as a list, suitable for use in ``tools=[GITLAB_TOOLS, ...]``."""
 
@@ -389,5 +411,6 @@ __all__ = [
     "create_merge_request",
     "get_merge_request",
     "list_merge_requests",
+    "gitlab_mark_todo_done",
     "GITLAB_TOOLS",
 ]
