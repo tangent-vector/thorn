@@ -8,6 +8,12 @@ from pathlib import Path
 import pytest
 
 from thorn.core._history import DirectoryListCallNode, FileReadCallNode
+from thorn.core._context import (
+    ExecutionContext,
+    reset_context,
+    set_context,
+)
+from thorn.core._provider import MockProvider
 from thorn.core._tools import (
     EDIT_CONTEXT_LINES,
     MAX_FIND_RESULTS,
@@ -858,9 +864,6 @@ class TestAskUser:
 
     async def test_delegates_to_handler(self):
         """ask_user delegates to the configured handler."""
-        from thorn.core._context import ExecutionContext, set_context, reset_context
-        from thorn.core._provider import MockProvider
-
         async def fake_handler(question: str) -> str:
             return f"answer to: {question}"
 
@@ -874,3 +877,95 @@ class TestAskUser:
             assert result == "answer to: what?"
         finally:
             reset_context(token)
+
+
+# ---------------------------------------------------------------------------
+# Workspace-aware path resolution in tools
+# ---------------------------------------------------------------------------
+
+class TestWorkspacePathResolution:
+    """Verify that file tools resolve relative paths against the workspace."""
+
+    @pytest.fixture
+    def workspace(self, tmp_path: Path) -> Path:
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        return ws
+
+    @pytest.fixture
+    def ctx_token(self, workspace: Path):
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=workspace,
+        )
+        token = set_context(ctx)
+        yield token
+        reset_context(token)
+
+    async def test_read_file_resolves_relative(
+        self, workspace: Path, ctx_token,
+    ):
+        (workspace / "hello.txt").write_text("hi", encoding="utf-8")
+        result = await read_file("hello.txt")
+        assert "hi" in result
+
+    async def test_create_file_resolves_relative(
+        self, workspace: Path, ctx_token,
+    ):
+        await create_file("sub/new.txt", "content")
+        assert (workspace / "sub" / "new.txt").read_text() == "content"
+
+    async def test_list_directory_resolves_relative(
+        self, workspace: Path, ctx_token,
+    ):
+        (workspace / "sub").mkdir()
+        (workspace / "sub" / "a.txt").touch()
+        result = await list_directory("sub")
+        assert "a.txt" in result
+
+    async def test_edit_file_resolves_relative(
+        self, workspace: Path, ctx_token,
+    ):
+        f = workspace / "edit_me.txt"
+        f.write_text("old text", encoding="utf-8")
+        await edit_file("edit_me.txt", [FileEdit(old_string="old", new_string="new")])
+        assert "new text" in f.read_text()
+
+    async def test_delete_file_resolves_relative(
+        self, workspace: Path, ctx_token,
+    ):
+        f = workspace / "doomed.txt"
+        f.write_text("bye", encoding="utf-8")
+        await delete_file("doomed.txt")
+        assert not f.exists()
+
+    async def test_find_files_resolves_relative(
+        self, workspace: Path, ctx_token,
+    ):
+        (workspace / "deep").mkdir()
+        (workspace / "deep" / "found.py").touch()
+        result = await find_files("*.py", "deep")
+        assert "found.py" in result
+
+    async def test_search_files_resolves_relative(
+        self, workspace: Path, ctx_token,
+    ):
+        f = workspace / "haystack.txt"
+        f.write_text("needle in the haystack", encoding="utf-8")
+        result = await search_files("needle", "haystack.txt")
+        assert "needle" in result
+
+    async def test_move_file_resolves_relative(
+        self, workspace: Path, ctx_token,
+    ):
+        (workspace / "src.txt").write_text("data", encoding="utf-8")
+        await move_file("src.txt", "dst.txt")
+        assert not (workspace / "src.txt").exists()
+        assert (workspace / "dst.txt").read_text() == "data"
+
+    async def test_dot_path_is_workspace_root(
+        self, workspace: Path, ctx_token,
+    ):
+        (workspace / "root_file.txt").touch()
+        result = await list_directory(".")
+        assert "root_file.txt" in result

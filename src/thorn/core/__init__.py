@@ -22,6 +22,7 @@ from thorn.core._context import (
     Verbosity,
     get_context,
     reset_context,
+    resolve_path,
     set_context,
 )
 from thorn.core._agent import Agent
@@ -83,6 +84,7 @@ __all__ = [
     "Verbosity",
     "get_context",
     "reset_context",
+    "resolve_path",
     "set_context",
     # Context injection
     "DirectorySeed",

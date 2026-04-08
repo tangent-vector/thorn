@@ -23,6 +23,17 @@ from pydantic import Field
 from pydantic.dataclasses import dataclass
 
 
+def _resolve(path: str) -> Path:
+    """Resolve a tool path argument against the active workspace.
+
+    Deferred import of :func:`resolve_path` avoids circular imports at
+    module-load time while giving every tool a single consistent way
+    to turn an agent-supplied path into an absolute filesystem path.
+    """
+    from thorn.core._context import resolve_path
+    return resolve_path(path)
+
+
 def _enforce_access(path: str, required_name: str) -> None:
     """Check the active file-access policy, if any.
 
@@ -137,8 +148,8 @@ async def read_file(
             of MAX_READ_LINES still applies even if a larger value is
             given.
     """
-    _enforce_access(path, "READ")
-    p = Path(path)
+    p = _resolve(path)
+    _enforce_access(str(p), "READ")
     if not p.is_file():
         raise FileNotFoundError(f"File not found: {path}")
 
@@ -233,8 +244,8 @@ async def edit_file(path: str, edits: list[FileEdit]) -> str:
             must match exactly once in the file at the time it is
             applied.
     """
-    _enforce_access(path, "WRITE")
-    p = Path(path)
+    p = _resolve(path)
+    _enforce_access(str(p), "WRITE")
     if not p.is_file():
         raise FileNotFoundError(f"File not found: {path}")
 
@@ -320,8 +331,8 @@ async def create_file(path: str, content: str) -> str:
         path: Filesystem path for the new file.
         content: Full text content to write.
     """
-    _enforce_access(path, "WRITE")
-    p = Path(path)
+    p = _resolve(path)
+    _enforce_access(str(p), "WRITE")
     if p.exists():
         raise FileExistsError(
             f"File already exists: {path}. "
@@ -383,8 +394,8 @@ async def write_file(path: str, content: str) -> str:
         available for backward compatibility but is no longer
         included in the default tool sets.
     """
-    _enforce_access(path, "WRITE")
-    p = Path(path)
+    p = _resolve(path)
+    _enforce_access(str(p), "WRITE")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return f"Wrote {len(content)} bytes to {path}"
@@ -399,8 +410,8 @@ async def delete_file(path: str) -> str:
     Args:
         path: Filesystem path of the file to delete.
     """
-    _enforce_access(path, "WRITE")
-    p = Path(path)
+    p = _resolve(path)
+    _enforce_access(str(p), "WRITE")
     if not p.exists():
         raise FileNotFoundError(f"File not found: {path}")
     if p.is_dir():
@@ -422,10 +433,10 @@ async def move_file(source: str, destination: str) -> str:
         source: Current path of the file to move.
         destination: New path for the file.
     """
-    _enforce_access(source, "READ")
-    _enforce_access(destination, "WRITE")
-    src = Path(source)
-    dst = Path(destination)
+    src = _resolve(source)
+    dst = _resolve(destination)
+    _enforce_access(str(src), "READ")
+    _enforce_access(str(dst), "WRITE")
     if not src.exists():
         raise FileNotFoundError(f"Source not found: {source}")
     if dst.exists():
@@ -523,8 +534,8 @@ async def list_directory(
         max_depth: Maximum recursion depth (only applies when
             *recursive* is ``True``).  Defaults to 3.
     """
-    _enforce_access(path, "READ")
-    p = Path(path)
+    p = _resolve(path)
+    _enforce_access(str(p), "READ")
     if not p.is_dir():
         raise NotADirectoryError(f"Not a directory: {path}")
 
@@ -533,7 +544,7 @@ async def list_directory(
 
     raw_entries = sorted(p.iterdir())
     names = [e.name for e in raw_entries]
-    names = _apply_listing_filter(names, path)
+    names = _apply_listing_filter(names, str(p))
 
     dir_set = {e.name for e in raw_entries if e.is_dir()}
     formatted = [
@@ -576,8 +587,8 @@ async def find_files(
         type: Restrict results to ``"file"`` or ``"directory"``.
             When ``None`` (the default), both are included.
     """
-    _enforce_access(path, "READ")
-    p = Path(path)
+    p = _resolve(path)
+    _enforce_access(str(p), "READ")
     if not p.is_dir():
         raise NotADirectoryError(f"Not a directory: {path}")
 
@@ -722,10 +733,10 @@ async def search_files(
     except re.error as exc:
         raise ValueError(f"Invalid regex pattern: {exc}") from exc
 
-    p = Path(path)
+    p = _resolve(path)
 
     if p.is_file():
-        _enforce_access(path, "READ")
+        _enforce_access(str(p), "READ")
         match_count, groups = _search_single_file(p, compiled, context_lines)
         if match_count == 0:
             return f'No matches found for "{pattern}" in {path}.'
@@ -734,7 +745,7 @@ async def search_files(
     if not p.is_dir():
         raise FileNotFoundError(f"Path not found: {path}")
 
-    _enforce_access(path, "READ")
+    _enforce_access(str(p), "READ")
 
     target_files: list[Path] = sorted(
         f
@@ -831,11 +842,12 @@ async def run_shell(
         timeout: Maximum seconds to wait before killing the process.
             Defaults to 120.
     """
+    resolved_cwd = str(_resolve(working_directory or "."))
     proc = await asyncio.create_subprocess_shell(
         command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        cwd=working_directory,
+        cwd=resolved_cwd,
     )
     timed_out = False
     try:

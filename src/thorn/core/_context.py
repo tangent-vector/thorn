@@ -564,3 +564,36 @@ def set_context(ctx: ExecutionContext) -> contextvars.Token[ExecutionContext]:
 def reset_context(token: contextvars.Token[ExecutionContext]) -> None:
     """Restore the ``ExecutionContext`` to its previous value."""
     _current_context.reset(token)
+
+
+def resolve_path(raw: str | Path) -> Path:
+    """Resolve *raw* against the active workspace, returning an absolute path.
+
+    Tool implementations should call this on every user-supplied path
+    argument so that relative paths are interpreted relative to the
+    agent's workspace rather than the process CWD.
+
+    Resolution rules:
+
+    1. **Absolute paths** are returned as-is (canonicalized via
+       :meth:`~pathlib.Path.resolve`).
+    2. **Relative paths** are joined to the current
+       ``ExecutionContext.workspace_root`` when a context is active and
+       a workspace is set.
+    3. If no context or workspace is available, the path is resolved
+       against the process CWD (matching default ``pathlib`` behavior).
+    """
+    from pathlib import Path as _Path
+
+    p = _Path(raw)
+    if p.is_absolute():
+        return p.resolve()
+
+    try:
+        ctx = get_context()
+        if ctx.workspace_root is not None:
+            return (ctx.workspace_root / p).resolve()
+    except RuntimeError:
+        pass
+
+    return (_Path.cwd() / p).resolve()

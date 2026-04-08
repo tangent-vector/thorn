@@ -359,3 +359,110 @@ class TestGitToolsList:
 
     def test_expected_count(self) -> None:
         assert len(GIT_TOOLS) == 9
+
+
+# ---------------------------------------------------------------------------
+# Workspace-aware path resolution
+# ---------------------------------------------------------------------------
+
+
+class TestGitWorkspaceResolution:
+    """Verify that git tools resolve relative paths against the workspace."""
+
+    @pytest.fixture()
+    def workspace_repo(self, tmp_path: Path) -> tuple[Path, Path]:
+        """Create a workspace with a git repo inside it.
+
+        Returns (workspace, git_repo).
+        """
+        import subprocess
+
+        workspace = tmp_path / "agent_workspace"
+        workspace.mkdir()
+        repo = workspace / "myrepo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        (repo / "README.md").write_text("# Workspace test\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        return workspace, repo
+
+    @pytest.fixture()
+    def ctx_token(self, workspace_repo: tuple[Path, Path]):
+        from thorn.core._context import ExecutionContext, set_context, reset_context
+        from thorn.core._provider import MockProvider
+
+        workspace, _repo = workspace_repo
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=workspace,
+        )
+        token = set_context(ctx)
+        yield token
+        reset_context(token)
+
+    async def test_git_status_relative_to_workspace(
+        self, workspace_repo: tuple[Path, Path], ctx_token,
+    ) -> None:
+        _workspace, repo = workspace_repo
+        result = await git_status("myrepo")
+        assert "clean" in result.lower()
+
+    async def test_git_log_relative_to_workspace(
+        self, workspace_repo: tuple[Path, Path], ctx_token,
+    ) -> None:
+        result = await git_log("myrepo")
+        assert "initial" in result
+
+    async def test_git_commit_relative_to_workspace(
+        self, workspace_repo: tuple[Path, Path], ctx_token,
+    ) -> None:
+        workspace, repo = workspace_repo
+        (repo / "new.txt").write_text("hello\n")
+        result = await git_commit("myrepo", "add new file")
+        assert "new file" in result.lower() or "add new" in result.lower()
+
+    async def test_git_clone_relative_to_workspace(
+        self, workspace_repo: tuple[Path, Path], ctx_token,
+    ) -> None:
+        workspace, repo = workspace_repo
+        result = await git_clone(str(repo), "repos/cloned.git")
+        assert "Cloned" in result
+        assert (workspace / "repos" / "cloned.git").is_dir()
+
+    async def test_git_worktree_relative_to_workspace(
+        self, workspace_repo: tuple[Path, Path], ctx_token,
+    ) -> None:
+        """Worktree paths resolve against workspace, not the bare repo CWD."""
+        import subprocess
+
+        workspace, repo = workspace_repo
+        bare = workspace / "repos" / "bare.git"
+        subprocess.run(
+            ["git", "clone", "--bare", str(repo), str(bare)],
+            check=True, capture_output=True,
+        )
+        result = await git_worktree_add(
+            "repos/bare.git",
+            "worktrees/my-branch",
+            "my-branch",
+            start_point="HEAD",
+        )
+        assert "Created worktree" in result
+        wt_path = workspace / "worktrees" / "my-branch"
+        assert wt_path.is_dir(), (
+            f"Worktree should exist at {wt_path}, "
+            f"not inside the bare repo"
+        )
+        assert (wt_path / "README.md").is_file()

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import pytest
 
+from pathlib import Path
+
 from thorn.core._context import (
     ExecutionContext,
     NullEventSink,
     Scope,
     get_context,
     reset_context,
+    resolve_path,
     set_context,
 )
 from thorn.core._provider import MockProvider
@@ -130,3 +133,74 @@ class TestContextVar:
             assert get_context() is ctx_a
         finally:
             reset_context(token_a)
+
+
+# ---------------------------------------------------------------------------
+# resolve_path
+# ---------------------------------------------------------------------------
+
+class TestResolvePath:
+    def test_absolute_path_returned_as_is(self, tmp_path: Path):
+        """Absolute paths pass through without workspace resolution."""
+        absolute = tmp_path / "some" / "file.txt"
+        result = resolve_path(str(absolute))
+        assert result == absolute.resolve()
+
+    def test_relative_path_resolved_against_workspace(self, tmp_path: Path):
+        """Relative paths are joined to the active workspace_root."""
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+        )
+        token = set_context(ctx)
+        try:
+            result = resolve_path("subdir/file.txt")
+            assert result == (tmp_path / "subdir" / "file.txt").resolve()
+        finally:
+            reset_context(token)
+
+    def test_dot_resolved_to_workspace_root(self, tmp_path: Path):
+        """The special path '.' resolves to the workspace root."""
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+        )
+        token = set_context(ctx)
+        try:
+            result = resolve_path(".")
+            assert result == tmp_path.resolve()
+        finally:
+            reset_context(token)
+
+    def test_no_context_falls_back_to_cwd(self):
+        """Without an active context, falls back to process CWD."""
+        result = resolve_path("relative/path")
+        expected = (Path.cwd() / "relative" / "path").resolve()
+        assert result == expected
+
+    def test_context_without_workspace_falls_back_to_cwd(self):
+        """Context with workspace_root=None falls back to process CWD."""
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=None,
+        )
+        token = set_context(ctx)
+        try:
+            result = resolve_path("relative/path")
+            expected = (Path.cwd() / "relative" / "path").resolve()
+            assert result == expected
+        finally:
+            reset_context(token)
+
+    def test_accepts_path_object(self, tmp_path: Path):
+        """resolve_path also accepts a Path object, not just str."""
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+        )
+        token = set_context(ctx)
+        try:
+            result = resolve_path(Path("foo/bar"))
+            assert result == (tmp_path / "foo" / "bar").resolve()
+        finally:
+            reset_context(token)

@@ -133,6 +133,21 @@ def _inject_url_credentials(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Workspace-aware path resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_tool_path(path: str) -> str:
+    """Resolve a tool path argument against the active workspace.
+
+    Returns an absolute path string.  Deferred import avoids circular
+    imports at module-load time.
+    """
+    from thorn.core._context import resolve_path
+    return str(resolve_path(path))
+
+
+# ---------------------------------------------------------------------------
 # @tool functions
 # ---------------------------------------------------------------------------
 
@@ -147,13 +162,14 @@ async def git_clone(remote_url: str, local_path: str) -> str:
 
     Returns a confirmation message with the local path.
     """
+    resolved = _resolve_tool_path(local_path)
     authenticated_url = _inject_url_credentials(remote_url)
 
-    if os.path.isdir(local_path):
-        _, output = await _run_git("fetch", "--all", cwd=local_path)
+    if os.path.isdir(resolved):
+        _, output = await _run_git("fetch", "--all", cwd=resolved)
         return f"Fetched updates in {local_path}\n{output}".strip()
 
-    _, output = await _run_git("clone", "--bare", authenticated_url, local_path)
+    _, output = await _run_git("clone", "--bare", authenticated_url, resolved)
     return f"Cloned {remote_url} -> {local_path}\n{output}".strip()
 
 
@@ -168,8 +184,9 @@ async def git_branch(
     Creates the branch from *start_point* (default ``HEAD``) and
     switches to it.  Fails if the branch already exists.
     """
+    resolved = _resolve_tool_path(repo_path)
     _, output = await _run_git(
-        "checkout", "-b", branch_name, start_point, cwd=repo_path,
+        "checkout", "-b", branch_name, start_point, cwd=resolved,
     )
     return f"Created and checked out branch '{branch_name}'\n{output}".strip()
 
@@ -181,8 +198,9 @@ async def git_commit(repo_path: str, message: str) -> str:
     Equivalent to ``git add -A && git commit -m <message>``.
     Returns the commit summary.
     """
-    await _run_git("add", "-A", cwd=repo_path)
-    _, output = await _run_git("commit", "-m", message, cwd=repo_path)
+    resolved = _resolve_tool_path(repo_path)
+    await _run_git("add", "-A", cwd=resolved)
+    _, output = await _run_git("commit", "-m", message, cwd=resolved)
     return output.strip()
 
 
@@ -199,10 +217,8 @@ async def git_push(
     ``access_token`` in its metadata, the push will authenticate
     transparently.
     """
-    # For pushes from worktrees, the remote URL was already embedded
-    # during clone.  For cases where the remote was added manually or
-    # the URL has changed, we can set the push URL temporarily.
-    _, output = await _run_git("push", remote, branch_name, cwd=repo_path)
+    resolved = _resolve_tool_path(repo_path)
+    _, output = await _run_git("push", remote, branch_name, cwd=resolved)
     return f"Pushed {branch_name} to {remote}\n{output}".strip()
 
 
@@ -213,7 +229,8 @@ async def git_status(repo_path: str) -> str:
     Returns the output of ``git status --short``, which shows
     modified, added, deleted, and untracked files.
     """
-    _, output = await _run_git("status", "--short", cwd=repo_path)
+    resolved = _resolve_tool_path(repo_path)
+    _, output = await _run_git("status", "--short", cwd=resolved)
     if not output.strip():
         return "Working tree clean — no changes."
     return output.strip()
@@ -230,10 +247,11 @@ async def git_diff(
     When *staged* is True, shows changes that have been staged
     (``git diff --cached``).
     """
+    resolved = _resolve_tool_path(repo_path)
     args = ["diff"]
     if staged:
         args.append("--cached")
-    _, output = await _run_git(*args, cwd=repo_path)
+    _, output = await _run_git(*args, cwd=resolved)
     if not output.strip():
         qualifier = "staged " if staged else ""
         return f"No {qualifier}changes."
@@ -253,10 +271,12 @@ async def git_worktree_add(
     worktree is created at *worktree_path* with a new branch
     named *branch_name* starting from *start_point*.
     """
+    resolved_repo = _resolve_tool_path(bare_repo)
+    resolved_wt = _resolve_tool_path(worktree_path)
     _, output = await _run_git(
         "worktree", "add", "-b", branch_name,
-        worktree_path, start_point,
-        cwd=bare_repo,
+        resolved_wt, start_point,
+        cwd=resolved_repo,
     )
     return f"Created worktree at {worktree_path} on branch '{branch_name}'\n{output}".strip()
 
@@ -268,8 +288,10 @@ async def git_worktree_remove(bare_repo: str, worktree_path: str) -> str:
     Cleans up the worktree directory and its administrative files
     in the bare repository.
     """
+    resolved_repo = _resolve_tool_path(bare_repo)
+    resolved_wt = _resolve_tool_path(worktree_path)
     _, output = await _run_git(
-        "worktree", "remove", worktree_path, cwd=bare_repo,
+        "worktree", "remove", resolved_wt, cwd=resolved_repo,
     )
     return f"Removed worktree {worktree_path}\n{output}".strip()
 
@@ -284,9 +306,10 @@ async def git_log(
 
     Returns the last *max_count* commits in the specified *format*.
     """
+    resolved = _resolve_tool_path(repo_path)
     fmt_flag = f"--format={format}"
     _, output = await _run_git(
-        "log", fmt_flag, f"--max-count={max_count}", cwd=repo_path,
+        "log", fmt_flag, f"--max-count={max_count}", cwd=resolved,
     )
     if not output.strip():
         return "No commits yet."
