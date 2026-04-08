@@ -10,6 +10,7 @@ import pytest
 from thorn.core._discovery import (
     discover_tools,
     find_thorn_dirs,
+    load_agent_memory,
     load_module_tools,
     load_workspace_instructions,
 )
@@ -125,6 +126,29 @@ class TestLoadWorkspaceInstructions:
         content = "# Rules\n\n- Be concise\n- Use types\n"
         (tmp_path / "AGENTS.md").write_text(content, encoding="utf-8")
         assert load_workspace_instructions(tmp_path) == content
+
+
+# ---------------------------------------------------------------------------
+# load_agent_memory
+# ---------------------------------------------------------------------------
+
+class TestLoadAgentMemory:
+    def test_returns_content_when_file_exists(self, tmp_path: Path):
+        memory_md = tmp_path / "MEMORY.md"
+        memory_md.write_text("The repository URL is https://example.com/repo.git", encoding="utf-8")
+        assert load_agent_memory(tmp_path) == "The repository URL is https://example.com/repo.git"
+
+    def test_returns_none_when_absent(self, tmp_path: Path):
+        assert load_agent_memory(tmp_path) is None
+
+    def test_returns_none_when_memory_md_is_directory(self, tmp_path: Path):
+        (tmp_path / "MEMORY.md").mkdir()
+        assert load_agent_memory(tmp_path) is None
+
+    def test_preserves_multiline_content(self, tmp_path: Path):
+        content = "# Agent Memory\n\n- Project URL: https://example.com\n- Default branch: main\n"
+        (tmp_path / "MEMORY.md").write_text(content, encoding="utf-8")
+        assert load_agent_memory(tmp_path) == content
 
 
 # ---------------------------------------------------------------------------

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from thorn.tools.git import (
     GIT_TOOLS,
     GitError,
+    _inject_url_credentials,
+    _resolve_env_reference,
     _run_git,
     git_branch,
     git_clone,
@@ -64,6 +67,95 @@ def bare_repo(tmp_path: Path, git_repo: Path) -> Path:
         check=True, capture_output=True,
     )
     return bare
+
+
+# ---------------------------------------------------------------------------
+# Credential injection
+# ---------------------------------------------------------------------------
+
+
+class TestResolveEnvReference:
+    def test_plain_value_returned_as_is(self) -> None:
+        assert _resolve_env_reference("my-token") == "my-token"
+
+    def test_dollar_prefix_resolves_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MY_TOKEN", "secret-123")
+        assert _resolve_env_reference("$MY_TOKEN") == "secret-123"
+
+    def test_missing_env_var_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("NONEXISTENT_VAR_XYZ", raising=False)
+        with pytest.raises(ValueError, match="NONEXISTENT_VAR_XYZ"):
+            _resolve_env_reference("$NONEXISTENT_VAR_XYZ")
+
+
+class TestInjectUrlCredentials:
+    _CTX_PATH = "thorn.core._context.get_context"
+
+    def test_no_context_returns_url_unchanged(self) -> None:
+        url = "https://gitlab.example.com/group/project.git"
+        with patch(self._CTX_PATH, side_effect=RuntimeError):
+            assert _inject_url_credentials(url) == url
+
+    def test_no_agent_returns_url_unchanged(self) -> None:
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        ctx = ExecutionContext(provider=MockProvider(), agent=None)
+        with patch(self._CTX_PATH, return_value=ctx):
+            url = "https://gitlab.example.com/group/project.git"
+            assert _inject_url_credentials(url) == url
+
+    def test_no_access_token_returns_url_unchanged(self) -> None:
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        agent = Agent(metadata={})
+        ctx = ExecutionContext(provider=MockProvider(), agent=agent)
+        with patch(self._CTX_PATH, return_value=ctx):
+            url = "https://gitlab.example.com/group/project.git"
+            assert _inject_url_credentials(url) == url
+
+    def test_rewrites_https_url_with_token(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        monkeypatch.setenv("GL_TOKEN", "glpat-abc123")
+        agent = Agent(metadata={"access_token": "$GL_TOKEN"})
+        ctx = ExecutionContext(provider=MockProvider(), agent=agent)
+        with patch(self._CTX_PATH, return_value=ctx):
+            result = _inject_url_credentials(
+                "https://gitlab.example.com/group/project.git",
+            )
+        assert result == "https://oauth2:glpat-abc123@gitlab.example.com/group/project.git"
+
+    def test_literal_token_without_dollar(self) -> None:
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        agent = Agent(metadata={"access_token": "literal-token"})
+        ctx = ExecutionContext(provider=MockProvider(), agent=agent)
+        with patch(self._CTX_PATH, return_value=ctx):
+            result = _inject_url_credentials(
+                "https://gitlab.example.com/group/project.git",
+            )
+        assert "oauth2:literal-token@" in result
+
+    def test_non_https_url_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        monkeypatch.setenv("GL_TOKEN", "secret")
+        agent = Agent(metadata={"access_token": "$GL_TOKEN"})
+        ctx = ExecutionContext(provider=MockProvider(), agent=agent)
+        with patch(self._CTX_PATH, return_value=ctx):
+            url = "git@gitlab.example.com:group/project.git"
+            assert _inject_url_credentials(url) == url
 
 
 # ---------------------------------------------------------------------------

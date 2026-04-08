@@ -77,6 +77,27 @@ def load_workspace_instructions(workspace_root: Path) -> str | None:
         return None
 
 
+def load_agent_memory(workspace: Path) -> str | None:
+    """Read ``MEMORY.md`` from *workspace*, if it exists.
+
+    ``MEMORY.md`` holds instance-specific knowledge for an agent (e.g.
+    "the repository URL is X", "the default branch is Y").  It belongs
+    to the agent *instance* (not the role/class) and is auto-injected
+    into the system prompt when present.
+
+    Returns the file contents as a string, or ``None`` when the file is
+    absent or unreadable.
+    """
+    memory_md = workspace / "MEMORY.md"
+    if not memory_md.is_file():
+        return None
+    try:
+        return memory_md.read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("failed to read %s", memory_md, exc_info=True)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Synthetic package management for .thorn/ directories
 # ---------------------------------------------------------------------------

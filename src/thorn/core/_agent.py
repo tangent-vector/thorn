@@ -318,6 +318,20 @@ async def _run_session_prompt(
     if workspace is not None:
         child.workspace_root = workspace
 
+    # When the agent's effective workspace differs from the parent
+    # context, reload AGENTS.md so sub-agents get project-specific
+    # instructions rather than inheriting the parent's.
+    if workspace is not None and workspace != ctx.workspace_root:
+        from thorn.core._discovery import load_workspace_instructions
+        child.workspace_instructions = load_workspace_instructions(workspace)
+
+    # Inject MEMORY.md (instance-specific knowledge) when present.
+    if workspace is not None:
+        from thorn.core._discovery import load_agent_memory
+        memory = load_agent_memory(workspace)
+        if memory:
+            sys_prompts.append(memory)
+
     await child.event_sink.on_scope_enter(child.scope)
     t0 = time.monotonic()
     token = set_context(child)

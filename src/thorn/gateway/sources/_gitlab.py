@@ -104,8 +104,12 @@ class GitLabSourceConfig(BaseModel):
 
 def _format_event_content(todo: Any) -> str:
     """Build a human-readable prompt from a GitLab TODO object."""
-    project_id = todo.project["id"]
-    project_name = todo.project.get("path_with_namespace", str(project_id))
+    project = todo.project
+    project_id = project["id"]
+    project_name = project.get("path_with_namespace", str(project_id))
+    clone_url = project.get("http_url_to_repo", "")
+    default_branch = project.get("default_branch", "main")
+    web_url = project.get("web_url", "")
     noteable_type = todo.target_type
     noteable_iid = todo.target["iid"]
     action = todo.action_name
@@ -119,19 +123,21 @@ def _format_event_content(todo: Any) -> str:
         f"TODO ID: {todo.id}",
         f"Action: {action}",
         f"Target: {noteable_type} #{noteable_iid}",
-        "",
     ]
+    if clone_url:
+        lines.append(f"Clone URL: {clone_url}")
+    if default_branch:
+        lines.append(f"Default branch: {default_branch}")
+    if web_url:
+        lines.append(f"Project URL: {web_url}")
+    lines.append("")
+
     if body:
         lines.append("Comment body:")
         lines.append(body)
         lines.append("")
 
     lines.extend([
-        "You have the following tools available:",
-        "- post_comment: reply on the issue or merge request",
-        "- read_issue: read full issue details",
-        "- gitlab_mark_todo_done: mark this TODO as handled",
-        "",
         "Respond to the notification as appropriate, then mark the "
         "TODO as done using gitlab_mark_todo_done.",
     ])
@@ -151,16 +157,20 @@ def _make_session_key(todo: Any) -> SessionKey:
 
 def _make_event(todo: Any) -> IncomingEvent:
     """Convert a GitLab TODO into an ``IncomingEvent``."""
+    project = todo.project
     return IncomingEvent(
         source="gitlab",
         session_key=_make_session_key(todo),
         content=_format_event_content(todo),
         metadata={
             "todo_id": todo.id,
-            "project_id": todo.project["id"],
+            "project_id": project["id"],
             "noteable_type": todo.target_type,
             "noteable_iid": todo.target["iid"],
             "action_name": todo.action_name,
+            "clone_url": project.get("http_url_to_repo", ""),
+            "default_branch": project.get("default_branch", "main"),
+            "web_url": project.get("web_url", ""),
         },
     )
 

@@ -87,15 +87,33 @@ class Gateway:
     def _resolve_agent(self, event: IncomingEvent) -> Agent:
         """Map an event to the agent instance that should handle it.
 
-        For the current single-agent gateway, this returns (or creates)
-        a single default agent.  Future multi-project support would look
-        up or create a project-scoped agent instance based on the event.
+        Routing logic (in priority order):
+
+        1. If the event carries an explicit ``agent_id``, use that.
+        2. Look for a pre-configured coordinator agent in the runtime
+           store.  For the single-coordinator vertical slice, the first
+           (and only) persisted agent is used.
+        3. Fall back to a bare ``Agent`` with the default ID.
+
+        Future multi-project support would match event metadata (e.g.
+        ``project_id``) to the appropriate project-scoped coordinator.
         """
-        agent_id = event.agent_id or _DEFAULT_AGENT_ID
-        return self._runtime.get_or_create_agent(agent_id)
+        if event.agent_id is not None:
+            return self._runtime.get_or_create_agent(event.agent_id)
+
+        persisted_ids = self._runtime.sessions.list_agent_ids()
+        if persisted_ids:
+            return self._runtime.get_or_create_agent(persisted_ids[0])
+
+        return self._runtime.get_or_create_agent(_DEFAULT_AGENT_ID)
 
     async def _handle_event(self, event: IncomingEvent) -> None:
-        """Route a single event to the appropriate agent and session."""
+        """Route a single event to the appropriate agent and session.
+
+        Tools are determined by the agent's class-level ``tools``
+        declaration (via ``Agent._collect_tools``), not passed
+        explicitly by the gateway.
+        """
         log.info(
             "Handling event from %s (session=%s)",
             event.source, event.session_key,
@@ -104,7 +122,7 @@ class Gateway:
         self._runtime.save_agent(agent)
         session = self._runtime.get_or_create_session(agent, event.session_key)
         try:
-            await session.prompt(event.content, tools=self._tools)
+            await session.prompt(event.content)
         except Exception:
             log.exception(
                 "Agent failed for event (source=%s, session=%s)",

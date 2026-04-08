@@ -5,6 +5,7 @@ event-source abstraction that feeds external notifications (GitLab
 TODOs, future webhook endpoints, etc.) into Thorn agents.
 """
 
+from thorn.gateway._agents import ProjectCoordinator
 from thorn.gateway._event import EventSource, IncomingEvent
 from thorn.gateway._gateway import Gateway
 
@@ -12,4 +13,5 @@ __all__ = [
     "EventSource",
     "Gateway",
     "IncomingEvent",
+    "ProjectCoordinator",
 ]

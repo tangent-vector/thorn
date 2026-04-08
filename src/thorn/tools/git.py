@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Literal
+from urllib.parse import urlparse, urlunparse
 
 from thorn.core._func import tool
 
@@ -65,6 +67,72 @@ async def _run_git(
 
 
 # ---------------------------------------------------------------------------
+# Credential injection
+# ---------------------------------------------------------------------------
+
+
+def _resolve_env_reference(value: str) -> str:
+    """Resolve a value that may reference an environment variable.
+
+    If *value* starts with ``$``, the remainder is treated as an
+    environment variable name whose value is returned.  Otherwise
+    *value* is returned as-is.
+
+    Raises ``ValueError`` if the referenced variable is not set.
+    """
+    if value.startswith("$"):
+        env_name = value[1:]
+        result = os.environ.get(env_name)
+        if result is None:
+            raise ValueError(
+                f"Environment variable {env_name!r} is not set "
+                f"(referenced by agent metadata)"
+            )
+        return result
+    return value
+
+
+def _inject_url_credentials(url: str) -> str:
+    """Rewrite a git HTTPS URL to embed credentials from the current agent.
+
+    Looks up ``access_token`` in the agent's ``metadata`` (via the
+    ambient ``ExecutionContext``).  If the token value starts with
+    ``$``, it is resolved as an environment variable reference.
+
+    The URL is rewritten to ``https://oauth2:{token}@host/path`` so
+    that git operations authenticate transparently.  Non-HTTPS URLs
+    and agents without an ``access_token`` are returned unchanged.
+    """
+    from thorn.core._context import get_context
+
+    try:
+        ctx = get_context()
+    except RuntimeError:
+        return url
+
+    agent = ctx.agent
+    if agent is None:
+        return url
+
+    token_ref = agent.metadata.get("access_token")
+    if not token_ref:
+        return url
+
+    token = _resolve_env_reference(token_ref)
+
+    if url.startswith("https://"):
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        port_suffix = f":{parsed.port}" if parsed.port else ""
+        rewritten = parsed._replace(
+            netloc=f"oauth2:{token}@{host}{port_suffix}",
+        )
+        return urlunparse(rewritten)
+
+    return url
+
+
+# ---------------------------------------------------------------------------
 # @tool functions
 # ---------------------------------------------------------------------------
 
@@ -74,17 +142,18 @@ async def git_clone(remote_url: str, local_path: str) -> str:
     """Clone a git repository (bare) or fetch updates if it already exists.
 
     Uses ``--bare`` clones so that worktrees can be created from the
-    clone for parallel work on multiple branches.
+    clone for parallel work on multiple branches.  Credentials are
+    injected transparently from the agent's metadata when available.
 
     Returns a confirmation message with the local path.
     """
-    import os
+    authenticated_url = _inject_url_credentials(remote_url)
 
     if os.path.isdir(local_path):
         _, output = await _run_git("fetch", "--all", cwd=local_path)
         return f"Fetched updates in {local_path}\n{output}".strip()
 
-    _, output = await _run_git("clone", "--bare", remote_url, local_path)
+    _, output = await _run_git("clone", "--bare", authenticated_url, local_path)
     return f"Cloned {remote_url} -> {local_path}\n{output}".strip()
 
 
@@ -126,7 +195,13 @@ async def git_push(
     """Push a branch to a remote repository.
 
     Pushes the specified *branch_name* to *remote* (default ``origin``).
+    If the remote URL requires authentication and the agent has an
+    ``access_token`` in its metadata, the push will authenticate
+    transparently.
     """
+    # For pushes from worktrees, the remote URL was already embedded
+    # during clone.  For cases where the remote was added manually or
+    # the URL has changed, we can set the push URL temporarily.
     _, output = await _run_git("push", remote, branch_name, cwd=repo_path)
     return f"Pushed {branch_name} to {remote}\n{output}".strip()
 

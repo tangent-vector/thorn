@@ -220,6 +220,36 @@ class GitLabClient:
             for mr in mrs
         ]
 
+    def get_project_info(self, project_id: int) -> dict[str, Any]:
+        """Fetch project metadata: name, clone URL, default branch, etc."""
+        project = self._gl.projects.get(project_id)
+        return {
+            "id": project.id,
+            "name": project.name,
+            "name_with_namespace": project.name_with_namespace,
+            "path_with_namespace": project.path_with_namespace,
+            "http_url_to_repo": project.http_url_to_repo,
+            "ssh_url_to_repo": project.ssh_url_to_repo,
+            "default_branch": project.default_branch,
+            "web_url": project.web_url,
+            "description": project.description or "",
+        }
+
+    def read_file(
+        self,
+        project_id: int,
+        file_path: str,
+        ref: str = "HEAD",
+    ) -> dict[str, Any]:
+        """Read a file from a repository via the GitLab API."""
+        project = self._gl.projects.get(project_id)
+        f = project.files.get(file_path=file_path, ref=ref)
+        return {
+            "file_path": f.file_path,
+            "ref": ref,
+            "content": f.decode().decode("utf-8", errors="replace"),
+        }
+
     def mark_todo_done(self, todo_id: int) -> None:
         """Mark a GitLab TODO as done by its numeric ID.
 
@@ -378,6 +408,44 @@ async def list_merge_requests(
 
 
 @tool
+async def gitlab_get_project_info(project_id: int) -> str:
+    """Get information about a GitLab project.
+
+    Returns the project's name, clone URL (HTTPS), default branch,
+    namespace path, and web URL.
+    """
+    client = get_client()
+    info = await asyncio.to_thread(client.get_project_info, project_id)
+    lines = [
+        f"Project: {info['name_with_namespace']}",
+        f"Path: {info['path_with_namespace']}",
+        f"Clone URL (HTTPS): {info['http_url_to_repo']}",
+        f"Clone URL (SSH): {info['ssh_url_to_repo']}",
+        f"Default branch: {info['default_branch']}",
+        f"Web URL: {info['web_url']}",
+    ]
+    if info["description"]:
+        lines.append(f"Description: {info['description']}")
+    return "\n".join(lines)
+
+
+@tool
+async def gitlab_read_file(
+    project_id: int,
+    file_path: str,
+    ref: str = "HEAD",
+) -> str:
+    """Read a file from a GitLab repository via the API.
+
+    Useful for inspecting files without cloning the entire repository.
+    *ref* can be a branch name, tag, or commit SHA.
+    """
+    client = get_client()
+    info = await asyncio.to_thread(client.read_file, project_id, file_path, ref)
+    return f"--- {info['file_path']} (ref: {info['ref']}) ---\n{info['content']}"
+
+
+@tool
 async def gitlab_mark_todo_done(todo_id: int) -> str:
     """Mark a GitLab TODO item as done.
 
@@ -396,6 +464,8 @@ GITLAB_TOOLS: list[object] = [
     create_merge_request,
     get_merge_request,
     list_merge_requests,
+    gitlab_get_project_info,
+    gitlab_read_file,
     gitlab_mark_todo_done,
 ]
 """All GitLab tools as a list, suitable for use in ``tools=[GITLAB_TOOLS, ...]``."""
@@ -411,6 +481,8 @@ __all__ = [
     "create_merge_request",
     "get_merge_request",
     "list_merge_requests",
+    "gitlab_get_project_info",
+    "gitlab_read_file",
     "gitlab_mark_todo_done",
     "GITLAB_TOOLS",
 ]

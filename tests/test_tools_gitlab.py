@@ -262,4 +262,9 @@ class TestGitLabToolsList:
             )
 
     def test_expected_count(self) -> None:
-        assert len(GITLAB_TOOLS) == 6
+        assert len(GITLAB_TOOLS) == 8
+
+    def test_includes_project_info(self) -> None:
+        names = [getattr(fn, "__name__", "?") for fn in GITLAB_TOOLS]
+        assert "gitlab_get_project_info" in names
+        assert "gitlab_read_file" in names

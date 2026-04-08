@@ -552,7 +552,6 @@ def _serve_gateway(
 
     from thorn.gateway import Gateway
     from thorn.gateway.sources import GitLabSourceConfig, GitLabTODOsSource
-    from thorn.tools.gitlab import GITLAB_TOOLS
 
     verbosity = _resolve_verbosity(verbose, quiet)
 
@@ -588,7 +587,6 @@ def _serve_gateway(
     gateway = Gateway(
         runtime=runtime,
         sources=[source],
-        tools=GITLAB_TOOLS,
     )
 
     console.print(
@@ -606,6 +604,48 @@ def _serve_gateway(
     finally:
         if trace_file:
             trace_file.close()
+
+
+@serve.command("bootstrap")
+@click.option("--agent-id", required=True, help="Unique identifier for the coordinator agent.")
+@click.option("--project-name", required=True, help="Human-readable project name.")
+@click.option("--clone-url", required=True, help="HTTPS clone URL for the project.")
+@click.option("--default-branch", default="main", help="Default branch name (default: main).")
+@click.option("--project-id", type=int, default=None, help="Numeric GitLab project ID.")
+@click.option("--token-env", default="GITLAB_TOKEN", help="Environment variable holding the access token.")
+@click.option("--workspace", "workspace_path", type=click.Path(file_okay=False), default=".", help="Runtime root directory (default: current dir).")
+@click.pass_context
+def serve_bootstrap(
+    ctx: click.Context,
+    agent_id: str,
+    project_name: str,
+    clone_url: str,
+    default_branch: str,
+    project_id: int | None,
+    token_env: str,
+    workspace_path: str,
+) -> None:
+    """Bootstrap a ProjectCoordinator agent in the runtime directory."""
+    from pathlib import Path
+    from thorn.gateway._bootstrap import bootstrap_coordinator
+
+    runtime_root = Path(workspace_path).resolve()
+    aid = bootstrap_coordinator(
+        runtime_root=runtime_root,
+        agent_id=agent_id,
+        project_name=project_name,
+        clone_url=clone_url,
+        default_branch=default_branch,
+        project_id=project_id,
+        access_token_env=token_env,
+    )
+    console.print(f"[green]Bootstrapped coordinator:[/green] {aid}")
+    console.print(f"  Identity: {runtime_root / '.thorn' / 'agents' / f'{aid}.json'}")
+    console.print(f"  Workspace: {runtime_root / '.thorn' / 'agents' / str(aid)}")
+    console.print(
+        "\nEnsure your .env file sets the required environment variables "
+        f"(e.g. {token_env}) before running 'thorn serve'."
+    )
 
 
 @serve.command("mcp")
