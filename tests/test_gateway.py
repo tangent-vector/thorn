@@ -273,6 +273,86 @@ class TestGateway:
         assert runtime.sessions.agent_exists(AgentID("default"))
 
     @pytest.mark.asyncio
+    async def test_same_session_key_accumulates_history(self, tmp_path: Path):
+        """Two events with the same session_key share one session whose
+        history grows across both.  The second event's prompt sees the
+        full conversation from the first."""
+        from thorn.core._history import TurnNode, UserPromptNode
+
+        key = SessionKey("shared_session")
+        event1 = IncomingEvent(
+            source="test", session_key=key, content="First message",
+        )
+        event2 = IncomingEvent(
+            source="test", session_key=key, content="Second message",
+        )
+        source = StubSource([event1, event2])
+        runtime = self._make_runtime(tmp_path)
+        gateway = Gateway(runtime=runtime, sources=[source])
+
+        await gateway.run()
+
+        agent_id = runtime.sessions.list_agent_ids()[0]
+        agent = runtime.sessions.load_agent(agent_id)
+        session = runtime.sessions.load_session(agent, key)
+
+        nodes = session._history.nodes
+        assert len(nodes) == 4, (
+            f"Expected 4 nodes (2 user + 2 turn), got {len(nodes)}: "
+            f"{[type(n).__name__ for n in nodes]}"
+        )
+
+        assert isinstance(nodes[0], UserPromptNode)
+        assert isinstance(nodes[1], TurnNode)
+        assert isinstance(nodes[2], UserPromptNode)
+        assert isinstance(nodes[3], TurnNode)
+
+        assert "First message" in nodes[0].message.content
+        assert "Second message" in nodes[2].message.content
+
+    @pytest.mark.asyncio
+    async def test_same_session_key_provider_sees_prior_history(
+        self, tmp_path: Path,
+    ):
+        """On the second event with the same session_key, the provider
+        receives the full prior conversation (not just the new message)."""
+        key = SessionKey("shared_session")
+        event1 = IncomingEvent(
+            source="test", session_key=key, content="First message",
+        )
+        event2 = IncomingEvent(
+            source="test", session_key=key, content="Second message",
+        )
+        source = StubSource([event1, event2])
+
+        provider = MockProvider()
+        runtime = Runtime(provider=provider, workspace_root=tmp_path)
+
+        calls_messages: list[list[Any]] = []
+        original_complete = provider.complete
+
+        async def tracking_complete(
+            system_prompts: list[str],
+            tools: list[dict],
+            messages: list[Any],
+        ):
+            calls_messages.append(list(messages))
+            async for chunk in original_complete(system_prompts, tools, messages):
+                yield chunk
+
+        provider.complete = tracking_complete  # type: ignore[assignment]
+        gateway = Gateway(runtime=runtime, sources=[source])
+        await gateway.run()
+
+        assert len(calls_messages) == 2
+
+        first_call_msgs = calls_messages[0]
+        assert len(first_call_msgs) == 1  # just the user prompt
+
+        second_call_msgs = calls_messages[1]
+        assert len(second_call_msgs) == 3  # user + assistant + user
+
+    @pytest.mark.asyncio
     async def test_multiple_sources(self, tmp_path: Path):
         event1 = IncomingEvent(
             source="a", session_key=SessionKey("k1"), content="from a",
