@@ -89,11 +89,9 @@ def bootstrap_coordinator(
 
     memory_lines.extend([
         "",
-        "## Conventions",
+        "## Active work",
         "",
-        "- Branch naming: `thorn/issue-<iid>`",
-        "- Bare clone location: `repos/<project-name>/`",
-        "- Worktrees: `worktrees/thorn/issue-<iid>/`",
+        "_No active issues or MRs yet._",
     ])
 
     memory_path.write_text("\n".join(memory_lines) + "\n", encoding="utf-8")
