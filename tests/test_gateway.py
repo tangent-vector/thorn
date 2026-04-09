@@ -448,6 +448,29 @@ class TestGitLabTODOsSourceEventFormatting:
         assert event.metadata["default_branch"] == "main"
         assert event.metadata["web_url"] == "https://gitlab.example.com/org/repo"
 
+    def test_same_noteable_different_todo_ids_share_session_key(self):
+        """Two TODOs on the same noteable (different todo.id) produce
+        identical session keys -- this is how multi-turn on a single
+        issue or MR works."""
+        from thorn.gateway.sources._gitlab import _make_session_key
+
+        todo_a = _make_mock_todo(todo_id=100, project_id=42, noteable_type="Issue", noteable_iid=7)
+        todo_b = _make_mock_todo(todo_id=200, project_id=42, noteable_type="Issue", noteable_iid=7)
+        assert _make_session_key(todo_a) == _make_session_key(todo_b)
+
+    def test_issue_and_mr_produce_different_session_keys(self):
+        """An Issue TODO and a MergeRequest TODO on the same project
+        produce distinct session keys, even with the same iid."""
+        from thorn.gateway.sources._gitlab import _make_session_key
+
+        issue_todo = _make_mock_todo(
+            todo_id=1, project_id=42, noteable_type="Issue", noteable_iid=7,
+        )
+        mr_todo = _make_mock_todo(
+            todo_id=2, project_id=42, noteable_type="MergeRequest", noteable_iid=7,
+        )
+        assert _make_session_key(issue_todo) != _make_session_key(mr_todo)
+
     def test_format_event_content_includes_project_info(self):
         from thorn.gateway.sources._gitlab import _format_event_content
 
@@ -503,6 +526,53 @@ class TestGitLabTODOsSourcePolling:
             assert len(events) == 1
             assert events[0].source == "gitlab"
             assert events[0].session_key == SessionKey("gitlab_123_Issue_42")
+
+    @pytest.mark.asyncio
+    async def test_emits_both_todos_with_same_session_key(self):
+        """Two TODOs with different ids but the same noteable (same
+        session key) should both be emitted.  _seen deduplicates by
+        todo.id, not by session key."""
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib") as mock_gl_mod,
+        ):
+            mock_gl_instance = MagicMock()
+            mock_gl_mod.Gitlab.return_value = mock_gl_instance
+
+            mock_user = MagicMock()
+            mock_user.id = 1
+            mock_user.username = "thorn-bot"
+            mock_user.name = "Thorn Bot"
+            mock_user.web_url = "https://gitlab.example.com/thorn-bot"
+            mock_gl_instance.user = mock_user
+
+            todo_a = _make_mock_todo(todo_id=10, noteable_type="Issue", noteable_iid=7)
+            todo_b = _make_mock_todo(todo_id=20, noteable_type="Issue", noteable_iid=7)
+            mock_gl_instance.todos.list.return_value = [todo_a, todo_b]
+
+            from thorn.gateway.sources._gitlab import (
+                GitLabSourceConfig,
+                GitLabTODOsSource,
+            )
+
+            config = GitLabSourceConfig(
+                url="https://gitlab.example.com",
+                token="test-token",
+                poll_interval=5,
+            )
+            source = GitLabTODOsSource(config)
+
+            events: list[IncomingEvent] = []
+
+            async def on_event(event: IncomingEvent) -> None:
+                events.append(event)
+
+            with patch.object(source, "_configure_tools_client"):
+                await source._poll_once(on_event)
+
+            assert len(events) == 2
+            assert events[0].session_key == events[1].session_key
+            assert events[0].metadata["todo_id"] != events[1].metadata["todo_id"]
 
     @pytest.mark.asyncio
     async def test_deduplicates_todos(self):
