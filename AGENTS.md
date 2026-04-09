@@ -9,6 +9,13 @@
 - Make sure to add adequate test coverage for code you introduce or change.
   Ensure that you are testing the functionality a user of your code/API would actually care about, rather than just adding fluff.
 
+- When working on code, follow this general sequence, and perform a self-review of your work after each step:
+  - Make any necessary changes to the architecture and decomposition of modules
+  - Make any necessary changes the public API surface area of modules.
+    Ensure documentation comments / docstrings properly reflect the intended behavior
+  - Author/update black-box tests related to the new/changed API surface area, based on their documented behavioral contract
+  - Author/update the implementations of the new/changed API surface area (and supporting non-public code), based on documented behavior and testing against the previously-authored tests
+
 - Flat code is better than deeply nested code.
   Handle-early-out cases in functions and loops first, so that the main or most complicated path can remain less nested.
 

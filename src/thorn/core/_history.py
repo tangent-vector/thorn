@@ -66,6 +66,17 @@ DEFAULT_HIGH_WATERMARK: float = 0.8
 DEFAULT_LOW_WATERMARK: float = 0.6
 """Target fraction of context window after compaction."""
 
+DEFAULT_PROTECTED_TAIL_NODES: int = 4
+"""Minimum number of most-recent top-level nodes (UserPromptNode or
+TurnNode) that compaction will never collapse.  Ensures the agent
+always has visibility into its recent interactions."""
+
+DEFAULT_PROTECTED_TAIL_TOOL_CALLS: int = 6
+"""Minimum number of most-recent tool calls whose containing TurnNodes
+compaction will never collapse.  Ensures the agent can see what it
+recently did, even when tool-heavy turns push beyond the
+*tail_nodes* window."""
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -638,6 +649,8 @@ class HistoryTree:
         overhead_tokens: int = 0,
         actual_prompt_tokens: int | None = None,
         decay_rate: float = DEFAULT_SALIENCE_DECAY_RATE,
+        protected_tail_nodes: int = DEFAULT_PROTECTED_TAIL_NODES,
+        protected_tail_tool_calls: int = DEFAULT_PROTECTED_TAIL_TOOL_CALLS,
     ) -> CompactionResult:
         """Run the greedy collapse algorithm to reduce token usage.
 
@@ -662,6 +675,10 @@ class HistoryTree:
             actual_prompt_tokens: Real prompt token count from the
                 provider, used to calibrate the savings target.
             decay_rate: Exponential decay rate for salience.
+            protected_tail_nodes: Number of most-recent top-level
+                nodes that must never be collapsed.
+            protected_tail_tool_calls: Number of most-recent tool
+                calls whose containing turns must never be collapsed.
 
         Returns:
             A ``CompactionResult`` with actual (recomputed) savings.
@@ -696,7 +713,10 @@ class HistoryTree:
                     tokens_after=est_total,
                 )
 
-        protected = self._protected_indices()
+        protected = self._protected_indices(
+            tail_nodes=protected_tail_nodes,
+            tail_tool_calls=protected_tail_tool_calls,
+        )
         candidates = self._build_candidates(protected, decay_rate)
         candidates.sort()
 
@@ -731,23 +751,44 @@ class HistoryTree:
 
     # -- Internal helpers ---------------------------------------------------
 
-    def _protected_indices(self) -> set[int]:
+    def _protected_indices(
+        self,
+        *,
+        tail_nodes: int = DEFAULT_PROTECTED_TAIL_NODES,
+        tail_tool_calls: int = DEFAULT_PROTECTED_TAIL_TOOL_CALLS,
+    ) -> set[int]:
         """Indices of nodes that should not be collapsed.
 
-        Protects the last two nodes (the most recent turn and its
-        predecessor) and the most recent ``UserPromptNode`` (so the
-        agent doesn't lose sight of what it was asked to do).
+        Three rules, applied additively:
+
+        1. The most recent *tail_nodes* nodes are always protected.
+        2. The most recent ``UserPromptNode`` is always protected so the
+           agent doesn't lose sight of what it was asked to do, even
+           when it falls outside the tail window.
+        3. Any ``TurnNode`` containing one or more of the most recent
+           *tail_tool_calls* tool calls is protected, ensuring the agent
+           retains visibility into its recent actions even when
+           tool-heavy turns push beyond the *tail_nodes* window.
         """
         protected: set[int] = set()
         n = len(self.nodes)
 
-        for i in range(max(0, n - 2), n):
+        for i in range(max(0, n - tail_nodes), n):
             protected.add(i)
 
         for i in range(n - 1, -1, -1):
             if isinstance(self.nodes[i], UserPromptNode):
                 protected.add(i)
                 break
+
+        tool_calls_remaining = tail_tool_calls
+        for i in range(n - 1, -1, -1):
+            if tool_calls_remaining <= 0:
+                break
+            node = self.nodes[i]
+            if isinstance(node, TurnNode) and node.tool_call_nodes:
+                protected.add(i)
+                tool_calls_remaining -= len(node.tool_call_nodes)
 
         return protected
 

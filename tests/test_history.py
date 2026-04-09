@@ -12,6 +12,8 @@ from thorn.core._history import (
     CHARS_PER_TOKEN,
     DEFAULT_HIGH_WATERMARK,
     DEFAULT_LOW_WATERMARK,
+    DEFAULT_PROTECTED_TAIL_NODES,
+    DEFAULT_PROTECTED_TAIL_TOOL_CALLS,
     LONG_CONTENT_THRESHOLD,
     TRUNCATED_PREFIX_CHARS,
     CollapseState,
@@ -601,6 +603,8 @@ class TestCompaction:
             context_budget=tokens_before,
             low_watermark=0.5,
             overhead_tokens=0,
+            protected_tail_nodes=2,
+            protected_tail_tool_calls=0,
         )
 
         assert result.tool_calls_detail_collapsed > 0 or result.nodes_collapsed > 0
@@ -626,6 +630,8 @@ class TestCompaction:
             context_budget=tree.estimated_tokens(),
             low_watermark=0.3,
             overhead_tokens=0,
+            protected_tail_nodes=2,
+            protected_tail_tool_calls=0,
         )
 
         assert result.nodes_collapsed > 0
@@ -692,6 +698,8 @@ class TestCompaction:
             context_budget=tree.estimated_tokens(),
             low_watermark=0.3,
             overhead_tokens=0,
+            protected_tail_nodes=2,
+            protected_tail_tool_calls=0,
         )
 
         assert result.tokens_after == tree.estimated_tokens()
@@ -710,11 +718,15 @@ class TestCompaction:
         tree.append_turn(AssistantMessage(content="done"), [])
 
         budget = tree.estimated_tokens()
-        tree.compact(context_budget=budget, low_watermark=0.3, overhead_tokens=0)
+        tree.compact(
+            context_budget=budget, low_watermark=0.3, overhead_tokens=0,
+            protected_tail_nodes=2, protected_tail_tool_calls=0,
+        )
         tokens_after_first = tree.estimated_tokens()
 
         result2 = tree.compact(
             context_budget=budget, low_watermark=0.3, overhead_tokens=0,
+            protected_tail_nodes=2, protected_tail_tool_calls=0,
         )
         assert tree.estimated_tokens() == tokens_after_first
         assert result2.nodes_collapsed == 0
@@ -742,6 +754,8 @@ class TestCompaction:
             context_budget=tokens_before,
             low_watermark=0.2,
             overhead_tokens=0,
+            protected_tail_nodes=2,
+            protected_tail_tool_calls=0,
         )
 
         actual_after = tree.estimated_tokens()
@@ -765,6 +779,8 @@ class TestCompaction:
             context_budget=tree.estimated_tokens(),
             low_watermark=0.3,
             overhead_tokens=0,
+            protected_tail_nodes=2,
+            protected_tail_tool_calls=0,
         )
 
         rendered = tree.render()
@@ -784,6 +800,265 @@ class TestCompaction:
                     else:
                         break
                 assert expected_ids == actual_ids
+
+
+# ---------------------------------------------------------------------------
+# HistoryTree — protected-tail guardrails
+# ---------------------------------------------------------------------------
+
+
+def _build_tool_heavy_tree(
+    num_turns: int = 10,
+    tool_calls_per_turn: int = 2,
+    result_size: int = 2000,
+) -> HistoryTree:
+    """Build a tree with a user prompt followed by tool-heavy turns.
+
+    Returns a tree with (1 + num_turns) nodes: one ``UserPromptNode``
+    at index 0, then *num_turns* ``TurnNode``s each containing
+    *tool_calls_per_turn* tool calls with *result_size*-char results.
+    """
+    tree = HistoryTree()
+    tree.append_user_prompt("initial task")
+    for t in range(num_turns):
+        tcs = []
+        results = []
+        for c in range(tool_calls_per_turn):
+            cid = f"t{t}_c{c}"
+            tcs.append(_tc(cid, "read_file", {"path": f"file_{t}_{c}.py"}))
+            results.append(_result(cid, "x" * result_size))
+        tree.append_turn(
+            AssistantMessage(
+                content=f"turn {t}",
+                tool_calls=tcs,
+            ),
+            results,
+        )
+    return tree
+
+
+class TestProtectedTailGuardrails:
+    """Tests for the protected-tail guardrails in compact()."""
+
+    def test_default_tail_nodes_protected(self):
+        """With default N=4, the last 4 nodes must never be collapsed
+        even under extreme compaction pressure."""
+        tree = HistoryTree()
+        tree.append_user_prompt("start")
+        for i in range(8):
+            tree.append_turn(
+                AssistantMessage(content=f"turn {i} " + "y" * 500), [],
+            )
+
+        tree.compact(
+            context_budget=1, low_watermark=0.1, overhead_tokens=0,
+            protected_tail_tool_calls=0,
+        )
+
+        n = len(tree.nodes)
+        for i in range(n - DEFAULT_PROTECTED_TAIL_NODES, n):
+            assert tree.nodes[i].collapse_state == CollapseState.EXPANDED
+
+    def test_nodes_outside_tail_can_be_collapsed(self):
+        """Nodes older than the tail window are eligible for collapse."""
+        tree = HistoryTree()
+        tree.append_user_prompt("start")
+        for i in range(8):
+            tree.append_turn(
+                AssistantMessage(content=f"turn {i} " + "y" * 500), [],
+            )
+
+        tree.compact(
+            context_budget=1, low_watermark=0.1, overhead_tokens=0,
+            protected_tail_tool_calls=0,
+        )
+
+        collapsed_count = sum(
+            1 for node in tree.nodes
+            if isinstance(node, TurnNode)
+            and node.collapse_state == CollapseState.COLLAPSED
+        )
+        assert collapsed_count > 0
+
+    def test_most_recent_user_prompt_protected_outside_tail(self):
+        """The most recent UserPromptNode is protected even if it falls
+        outside the tail_nodes window."""
+        tree = HistoryTree()
+        tree.append_user_prompt("important task " + "a" * 3000)
+        for i in range(8):
+            tree.append_turn(
+                AssistantMessage(content=f"turn {i} " + "b" * 500), [],
+            )
+
+        tree.compact(
+            context_budget=1, low_watermark=0.1, overhead_tokens=0,
+            protected_tail_nodes=4, protected_tail_tool_calls=0,
+        )
+
+        assert tree.nodes[0].collapse_state == CollapseState.EXPANDED
+
+    def test_tool_call_protection_extends_beyond_tail(self):
+        """Turns containing recent tool calls are protected even when
+        they fall outside the tail_nodes window."""
+        tree = _build_tool_heavy_tree(num_turns=8, tool_calls_per_turn=2)
+        # 9 nodes: user(0), turn(1)..turn(8)
+        # tail_nodes=2 protects {7,8}
+        # tail_tool_calls=6 needs 6 tool calls (2 per turn):
+        #   turn 8 → 2 (remaining 4), turn 7 → 2 (remaining 2),
+        #   turn 6 → 2 (remaining 0)
+        # So turns 6,7,8 are protected by tool calls.
+
+        tree.compact(
+            context_budget=1, low_watermark=0.1, overhead_tokens=0,
+            protected_tail_nodes=2, protected_tail_tool_calls=6,
+        )
+
+        for i in [6, 7, 8]:
+            assert tree.nodes[i].collapse_state == CollapseState.EXPANDED, (
+                f"node {i} should be protected by tool-call guardrail"
+            )
+
+    def test_tool_call_protection_counts_across_turns(self):
+        """The M-tool-call budget counts across multiple turns, not
+        per-turn.  A turn with many tool calls consumes more budget."""
+        tree = HistoryTree()
+        tree.append_user_prompt("go")
+        # Turn 0: 5 tool calls
+        tcs = [_tc(f"t0_c{c}", "read_file", {"path": f"f{c}.py"}) for c in range(5)]
+        results = [_result(f"t0_c{c}", "x" * 1000) for c in range(5)]
+        tree.append_turn(
+            AssistantMessage(content="batch read", tool_calls=tcs),
+            results,
+        )
+        # Turn 1: 1 tool call
+        tree.append_turn(
+            AssistantMessage(
+                content="one more",
+                tool_calls=[_tc("t1_c0", "read_file", {"path": "extra.py"})],
+            ),
+            [_result("t1_c0", "x" * 1000)],
+        )
+        # Turn 2: text-only (no tool calls)
+        tree.append_turn(AssistantMessage(content="done " + "z" * 500), [])
+
+        # tail_tool_calls=4: turn 2 has 0 tc, turn 1 has 1 tc
+        # (remaining 3), turn 0 has 5 tc (remaining -2) → turn 0 protected
+        tree.compact(
+            context_budget=1, low_watermark=0.1, overhead_tokens=0,
+            protected_tail_nodes=1, protected_tail_tool_calls=4,
+        )
+
+        # Turn 0 (index 1) is protected because it contains some of
+        # the 4 most recent tool calls.
+        assert tree.nodes[1].collapse_state == CollapseState.EXPANDED
+
+    def test_custom_small_guardrails(self):
+        """Passing smaller guardrail values allows more aggressive
+        compaction."""
+        tree = _build_tool_heavy_tree(num_turns=6, tool_calls_per_turn=1)
+
+        tree.compact(
+            context_budget=1, low_watermark=0.1, overhead_tokens=0,
+            protected_tail_nodes=1, protected_tail_tool_calls=1,
+        )
+
+        collapsed = [
+            i for i, node in enumerate(tree.nodes)
+            if isinstance(node, TurnNode)
+            and node.collapse_state == CollapseState.COLLAPSED
+        ]
+        assert len(collapsed) >= 3, (
+            "with tight guardrails, most old turns should be collapsed"
+        )
+
+    def test_custom_large_guardrails(self):
+        """Passing larger guardrail values protects more nodes."""
+        tree = _build_tool_heavy_tree(num_turns=6, tool_calls_per_turn=1)
+
+        tree.compact(
+            context_budget=1, low_watermark=0.1, overhead_tokens=0,
+            protected_tail_nodes=10, protected_tail_tool_calls=10,
+        )
+
+        collapsed = [
+            i for i, node in enumerate(tree.nodes)
+            if isinstance(node, TurnNode)
+            and node.collapse_state == CollapseState.COLLAPSED
+        ]
+        assert len(collapsed) == 0
+
+    def test_detail_collapse_skipped_for_protected_tool_calls(self):
+        """Tool call detail-collapse is also skipped for turns in the
+        protected set (the entire turn is off-limits, including its
+        individual tool call nodes)."""
+        tree = _build_tool_heavy_tree(num_turns=4, tool_calls_per_turn=2)
+        # 5 nodes: user(0), turn(1)..turn(4)
+        # tail_nodes=4 + tail_tool_calls=8 → all turns protected
+
+        tree.compact(
+            context_budget=1, low_watermark=0.1, overhead_tokens=0,
+        )
+
+        for node in tree.nodes:
+            if isinstance(node, TurnNode):
+                for tcn in node.tool_call_nodes:
+                    assert not tcn.detail_collapsed
+
+    def test_zero_guardrails_allow_full_compaction(self):
+        """Setting both guardrails to 0 restores the most aggressive
+        compaction possible (only the most recent UserPromptNode is
+        still protected by rule 2)."""
+        tree = HistoryTree()
+        tree.append_user_prompt("start")
+        for i in range(5):
+            tree.append_turn(
+                AssistantMessage(content=f"turn {i} " + "y" * 500), [],
+            )
+        tree.append_user_prompt("latest " + "z" * 3000)
+
+        tree.compact(
+            context_budget=1, low_watermark=0.1, overhead_tokens=0,
+            protected_tail_nodes=0, protected_tail_tool_calls=0,
+        )
+
+        # All turns should be collapsed
+        for i, node in enumerate(tree.nodes):
+            if isinstance(node, TurnNode):
+                assert node.collapse_state == CollapseState.COLLAPSED
+
+        # The most recent UserPromptNode ("latest ...") is still protected
+        assert tree.nodes[-1].collapse_state == CollapseState.EXPANDED
+
+    def test_empty_tree_is_fine(self):
+        """Guardrail logic handles an empty tree without errors."""
+        tree = HistoryTree()
+        result = tree.compact(context_budget=1000, overhead_tokens=0)
+        assert result.nodes_collapsed == 0
+
+    def test_protected_indices_returns_correct_set(self):
+        """Directly verify _protected_indices for a known layout."""
+        tree = _build_tool_heavy_tree(num_turns=6, tool_calls_per_turn=2)
+        # 7 nodes: user(0), turn(1)..turn(6)
+        # 12 tool calls total (2 per turn)
+        protected = tree._protected_indices(
+            tail_nodes=3,
+            tail_tool_calls=5,
+        )
+
+        # tail_nodes=3 → {4, 5, 6}
+        assert {4, 5, 6}.issubset(protected)
+
+        # Most recent UserPromptNode → {0}
+        assert 0 in protected
+
+        # tail_tool_calls=5: walk backward
+        #   turn 6 → 2 tc (remaining 3), turn 5 → 2 tc (remaining 1),
+        #   turn 4 → 2 tc (remaining -1)
+        # → turns 4, 5, 6 protected (already in tail)
+        # So turns 1, 2, 3 should NOT be protected
+        assert 1 not in protected
+        assert 2 not in protected
+        assert 3 not in protected
 
 
 # ---------------------------------------------------------------------------
@@ -869,8 +1144,9 @@ class TestCompactionIntegration:
         )
 
         tree = HistoryTree()
-        # Pre-populate with some old history so there's something to compact
-        for i in range(5):
+        # Pre-populate with enough old history that some falls outside
+        # the default protected-tail window and is eligible for compaction.
+        for i in range(10):
             tree.append_user_prompt(f"old prompt {i}")
             tc = _tc(f"old{i}", "read_file", {"path": f"old{i}.py"})
             tree.append_turn(
@@ -940,13 +1216,13 @@ class TestCompactionIntegration:
             tools = [big_read]
 
         responses = []
-        for i in range(6):
+        for i in range(12):
             responses.append([
                 ToolCallChunk(call_id=f"c{i}", name="big_read", arguments="{}"),
                 UsageChunk(
-                    prompt_tokens=8000 * (i + 1),
+                    prompt_tokens=3000 * (i + 1),
                     completion_tokens=100,
-                    total_tokens=8000 * (i + 1) + 100,
+                    total_tokens=3000 * (i + 1) + 100,
                 ),
                 FinishChunk(reason="tool_calls"),
             ])
