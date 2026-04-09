@@ -112,6 +112,7 @@ class Runtime:
             context_window=self.context_window,
             system_prompts=list(system_prompts or []),
             validation_tracker=self.validation_tracker,
+            agency_root_directory=self.workspace_root,
         )
 
     @property
@@ -159,20 +160,22 @@ class Runtime:
         When *id* is ``None``, a UUID-based ID is generated.
         When *name* is ``None``, the ID is used as the display name.
         When *workspace* is ``None``, a directory under the runtime's
-        agents root is used.
+        agents root is used (same as ``home``).
         """
         if id is None:
             id = AgentID(str(uuid.uuid4()))
         elif not isinstance(id, AgentID):
             id = AgentID(id)
 
+        home = self.sessions.root / str(id)
         if workspace is None:
-            workspace = self.sessions.root / str(id)
+            workspace = home
 
         return agent_class(
             id=id,
             name=name if name is not None else str(id),
             workspace=workspace,
+            home=home,
             metadata=metadata or {},
         )
 

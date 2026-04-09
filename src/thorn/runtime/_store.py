@@ -86,9 +86,12 @@ class SessionStore:
     def load_agent(self, agent_id: AgentID | str) -> Agent:
         """Load a previously persisted agent identity.
 
-        The agent's workspace is derived from the store layout convention
-        (``<root>/<agent-id>/``) rather than being stored in the identity
-        file.  This keeps the layout deterministic.
+        The agent's ``home`` and ``workspace`` are derived from the
+        store layout convention (``<root>/<agent-id>/``) rather than
+        being stored in the identity file.  This keeps the layout
+        deterministic.  Both default to the same directory; callers
+        (e.g. ``Runtime.create_agent``) may override ``workspace``
+        for agents that work in a separate project directory.
 
         Raises ``KeyError`` if no agent with the given ID exists.
         """
@@ -98,8 +101,11 @@ class SessionStore:
         if not path.exists():
             raise KeyError(f"No agent found for id {agent_id!r}")
         agent = self._serializer.load_agent(path)
-        agent._workspace = self._agent_dir(agent_id)
+        agent_dir = self._agent_dir(agent_id)
+        agent._workspace = agent_dir
         agent._workspace_resolved = True
+        agent._home = agent_dir
+        agent._home_resolved = True
         return agent
 
     def agent_exists(self, agent_id: AgentID | str) -> bool:

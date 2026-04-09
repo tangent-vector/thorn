@@ -467,6 +467,13 @@ class ExecutionContext:
                             status.  ``None`` when no tracker has been
                             attached.  Propagated by reference across
                             nested scopes.
+        agency_root_directory: The top-level directory that owns the
+                               ``.thorn/`` directory.  Used to derive
+                               agent home paths
+                               (``<agency_root>/.thorn/agents/<id>/``).
+                               Set once by the ``Runtime`` or
+                               ``thorn.run()`` and inherited unchanged
+                               by all child contexts.
     """
 
     provider: LLMProvider
@@ -482,6 +489,7 @@ class ExecutionContext:
     ask_user_handler: AskUserHandler | None = None
     context_window: int | None = None
     validation_tracker: ValidationTracker | None = None
+    agency_root_directory: Path | None = None
 
     def push_scope(
         self,
@@ -528,6 +536,7 @@ class ExecutionContext:
             ask_user_handler=self.ask_user_handler,
             context_window=self.context_window,
             validation_tracker=self.validation_tracker,
+            agency_root_directory=self.agency_root_directory,
         )
 
 

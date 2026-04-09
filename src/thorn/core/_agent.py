@@ -62,6 +62,7 @@ class Agent:
         metadata: dict[str, Any] | None = None,
         id: AgentID | None = None,
         workspace: Path | None = None,
+        home: Path | None = None,
         **kwargs: Any,
     ) -> None:
         self.name: str | None = name
@@ -69,17 +70,20 @@ class Agent:
         self.id: AgentID | None = id
         self._workspace: Path | None = workspace
         self._workspace_resolved: bool = workspace is not None
+        self._home: Path | None = home
+        self._home_resolved: bool = home is not None
         for k, v in kwargs.items():
             setattr(self, k, v)
 
     @property
     def workspace(self) -> Path | None:
-        """The agent's workspace directory.
+        """The agent's workspace directory (analogous to ``.``).
 
-        Resolved lazily: if not explicitly provided at construction,
-        inherited from the ambient ``ExecutionContext.workspace_root``
-        on first access.  Once resolved, the value is fixed for the
-        lifetime of the instance.
+        Where the agent performs file I/O.  ``AGENTS.md`` is loaded
+        from here.  Resolved lazily: if not explicitly provided at
+        construction, inherited from the ambient
+        ``ExecutionContext.workspace_root`` on first access.  Once
+        resolved, the value is fixed for the lifetime of the instance.
         """
         if not self._workspace_resolved:
             self._workspace_resolved = True
@@ -89,6 +93,43 @@ class Agent:
             except RuntimeError:
                 pass
         return self._workspace
+
+    @property
+    def home(self) -> Path | None:
+        """The agent's personal state directory (analogous to ``~``).
+
+        Where the agent stores ``MEMORY.md``, ``journal/``, and any
+        other instance-specific scratch state.  Always at
+        ``<agency_root>/.thorn/agents/<agent-id>/``.
+
+        Resolved lazily from the ambient ``ExecutionContext`` on first
+        access.  If the agent has no ``id``, a stable one is derived
+        from the class name and workspace path so that personal state
+        persists across runs.  Returns ``None`` when insufficient
+        context is available (no execution context, no workspace).
+        """
+        if not self._home_resolved:
+            self._home_resolved = True
+            try:
+                from thorn.core._context import get_context
+                ctx = get_context()
+                agency_root = ctx.agency_root_directory or ctx.workspace_root
+                if agency_root is not None:
+                    agent_id = self.id
+                    if agent_id is None:
+                        ws = self.workspace
+                        if ws is not None:
+                            agent_id = _derive_stable_agent_id(
+                                type(self).__name__, ws,
+                            )
+                            self.id = agent_id
+                    if agent_id is not None:
+                        self._home = (
+                            agency_root / ".thorn" / "agents" / str(agent_id)
+                        )
+            except RuntimeError:
+                pass
+        return self._home
 
     @property
     def _default_session(self) -> Session:
@@ -248,6 +289,23 @@ class Agent:
         return _SessionPromptAccessor(self._default_session)
 
 
+def _derive_stable_agent_id(class_name: str, workspace: Path) -> AgentID:
+    """Derive a deterministic agent ID from a class name and workspace path.
+
+    Produces a filesystem-safe identifier that is stable across process
+    restarts, so that an agent's ``home`` directory (and therefore its
+    ``MEMORY.md`` and ``journal/``) persists across ``thorn run``
+    invocations in the same project with the same agent class.
+    """
+    import hashlib
+
+    from thorn.runtime._session import AgentID
+
+    key = f"{class_name}:{workspace.resolve()}"
+    digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return AgentID(f"{class_name.lower()}-{digest}")
+
+
 def _default_file_access() -> list[FileAccessRule]:
     """The fallback file-access rules when no class in the MRO defines any."""
     from thorn.core._file_access import FileAccessLevel, FileAccessRule
@@ -325,10 +383,13 @@ async def _run_session_prompt(
         from thorn.core._discovery import load_workspace_instructions
         child.workspace_instructions = load_workspace_instructions(workspace)
 
-    # Inject MEMORY.md (instance-specific knowledge) when present.
-    if workspace is not None:
+    # Inject MEMORY.md from the agent's home directory (personal state),
+    # NOT the workspace.  AGENTS.md comes from workspace (project-level);
+    # MEMORY.md comes from home (agent-level personal knowledge).
+    agent_home = agent.home
+    if agent_home is not None:
         from thorn.core._discovery import load_agent_memory
-        memory = load_agent_memory(workspace)
+        memory = load_agent_memory(agent_home)
         if memory:
             sys_prompts.append(memory)
 

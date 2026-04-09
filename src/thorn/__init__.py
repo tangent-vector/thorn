@@ -247,6 +247,7 @@ def run(
         workspace_instructions=load_workspace_instructions(ws_root),
         global_ignores=global_ignores,
         context_window=effective_cw,
+        agency_root_directory=ws_root,
     )
 
     async def _run_with_context() -> T:

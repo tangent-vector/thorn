@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from thorn.core._agent import Agent, _SafeDict
+from thorn.core._agent import Agent, _SafeDict, _derive_stable_agent_id
 from thorn.core._context import (
     ExecutionContext,
     get_context,
@@ -18,6 +18,7 @@ from thorn.core._func import skill
 from thorn.core._messages import AssistantMessage
 from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
 from thorn.core._session import Session
+from thorn.runtime._session import AgentID
 
 
 # ---------------------------------------------------------------------------
@@ -659,6 +660,64 @@ class TestSkillWithRole:
 
 class TestMemoryMdInjection:
     @pytest.mark.asyncio
+    async def test_memory_loaded_from_home_not_workspace(self, tmp_path: Path):
+        """MEMORY.md is loaded from agent.home, not agent.workspace.
+
+        When the two directories differ, only the home copy should be
+        injected into the system prompt.
+        """
+        home_dir = tmp_path / "home"
+        workspace_dir = tmp_path / "ws"
+        home_dir.mkdir()
+        workspace_dir.mkdir()
+
+        memory_content = (
+            "# Agent Memory\n\n"
+            "- Project: example-project\n"
+            "- Default branch: main\n"
+        )
+        (home_dir / "MEMORY.md").write_text(memory_content, encoding="utf-8")
+        (workspace_dir / "MEMORY.md").write_text(
+            "WRONG -- this should not be loaded", encoding="utf-8",
+        )
+
+        provider = MockProvider()
+        captured_prompts: list[list[str]] = []
+        original_complete = provider.complete
+
+        async def tracking_complete(
+            system_prompts: list[str],
+            tools: list[dict],
+            messages: list[Any],
+        ):
+            captured_prompts.append(list(system_prompts))
+            async for chunk in original_complete(system_prompts, tools, messages):
+                yield chunk
+
+        provider.complete = tracking_complete  # type: ignore[assignment]
+
+        context = ExecutionContext(provider=provider, workspace_root=workspace_dir)
+        token = set_context(context)
+        try:
+            agent = Agent(workspace=workspace_dir, home=home_dir)
+            session = Session(agent=agent)
+
+            session._history.append_user_prompt("Earlier message")
+            session._history.append_turn(
+                AssistantMessage(content="Earlier response"), [],
+            )
+
+            await session.prompt("New message after resume")
+
+            assert len(captured_prompts) == 1
+            joined = "\n".join(captured_prompts[0])
+            assert "example-project" in joined
+            assert "Default branch: main" in joined
+            assert "WRONG" not in joined
+        finally:
+            reset_context(token)
+
+    @pytest.mark.asyncio
     async def test_memory_included_on_resumed_session(self, tmp_path: Path):
         """On a resumed session (non-empty history), MEMORY.md content
         still appears in the system prompts sent to the provider.
@@ -693,7 +752,8 @@ class TestMemoryMdInjection:
         context = ExecutionContext(provider=provider, workspace_root=tmp_path)
         token = set_context(context)
         try:
-            agent = Agent(workspace=tmp_path)
+            # home=tmp_path so MEMORY.md is found there directly
+            agent = Agent(workspace=tmp_path, home=tmp_path)
             session = Session(agent=agent)
 
             session._history.append_user_prompt("Earlier message")
@@ -709,3 +769,160 @@ class TestMemoryMdInjection:
             assert "Default branch: main" in joined
         finally:
             reset_context(token)
+
+
+# ---------------------------------------------------------------------------
+# Stable agent ID derivation
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveStableAgentId:
+    def test_deterministic(self, tmp_path: Path):
+        id1 = _derive_stable_agent_id("MyAgent", tmp_path)
+        id2 = _derive_stable_agent_id("MyAgent", tmp_path)
+        assert id1 == id2
+
+    def test_different_class_name_different_id(self, tmp_path: Path):
+        id1 = _derive_stable_agent_id("AgentA", tmp_path)
+        id2 = _derive_stable_agent_id("AgentB", tmp_path)
+        assert id1 != id2
+
+    def test_different_workspace_different_id(self, tmp_path: Path):
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        id1 = _derive_stable_agent_id("MyAgent", dir_a)
+        id2 = _derive_stable_agent_id("MyAgent", dir_b)
+        assert id1 != id2
+
+    def test_returns_agent_id_type(self, tmp_path: Path):
+        result = _derive_stable_agent_id("MyAgent", tmp_path)
+        assert isinstance(result, AgentID)
+
+    def test_format_includes_lowercase_class_name(self, tmp_path: Path):
+        result = _derive_stable_agent_id("MyAgent", tmp_path)
+        assert result.startswith("myagent-")
+
+    def test_filesystem_safe(self, tmp_path: Path):
+        result = _derive_stable_agent_id("MyAgent", tmp_path)
+        assert "/" not in result
+        assert "\\" not in result
+        assert " " not in result
+
+
+# ---------------------------------------------------------------------------
+# Agent.home property
+# ---------------------------------------------------------------------------
+
+
+class TestAgentHome:
+    def test_explicit_home(self, tmp_path: Path):
+        home_dir = tmp_path / "my-home"
+        agent = Agent(home=home_dir)
+        assert agent.home == home_dir
+
+    def test_home_none_without_context(self):
+        agent = Agent()
+        assert agent.home is None
+
+    def test_home_lazily_resolved_from_context(self, tmp_path: Path):
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agency_root_directory=tmp_path,
+        )
+        token = set_context(ctx)
+        try:
+            agent = Agent(id=AgentID("test-agent"))
+            assert agent.home == tmp_path / ".thorn" / "agents" / "test-agent"
+        finally:
+            reset_context(token)
+
+    def test_home_derives_stable_id_when_id_is_none(self, tmp_path: Path):
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agency_root_directory=tmp_path,
+        )
+        token = set_context(ctx)
+        try:
+            agent = Agent()
+            home = agent.home
+            assert home is not None
+            assert home.parent == tmp_path / ".thorn" / "agents"
+            # The agent should now have a derived ID
+            assert agent.id is not None
+            assert isinstance(agent.id, AgentID)
+        finally:
+            reset_context(token)
+
+    def test_home_falls_back_to_workspace_root_as_agency_root(self, tmp_path: Path):
+        """When agency_root_directory is not set, workspace_root is used."""
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+        )
+        token = set_context(ctx)
+        try:
+            agent = Agent(id=AgentID("fallback-agent"))
+            assert agent.home == tmp_path / ".thorn" / "agents" / "fallback-agent"
+        finally:
+            reset_context(token)
+
+    def test_home_none_when_no_workspace_and_no_id(self, tmp_path: Path):
+        """An agent without an id and without workspace context gets no home."""
+        ctx = ExecutionContext(provider=MockProvider())
+        token = set_context(ctx)
+        try:
+            agent = Agent()
+            assert agent.home is None
+        finally:
+            reset_context(token)
+
+    def test_home_resolved_once(self, tmp_path: Path):
+        """Once resolved, home does not change even if context changes."""
+        ctx1 = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agency_root_directory=tmp_path,
+        )
+        token1 = set_context(ctx1)
+        try:
+            agent = Agent(id=AgentID("pinned"))
+            first_home = agent.home
+            assert first_home is not None
+        finally:
+            reset_context(token1)
+
+        other = tmp_path / "other"
+        other.mkdir()
+        ctx2 = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=other,
+            agency_root_directory=other,
+        )
+        token2 = set_context(ctx2)
+        try:
+            assert agent.home == first_home
+        finally:
+            reset_context(token2)
+
+
+# ---------------------------------------------------------------------------
+# agency_root_directory propagation
+# ---------------------------------------------------------------------------
+
+
+class TestAgencyRootPropagation:
+    def test_push_scope_preserves_agency_root(self, tmp_path: Path):
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            agency_root_directory=tmp_path,
+        )
+        child = ctx.push_scope("child")
+        assert child.agency_root_directory == tmp_path
+
+    def test_agency_root_defaults_to_none(self):
+        ctx = ExecutionContext(provider=MockProvider())
+        assert ctx.agency_root_directory is None

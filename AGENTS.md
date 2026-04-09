@@ -25,4 +25,7 @@
 
   Comments that just state *what* the code is doing are a code smell.
   If code is complicated enough that you need a comment to explain what it's doing, then you should be defining cleanly named helper routines, temporaries, or whatever it takes to make the code more obvious to somebody reading the code itself.
-  
+
+- Names should favor clarity and accuracy over brevity.
+  Variables/attributes/parameters should accurately name what they hold/are, functions should accurately describe what they do or compute, etc.
+  When clear and accurate names are verbose or ugly, they can help us identify where better designs are called for.
