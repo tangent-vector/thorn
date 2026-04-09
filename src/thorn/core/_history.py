@@ -564,8 +564,9 @@ class ArchiveMarkerNode(HistoryNode):
         self._token_cost: int | None = None
 
     def _render_text(self) -> str:
+        label = "turn" if self.node_count == 1 else "turns"
         return (
-            f"[Earlier conversation ({self.node_count} turns, "
+            f"[Earlier conversation ({self.node_count} {label}, "
             f"archived {self.journal_date}) is available in the agent "
             f"journal. Use read_journal('{self.journal_date}') to "
             f"review if needed.]"

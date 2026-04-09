@@ -14,7 +14,6 @@ from thorn.core._context import ExecutionContext, get_context
 from thorn.core._history import (
     ArchiveMarkerNode,
     CollapseState,
-    HistoryNode,
     HistoryTree,
     HousekeepingNode,
     ToolCallNode,

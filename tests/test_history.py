@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -1381,7 +1382,6 @@ class TestHistoryNodeHierarchy:
         assert isinstance(node, HistoryNode)
 
     def test_archive_marker_is_history_node(self):
-        from datetime import datetime, timezone
         node = ArchiveMarkerNode(
             archived_at=datetime.now(timezone.utc),
             summary="test",
@@ -1418,7 +1418,6 @@ class TestHistoryNodeHierarchy:
 
 class TestArchiveMarkerNode:
     def _make_marker(self) -> ArchiveMarkerNode:
-        from datetime import datetime, timezone
         return ArchiveMarkerNode(
             archived_at=datetime(2026, 4, 8, 22, 10, 0, tzinfo=timezone.utc),
             summary="Investigated issue #6 and opened MR",
@@ -1436,6 +1435,17 @@ class TestArchiveMarkerNode:
         node = self._make_marker()
         text = node.render()[0].content
         assert "12 turns" in text
+
+    def test_render_text_singular_turn(self):
+        node = ArchiveMarkerNode(
+            archived_at=datetime(2026, 4, 8, 22, 10, 0, tzinfo=timezone.utc),
+            summary="brief",
+            node_count=1,
+            journal_date="2026-04-08",
+        )
+        text = node.render()[0].content
+        assert "1 turn," in text
+        assert "1 turns" not in text
 
     def test_render_text_contains_journal_date(self):
         node = self._make_marker()
@@ -1456,7 +1466,6 @@ class TestArchiveMarkerNode:
         assert node.token_cost() == node.token_cost()
 
     def test_fields_accessible(self):
-        from datetime import datetime, timezone
         node = self._make_marker()
         assert node.node_count == 12
         assert node.journal_date == "2026-04-08"
@@ -1504,7 +1513,6 @@ class TestHousekeepingNode:
 
 class TestNewNodeTypesInTree:
     def test_archive_marker_renders_in_tree(self):
-        from datetime import datetime, timezone
         tree = HistoryTree()
         marker = ArchiveMarkerNode(
             archived_at=datetime.now(timezone.utc),
@@ -1552,7 +1560,6 @@ class TestNewNodeTypesInTree:
         assert tree.estimated_tokens() == tokens_before
 
     def test_estimated_tokens_includes_archive_marker(self):
-        from datetime import datetime, timezone
         tree = HistoryTree()
         tokens_empty = tree.estimated_tokens()
 
@@ -1567,7 +1574,6 @@ class TestNewNodeTypesInTree:
 
     def test_compaction_skips_archive_marker(self):
         """ArchiveMarkerNode should not be collapsed by compaction."""
-        from datetime import datetime, timezone
         tree = HistoryTree()
         marker = ArchiveMarkerNode(
             archived_at=datetime.now(timezone.utc),
