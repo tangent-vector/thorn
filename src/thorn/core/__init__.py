@@ -33,7 +33,7 @@ from thorn.core._history import CollapseState, CompactionResult, HistoryTree
 from thorn.core._module import ModulePath
 from thorn.core._validation import ValidationRule
 from thorn.core._validation_tracker import ValidationStatus, ValidationTracker
-from thorn.core._file_access import FileAccessLevel, FileAccessPolicy, FileAccessRule
+from thorn.core._file_access import FileAccessLevel, FileAccessPolicy, FileAccessRule, RelativeTo
 from thorn.core._func import prompt, skill, tool, wrap_function
 from thorn.core._retry import bound_retries
 from thorn.core._loop import _WrappedTool, run_agent_loop
@@ -107,6 +107,7 @@ __all__ = [
     "FileAccessLevel",
     "FileAccessPolicy",
     "FileAccessRule",
+    "RelativeTo",
     # Function decorators
     "prompt",
     "skill",

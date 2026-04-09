@@ -12,10 +12,10 @@ OS-level sandboxing, which is out of scope.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import IntEnum
-from pathlib import Path, PurePosixPath
-from typing import Sequence
+from dataclasses import dataclass
+from enum import Enum, IntEnum
+from pathlib import Path
+from typing import Mapping, Sequence
 
 import pathspec
 
@@ -29,6 +29,18 @@ class FileAccessLevel(IntEnum):
     WRITE = 3
 
 
+class RelativeTo(Enum):
+    """Which root directory a :class:`FileAccessRule` pattern is relative to.
+
+    Each variant names a conceptual root.  The concrete path for each
+    root is supplied when constructing a :class:`FileAccessPolicy` via
+    the *roots* mapping.
+    """
+
+    WORKSPACE = "workspace"
+    AGENT_HOME = "agent_home"
+
+
 @dataclass(frozen=True)
 class FileAccessRule:
     """A single gitignore-style pattern mapped to an access level.
@@ -38,32 +50,34 @@ class FileAccessRule:
 
     - ``*`` matches anything except ``/``
     - ``**`` matches zero or more path components
-    - A leading ``/`` anchors to the workspace root
+    - A leading ``/`` anchors to the root directory
     - A trailing ``/`` matches only directories
+
+    The *relative_to* field determines which root directory the pattern
+    is resolved against.  See :class:`RelativeTo`.
     """
 
     pattern: str
     access: FileAccessLevel
+    relative_to: RelativeTo = RelativeTo.WORKSPACE
 
 
-def _normalise_pattern(pattern: str, workspace: Path | None) -> str:
-    """Convert an absolute-path pattern to workspace-relative POSIX form.
+def _normalise_pattern(pattern: str, root: Path | None) -> str:
+    """Convert an absolute-path pattern to root-relative POSIX form.
 
     If *pattern* is a relative path or a glob expression (containing
     ``*`` or ``?``), it is returned unchanged.  Only literal absolute
-    paths are converted, using *workspace* to strip the prefix.
+    paths are converted, using *root* to strip the prefix.
     """
-    if workspace is None:
+    if root is None:
         return pattern
-    # Only convert patterns that look like literal absolute paths
-    # (no glob wildcards) — e.g. output from module_source_path().
     if "*" in pattern or "?" in pattern:
         return pattern
     p = Path(pattern)
     if not p.is_absolute():
         return pattern
     try:
-        rel = p.resolve().relative_to(workspace.resolve())
+        rel = p.resolve().relative_to(root)
         return rel.as_posix()
     except ValueError:
         return pattern
@@ -77,11 +91,12 @@ class FileAccessPolicy:
     the effective level so that global ignore files can only *reduce*
     access.
 
-    If *workspace* is provided, absolute paths in rule patterns are
-    normalised to workspace-relative POSIX paths before matching.
-    This lets ``_instance_file_access()`` methods pass the output of
-    path-computing functions (which may return absolute paths) directly
-    as patterns.
+    *roots* maps each :class:`RelativeTo` variant to the concrete
+    directory path it represents.  Rules whose ``relative_to`` variant
+    has no entry in *roots* (or maps to ``None``) are silently skipped
+    during matching -- they cannot apply without a root to resolve
+    against.  Absolute-path patterns in rules are normalised against
+    the corresponding root at construction time.
     """
 
     def __init__(
@@ -90,18 +105,23 @@ class FileAccessPolicy:
         *,
         default: FileAccessLevel = FileAccessLevel.NONE,
         global_ceiling: FileAccessPolicy | None = None,
-        workspace: Path | None = None,
+        roots: Mapping[RelativeTo, Path | None] | None = None,
     ) -> None:
         self._rules = list(rules)
         self._default = default
         self._global_ceiling = global_ceiling
-        self._workspace = workspace
+        self._roots: dict[RelativeTo, Path] = {
+            k: v.resolve() for k, v in (roots or {}).items() if v is not None
+        }
 
-        self._specs: list[tuple[pathspec.PathSpec, FileAccessLevel]] = []
+        self._compiled: list[
+            tuple[pathspec.PathSpec, FileAccessLevel, Path | None]
+        ] = []
         for rule in self._rules:
-            pattern = _normalise_pattern(rule.pattern, workspace)
+            root = self._roots.get(rule.relative_to)
+            pattern = _normalise_pattern(rule.pattern, root)
             spec = pathspec.PathSpec.from_lines("gitwildmatch", [pattern])
-            self._specs.append((spec, rule.access))
+            self._compiled.append((spec, rule.access, root))
 
     @property
     def rules(self) -> list[FileAccessRule]:
@@ -111,21 +131,30 @@ class FileAccessPolicy:
     def default(self) -> FileAccessLevel:
         return self._default
 
-    def check(self, path: str | PurePosixPath) -> FileAccessLevel:
+    def check(self, path: Path) -> FileAccessLevel:
         """Return the effective access level for *path*.
 
-        *path* should be workspace-relative (forward slashes, no
-        leading ``./``).  Every rule is tested; the last match wins.
+        *path* must be an absolute, resolved filesystem path.  Each
+        rule is tested against *path* made relative to the rule's root
+        directory; rules whose root is ``None`` or that do not contain
+        *path* are skipped.  Last matching rule wins.
+
         If a *global_ceiling* is set, the result is capped.
         """
-        path_str = str(path)
+        resolved = path.resolve()
         result = self._default
-        for spec, access in self._specs:
-            if spec.match_file(path_str):
+        for spec, access, root in self._compiled:
+            if root is None:
+                continue
+            try:
+                rel = resolved.relative_to(root)
+            except ValueError:
+                continue
+            if spec.match_file(rel.as_posix()):
                 result = access
 
         if self._global_ceiling is not None:
-            ceiling = self._global_ceiling.check(path_str)
+            ceiling = self._global_ceiling.check(resolved)
             result = min(result, ceiling)
 
         return result
@@ -133,16 +162,16 @@ class FileAccessPolicy:
     def filter_listing(
         self,
         entries: list[str],
-        directory: str | PurePosixPath,
+        directory: Path,
     ) -> list[str]:
         """Return *entries* with ``HIDDEN`` items removed.
 
-        Each entry is checked as ``directory/entry``.
+        *directory* must be an absolute path.  Each entry is checked
+        as ``directory / entry``.
         """
-        dir_path = PurePosixPath(directory) if not isinstance(directory, PurePosixPath) else directory
         return [
             e for e in entries
-            if self.check(dir_path / e) > FileAccessLevel.HIDDEN
+            if self.check(directory / e) > FileAccessLevel.HIDDEN
         ]
 
     def with_ceiling(self, ceiling: FileAccessPolicy) -> FileAccessPolicy:
@@ -151,7 +180,7 @@ class FileAccessPolicy:
             self._rules,
             default=self._default,
             global_ceiling=ceiling,
-            workspace=self._workspace,
+            roots=self._roots,
         )
 
 
@@ -159,26 +188,18 @@ class FileAccessPolicy:
 # Path resolution
 # ---------------------------------------------------------------------------
 
-def resolve_for_check(raw_path: str, workspace: Path) -> PurePosixPath:
-    """Resolve *raw_path* to a workspace-relative POSIX path for matching.
+def resolve_for_check(raw_path: str, workspace: Path) -> Path:
+    """Resolve *raw_path* to an absolute, canonical filesystem path.
 
-    Follows symlinks and canonicalizes case (important on
-    case-insensitive filesystems like Windows NTFS) so that agents
-    cannot bypass rules by varying capitalisation.
-
-    Paths outside the workspace are returned as absolute POSIX paths,
-    which will not match workspace-relative patterns and therefore
-    fall through to the policy default (typically ``NONE``).
+    Relative paths are resolved against *workspace*.  Symlinks are
+    followed and case is canonicalized (important on case-insensitive
+    filesystems like Windows NTFS) so that agents cannot bypass rules
+    by varying capitalisation.
     """
     p = Path(raw_path)
     if not p.is_absolute():
-        p = Path.cwd() / p
-    p = p.resolve()
-    try:
-        rel = p.relative_to(workspace)
-    except ValueError:
-        return PurePosixPath(p.as_posix())
-    return PurePosixPath(rel.as_posix())
+        p = workspace / p
+    return p.resolve()
 
 
 def check_access(
@@ -232,10 +253,17 @@ def load_global_ignores(workspace: Path) -> FileAccessPolicy | None:
     Returns ``None`` if no ignore files exist.  ``.thornignore``
     rules are appended after ``.aiignore`` (last match wins), so
     Thorn-specific overrides take precedence.
+
+    Ignore rules are always workspace-relative (``RelativeTo.WORKSPACE``
+    by default), so the workspace is passed as the sole root.
     """
     rules: list[FileAccessRule] = []
     rules.extend(load_ignore_file(workspace / ".aiignore"))
     rules.extend(load_ignore_file(workspace / ".thornignore"))
     if not rules:
         return None
-    return FileAccessPolicy(rules, default=FileAccessLevel.WRITE)
+    return FileAccessPolicy(
+        rules,
+        default=FileAccessLevel.WRITE,
+        roots={RelativeTo.WORKSPACE: workspace},
+    )

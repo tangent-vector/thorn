@@ -307,12 +307,25 @@ def _derive_stable_agent_id(class_name: str, workspace: Path) -> AgentID:
 
 
 def _default_file_access() -> list[FileAccessRule]:
-    """The fallback file-access rules when no class in the MRO defines any."""
-    from thorn.core._file_access import FileAccessLevel, FileAccessRule
+    """The fallback file-access rules when no class in the MRO defines any.
+
+    Rule ordering matters (last match wins):
+
+    1. Grant write access everywhere in the workspace.
+    2. Restrict ``.thorn/`` to read-only in the workspace (framework
+       internals should not be casually mutated by agents).
+    3. Grant write access everywhere in the agent's home directory.
+       This overrides the ``.thorn/`` restriction for paths that fall
+       under the agent's home, which lives *inside* ``.thorn/``.
+
+    Do not reorder these rules without considering the interactions.
+    """
+    from thorn.core._file_access import FileAccessLevel, FileAccessRule, RelativeTo
     return [
         FileAccessRule("**", FileAccessLevel.WRITE),
         FileAccessRule(".thorn", FileAccessLevel.READ),
         FileAccessRule(".thorn/**", FileAccessLevel.READ),
+        FileAccessRule("**", FileAccessLevel.WRITE, relative_to=RelativeTo.AGENT_HOME),
     ]
 
 
@@ -335,7 +348,7 @@ async def _run_session_prompt(
     import time
 
     from thorn.core._context import get_context, reset_context, set_context
-    from thorn.core._file_access import FileAccessLevel, FileAccessPolicy
+    from thorn.core._file_access import FileAccessLevel, FileAccessPolicy, RelativeTo
     from thorn.core._func import _prepare_tools, _type_label
     from thorn.core._loop import run_agent_loop
 
@@ -359,7 +372,12 @@ async def _run_session_prompt(
     if extra_file_access:
         rules.extend(extra_file_access)
     policy = FileAccessPolicy(
-        rules, default=FileAccessLevel.NONE, workspace=workspace,
+        rules,
+        default=FileAccessLevel.NONE,
+        roots={
+            RelativeTo.WORKSPACE: workspace,
+            RelativeTo.AGENT_HOME: agent.home,
+        },
     )
 
     if ctx.global_ignores is not None:

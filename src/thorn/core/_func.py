@@ -149,13 +149,15 @@ def _push_bare_prompt_scope(
     more permissions than an explicit ``Agent()``.
     """
     from thorn.core._agent import Agent
-    from thorn.core._file_access import FileAccessLevel, FileAccessPolicy
+    from thorn.core._file_access import FileAccessLevel, FileAccessPolicy, RelativeTo
 
     rules = list(Agent._collect_file_access())
     if extra_file_access:
         rules.extend(extra_file_access)
     policy = FileAccessPolicy(
-        rules, default=FileAccessLevel.NONE, workspace=ctx.workspace_root,
+        rules,
+        default=FileAccessLevel.NONE,
+        roots={RelativeTo.WORKSPACE: ctx.workspace_root},
     )
 
     if ctx.global_ignores is not None:

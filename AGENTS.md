@@ -29,3 +29,6 @@
 - Names should favor clarity and accuracy over brevity.
   Variables/attributes/parameters should accurately name what they hold/are, functions should accurately describe what they do or compute, etc.
   When clear and accurate names are verbose or ugly, they can help us identify where better designs are called for.
+
+- If something would typically be rendered in all caps in English (ID, HTML, API, etc.) then it should either appear in all caps or all lowercase in names (`user_id`, `UserID`, `html_node`, `HTMLNode`, etc.).
+  Pascal-case conventions that mix this up (`HtmlNode`) are ugly and bad.

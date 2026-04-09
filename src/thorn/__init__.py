@@ -54,6 +54,7 @@ from thorn.core import (
     FileAccessLevel,
     FileAccessPolicy,
     FileAccessRule,
+    RelativeTo,
     prompt,
     skill,
     tool,
@@ -147,6 +148,7 @@ __all__ = [
     "FileAccessLevel",
     "FileAccessRule",
     "FileAccessPolicy",
+    "RelativeTo",
     # Providers
     "LLMProvider",
     "MockProvider",
