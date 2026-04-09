@@ -67,7 +67,9 @@ def append_journal_entry(
     attribution = f" -- {session_key}" if session_key else ""
     header = f"## {time_str} UTC{attribution}"
 
-    entry = f"\n{header}\n\n{content}\n"
+    needs_separator = file_path.exists() and file_path.stat().st_size > 0
+    prefix = "\n" if needs_separator else ""
+    entry = f"{prefix}{header}\n\n{content}\n"
 
     with file_path.open("a", encoding="utf-8") as f:
         f.write(entry)
@@ -338,10 +340,9 @@ async def write_journal(content: str) -> str:
         return "Error: no agent home directory available. Cannot write journal."
 
     session_key = _resolve_session_key()
-    append_journal_entry(journal_dir, content, session_key=session_key)
+    file_path = append_journal_entry(journal_dir, content, session_key=session_key)
 
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return f"Journal entry appended to {date_str}."
+    return f"Journal entry appended to {file_path.stem}."
 
 
 @tool
