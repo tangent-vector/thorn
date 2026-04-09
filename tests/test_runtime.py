@@ -12,8 +12,11 @@ import pytest
 from thorn.core._agent import Agent
 from thorn.core._context import ExecutionContext, get_context
 from thorn.core._history import (
+    ArchiveMarkerNode,
     CollapseState,
+    HistoryNode,
     HistoryTree,
+    HousekeepingNode,
     ToolCallNode,
     TurnNode,
     UserPromptNode,
@@ -538,6 +541,149 @@ class TestHistorySerialization:
         data = serialize_history(tree)
         restored = deserialize_history(data)
         assert restored.nodes[0].collapse_state == CollapseState.COLLAPSED
+
+    def test_archive_marker_roundtrip(self):
+        tree = HistoryTree()
+        marker = ArchiveMarkerNode(
+            archived_at=datetime(2026, 4, 8, 22, 10, 0, tzinfo=timezone.utc),
+            summary="Investigated issue #6 and opened MR",
+            node_count=12,
+            journal_date="2026-04-08",
+        )
+        tree.nodes.append(marker)
+        tree.append_user_prompt("continue")
+
+        data = serialize_history(tree)
+        restored = deserialize_history(data)
+
+        assert len(restored.nodes) == 2
+        rm = restored.nodes[0]
+        assert isinstance(rm, ArchiveMarkerNode)
+        assert rm.archived_at == datetime(2026, 4, 8, 22, 10, 0, tzinfo=timezone.utc)
+        assert rm.summary == "Investigated issue #6 and opened MR"
+        assert rm.node_count == 12
+        assert rm.journal_date == "2026-04-08"
+
+    def test_archive_marker_serialized_format(self):
+        tree = HistoryTree()
+        marker = ArchiveMarkerNode(
+            archived_at=datetime(2026, 4, 8, 22, 10, 0, tzinfo=timezone.utc),
+            summary="archived",
+            node_count=5,
+            journal_date="2026-04-08",
+        )
+        tree.nodes.append(marker)
+
+        data = serialize_history(tree)
+        assert len(data) == 1
+        assert data[0]["type"] == "archive_marker"
+        assert data[0]["node_count"] == 5
+        assert data[0]["journal_date"] == "2026-04-08"
+        assert "archived_at" in data[0]
+
+    def test_housekeeping_node_roundtrip(self):
+        tree = HistoryTree()
+        tree.append_user_prompt("start")
+        hk = HousekeepingNode(inner_nodes=[
+            UserPromptNode(UserMessage(content="housekeeping prompt")),
+            TurnNode(
+                assistant_content="journaled everything",
+                tool_call_nodes=[],
+            ),
+        ])
+        tree.nodes.append(hk)
+        tree.append_user_prompt("next task")
+
+        data = serialize_history(tree)
+        restored = deserialize_history(data)
+
+        assert len(restored.nodes) == 3
+        assert isinstance(restored.nodes[0], UserPromptNode)
+        rh = restored.nodes[1]
+        assert isinstance(rh, HousekeepingNode)
+        assert len(rh.inner_nodes) == 2
+        assert isinstance(rh.inner_nodes[0], UserPromptNode)
+        assert rh.inner_nodes[0].message.content == "housekeeping prompt"
+        assert isinstance(rh.inner_nodes[1], TurnNode)
+        assert rh.inner_nodes[1].assistant_content == "journaled everything"
+
+    def test_housekeeping_node_serialized_format(self):
+        hk = HousekeepingNode(inner_nodes=[
+            UserPromptNode(UserMessage(content="prompt")),
+        ])
+        tree = HistoryTree()
+        tree.nodes.append(hk)
+
+        data = serialize_history(tree)
+        assert len(data) == 1
+        assert data[0]["type"] == "housekeeping"
+        assert len(data[0]["inner_nodes"]) == 1
+        assert data[0]["inner_nodes"][0]["type"] == "user_prompt"
+
+    def test_mixed_tree_roundtrip(self):
+        """Full roundtrip with all four node types."""
+        tree = HistoryTree()
+
+        marker = ArchiveMarkerNode(
+            archived_at=datetime(2026, 4, 7, 12, 0, 0, tzinfo=timezone.utc),
+            summary="old content",
+            node_count=20,
+            journal_date="2026-04-07",
+        )
+        tree.nodes.append(marker)
+
+        tree.append_user_prompt("continue working")
+        tree.append_turn(
+            AssistantMessage(
+                content="reading file",
+                tool_calls=[ToolCall(call_id="c1", name="read_file", arguments='{"path": "x.py"}')],
+            ),
+            [ToolResultMessage(call_id="c1", content="file content")],
+        )
+
+        hk = HousekeepingNode(inner_nodes=[
+            UserPromptNode(UserMessage(content="please journal")),
+            TurnNode(assistant_content="done", tool_call_nodes=[]),
+        ])
+        tree.nodes.append(hk)
+
+        tree.append_user_prompt("final task")
+
+        data = serialize_history(tree)
+        restored = deserialize_history(data)
+
+        assert len(restored.nodes) == 5
+        assert isinstance(restored.nodes[0], ArchiveMarkerNode)
+        assert isinstance(restored.nodes[1], UserPromptNode)
+        assert isinstance(restored.nodes[2], TurnNode)
+        assert isinstance(restored.nodes[3], HousekeepingNode)
+        assert isinstance(restored.nodes[4], UserPromptNode)
+
+        original_messages = tree.render()
+        restored_messages = restored.render()
+        assert len(original_messages) == len(restored_messages)
+        for orig, rest in zip(original_messages, restored_messages):
+            assert type(orig) is type(rest)
+            assert orig.role == rest.role
+
+    def test_rendered_messages_match_after_archive_marker_roundtrip(self):
+        tree = HistoryTree()
+        marker = ArchiveMarkerNode(
+            archived_at=datetime(2026, 4, 8, 10, 0, 0, tzinfo=timezone.utc),
+            summary="test",
+            node_count=3,
+            journal_date="2026-04-08",
+        )
+        tree.nodes.append(marker)
+        tree.append_user_prompt("hi")
+
+        original = tree.render()
+        data = serialize_history(tree)
+        restored = deserialize_history(data)
+        restored_msgs = restored.render()
+
+        assert len(original) == len(restored_msgs)
+        assert original[0].content == restored_msgs[0].content
 
 
 # ---------------------------------------------------------------------------

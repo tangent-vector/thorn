@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Any, Callable
 
@@ -237,6 +238,25 @@ def _tool_call_summary(tool_call: ToolCall, result: ToolResultMessage) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Base node type
+# ---------------------------------------------------------------------------
+
+class HistoryNode:
+    """Base class for all top-level nodes in a ``HistoryTree``.
+
+    Every subclass must implement ``render()`` and ``token_cost()``.
+    """
+
+    __slots__ = ()
+
+    def render(self) -> list[Message]:
+        raise NotImplementedError
+
+    def token_cost(self) -> int:
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
 # Node types
 # ---------------------------------------------------------------------------
 
@@ -362,7 +382,7 @@ class DirectoryListCallNode(ToolCallNode):
     __slots__ = ()
 
 
-class UserPromptNode:
+class UserPromptNode(HistoryNode):
     """A user prompt in the history.
 
     Short prompts are leaves with no meaningful collapsed form.  Long
@@ -425,7 +445,7 @@ class UserPromptNode:
         return [self.message]
 
 
-class TurnNode:
+class TurnNode(HistoryNode):
     """An assistant turn: the assistant's text plus zero or more tool calls.
 
     Stores the assistant's text content separately from tool call nodes
@@ -511,10 +531,76 @@ class TurnNode:
 
 
 # ---------------------------------------------------------------------------
-# Type alias for top-level tree nodes
+# Archive and housekeeping node types
 # ---------------------------------------------------------------------------
 
-HistoryNode = UserPromptNode | TurnNode
+class ArchiveMarkerNode(HistoryNode):
+    """Placeholder for content that has been archived to the agent journal.
+
+    Rendered as a brief notice telling the agent where to find the
+    archived content.  Not collapsible -- it is already minimal.
+    """
+
+    __slots__ = (
+        "archived_at",
+        "summary",
+        "node_count",
+        "journal_date",
+        "_token_cost",
+    )
+
+    def __init__(
+        self,
+        *,
+        archived_at: datetime,
+        summary: str,
+        node_count: int,
+        journal_date: str,
+    ) -> None:
+        self.archived_at = archived_at
+        self.summary = summary
+        self.node_count = node_count
+        self.journal_date = journal_date
+        self._token_cost: int | None = None
+
+    def _render_text(self) -> str:
+        return (
+            f"[Earlier conversation ({self.node_count} turns, "
+            f"archived {self.journal_date}) is available in the agent "
+            f"journal. Use read_journal('{self.journal_date}') to "
+            f"review if needed.]"
+        )
+
+    def render(self) -> list[Message]:
+        return [UserMessage(content=self._render_text())]
+
+    def token_cost(self) -> int:
+        if self._token_cost is None:
+            self._token_cost = estimate_tokens(self._render_text())
+        return self._token_cost
+
+
+class HousekeepingNode(HistoryNode):
+    """Wraps a housekeeping interaction so it does not consume context.
+
+    Contains the boundary marker, housekeeping prompt, and agent
+    response.  Renders as nothing in the agent's view -- the whole
+    point of housekeeping was to reduce history size.
+
+    Retained in the serialized history for human inspection and
+    debugging, but excluded from ``HistoryTree.render()``.
+    """
+
+    __slots__ = ("inner_nodes",)
+
+    def __init__(self, inner_nodes: list[HistoryNode]) -> None:
+        self.inner_nodes = inner_nodes
+
+    def render(self) -> list[Message]:
+        return []
+
+    def token_cost(self) -> int:
+        return 0
 
 
 # ---------------------------------------------------------------------------

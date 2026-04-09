@@ -29,7 +29,14 @@ from thorn.core._agent import Agent
 from thorn.core._session import Session
 from thorn.core._context_injection import DirectorySeed, FileSeed, SearchSeed, SeedContent
 from thorn.core._discovery import discover_tools
-from thorn.core._history import CollapseState, CompactionResult, HistoryTree
+from thorn.core._history import (
+    ArchiveMarkerNode,
+    CollapseState,
+    CompactionResult,
+    HistoryNode,
+    HistoryTree,
+    HousekeepingNode,
+)
 from thorn.core._module import ModulePath
 from thorn.core._validation import ValidationRule
 from thorn.core._validation_tracker import ValidationStatus, ValidationTracker
@@ -103,9 +110,12 @@ __all__ = [
     # Discovery
     "discover_tools",
     # History
+    "ArchiveMarkerNode",
     "CollapseState",
     "CompactionResult",
+    "HistoryNode",
     "HistoryTree",
+    "HousekeepingNode",
     # Module
     "ModulePath",
     # Validation

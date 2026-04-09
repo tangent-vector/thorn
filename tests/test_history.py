@@ -16,11 +16,14 @@ from thorn.core._history import (
     DEFAULT_PROTECTED_TAIL_TOOL_CALLS,
     LONG_CONTENT_THRESHOLD,
     TRUNCATED_PREFIX_CHARS,
+    ArchiveMarkerNode,
     CollapseState,
     CompactionResult,
     DirectoryListCallNode,
     FileReadCallNode,
+    HistoryNode,
     HistoryTree,
+    HousekeepingNode,
     ToolCallNode,
     TurnNode,
     UserPromptNode,
@@ -1361,3 +1364,251 @@ class TestCallNodeClassIntegration:
         assert isinstance(tool_turn.tool_call_nodes[0], FileReadCallNode)
         assert isinstance(tool_turn.tool_call_nodes[1], DirectoryListCallNode)
         assert type(tool_turn.tool_call_nodes[2]) is ToolCallNode
+
+
+# ---------------------------------------------------------------------------
+# HistoryNode base class
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryNodeHierarchy:
+    def test_user_prompt_is_history_node(self):
+        node = UserPromptNode(UserMessage(content="hi"))
+        assert isinstance(node, HistoryNode)
+
+    def test_turn_is_history_node(self):
+        node = TurnNode(assistant_content="hi", tool_call_nodes=[])
+        assert isinstance(node, HistoryNode)
+
+    def test_archive_marker_is_history_node(self):
+        from datetime import datetime, timezone
+        node = ArchiveMarkerNode(
+            archived_at=datetime.now(timezone.utc),
+            summary="test",
+            node_count=5,
+            journal_date="2026-04-08",
+        )
+        assert isinstance(node, HistoryNode)
+
+    def test_housekeeping_is_history_node(self):
+        node = HousekeepingNode(inner_nodes=[])
+        assert isinstance(node, HistoryNode)
+
+    def test_tool_call_node_is_not_history_node(self):
+        """ToolCallNode is an inner node within a TurnNode, not a
+        top-level HistoryNode."""
+        tc = _tc("c1", "read_file", {"path": "x.py"})
+        result = _result("c1", "content")
+        node = ToolCallNode(tc, result)
+        assert not isinstance(node, HistoryNode)
+
+    def test_base_class_render_raises(self):
+        with pytest.raises(NotImplementedError):
+            HistoryNode().render()
+
+    def test_base_class_token_cost_raises(self):
+        with pytest.raises(NotImplementedError):
+            HistoryNode().token_cost()
+
+
+# ---------------------------------------------------------------------------
+# ArchiveMarkerNode
+# ---------------------------------------------------------------------------
+
+
+class TestArchiveMarkerNode:
+    def _make_marker(self) -> ArchiveMarkerNode:
+        from datetime import datetime, timezone
+        return ArchiveMarkerNode(
+            archived_at=datetime(2026, 4, 8, 22, 10, 0, tzinfo=timezone.utc),
+            summary="Investigated issue #6 and opened MR",
+            node_count=12,
+            journal_date="2026-04-08",
+        )
+
+    def test_render_returns_single_user_message(self):
+        node = self._make_marker()
+        rendered = node.render()
+        assert len(rendered) == 1
+        assert isinstance(rendered[0], UserMessage)
+
+    def test_render_text_contains_node_count(self):
+        node = self._make_marker()
+        text = node.render()[0].content
+        assert "12 turns" in text
+
+    def test_render_text_contains_journal_date(self):
+        node = self._make_marker()
+        text = node.render()[0].content
+        assert "2026-04-08" in text
+
+    def test_render_text_mentions_read_journal(self):
+        node = self._make_marker()
+        text = node.render()[0].content
+        assert "read_journal" in text
+
+    def test_token_cost_positive(self):
+        node = self._make_marker()
+        assert node.token_cost() > 0
+
+    def test_token_cost_is_consistent(self):
+        node = self._make_marker()
+        assert node.token_cost() == node.token_cost()
+
+    def test_fields_accessible(self):
+        from datetime import datetime, timezone
+        node = self._make_marker()
+        assert node.node_count == 12
+        assert node.journal_date == "2026-04-08"
+        assert node.summary == "Investigated issue #6 and opened MR"
+        assert node.archived_at == datetime(2026, 4, 8, 22, 10, 0, tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# HousekeepingNode
+# ---------------------------------------------------------------------------
+
+
+class TestHousekeepingNode:
+    def test_render_returns_empty_list(self):
+        node = HousekeepingNode(inner_nodes=[])
+        assert node.render() == []
+
+    def test_token_cost_is_zero(self):
+        inner = [
+            UserPromptNode(UserMessage(content="x" * 5000)),
+            TurnNode(assistant_content="y" * 5000, tool_call_nodes=[]),
+        ]
+        node = HousekeepingNode(inner_nodes=inner)
+        assert node.token_cost() == 0
+
+    def test_inner_nodes_accessible(self):
+        prompt = UserPromptNode(UserMessage(content="housekeeping prompt"))
+        turn = TurnNode(assistant_content="journaled everything", tool_call_nodes=[])
+        node = HousekeepingNode(inner_nodes=[prompt, turn])
+        assert len(node.inner_nodes) == 2
+        assert isinstance(node.inner_nodes[0], UserPromptNode)
+        assert isinstance(node.inner_nodes[1], TurnNode)
+
+    def test_render_empty_even_with_inner_content(self):
+        """Inner nodes exist for debugging but never contribute to render."""
+        prompt = UserPromptNode(UserMessage(content="big prompt " + "z" * 3000))
+        node = HousekeepingNode(inner_nodes=[prompt])
+        assert node.render() == []
+
+
+# ---------------------------------------------------------------------------
+# New node types in HistoryTree
+# ---------------------------------------------------------------------------
+
+
+class TestNewNodeTypesInTree:
+    def test_archive_marker_renders_in_tree(self):
+        from datetime import datetime, timezone
+        tree = HistoryTree()
+        marker = ArchiveMarkerNode(
+            archived_at=datetime.now(timezone.utc),
+            summary="archived old content",
+            node_count=8,
+            journal_date="2026-04-07",
+        )
+        tree.nodes.append(marker)
+        tree.append_user_prompt("continue working")
+        tree.append_turn(AssistantMessage(content="ok"), [])
+
+        rendered = tree.render()
+        assert len(rendered) == 3
+        assert isinstance(rendered[0], UserMessage)
+        assert "8 turns" in rendered[0].content
+
+    def test_housekeeping_node_invisible_in_tree(self):
+        tree = HistoryTree()
+        tree.append_user_prompt("start")
+        tree.append_turn(AssistantMessage(content="working"), [])
+
+        hk = HousekeepingNode(inner_nodes=[
+            UserPromptNode(UserMessage(content="housekeeping prompt")),
+            TurnNode(assistant_content="done journaling", tool_call_nodes=[]),
+        ])
+        tree.nodes.append(hk)
+        tree.append_user_prompt("next task")
+
+        rendered = tree.render()
+        roles = [m.role for m in rendered]
+        assert "user" in roles
+        assert "assistant" in roles
+        # HousekeepingNode contributes nothing
+        assert len(rendered) == 3
+
+    def test_estimated_tokens_excludes_housekeeping(self):
+        tree = HistoryTree()
+        tree.append_user_prompt("start")
+        tokens_before = tree.estimated_tokens()
+
+        hk = HousekeepingNode(inner_nodes=[
+            UserPromptNode(UserMessage(content="x" * 10000)),
+        ])
+        tree.nodes.append(hk)
+        assert tree.estimated_tokens() == tokens_before
+
+    def test_estimated_tokens_includes_archive_marker(self):
+        from datetime import datetime, timezone
+        tree = HistoryTree()
+        tokens_empty = tree.estimated_tokens()
+
+        marker = ArchiveMarkerNode(
+            archived_at=datetime.now(timezone.utc),
+            summary="test",
+            node_count=3,
+            journal_date="2026-04-08",
+        )
+        tree.nodes.append(marker)
+        assert tree.estimated_tokens() > tokens_empty
+
+    def test_compaction_skips_archive_marker(self):
+        """ArchiveMarkerNode should not be collapsed by compaction."""
+        from datetime import datetime, timezone
+        tree = HistoryTree()
+        marker = ArchiveMarkerNode(
+            archived_at=datetime.now(timezone.utc),
+            summary="old content",
+            node_count=20,
+            journal_date="2026-04-07",
+        )
+        tree.nodes.append(marker)
+        for i in range(6):
+            tree.append_turn(
+                AssistantMessage(content=f"turn {i} " + "y" * 500), [],
+            )
+
+        result = tree.compact(
+            context_budget=1, low_watermark=0.1, overhead_tokens=0,
+            protected_tail_nodes=2, protected_tail_tool_calls=0,
+        )
+
+        # The archive marker is still just the archive marker; its type
+        # is unchanged and it doesn't have a collapse_state.
+        assert isinstance(tree.nodes[0], ArchiveMarkerNode)
+        # Other unprotected turns should have been collapsed.
+        assert result.nodes_collapsed > 0
+
+    def test_compaction_skips_housekeeping_node(self):
+        """HousekeepingNode should not be collapsed by compaction."""
+        tree = HistoryTree()
+        tree.append_user_prompt("start")
+        hk = HousekeepingNode(inner_nodes=[
+            UserPromptNode(UserMessage(content="hk prompt")),
+        ])
+        tree.nodes.append(hk)
+        for i in range(6):
+            tree.append_turn(
+                AssistantMessage(content=f"turn {i} " + "y" * 500), [],
+            )
+
+        result = tree.compact(
+            context_budget=1, low_watermark=0.1, overhead_tokens=0,
+            protected_tail_nodes=2, protected_tail_tool_calls=0,
+        )
+
+        assert isinstance(tree.nodes[1], HousekeepingNode)
+        assert result.nodes_collapsed > 0

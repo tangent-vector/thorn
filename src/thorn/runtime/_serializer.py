@@ -28,9 +28,11 @@ from typing import Any, Protocol, runtime_checkable
 
 from thorn.core._agent import Agent
 from thorn.core._history import (
+    ArchiveMarkerNode,
     CollapseState,
-    HistoryTree,
     HistoryNode,
+    HistoryTree,
+    HousekeepingNode,
     ToolCallNode,
     TurnNode,
     UserPromptNode,
@@ -116,6 +118,19 @@ def _serialize_node(node: HistoryNode) -> dict[str, Any]:
                 for tcn in node.tool_call_nodes
             ],
         }
+    if isinstance(node, ArchiveMarkerNode):
+        return {
+            "type": "archive_marker",
+            "archived_at": node.archived_at.isoformat(),
+            "summary": node.summary,
+            "node_count": node.node_count,
+            "journal_date": node.journal_date,
+        }
+    if isinstance(node, HousekeepingNode):
+        return {
+            "type": "housekeeping",
+            "inner_nodes": [_serialize_node(inner) for inner in node.inner_nodes],
+        }
     raise TypeError(f"Unknown node type: {type(node).__name__}")
 
 
@@ -164,6 +179,18 @@ def _deserialize_node(data: dict[str, Any]) -> HistoryNode:
         state = data.get("collapse_state", "expanded")
         node.collapse_state = CollapseState(state)
         return node
+
+    if node_type == "archive_marker":
+        return ArchiveMarkerNode(
+            archived_at=datetime.fromisoformat(data["archived_at"]),
+            summary=data["summary"],
+            node_count=data["node_count"],
+            journal_date=data["journal_date"],
+        )
+
+    if node_type == "housekeeping":
+        inner = [_deserialize_node(d) for d in data.get("inner_nodes", [])]
+        return HousekeepingNode(inner_nodes=inner)
 
     raise ValueError(f"Unknown history node type: {node_type!r}")
 
