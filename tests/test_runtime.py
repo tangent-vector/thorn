@@ -315,6 +315,76 @@ def _make_history_with_collapsed_nodes() -> HistoryTree:
     return tree
 
 
+def _make_history_with_mixed_collapse_states() -> HistoryTree:
+    """Build a multi-turn history exercising all collapse state combinations.
+
+    NOTE: the compaction design is expected to change; this helper will
+    need updating when that happens.
+
+    Nodes:
+      [0] UserPromptNode  -- expanded (short content)
+      [1] TurnNode        -- expanded, with one detail-collapsed tool call
+      [2] UserPromptNode  -- expanded (second user message)
+      [3] TurnNode        -- fully collapsed (summary only)
+      [4] UserPromptNode  -- expanded (third user message)
+      [5] TurnNode        -- expanded, all tool calls expanded
+    """
+    tree = HistoryTree()
+
+    tree.append_user_prompt("Read foo.py and bar.py")
+
+    tree.append_turn(
+        AssistantMessage(
+            content="I'll read both files.",
+            tool_calls=[
+                ToolCall(call_id="tc_1", name="read_file", arguments='{"path": "foo.py"}'),
+                ToolCall(call_id="tc_2", name="read_file", arguments='{"path": "bar.py"}'),
+            ],
+        ),
+        [
+            ToolResultMessage(call_id="tc_1", content="def hello(): pass"),
+            ToolResultMessage(call_id="tc_2", content="class Bar:\n    x = 1"),
+        ],
+    )
+    turn1 = tree.nodes[1]
+    assert isinstance(turn1, TurnNode)
+    turn1.tool_call_nodes[0].detail_collapsed = True
+
+    tree.append_user_prompt("Now edit foo.py to add a docstring")
+
+    tree.append_turn(
+        AssistantMessage(
+            content="I'll add a docstring.",
+            tool_calls=[
+                ToolCall(call_id="tc_3", name="edit_file",
+                         arguments='{"path": "foo.py", "edits": [{"old": "def hello(): pass", "new": "def hello():\\n    \\"Greet.\\"\\n    pass"}]}'),
+            ],
+        ),
+        [
+            ToolResultMessage(call_id="tc_3", content="Applied 1 edit(s) to foo.py"),
+        ],
+    )
+    turn2 = tree.nodes[3]
+    assert isinstance(turn2, TurnNode)
+    turn2.collapse_state = CollapseState.COLLAPSED
+
+    tree.append_user_prompt("Looks good, now run the tests")
+
+    tree.append_turn(
+        AssistantMessage(
+            content="Running tests now.",
+            tool_calls=[
+                ToolCall(call_id="tc_4", name="run_shell", arguments='{"command": "pytest"}'),
+            ],
+        ),
+        [
+            ToolResultMessage(call_id="tc_4", content="3 passed"),
+        ],
+    )
+
+    return tree
+
+
 def _make_history_with_error_result() -> HistoryTree:
     """Build a history with an error tool result."""
     tree = HistoryTree()
@@ -678,6 +748,64 @@ class TestJsonSessionSerializerSession:
         serializer.save_session(session, session_dir)
         restored = serializer.load_session(session_dir, agent)
         assert restored.key is None
+
+    def test_compacted_history_render_survives_roundtrip(self, tmp_path: Path):
+        """Save a session with mixed collapse states, reload it, and
+        verify that rendered messages match exactly.
+
+        NOTE: this test encodes current compaction/collapse rendering
+        behavior.  The compaction design is expected to change; update
+        this test when that happens.
+        """
+        agent = self._make_agent()
+        session = Session(agent=agent, key=SessionKey("compacted"))
+        session._history = _make_history_with_mixed_collapse_states()
+
+        rendered_before = session._history.render()
+
+        serializer = JsonSessionSerializer()
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+        restored = serializer.load_session(session_dir, agent)
+
+        rendered_after = restored._history.render()
+
+        assert len(rendered_after) == len(rendered_before)
+        for orig, loaded in zip(rendered_before, rendered_after):
+            assert type(orig) is type(loaded)
+            assert orig.role == loaded.role
+
+            if isinstance(orig, UserMessage):
+                assert orig.content == loaded.content
+            elif isinstance(orig, AssistantMessage):
+                assert orig.content == loaded.content
+                assert len(orig.tool_calls) == len(loaded.tool_calls)
+                for tc_orig, tc_loaded in zip(orig.tool_calls, loaded.tool_calls):
+                    assert tc_orig.call_id == tc_loaded.call_id
+                    assert tc_orig.name == tc_loaded.name
+                    assert tc_orig.arguments == tc_loaded.arguments
+            elif isinstance(orig, ToolResultMessage):
+                assert orig.call_id == loaded.call_id
+                assert orig.content == loaded.content
+                assert orig.is_error == loaded.is_error
+
+        nodes = restored._history.nodes
+        assert len(nodes) == 6
+
+        turn1 = nodes[1]
+        assert isinstance(turn1, TurnNode)
+        assert turn1.collapse_state == CollapseState.EXPANDED
+        assert turn1.tool_call_nodes[0].detail_collapsed is True
+        assert turn1.tool_call_nodes[1].detail_collapsed is False
+
+        turn2 = nodes[3]
+        assert isinstance(turn2, TurnNode)
+        assert turn2.collapse_state == CollapseState.COLLAPSED
+
+        turn3 = nodes[5]
+        assert isinstance(turn3, TurnNode)
+        assert turn3.collapse_state == CollapseState.EXPANDED
+        assert turn3.tool_call_nodes[0].detail_collapsed is False
 
 
 # ---------------------------------------------------------------------------
