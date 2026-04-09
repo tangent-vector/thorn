@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import pytest
 
 from thorn.core._agent import Agent, _SafeDict
@@ -12,7 +15,9 @@ from thorn.core._context import (
     set_context,
 )
 from thorn.core._func import skill
+from thorn.core._messages import AssistantMessage
 from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
+from thorn.core._session import Session
 
 
 # ---------------------------------------------------------------------------
@@ -643,5 +648,64 @@ class TestSkillWithRole:
 
             result = await count_items(module="parser")
             assert result == 42
+        finally:
+            reset_context(token)
+
+
+# ---------------------------------------------------------------------------
+# MEMORY.md injection into system prompts
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryMdInjection:
+    @pytest.mark.asyncio
+    async def test_memory_included_on_resumed_session(self, tmp_path: Path):
+        """On a resumed session (non-empty history), MEMORY.md content
+        still appears in the system prompts sent to the provider.
+
+        This guards against accidentally gating MEMORY.md loading on the
+        same ``if not session._history.nodes`` check that controls
+        one-time context injection.
+        """
+        memory_content = (
+            "# Agent Memory\n\n"
+            "- Project: example-project\n"
+            "- Default branch: main\n"
+        )
+        (tmp_path / "MEMORY.md").write_text(memory_content, encoding="utf-8")
+
+        provider = MockProvider()
+
+        captured_prompts: list[list[str]] = []
+        original_complete = provider.complete
+
+        async def tracking_complete(
+            system_prompts: list[str],
+            tools: list[dict],
+            messages: list[Any],
+        ):
+            captured_prompts.append(list(system_prompts))
+            async for chunk in original_complete(system_prompts, tools, messages):
+                yield chunk
+
+        provider.complete = tracking_complete  # type: ignore[assignment]
+
+        context = ExecutionContext(provider=provider, workspace_root=tmp_path)
+        token = set_context(context)
+        try:
+            agent = Agent(workspace=tmp_path)
+            session = Session(agent=agent)
+
+            session._history.append_user_prompt("Earlier message")
+            session._history.append_turn(
+                AssistantMessage(content="Earlier response"), [],
+            )
+
+            await session.prompt("New message after resume")
+
+            assert len(captured_prompts) == 1
+            joined = "\n".join(captured_prompts[0])
+            assert "example-project" in joined
+            assert "Default branch: main" in joined
         finally:
             reset_context(token)
