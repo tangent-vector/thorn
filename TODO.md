@@ -71,3 +71,79 @@
   As a possibly-questionable extension/abuse of that concept, we could make it so that when the tool sees a `SKILL.md` file it extracts the `description:` from the YAML front-matter and uses that as the hint text intead of trying to scrape for a title in the Markdown content. With that kind of subtle policy tweak, a simple `ls`-like tool call on `.agents/skills/` directory would "automatically" yield a listing of available skills and their descriptions.
 
 - Some kind of config file under `.thorn/` that can be used to specify options even for sub-tools (like the gateway server).
+
+---
+
+## Gateway & Multi-Agent System
+
+*Migrated from the completed Phase 5 vertical slice and system architecture plans. The end-to-end vertical slice (GitLab TODO -> coordinator agent -> clone/worktree -> code change -> MR -> comment -> mark done) is working. These are the follow-on items.*
+
+- **`delegate_task` tool**: Implement the decided "Option B" delegation mechanism — a transient sub-agent with its own workspace. The tool creates `Agent(workspace=worktree_path)`, creates a `Session`, runs the prompt, and returns the result. The sub-agent's class-level `tools` determine its capabilities. This is the bridge from the current single-agent shortcut (coordinator does everything) to the two-tier coordinator/developer model.
+
+- **Multi-coordinator routing**: Support one coordinator agent per project, with gateway routing logic directing incoming events to the appropriate coordinator based on project ID or similar. Currently a single pre-configured coordinator handles everything.
+
+- **Data-driven persona/role definitions**: Allow agent roles to be loaded from configuration files rather than requiring Python `Agent` subclasses. The `Agent.role` property (returning `self._role` if set, else `type(self)`) is the seam where this plugs in. See also: Claude Code's `.claude/agents/` markdown-file-based agent definitions.
+
+- **Credential store via `contextvars`**: Replace the current metadata/$ENV_VAR approach for git authentication with a gateway-level credential store accessible via `contextvars`. Decide whether to keep bundling ambient state into `ExecutionContext` or use separate `contextvars` for different concerns.
+
+- **ChannelRegistry / ChannelID**: The architecture plan designed a generic channel abstraction for routing replies from agents back through event sources, but it was never built — the gateway currently posts responses via GitLab tools directly. This becomes important when adding a second event source (Slack, etc.) that needs a uniform reply mechanism.
+
+- **Cross-service user identity**: A `UserID` type and mapping layer for correlating users across GitLab, Slack, CLI, etc. Needed for per-user memory scoping.
+
+- **Per-user vs. global long-term memory**: Policies for scoping agent memory writes — some knowledge is global (project conventions), some is per-user (preferences, past interactions). Requires the user identity layer.
+
+- **Concurrent memory writes**: When multiple agents write to shared long-term memory simultaneously, conflict resolution is needed. Currently single-threaded access is assumed.
+
+- **Markdown-based session serialization**: An alternative `SessionSerializer` that writes history as structured Markdown, enabling agents to read and self-edit their own history for compaction/summarization. The `SessionSerializer` protocol was designed to accommodate this.
+
+- **CLI chat via gateway**: `thorn chat` connecting to a running gateway instead of running an ephemeral local session. Would enable attaching to persistent agent sessions.
+
+- **Additional event sources**: Slack, Discord, and other integrations as `EventSource` implementations.
+
+- **Runtime naming**: `Runtime` is still a provisional name. The concept (persistent substrate of sessions, memory, channels) would benefit from a more evocative name.
+
+## Sub-Agent Context Injection
+
+*Migrated from the sub-agent context injection plan. These ideas reduce the bootstrap cost when a parent agent delegates to a child by pre-populating the child's context with relevant information.*
+
+- **`context_seed_items()` API**: Add a hook to the `Agent` base class that returns items the framework should consider injecting into a newly-spawned sub-agent's initial context. `Agent` subclasses override to declare structurally relevant files, directories, etc.
+
+- **Prompt text analysis**: A utility to extract file paths and identifier names from a task prompt, so the framework can auto-inject content that the task description references.
+
+- **Parent state salience**: Extract currently-salient file paths from the parent agent's `HistoryTree` (e.g., files whose tool results are still expanded) to inform context injection for the child.
+
+- **Budget-constrained briefing assembly**: Rank candidate context items by salience, greedily fill a token budget, and inject synthetic tool-call-and-result history entries into the child agent's `HistoryTree` before its first prompt.
+
+- **Agent scratchpad** (`.thorn/scratch/`): A filesystem area for transient working documents (plan files, design notes, inter-agent communication) that persists for the run duration but isn't part of the committed codebase. Agents can write plans here before delegating, and the child picks them up via context injection.
+
+- **Parallel dispatch**: A `parallel_tasks` variant of `delegate_task` that dispatches N tasks to N sub-agents concurrently, each in its own git worktree. After all complete, merge results and present conflicts to the parent.
+
+## C++ Evaluation Workflow (Push 3b/3c)
+
+*Migrated from the push 3 seam refactoring plan. Push 3a (ModulePath, ValidationRule, callable system_prompts) is complete. Pushes 3b and 3c remain.*
+
+- **Reorganize calc source layout**: Move from `src/main.cpp` (root-module special case) to `src/calc.cpp` + `src/calc/` (uniform convention). Eliminates the `qualify("main", child) -> child` hack and `if name == "main"` branches.
+
+- **Migrate `module_tools.py` to `ModulePath`**: Replace `qualify()` with `ModulePath.child()`, use `ModulePath` internally throughout module tooling functions.
+
+- **Migrate validation to `ValidationRule` + role-owned metadata**: Define `BUILD`/`TEST` as `ValidationRule` instances in `build_tools.py`. Add `validation_rules` ClassVar to role classes. Replace the flat validation config with two-set ContextVar override design.
+
+- **Dynamic Coordinator role list**: Replace the Coordinator's static "AVAILABLE ROLES" prompt section with a callable that queries registered roles at runtime.
+
+- **Move prompts to separate files**: Extract C++-specific prompts to `cpp_prompts.py` and doctest/CMake prompts to `toolset_prompts.py`.
+
+- **Create `ARCHITECTURE.md`**: Document the four-tier classification, component model vision, `ModulePath` design, and module-to-file pattern system for the calc workflow.
+
+## Evaluation Scenarios
+
+*Migrated from the evaluation scenario expansion plan. One scenario (`calc`, greenfield) exists. A reference calc implementation has been written. The remaining scenarios are pending.*
+
+- **wordcount** (greenfield, low difficulty): Simplified `wc` clone — lines, words, bytes/characters with flags.
+- **calc_bugfix** (bug fix, medium): Inject bugs into the reference calc, provide failing-case prompt.
+- **calc_refactor** (refactoring, medium): Monolithize the reference calc, ask agent to split into modules.
+- **calc_functions** (feature addition, medium): Extend reference calc with user-defined functions.
+- **markdown** (greenfield, medium): Subset Markdown-to-HTML converter.
+- **json_tool** (greenfield, medium-hard): JSON parser/formatter/query tool.
+- **calc_plot** (feature addition, medium-hard): Add ASCII plotting to reference calc.
+- **lzw** (greenfield, hard): LZW compression/decompression CLI tool.
+- **Shared evaluation utilities**: Extract common CMake build, binary discovery, and output matching logic into a reusable module.
