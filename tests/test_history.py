@@ -638,8 +638,8 @@ class TestCompaction:
         # The earliest turns should be collapsed
         assert tree.nodes[1].collapse_state == CollapseState.COLLAPSED
 
-    def test_protects_last_two_nodes(self):
-        """The last two nodes should never be collapsed."""
+    def test_protects_tail_nodes(self):
+        """The tail N nodes should never be collapsed."""
         tree = HistoryTree()
         tree.append_user_prompt("start")
         tree.append_turn(
@@ -654,6 +654,8 @@ class TestCompaction:
             context_budget=1,
             low_watermark=0.1,
             overhead_tokens=0,
+            protected_tail_nodes=2,
+            protected_tail_tool_calls=0,
         )
 
         # Last two nodes should still be expanded
@@ -675,10 +677,13 @@ class TestCompaction:
             context_budget=1,
             low_watermark=0.1,
             overhead_tokens=0,
+            protected_tail_nodes=2,
+            protected_tail_tool_calls=0,
         )
 
         # The initial user prompt is the most recent (and only)
-        # UserPromptNode, so it should be protected.
+        # UserPromptNode, so it should be protected even though
+        # it falls outside the tail window.
         assert tree.nodes[0].collapse_state == CollapseState.EXPANDED
 
     def test_compaction_result_accuracy(self):
