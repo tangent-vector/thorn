@@ -52,6 +52,12 @@ class Agent:
 
     system_prompts: ClassVar[list[Any]] = []
     tools: ClassVar[list[Any]] = []
+    """Tool functions discovered via :meth:`_collect_tools` MRO walk.
+
+    The base ``Agent`` class provides journal tools
+    (``write_journal``, ``read_journal``) by default even when
+    ``tools`` is empty; see :meth:`_collect_tools` for details.
+    """
     file_access: ClassVar[list[FileAccessRule]]
     validation_rules: ClassVar[list[str]] = []
 
@@ -191,6 +197,12 @@ class Agent:
 
         Nested iterables (e.g. toolset constants like ``FILE_READING``)
         are flattened before deduplication.
+
+        Journal tools (``write_journal``, ``read_journal``) are always
+        appended unless a tool with the same name was already declared
+        in the MRO, so every agent gets journaling capability by default.
+        A subclass that needs to shadow a journal tool can declare its
+        own function with the same ``__name__``.
         """
         from thorn.core._func import _flatten_tools
 
@@ -203,6 +215,14 @@ class Agent:
                     if tool_name not in seen_names:
                         collected.append(tool_item)
                         seen_names.add(tool_name)
+
+        from thorn.core._journal import JOURNAL_TOOLS
+        for tool_item in _flatten_tools(JOURNAL_TOOLS):
+            tool_name = getattr(tool_item, "__name__", str(tool_item))
+            if tool_name not in seen_names:
+                collected.append(tool_item)
+                seen_names.add(tool_name)
+
         return collected
 
     @classmethod
@@ -386,7 +406,12 @@ async def _run_session_prompt(
     scope_label = f"agent:{type(agent).__name__}"
     if result_type is not str:
         scope_label += f"[{_type_label(result_type)}]"
-    child = ctx.push_scope(scope_label, agent=agent, file_access_policy=policy)
+    child = ctx.push_scope(
+        scope_label,
+        agent=agent,
+        file_access_policy=policy,
+        session_key=str(session.key) if session.key is not None else None,
+    )
 
     # Override workspace_root when the agent has its own workspace,
     # so file tools, AGENTS.md loading, and policies operate within
@@ -410,6 +435,27 @@ async def _run_session_prompt(
         memory = load_agent_memory(agent_home)
         if memory:
             sys_prompts.append(memory)
+
+    # Inject recent journal entries from other sessions so the agent
+    # has cross-session continuity.  Entries from the current session
+    # are excluded (they're already visible in the history).
+    if agent_home is not None:
+        journal_dir = agent_home / "journal"
+        if journal_dir.is_dir():
+            from thorn.core._journal import read_recent_journal
+            session_key_str = (
+                str(session.key) if session.key is not None else None
+            )
+            journal_content = read_recent_journal(
+                journal_dir,
+                exclude_session_key=session_key_str,
+            )
+            if journal_content:
+                sys_prompts.append(
+                    "Your recent activity log"
+                    " (shared across all sessions):\n\n"
+                    + journal_content
+                )
 
     await child.event_sink.on_scope_enter(child.scope)
     t0 = time.monotonic()

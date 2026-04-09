@@ -38,6 +38,15 @@ from thorn.core._func import prompt, skill, tool, wrap_function
 from thorn.core._retry import bound_retries
 from thorn.core._loop import _WrappedTool, run_agent_loop
 from thorn.core._provider import LLMProvider, MockProvider, UsageChunk, load_provider_from_env
+from thorn.core._journal import (
+    JOURNAL_TOOLS,
+    append_journal_entry,
+    list_journal_dates,
+    read_journal,
+    read_journal_day,
+    read_recent_journal,
+    write_journal,
+)
 from thorn.core._tools import (
     ALL_BUILTIN_TOOLS,
     FILE_READING,
@@ -123,6 +132,14 @@ __all__ = [
     "MockProvider",
     "UsageChunk",
     "load_provider_from_env",
+    # Journal
+    "JOURNAL_TOOLS",
+    "append_journal_entry",
+    "list_journal_dates",
+    "read_journal",
+    "read_journal_day",
+    "read_recent_journal",
+    "write_journal",
     # Built-in tools
     "ALL_BUILTIN_TOOLS",
     "FILE_READING",

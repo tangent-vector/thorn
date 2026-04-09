@@ -6,8 +6,8 @@
 - If you see build/lint/test failures that don't seem related to your own work, you are still responsible for addressing them or (if you cannot fix them) bringing them to the attention of the user.
   Do NOT shrug off any kind of issues as not your problem.
 
-- Make sure to add tests for code you introduce, whenever possible.
-  Ensure that you are only adding tests for the functionality a user of your code/API would actually care about; we don't need to pad out test counts with fluff.
+- Make sure to add adequate test coverage for code you introduce or change.
+  Ensure that you are testing the functionality a user of your code/API would actually care about, rather than just adding fluff.
 
 - Flat code is better than deeply nested code.
   Handle-early-out cases in functions and loops first, so that the main or most complicated path can remain less nested.
@@ -19,7 +19,10 @@
 
 - Prefer actual class hierarchies over ad hoc tagged union types unless there is a clear reason why you need to use a tagged union.
 
-- Scrutinize every boolean field/parameter you add. Is it really just two states, and will it realistically always remain that way? Should you be defining a new subtype rather than adding yet another flag to an existing one? Does the receiver of this boolean value actually have all the info they need, or is there other associated data (in which case you probably wanted an `Optional[T]` or `T | None`)? 
+- Scrutinize every boolean-typed field/parameter you add.
+  Is it really just two states, and will it realistically always remain that way?
+  Should you be defining a new subtype rather than adding yet another flag to an existing one?
+  Does the receiver of this boolean value actually have all the info they need, or is there other associated data (in which case you probably wanted an `Optional[T]` or `T | None`)? 
 
 - Comments should be used to explain *why* you are doing something in a particular way, or using a particular design/architecture approach. They should discuss alternatives considered, where appropriate.
 
