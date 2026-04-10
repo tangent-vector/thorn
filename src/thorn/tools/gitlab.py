@@ -328,7 +328,7 @@ NoteableKind = Literal["Issue", "MergeRequest"]
 
 
 @tool
-async def read_issue(project_id: int, issue_iid: int) -> str:
+async def gitlab_read_issue(project_id: int, issue_iid: int) -> str:
     """Read a GitLab issue, returning its title, description, labels, and assignees.
 
     *project_id* is the numeric project ID.  *issue_iid* is the
@@ -349,7 +349,7 @@ async def read_issue(project_id: int, issue_iid: int) -> str:
 
 
 @tool
-async def post_comment(
+async def gitlab_post_comment(
     project_id: int,
     noteable_type: NoteableKind,
     noteable_iid: int,
@@ -368,7 +368,7 @@ async def post_comment(
 
 
 @tool
-async def create_merge_request(
+async def gitlab_create_merge_request(
     project_id: int,
     source_branch: str,
     title: str,
@@ -397,7 +397,7 @@ async def create_merge_request(
 
 
 @tool
-async def get_merge_request(project_id: int, mr_iid: int) -> str:
+async def gitlab_get_merge_request(project_id: int, mr_iid: int) -> str:
     """Read details of a GitLab merge request.
 
     Returns the MR title, state, branches, merge status, and description.
@@ -419,7 +419,7 @@ async def get_merge_request(project_id: int, mr_iid: int) -> str:
 
 
 @tool
-async def list_merge_requests(
+async def gitlab_list_merge_requests(
     project_id: int,
     state: Literal["opened", "closed", "merged", "all"] = "opened",
 ) -> str:
@@ -481,7 +481,7 @@ async def gitlab_read_file(
 
 
 @tool
-async def list_notes(
+async def gitlab_list_notes(
     project_id: int,
     noteable_type: NoteableKind,
     noteable_iid: int,
@@ -530,12 +530,12 @@ async def gitlab_mark_todo_done(todo_id: int) -> str:
 
 
 GITLAB_TOOLS: list[object] = [
-    read_issue,
-    post_comment,
-    create_merge_request,
-    get_merge_request,
-    list_merge_requests,
-    list_notes,
+    gitlab_read_issue,
+    gitlab_post_comment,
+    gitlab_create_merge_request,
+    gitlab_get_merge_request,
+    gitlab_list_merge_requests,
+    gitlab_list_notes,
     gitlab_get_project_info,
     gitlab_read_file,
     gitlab_mark_todo_done,
@@ -548,12 +548,12 @@ __all__ = [
     "get_client",
     "set_client",
     "NoteableKind",
-    "read_issue",
-    "post_comment",
-    "create_merge_request",
-    "get_merge_request",
-    "list_merge_requests",
-    "list_notes",
+    "gitlab_read_issue",
+    "gitlab_post_comment",
+    "gitlab_create_merge_request",
+    "gitlab_get_merge_request",
+    "gitlab_list_merge_requests",
+    "gitlab_list_notes",
     "gitlab_get_project_info",
     "gitlab_read_file",
     "gitlab_mark_todo_done",

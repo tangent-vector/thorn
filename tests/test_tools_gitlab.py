@@ -14,14 +14,14 @@ from thorn.tools.gitlab import (
     GITLAB_TOOLS,
     GitLabClient,
     GitLabConfig,
-    create_merge_request,
     get_client,
-    get_merge_request,
+    gitlab_create_merge_request,
+    gitlab_get_merge_request,
+    gitlab_list_merge_requests,
+    gitlab_list_notes,
     gitlab_mark_todo_done,
-    list_merge_requests,
-    list_notes,
-    post_comment,
-    read_issue,
+    gitlab_post_comment,
+    gitlab_read_issue,
     set_client,
 )
 
@@ -242,7 +242,7 @@ class TestReadIssueTool:
         mock_issue = _make_mock_issue()
         mock_client._gl.projects.get.return_value.issues.get.return_value = mock_issue
 
-        result = await read_issue(1, 42)
+        result = await gitlab_read_issue(1, 42)
         assert "Fix the widget" in result
         assert "#42" in result
         assert "bug" in result
@@ -254,7 +254,7 @@ class TestPostCommentTool:
         mock_project = MagicMock()
         mock_client._gl.projects.get.return_value = mock_project
 
-        result = await post_comment(1, "Issue", 42, "Hello!")
+        result = await gitlab_post_comment(1, "Issue", 42, "Hello!")
         assert "Issue" in result
         assert "#42" in result
 
@@ -265,7 +265,7 @@ class TestCreateMergeRequestTool:
         mock_client._gl.projects.get.return_value.mergerequests.create.return_value = (
             mock_mr
         )
-        result = await create_merge_request(1, "fix-widget", "Fix widget")
+        result = await gitlab_create_merge_request(1, "fix-widget", "Fix widget")
         assert "!7" in result
         assert "fix-widget" in result
 
@@ -276,7 +276,7 @@ class TestGetMergeRequestTool:
         mock_client._gl.projects.get.return_value.mergerequests.get.return_value = (
             mock_mr
         )
-        result = await get_merge_request(1, 7)
+        result = await gitlab_get_merge_request(1, 7)
         assert "!7" in result
         assert "can_be_merged" in result
 
@@ -287,14 +287,14 @@ class TestListMergeRequestsTool:
             _make_mock_mr(iid=1, title="First MR"),
             _make_mock_mr(iid=2, title="Second MR"),
         ]
-        result = await list_merge_requests(1)
+        result = await gitlab_list_merge_requests(1)
         assert "2" in result
         assert "First MR" in result
         assert "Second MR" in result
 
     async def test_empty_list(self, mock_client: GitLabClient) -> None:
         mock_client._gl.projects.get.return_value.mergerequests.list.return_value = []
-        result = await list_merge_requests(1)
+        result = await gitlab_list_merge_requests(1)
         assert "No" in result
 
 
@@ -321,7 +321,7 @@ class TestListNotesTool:
         mock_project.mergerequests.get.return_value.notes.list.return_value = notes
         mock_client._gl.projects.get.return_value = mock_project
 
-        result = await list_notes(1, "MergeRequest", 7)
+        result = await gitlab_list_notes(1, "MergeRequest", 7)
         assert "[reviewer]" in result
         assert "Looks good overall." in result
         assert "[alice]" in result
@@ -338,7 +338,7 @@ class TestListNotesTool:
         mock_project.mergerequests.get.return_value.notes.list.return_value = notes
         mock_client._gl.projects.get.return_value = mock_project
 
-        result = await list_notes(1, "MergeRequest", 7)
+        result = await gitlab_list_notes(1, "MergeRequest", 7)
         assert "Real comment" in result
         assert "added label" not in result
 
@@ -353,7 +353,7 @@ class TestListNotesTool:
         mock_project.mergerequests.get.return_value.notes.list.return_value = notes
         mock_client._gl.projects.get.return_value = mock_project
 
-        result = await list_notes(
+        result = await gitlab_list_notes(
             1, "MergeRequest", 7, include_system_notes=True,
         )
         assert "Real comment" in result
@@ -364,7 +364,7 @@ class TestListNotesTool:
         mock_project.issues.get.return_value.notes.list.return_value = []
         mock_client._gl.projects.get.return_value = mock_project
 
-        result = await list_notes(1, "Issue", 42)
+        result = await gitlab_list_notes(1, "Issue", 42)
         assert "No comments" in result
         assert "#42" in result
 
@@ -374,7 +374,7 @@ class TestListNotesTool:
         mock_project.issues.get.return_value.notes.list.return_value = notes
         mock_client._gl.projects.get.return_value = mock_project
 
-        result = await list_notes(1, "Issue", 42)
+        result = await gitlab_list_notes(1, "Issue", 42)
         assert "Issue feedback" in result
 
 

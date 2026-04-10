@@ -184,7 +184,7 @@ class GitLabTODOsSource(EventSource):
     """Polls the GitLab Todos API and emits events for new TODOs.
 
     On :meth:`start`, also configures the ``thorn.tools.gitlab``
-    module-level client so that agent tools (``post_comment``,
+    module-level client so that agent tools (``gitlab_post_comment``,
     ``gitlab_mark_todo_done``, etc.) work with the same credentials.
     """
 
@@ -247,7 +247,7 @@ class GitLabTODOsSource(EventSource):
     def _configure_tools_client(self) -> None:
         """Set up the ``thorn.tools.gitlab`` module-level client.
 
-        This allows agent tools (``post_comment``, etc.) to use the
+        This allows agent tools (``gitlab_post_comment``, etc.) to use the
         same GitLab credentials without requiring separate env-var
         configuration.
         """

@@ -983,9 +983,9 @@ class TestProjectCoordinator:
 
         tools = ProjectCoordinator._collect_tools()
         tool_names = {getattr(t, "__name__", str(t)) for t in tools}
-        assert "read_issue" in tool_names
-        assert "post_comment" in tool_names
-        assert "create_merge_request" in tool_names
+        assert "gitlab_read_issue" in tool_names
+        assert "gitlab_post_comment" in tool_names
+        assert "gitlab_create_merge_request" in tool_names
         assert "gitlab_mark_todo_done" in tool_names
         assert "gitlab_get_project_info" in tool_names
 
@@ -1080,8 +1080,9 @@ class TestEndToEndWiring:
             tool_names = {getattr(t, "__name__", str(t)) for t in tools}
 
         required = {
-            "read_issue", "post_comment", "create_merge_request",
-            "gitlab_mark_todo_done", "gitlab_get_project_info",
+            "gitlab_read_issue", "gitlab_post_comment",
+            "gitlab_create_merge_request", "gitlab_mark_todo_done",
+            "gitlab_get_project_info",
             "git_clone", "git_push", "git_commit", "git_worktree_add",
             "read_file", "edit_file", "create_file",
         }
