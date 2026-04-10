@@ -28,15 +28,18 @@ import asyncio
 from typing import Any, Callable, Coroutine, TypeVar
 
 from thorn.core import (
+    AdvisoryNode,
     AskUserHandler,
     ConsoleEventSink,
     EventSink,
     ExecutionContext,
     NullEventSink,
     Scope,
+    StatusProvider,
     UsageTracker,
     Verbosity,
     get_context,
+    scoped_status_provider,
     set_context,
     Agent,
     DirectorySeed,

@@ -40,6 +40,7 @@ from thorn.runtime._session import AgentID, SessionKey
 from thorn.runtime._store import SessionStore
 
 if TYPE_CHECKING:
+    from thorn.core._context import StatusProvider
     from thorn.core._file_access import FileAccessPolicy
     from thorn.core._validation_tracker import ValidationTracker
 
@@ -71,6 +72,7 @@ class Runtime:
         context_window: int | None = None,
         session_store: SessionStore | None = None,
         validation_tracker: ValidationTracker | None = None,
+        status_providers: list[StatusProvider] | None = None,
     ) -> None:
         self.provider = provider
         self.event_sink: EventSink = event_sink or NullEventSink()
@@ -79,7 +81,9 @@ class Runtime:
         self.global_ignores = global_ignores
         self.ask_user_handler = ask_user_handler
         self.context_window = context_window
-        self.validation_tracker = validation_tracker
+        self.status_providers: list[StatusProvider] = list(status_providers or [])
+        if validation_tracker is not None:
+            self.status_providers.append(validation_tracker)
 
         if session_store is None:
             agents_root = workspace_root / ".thorn" / "agents"
@@ -111,7 +115,7 @@ class Runtime:
             ask_user_handler=self.ask_user_handler,
             context_window=self.context_window,
             system_prompts=list(system_prompts or []),
-            validation_tracker=self.validation_tracker,
+            status_providers=self.status_providers,
             agency_root_directory=self.workspace_root,
         )
 

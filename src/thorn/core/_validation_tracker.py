@@ -87,11 +87,19 @@ class ValidationTarget:
 
 class ValidationTracker:
     """Manages validation targets, detects staleness, and renders
-    a compact status dashboard."""
+    a compact status dashboard.
+
+    Conforms to the ``StatusProvider`` protocol so it can be
+    registered on an ``ExecutionContext`` alongside other providers.
+    """
 
     def __init__(self, root: Path) -> None:
         self._root = root
         self._targets: dict[str, ValidationTarget] = {}
+
+    @property
+    def source_label(self) -> str:
+        return "validation"
 
     @property
     def root(self) -> Path:
@@ -135,8 +143,13 @@ class ValidationTracker:
         target.baseline = FileSnapshot.scan(self._root, target.file_patterns)
         target.stale_file_count = 0
 
-    def refresh(self) -> None:
-        """Scan the filesystem and update staleness for every target."""
+    def refresh(self, session: object = None) -> None:
+        """Scan the filesystem and update staleness for every target.
+
+        The *session* parameter satisfies the ``StatusProvider``
+        protocol; this tracker's state is workspace-scoped, so the
+        session is ignored.
+        """
         for target in self._targets.values():
             current = FileSnapshot.scan(self._root, target.file_patterns)
             if target.baseline is None:
@@ -196,9 +209,14 @@ class ValidationTracker:
                 return dep_name, dep_status
         return None
 
-    def render_status(self) -> str | None:
+    def render_status(self, session: object = None) -> str | None:
         """Produce a one-line status dashboard, or ``None`` if nothing
-        useful to show."""
+        useful to show.
+
+        The *session* parameter satisfies the ``StatusProvider``
+        protocol; this tracker's state is workspace-scoped, so the
+        session is ignored.
+        """
         if not self._targets:
             return None
 

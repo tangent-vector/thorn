@@ -484,6 +484,7 @@ async def _run_session_prompt(
             system_prompts=sys_prompts,
             result_type=result_type,
             history=session._history,
+            session=session,
         )
     finally:
         duration_s = time.monotonic() - t0

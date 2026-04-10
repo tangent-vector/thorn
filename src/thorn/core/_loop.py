@@ -22,6 +22,7 @@ from thorn.core._context import ExecutionContext, Scope
 from thorn.core._history import (
     DEFAULT_HIGH_WATERMARK,
     DEFAULT_LOW_WATERMARK,
+    AdvisoryNode,
     HistoryTree,
     ToolCallNode,
     estimate_tokens,
@@ -90,6 +91,7 @@ async def run_agent_loop(
     max_tool_rounds: int = 50,
     max_failures: int = 5,
     history: HistoryTree | None = None,
+    session: Any = None,
     _housekeeping: bool = False,
 ) -> Any:
     """Drive the request -> tool-call -> response cycle.
@@ -105,6 +107,9 @@ async def run_agent_loop(
     history after the call returns (enabling multi-turn patterns).
     If *history* is ``None`` (the default), a fresh tree is created
     internally.
+
+    When *session* is provided, it is passed to status providers so
+    they can tailor advisory content to the active session/agent.
 
     The *_housekeeping* flag is set by the housekeeping subsystem to
     prevent recursive housekeeping triggers within a sub-loop.
@@ -187,16 +192,20 @@ async def run_agent_loop(
             continue
 
         # -- dispatch tool calls -------------------------------------------
-        result_msgs, call_node_classes, captured = await _execute_tool_calls(
-            tool_calls=tool_calls,
-            tool_dispatch=tool_dispatch,
-            context=context,
-            result_type=result_type if structured else None,
+        result_msgs, call_node_classes, advisory_nodes, captured = (
+            await _execute_tool_calls(
+                tool_calls=tool_calls,
+                tool_dispatch=tool_dispatch,
+                context=context,
+                result_type=result_type if structured else None,
+                session=session,
+            )
         )
 
         history.append_turn(
             AssistantMessage(content=text, tool_calls=tool_calls),
             result_msgs,
+            advisory_nodes=advisory_nodes or None,
             call_node_classes=call_node_classes or None,
         )
 
@@ -360,12 +369,16 @@ async def _execute_tool_calls(
     tool_dispatch: dict[str, _WrappedTool],
     context: ExecutionContext,
     result_type: type | None,
-) -> tuple[list[ToolResultMessage], dict[str, type[ToolCallNode]], Any]:
-    """Execute tool calls and return (result_messages, call_node_classes, captured_value).
+    session: Any = None,
+) -> tuple[list[ToolResultMessage], dict[str, type[ToolCallNode]], list[AdvisoryNode], Any]:
+    """Execute tool calls and return (result_messages, call_node_classes, advisory_nodes, captured_value).
 
     *call_node_classes* maps ``call_id`` to the ``ToolCallNode``
     subclass registered on the resolved tool (if any).  Only entries
     with a non-``None`` class are included.
+
+    *advisory_nodes* contains any advisories produced by registered
+    status providers for this tool-call round.
 
     *captured_value* is ``_RESULT_SENTINEL`` unless a ``return_result``
     call was processed (in structured mode).
@@ -463,17 +476,18 @@ async def _execute_tool_calls(
             tc.name, duration_s=duration_s, scope=context.scope,
         )
 
+    advisory_nodes: list[AdvisoryNode] = []
     if results:
-        tracker = context.validation_tracker
-        if tracker is not None:
-            tracker.refresh()
-            status_line = tracker.render_status()
-            if status_line:
-                last = results[-1]
-                results[-1] = ToolResultMessage(
-                    call_id=last.call_id,
-                    content=last.content + "\n\n" + status_line,
-                    is_error=last.is_error,
+        for provider in context.status_providers:
+            provider.refresh(session)
+            text = provider.render_status(session)
+            if text:
+                advisory_nodes.append(AdvisoryNode(
+                    source=provider.source_label,
+                    content=text,
+                ))
+                await context.event_sink.on_advisory(
+                    provider.source_label, text, scope=context.scope,
                 )
 
-    return results, call_node_classes, captured
+    return results, call_node_classes, advisory_nodes, captured

@@ -318,7 +318,7 @@ async def coordinate(
         tracker.add_target("test", file_patterns=[
             "src/**/*.h", "src/**/*.cpp", "tests/**/*.cpp",
         ], depends_on=["build"])
-        ctx.validation_tracker = tracker
+        ctx.add_status_provider(tracker)
 
     developer_cls = _get_developer_cls()
 

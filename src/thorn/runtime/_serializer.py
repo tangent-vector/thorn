@@ -28,6 +28,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from thorn.core._agent import Agent
 from thorn.core._history import (
+    AdvisoryNode,
     ArchiveMarkerNode,
     CollapseState,
     HistoryNode,
@@ -99,6 +100,25 @@ def _serialize_tool_call_node(node: ToolCallNode) -> dict[str, Any]:
     }
 
 
+def _serialize_advisory_node(node: AdvisoryNode) -> dict[str, Any]:
+    return {
+        "source": node.source,
+        "content": node.content,
+        "collapse_state": node.collapse_state.value,
+        "intrinsic_salience": node.intrinsic_salience,
+    }
+
+
+def _deserialize_advisory_node(data: dict[str, Any]) -> AdvisoryNode:
+    state = data.get("collapse_state", "expanded")
+    return AdvisoryNode(
+        source=data["source"],
+        content=data["content"],
+        collapse_state=CollapseState(state),
+        intrinsic_salience=data.get("intrinsic_salience", 0.2),
+    )
+
+
 def _serialize_node(node: HistoryNode) -> dict[str, Any]:
     if isinstance(node, UserPromptNode):
         return {
@@ -108,7 +128,7 @@ def _serialize_node(node: HistoryNode) -> dict[str, Any]:
             "intrinsic_salience": node.intrinsic_salience,
         }
     if isinstance(node, TurnNode):
-        return {
+        result: dict[str, Any] = {
             "type": "turn",
             "assistant_content": node.assistant_content,
             "collapse_state": node.collapse_state.value,
@@ -118,6 +138,12 @@ def _serialize_node(node: HistoryNode) -> dict[str, Any]:
                 for tcn in node.tool_call_nodes
             ],
         }
+        if node.advisory_nodes:
+            result["advisories"] = [
+                _serialize_advisory_node(adv)
+                for adv in node.advisory_nodes
+            ]
+        return result
     if isinstance(node, ArchiveMarkerNode):
         return {
             "type": "archive_marker",
@@ -171,9 +197,14 @@ def _deserialize_node(data: dict[str, Any]) -> HistoryNode:
             _deserialize_tool_call_node(tc_data)
             for tc_data in data.get("tool_calls", [])
         ]
+        advisory_nodes = [
+            _deserialize_advisory_node(adv_data)
+            for adv_data in data.get("advisories", [])
+        ]
         node = TurnNode(
             assistant_content=data.get("assistant_content", ""),
             tool_call_nodes=tool_call_nodes,
+            advisory_nodes=advisory_nodes or None,
             intrinsic_salience=data.get("intrinsic_salience", 1.0),
         )
         state = data.get("collapse_state", "expanded")

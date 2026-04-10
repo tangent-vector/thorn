@@ -58,6 +58,10 @@ DEFAULT_TOOL_CALL_SALIENCE: float = 0.8
 """Tool calls are slightly lower salience than the surrounding turn
 because their results are often the bulkiest, most compressible content."""
 
+DEFAULT_ADVISORY_SALIENCE: float = 0.2
+"""Advisory nodes default to low salience so stale dashboards are
+reclaimed aggressively by the compaction algorithm."""
+
 DEFAULT_SALIENCE_DECAY_RATE: float = 0.1
 """Exponential decay rate applied per node-position of age."""
 
@@ -92,6 +96,7 @@ class CollapseState(Enum):
 class _CandidateKind(Enum):
     """Type of collapse action in the greedy compaction algorithm."""
     TOOL_CALL = "tool_call"
+    ADVISORY = "advisory"
     TURN = "turn"
     USER_PROMPT = "user_prompt"
 
@@ -382,6 +387,68 @@ class DirectoryListCallNode(ToolCallNode):
     __slots__ = ()
 
 
+class AdvisoryNode:
+    """Runtime-injected status or advisory text, separate from tool output.
+
+    Lives inside a ``TurnNode`` (alongside ``ToolCallNode`` instances),
+    not at the top level of the tree.  Each advisory has its own
+    collapse state and salience so the compaction algorithm can reclaim
+    stale dashboard text independently of the tool calls.
+    """
+
+    __slots__ = (
+        "source",
+        "content",
+        "collapse_state",
+        "intrinsic_salience",
+        "_expanded_cost",
+        "_collapsed_cost",
+    )
+
+    def __init__(
+        self,
+        source: str,
+        content: str,
+        *,
+        collapse_state: CollapseState = CollapseState.EXPANDED,
+        intrinsic_salience: float = DEFAULT_ADVISORY_SALIENCE,
+    ) -> None:
+        self.source = source
+        self.content = content
+        self.collapse_state = collapse_state
+        self.intrinsic_salience = intrinsic_salience
+        self._expanded_cost: int | None = None
+        self._collapsed_cost: int | None = None
+
+    def summary(self) -> str:
+        return f"[{self.source} advisory]"
+
+    def expanded_token_cost(self) -> int:
+        if self._expanded_cost is None:
+            self._expanded_cost = estimate_tokens(self.content)
+        return self._expanded_cost
+
+    def collapsed_token_cost(self) -> int:
+        if self._collapsed_cost is None:
+            self._collapsed_cost = estimate_tokens(self.summary())
+        return self._collapsed_cost
+
+    def token_cost(self) -> int:
+        if self.collapse_state == CollapseState.COLLAPSED:
+            return self.collapsed_token_cost()
+        return self.expanded_token_cost()
+
+    def savings_if_collapsed(self) -> int:
+        return max(0, self.expanded_token_cost() - self.collapsed_token_cost())
+
+    @property
+    def is_collapsible(self) -> bool:
+        return (
+            self.collapse_state == CollapseState.EXPANDED
+            and self.savings_if_collapsed() > 0
+        )
+
+
 class UserPromptNode(HistoryNode):
     """A user prompt in the history.
 
@@ -452,11 +519,16 @@ class TurnNode(HistoryNode):
     so that individual tool calls can be detail-collapsed independently.
     When the entire turn is collapsed, it renders as a single text-only
     ``AssistantMessage`` with a summary.
+
+    Advisory nodes carry runtime-injected status text that is logically
+    separate from tool output but rendered into the last tool result at
+    render time (LLM API constraint).
     """
 
     __slots__ = (
         "assistant_content",
         "tool_call_nodes",
+        "advisory_nodes",
         "collapse_state",
         "intrinsic_salience",
         "_collapsed_cost",
@@ -468,10 +540,12 @@ class TurnNode(HistoryNode):
         assistant_content: str,
         tool_call_nodes: list[ToolCallNode],
         *,
+        advisory_nodes: list[AdvisoryNode] | None = None,
         intrinsic_salience: float = DEFAULT_INTRINSIC_SALIENCE,
     ) -> None:
         self.assistant_content = assistant_content
         self.tool_call_nodes = tool_call_nodes
+        self.advisory_nodes: list[AdvisoryNode] = advisory_nodes or []
         self.collapse_state = CollapseState.EXPANDED
         self.intrinsic_salience = intrinsic_salience
         self._collapsed_cost: int | None = None
@@ -484,6 +558,9 @@ class TurnNode(HistoryNode):
                 parts.append(_truncate_content(self.assistant_content, SUMMARY_CONTENT_PREFIX_CHARS))
             for tcn in self.tool_call_nodes:
                 parts.append(tcn.summary())
+            if self.advisory_nodes:
+                labels = ", ".join(a.source for a in self.advisory_nodes)
+                parts.append(f"[advisories: {labels}]")
             self._summary = " | ".join(parts) if parts else "[empty turn]"
         return self._summary
 
@@ -493,6 +570,8 @@ class TurnNode(HistoryNode):
         cost = estimate_tokens(self.assistant_content)
         for tcn in self.tool_call_nodes:
             cost += tcn.token_cost()
+        for adv in self.advisory_nodes:
+            cost += adv.token_cost()
         return cost
 
     def _get_collapsed_cost(self) -> int:
@@ -503,8 +582,8 @@ class TurnNode(HistoryNode):
     def savings_if_collapsed(self) -> int:
         """Token savings from collapsing the entire turn in its current state.
 
-        If individual tool calls have already been detail-collapsed, the
-        remaining savings are smaller.
+        If individual tool calls or advisories have already been
+        collapsed, the remaining savings are smaller.
         """
         return max(0, self.token_cost() - self._get_collapsed_cost())
 
@@ -516,12 +595,37 @@ class TurnNode(HistoryNode):
     def has_collapsible_tool_calls(self) -> bool:
         return any(tcn.is_collapsible for tcn in self.tool_call_nodes)
 
+    def _render_advisories(self) -> str:
+        """Concatenate advisory text for rendering into the tool-result stream.
+
+        Expanded advisories contribute their full content; collapsed ones
+        contribute their summary (omitted if empty).
+        """
+        parts: list[str] = []
+        for adv in self.advisory_nodes:
+            if adv.collapse_state == CollapseState.COLLAPSED:
+                s = adv.summary()
+                if s:
+                    parts.append(s)
+            else:
+                parts.append(adv.content)
+        return "\n\n".join(parts)
+
     def render(self) -> list[Message]:
         if self.collapse_state == CollapseState.COLLAPSED:
             return [AssistantMessage(content=self.summary())]
 
         tool_calls = [tcn.render_tool_call() for tcn in self.tool_call_nodes]
         results = [tcn.render_result() for tcn in self.tool_call_nodes]
+
+        advisory_text = self._render_advisories()
+        if advisory_text and results:
+            last = results[-1]
+            results[-1] = ToolResultMessage(
+                call_id=last.call_id,
+                content=last.content + "\n\n" + advisory_text,
+                is_error=last.is_error,
+            )
 
         msg = AssistantMessage(
             content=self.assistant_content,
@@ -678,6 +782,7 @@ class HistoryTree:
         assistant_msg: AssistantMessage,
         tool_results: list[ToolResultMessage],
         *,
+        advisory_nodes: list[AdvisoryNode] | None = None,
         intrinsic_salience: float = DEFAULT_INTRINSIC_SALIENCE,
         call_node_classes: dict[str, type[ToolCallNode]] | None = None,
     ) -> TurnNode:
@@ -692,6 +797,10 @@ class HistoryTree:
         constructed using that subclass instead of the base
         ``ToolCallNode``, enabling ``isinstance``-based identification
         in downstream code (e.g. context injection).
+
+        When *advisory_nodes* is provided, they are attached to the
+        ``TurnNode`` as runtime-injected status text, separate from
+        tool results in the data model.
         """
         result_by_id = {r.call_id: r for r in tool_results}
         tool_call_nodes: list[ToolCallNode] = []
@@ -706,6 +815,7 @@ class HistoryTree:
         node = TurnNode(
             assistant_content=assistant_msg.content,
             tool_call_nodes=tool_call_nodes,
+            advisory_nodes=advisory_nodes,
             intrinsic_salience=intrinsic_salience,
         )
         self.nodes.append(node)
@@ -824,6 +934,8 @@ class HistoryTree:
 
             if c.kind == _CandidateKind.TOOL_CALL:
                 tcs_collapsed += 1
+            elif c.kind == _CandidateKind.ADVISORY:
+                pass  # advisory collapses are sub-node; don't count as full nodes
             else:
                 nodes_collapsed += 1
 
@@ -914,13 +1026,29 @@ class HistoryTree:
                             apply=_do,
                         ))
 
+                for adv in node.advisory_nodes:
+                    if not adv.is_collapsible:
+                        continue
+                    adv_eff = adv.intrinsic_salience * math.exp(-decay_rate * age)
+                    adv_savings = adv.savings_if_collapsed()
+                    if adv_savings > 0:
+                        def _do_adv(a: AdvisoryNode = adv) -> None:
+                            a.collapse_state = CollapseState.COLLAPSED
+                        candidates.append(_CollapseCandidate(
+                            effective_salience=adv_eff,
+                            estimated_savings=adv_savings,
+                            kind=_CandidateKind.ADVISORY,
+                            parent_turn=node,
+                            apply=_do_adv,
+                        ))
+
                 eff = node.intrinsic_salience * math.exp(-decay_rate * age)
                 savings = node.savings_if_collapsed()
                 if savings > 0:
                     def _do_turn(n: TurnNode = node) -> None:
                         n.collapse_state = CollapseState.COLLAPSED
-                    # Bump by a small epsilon so tool-call collapses at the
-                    # same age are tried first.
+                    # Bump by a small epsilon so tool-call and advisory
+                    # collapses at the same age are tried first.
                     candidates.append(_CollapseCandidate(
                         effective_salience=eff + 0.001,
                         estimated_savings=savings,

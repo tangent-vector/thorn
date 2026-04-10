@@ -18,11 +18,13 @@ from thorn.core._context import (
     ExecutionContext,
     NullEventSink,
     Scope,
+    StatusProvider,
     UsageTracker,
     Verbosity,
     get_context,
     reset_context,
     resolve_path,
+    scoped_status_provider,
     set_context,
 )
 from thorn.core._agent import Agent
@@ -30,6 +32,7 @@ from thorn.core._session import Session
 from thorn.core._context_injection import DirectorySeed, FileSeed, SearchSeed, SeedContent
 from thorn.core._discovery import discover_tools
 from thorn.core._history import (
+    AdvisoryNode,
     ArchiveMarkerNode,
     CollapseState,
     CompactionResult,
@@ -101,11 +104,13 @@ __all__ = [
     "ExecutionContext",
     "NullEventSink",
     "Scope",
+    "StatusProvider",
     "UsageTracker",
     "Verbosity",
     "get_context",
     "reset_context",
     "resolve_path",
+    "scoped_status_provider",
     "set_context",
     # Context injection
     "DirectorySeed",
@@ -115,6 +120,7 @@ __all__ = [
     # Discovery
     "discover_tools",
     # History
+    "AdvisoryNode",
     "ArchiveMarkerNode",
     "CollapseState",
     "CompactionResult",

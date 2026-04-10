@@ -10,9 +10,10 @@ from __future__ import annotations
 import contextvars
 import json
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Generator, Protocol
 
 from thorn.core._provider import LLMProvider, ResponseChunk
 
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from thorn.core._file_access import FileAccessPolicy
+    from thorn.core._session import Session
     from thorn.core._validation_tracker import ValidationTracker
 
 
@@ -71,6 +73,48 @@ class Verbosity(IntEnum):
     NORMAL = 1
     VERBOSE = 2
     DEBUG = 3
+
+
+# ---------------------------------------------------------------------------
+# Status provider protocol
+# ---------------------------------------------------------------------------
+
+class StatusProvider(Protocol):
+    """Cross-cutting system that can inject advisory status text.
+
+    Implementations provide a ``source_label`` for identification and
+    a ``refresh`` / ``render_status`` pair that the agent loop calls
+    once per tool-call round.
+
+    Both ``refresh`` and ``render_status`` receive the ``Session``
+    being annotated so that a provider can inspect the agent's role,
+    workspace, or session metadata when deciding what (if anything) to
+    report.  Providers that don't care about session identity simply
+    ignore the parameter.
+    """
+
+    @property
+    def source_label(self) -> str:
+        """Short identifier, e.g. ``'validation'``, ``'inbox'``."""
+        ...
+
+    def refresh(self, session: Session | None) -> None:
+        """Re-evaluate current state (called once per tool round).
+
+        *session* is the active session, or ``None`` when running
+        outside of a session (e.g. bare ``thorn.run()``).  Providers
+        that only apply to certain agents/sessions can check
+        ``session.agent`` and short-circuit.
+        """
+        ...
+
+    def render_status(self, session: Session | None) -> str | None:
+        """Status text for the agent, or ``None`` if nothing to report.
+
+        Called after ``refresh``.  A provider that is irrelevant to the
+        given session should return ``None``.
+        """
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +199,16 @@ class EventSink(ABC):
             label += f" ({duration_s:.1f}s)"
         await self.on_status(label, scope=scope)
 
+    async def on_advisory(
+        self,
+        source: str,
+        content: str,
+        *,
+        scope: Scope | None = None,
+    ) -> None:
+        """Called when a status provider emits an advisory for the agent."""
+        await self.on_status(f"[{source}] {content}", scope=scope)
+
 
 class NullEventSink(EventSink):
     """Silently discards all events."""
@@ -195,6 +249,15 @@ class NullEventSink(EventSink):
     async def on_completion_end(
         self, *, duration_s: float | None = None,
         usage: dict[str, int] | None = None,
+        scope: Scope | None = None,
+    ) -> None:
+        pass
+
+    async def on_advisory(
+        self,
+        source: str,
+        content: str,
+        *,
         scope: Scope | None = None,
     ) -> None:
         pass
@@ -393,6 +456,23 @@ class ConsoleEventSink(EventSink):
             label += f" ({duration_s:.1f}s)"
         self._safe_print(f"{indent}[dim]{label}[/dim]", highlight=False)
 
+    # -- advisory events ----------------------------------------------------
+
+    async def on_advisory(
+        self,
+        source: str,
+        content: str,
+        *,
+        scope: Scope | None = None,
+    ) -> None:
+        if self._verbosity < Verbosity.NORMAL:
+            return
+        self._end_text()
+        indent = self._indent(scope)
+        self._safe_print(
+            f"{indent}[dim][{source}] {content}[/dim]", highlight=False,
+        )
+
 
 # ---------------------------------------------------------------------------
 # User-interaction callback
@@ -463,10 +543,11 @@ class ExecutionContext:
                         ``.thornignore`` at startup.  Applied as an upper
                         bound on every per-agent policy.
         usage:      Shared accumulator for LLM token counts.
-        validation_tracker: Shared tracker for scan-based validation
-                            status.  ``None`` when no tracker has been
-                            attached.  Propagated by reference across
-                            nested scopes.
+        status_providers: List of cross-cutting ``StatusProvider``
+                          instances that inject advisory text into
+                          the agent loop after tool-call rounds.
+                          Propagated by reference across nested
+                          scopes (shared list, not copied).
         agency_root_directory: The top-level directory that owns the
                                ``.thorn/`` directory.  Used to derive
                                agent home paths
@@ -488,8 +569,30 @@ class ExecutionContext:
     usage: UsageTracker = field(default_factory=UsageTracker)
     ask_user_handler: AskUserHandler | None = None
     context_window: int | None = None
-    validation_tracker: ValidationTracker | None = None
+    status_providers: list[StatusProvider] = field(default_factory=list)
     agency_root_directory: Path | None = None
+
+    def add_status_provider(self, provider: StatusProvider) -> None:
+        """Register a ``StatusProvider`` for advisory injection."""
+        self.status_providers.append(provider)
+
+    @property
+    def validation_tracker(self) -> ValidationTracker | None:
+        """Backward-compatible accessor for a ``ValidationTracker`` provider."""
+        from thorn.core._validation_tracker import ValidationTracker as _VT
+        for p in self.status_providers:
+            if isinstance(p, _VT):
+                return p
+        return None
+
+    @validation_tracker.setter
+    def validation_tracker(self, tracker: ValidationTracker | None) -> None:
+        from thorn.core._validation_tracker import ValidationTracker as _VT
+        self.status_providers = [
+            p for p in self.status_providers if not isinstance(p, _VT)
+        ]
+        if tracker is not None:
+            self.status_providers.append(tracker)
 
     def push_scope(
         self,
@@ -535,7 +638,7 @@ class ExecutionContext:
             usage=self.usage,
             ask_user_handler=self.ask_user_handler,
             context_window=self.context_window,
-            validation_tracker=self.validation_tracker,
+            status_providers=self.status_providers,
             agency_root_directory=self.agency_root_directory,
         )
 
@@ -573,6 +676,24 @@ def set_context(ctx: ExecutionContext) -> contextvars.Token[ExecutionContext]:
 def reset_context(token: contextvars.Token[ExecutionContext]) -> None:
     """Restore the ``ExecutionContext`` to its previous value."""
     _current_context.reset(token)
+
+
+@contextmanager
+def scoped_status_provider(provider: StatusProvider):
+    """Register *provider* on the current context for the duration of the block.
+
+    Removes the provider from ``status_providers`` on exit, even if an
+    exception is raised.
+    """
+    ctx = get_context()
+    ctx.status_providers.append(provider)
+    try:
+        yield provider
+    finally:
+        try:
+            ctx.status_providers.remove(provider)
+        except ValueError:
+            pass
 
 
 def resolve_path(raw: str | Path) -> Path:
