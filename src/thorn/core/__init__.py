@@ -45,6 +45,11 @@ from thorn.core._func import prompt, skill, tool, wrap_function
 from thorn.core._retry import bound_retries
 from thorn.core._loop import _WrappedTool, run_agent_loop
 from thorn.core._provider import LLMProvider, MockProvider, UsageChunk, load_provider_from_env
+from thorn.core._housekeeping import (
+    HousekeepingResult,
+    perform_housekeeping,
+    select_cut_point,
+)
 from thorn.core._journal import (
     JOURNAL_TOOLS,
     append_journal_entry,
@@ -142,6 +147,10 @@ __all__ = [
     "MockProvider",
     "UsageChunk",
     "load_provider_from_env",
+    # Housekeeping
+    "HousekeepingResult",
+    "perform_housekeeping",
+    "select_cut_point",
     # Journal
     "JOURNAL_TOOLS",
     "append_journal_entry",

@@ -68,6 +68,9 @@ from thorn.core import (
     MockProvider,
     UsageChunk,
     load_provider_from_env,
+    HousekeepingResult,
+    perform_housekeeping,
+    select_cut_point,
     JOURNAL_TOOLS,
     append_journal_entry,
     list_journal_dates,
@@ -188,6 +191,10 @@ __all__ = [
     "ALL_BUILTIN_TOOLS",
     "FILE_READING",
     "FILE_WRITING",
+    # Housekeeping
+    "HousekeepingResult",
+    "perform_housekeeping",
+    "select_cut_point",
     # History / compaction
     "ArchiveMarkerNode",
     "CollapseState",

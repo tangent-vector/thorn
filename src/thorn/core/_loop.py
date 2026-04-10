@@ -90,6 +90,7 @@ async def run_agent_loop(
     max_tool_rounds: int = 50,
     max_failures: int = 5,
     history: HistoryTree | None = None,
+    _housekeeping: bool = False,
 ) -> Any:
     """Drive the request -> tool-call -> response cycle.
 
@@ -104,6 +105,10 @@ async def run_agent_loop(
     history after the call returns (enabling multi-turn patterns).
     If *history* is ``None`` (the default), a fresh tree is created
     internally.
+
+    The *_housekeeping* flag is set by the housekeeping subsystem to
+    prevent recursive housekeeping triggers within a sub-loop.
+    External callers should not set this.
     """
     structured = result_type is not None and result_type is not str
 
@@ -195,7 +200,7 @@ async def run_agent_loop(
             call_node_classes=call_node_classes or None,
         )
 
-        # -- compaction check ----------------------------------------------
+        # -- compaction check + housekeeping trigger ------------------------
         if context_window is not None and usage is not None:
             prompt_tokens = usage.get("prompt_tokens", 0)
             if prompt_tokens > context_window * DEFAULT_HIGH_WATERMARK:
@@ -211,6 +216,24 @@ async def run_agent_loop(
                         f"~{compact_result.estimated_savings} est. tokens saved "
                         f"({compact_result.tokens_before} -> {compact_result.tokens_after})",
                         scope=context.scope,
+                    )
+
+                # Escalate to housekeeping when compaction alone
+                # cannot bring the context below the high watermark.
+                if (
+                    not _housekeeping
+                    and compact_result.tokens_after
+                        > int(context_window * DEFAULT_HIGH_WATERMARK)
+                ):
+                    from thorn.core._housekeeping import perform_housekeeping
+
+                    await perform_housekeeping(
+                        context=context,
+                        history=history,
+                        all_tools=all_tools,
+                        system_prompts=system_prompts,
+                        context_window=context_window,
+                        overhead_tokens=overhead_tokens,
                     )
 
         if captured is not _RESULT_SENTINEL:
