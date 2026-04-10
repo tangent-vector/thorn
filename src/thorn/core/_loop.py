@@ -117,6 +117,13 @@ async def run_agent_loop(
     """
     structured = result_type is not None and result_type is not str
 
+    # -- filter out ask_user when no handler is available ------------------
+    if context.ask_user_handler is None:
+        tools = [
+            t for t in tools
+            if _tool_name(t.schema) != "ask_user"
+        ]
+
     # -- build schemas and dispatch table ----------------------------------
     all_tools = list(tools)
     tool_dispatch: dict[str, _WrappedTool] = {

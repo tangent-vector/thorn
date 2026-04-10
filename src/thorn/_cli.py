@@ -32,7 +32,16 @@ console = Console()
 
 
 async def _rich_ask_user(question: str) -> str:
-    """Prompt the user via the rich console, suitable for interactive CLI use."""
+    """Prompt the user via the rich console, suitable for interactive CLI use.
+
+    Refuses to block on a non-TTY stdin (e.g. piped input) where
+    ``console.input()`` would read EOF or garbage.
+    """
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "ask_user is not available: stdin is not a TTY. "
+            "Cannot prompt for user input in a non-interactive context."
+        )
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None, lambda: console.input(f"\n[yellow]? {question}[/yellow]\n> "),
@@ -54,6 +63,8 @@ def _build_runtime(
     verbosity: Verbosity = Verbosity.NORMAL,
     trace_file: Any | None = None,
     workspace: str | None = None,
+    *,
+    interactive: bool = True,
 ) -> Runtime:
     """Create a ``Runtime`` from environment variables.
 
@@ -89,7 +100,7 @@ def _build_runtime(
         workspace_root=ws_root,
         workspace_instructions=load_workspace_instructions(ws_root),
         global_ignores=load_global_ignores(ws_root),
-        ask_user_handler=_rich_ask_user,
+        ask_user_handler=_rich_ask_user if interactive else None,
     )
 
 
@@ -576,7 +587,10 @@ def _serve_gateway(
 
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        runtime = _build_runtime(verbosity, trace_file=trace_file, workspace=workspace_path)
+        runtime = _build_runtime(
+            verbosity, trace_file=trace_file, workspace=workspace_path,
+            interactive=False,
+        )
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         if trace_file:

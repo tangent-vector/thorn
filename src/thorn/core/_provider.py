@@ -168,6 +168,7 @@ class OpenAIProviderConfig:
     api_url: str
     api_key: str
     model_name: str
+    max_tokens: int | None = None
 
 
 def _message_to_openai(msg: Message) -> dict[str, Any]:
@@ -238,6 +239,8 @@ class OpenAIProvider(LLMProvider):
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if self.config.max_tokens is not None:
+            body["max_tokens"] = self.config.max_tokens
         if tools:
             body["tools"] = tools
 
@@ -364,9 +367,20 @@ def load_provider_from_env() -> LLMProvider:
             f"missing required environment variables: {', '.join(missing)}"
         )
 
+    max_tokens_raw = os.environ.get("OPENAI_MAX_TOKENS")
+    max_tokens: int | None = None
+    if max_tokens_raw is not None:
+        try:
+            max_tokens = int(max_tokens_raw)
+        except ValueError:
+            raise ProviderError(
+                f"OPENAI_MAX_TOKENS must be an integer, got {max_tokens_raw!r}"
+            )
+
     config = OpenAIProviderConfig(
         api_url=api_url,  # type: ignore[arg-type]
         api_key=api_key,  # type: ignore[arg-type]
         model_name=model_name,  # type: ignore[arg-type]
+        max_tokens=max_tokens,
     )
     return OpenAIProvider(config)

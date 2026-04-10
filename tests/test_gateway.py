@@ -377,6 +377,114 @@ class TestGateway:
         assert SessionKey("k2") in handled
 
 
+    @pytest.mark.asyncio
+    async def test_same_agent_events_serialized(self, tmp_path: Path):
+        """Two events for the same agent should execute sequentially
+        (the per-agent lock serializes them)."""
+        timestamps: list[tuple[str, float]] = []
+        delay = 0.1
+
+        runtime = self._make_runtime(tmp_path)
+        gateway = Gateway(runtime=runtime, sources=[])
+
+        agent_id = AgentID("serial-agent")
+
+        async with runtime:
+            agent = runtime.get_or_create_agent(agent_id)
+            runtime.save_agent(agent)
+
+            original_prompt = _SessionPromptAccessor.__call__
+
+            async def slow_prompt(self_accessor, text, **kwargs):
+                timestamps.append(("enter", asyncio.get_event_loop().time()))
+                await asyncio.sleep(delay)
+                timestamps.append(("exit", asyncio.get_event_loop().time()))
+                return "ok"
+
+            event_a = IncomingEvent(
+                source="test",
+                session_key=SessionKey("k1"),
+                content="first",
+                agent_id=agent_id,
+            )
+            event_b = IncomingEvent(
+                source="test",
+                session_key=SessionKey("k2"),
+                content="second",
+                agent_id=agent_id,
+            )
+
+            with patch.object(
+                _SessionPromptAccessor, "__call__", slow_prompt,
+            ):
+                await asyncio.gather(
+                    gateway._handle_event(event_a),
+                    gateway._handle_event(event_b),
+                )
+
+        assert len(timestamps) == 4
+        first_exit = timestamps[1][1]
+        second_enter = timestamps[2][1]
+        assert second_enter >= first_exit, (
+            "Second event started before first finished — lock not working"
+        )
+
+    @pytest.mark.asyncio
+    async def test_different_agents_events_parallel(self, tmp_path: Path):
+        """Two events for different agents should execute in parallel."""
+        timestamps: dict[str, list[float]] = {}
+        delay = 0.1
+
+        runtime = self._make_runtime(tmp_path)
+        gateway = Gateway(runtime=runtime, sources=[])
+
+        id_a = AgentID("agent-a")
+        id_b = AgentID("agent-b")
+
+        async with runtime:
+            runtime.get_or_create_agent(id_a)
+            runtime.save_agent(runtime.get_or_create_agent(id_a))
+            runtime.get_or_create_agent(id_b)
+            runtime.save_agent(runtime.get_or_create_agent(id_b))
+
+            async def slow_prompt(self_accessor, text, **kwargs):
+                agent_id = str(self_accessor._session.agent.id)
+                if agent_id not in timestamps:
+                    timestamps[agent_id] = []
+                timestamps[agent_id].append(asyncio.get_event_loop().time())
+                await asyncio.sleep(delay)
+                timestamps[agent_id].append(asyncio.get_event_loop().time())
+                return "ok"
+
+            event_a = IncomingEvent(
+                source="test",
+                session_key=SessionKey("k1"),
+                content="from a",
+                agent_id=id_a,
+            )
+            event_b = IncomingEvent(
+                source="test",
+                session_key=SessionKey("k2"),
+                content="from b",
+                agent_id=id_b,
+            )
+
+            with patch.object(
+                _SessionPromptAccessor, "__call__", slow_prompt,
+            ):
+                t0 = asyncio.get_event_loop().time()
+                await asyncio.gather(
+                    gateway._handle_event(event_a),
+                    gateway._handle_event(event_b),
+                )
+                total = asyncio.get_event_loop().time() - t0
+
+        assert total < delay * 1.8, (
+            f"Two different agents took {total:.2f}s — expected parallel "
+            f"execution (~{delay}s, not ~{delay * 2}s)"
+        )
+
+
 # ---------------------------------------------------------------------------
 # GitLabTODOsSource (mocked)
 # ---------------------------------------------------------------------------

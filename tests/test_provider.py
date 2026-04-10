@@ -17,6 +17,8 @@ from thorn.core._messages import (
 from thorn.core._provider import (
     FinishChunk,
     MockProvider,
+    OpenAIProvider,
+    OpenAIProviderConfig,
     TextChunk,
     ToolCallChunk,
     _iter_sse_chunks,
@@ -210,3 +212,118 @@ class TestLoadProviderFromEnv:
         with pytest.raises(ProviderError, match="OPENAI_API_KEY") as exc_info:
             load_provider_from_env()
         assert "OPENAI_API_MODEL_NAME" in str(exc_info.value)
+
+    def test_max_tokens_from_env(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_URL", "http://localhost")
+        monkeypatch.setenv("OPENAI_API_KEY", "key")
+        monkeypatch.setenv("OPENAI_API_MODEL_NAME", "gpt-4")
+        monkeypatch.setenv("OPENAI_MAX_TOKENS", "8192")
+        provider = load_provider_from_env()
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.config.max_tokens == 8192
+
+    def test_max_tokens_absent_from_env(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_URL", "http://localhost")
+        monkeypatch.setenv("OPENAI_API_KEY", "key")
+        monkeypatch.setenv("OPENAI_API_MODEL_NAME", "gpt-4")
+        monkeypatch.delenv("OPENAI_MAX_TOKENS", raising=False)
+        provider = load_provider_from_env()
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.config.max_tokens is None
+
+    def test_max_tokens_non_integer_raises(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_URL", "http://localhost")
+        monkeypatch.setenv("OPENAI_API_KEY", "key")
+        monkeypatch.setenv("OPENAI_API_MODEL_NAME", "gpt-4")
+        monkeypatch.setenv("OPENAI_MAX_TOKENS", "not-a-number")
+        with pytest.raises(ProviderError, match="OPENAI_MAX_TOKENS"):
+            load_provider_from_env()
+
+
+# ---------------------------------------------------------------------------
+# OpenAIProvider max_tokens in request body
+# ---------------------------------------------------------------------------
+
+class TestOpenAIProviderMaxTokens:
+    """Verify that max_tokens is conditionally included in the HTTP body."""
+
+    async def test_max_tokens_included_when_set(self):
+        """When max_tokens is configured, the request body includes it."""
+        captured_bodies: list[dict] = []
+
+        config = OpenAIProviderConfig(
+            api_url="http://localhost:1234",
+            api_key="test",
+            model_name="test-model",
+            max_tokens=4096,
+        )
+        provider = OpenAIProvider(config)
+
+        original_stream = provider._client.stream
+
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def capturing_stream(method, url, *, json=None, **kwargs):
+            captured_bodies.append(json)
+            # Yield a fake response that produces a valid SSE stream
+            fake = _FakeHttpResponse(200, [
+                'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}',
+                "data: [DONE]",
+            ])
+            yield fake
+
+        provider._client.stream = capturing_stream  # type: ignore[assignment]
+
+        chunks = []
+        async for c in provider.complete(["sys"], [], [UserMessage(content="hi")]):
+            chunks.append(c)
+
+        assert len(captured_bodies) == 1
+        assert captured_bodies[0]["max_tokens"] == 4096
+
+    async def test_max_tokens_omitted_when_none(self):
+        """When max_tokens is None, the request body does not contain the key."""
+        captured_bodies: list[dict] = []
+
+        config = OpenAIProviderConfig(
+            api_url="http://localhost:1234",
+            api_key="test",
+            model_name="test-model",
+        )
+        provider = OpenAIProvider(config)
+
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def capturing_stream(method, url, *, json=None, **kwargs):
+            captured_bodies.append(json)
+            fake = _FakeHttpResponse(200, [
+                'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}',
+                "data: [DONE]",
+            ])
+            yield fake
+
+        provider._client.stream = capturing_stream  # type: ignore[assignment]
+
+        chunks = []
+        async for c in provider.complete(["sys"], [], [UserMessage(content="hi")]):
+            chunks.append(c)
+
+        assert len(captured_bodies) == 1
+        assert "max_tokens" not in captured_bodies[0]
+
+
+class _FakeHttpResponse:
+    """Minimal stand-in for httpx.Response with status_code and aiter_lines."""
+
+    def __init__(self, status_code: int, lines: list[str]) -> None:
+        self.status_code = status_code
+        self._lines = lines
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+    async def aread(self) -> None:
+        pass

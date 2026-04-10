@@ -113,28 +113,34 @@ class Gateway:
         Tools are determined by the agent's class-level ``tools``
         declaration (via ``Agent._collect_tools``), not passed
         explicitly by the gateway.
+
+        The agent's lock serializes all event handling for a given
+        agent, preventing concurrent mutations to its workspace,
+        session state, and MEMORY.md.
         """
         log.info(
             "Handling event from %s (session=%s)",
             event.source, event.session_key,
         )
         agent = self._resolve_agent(event)
-        self._runtime.save_agent(agent)
-        session = self._runtime.get_or_create_session(agent, event.session_key)
-        try:
-            await session.prompt(event.content)
-        except Exception:
-            log.exception(
-                "Agent failed for event (source=%s, session=%s)",
+
+        async with agent.lock:
+            self._runtime.save_agent(agent)
+            session = self._runtime.get_or_create_session(agent, event.session_key)
+            try:
+                await session.prompt(event.content)
+            except Exception:
+                log.exception(
+                    "Agent failed for event (source=%s, session=%s)",
+                    event.source, event.session_key,
+                )
+                return
+
+            self._runtime.save_session(session)
+            log.info(
+                "Event handled (source=%s, session=%s)",
                 event.source, event.session_key,
             )
-            return
-
-        self._runtime.save_session(session)
-        log.info(
-            "Event handled (source=%s, session=%s)",
-            event.source, event.session_key,
-        )
 
     async def shutdown(self) -> None:
         """Stop all sources and cancel background tasks."""

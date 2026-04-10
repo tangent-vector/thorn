@@ -879,6 +879,44 @@ class TestAskUser:
             reset_context(token)
 
 
+class TestRichAskUserNonTTYGuard:
+    async def test_raises_on_non_tty_stdin(self):
+        """_rich_ask_user should raise RuntimeError when stdin is not a TTY."""
+        from unittest.mock import patch
+        from thorn._cli import _rich_ask_user
+
+        with patch("thorn._cli.sys") as mock_sys:
+            mock_sys.stdin.isatty.return_value = False
+            with pytest.raises(RuntimeError, match="not a TTY"):
+                await _rich_ask_user("question?")
+
+    async def test_passes_through_on_tty_stdin(self):
+        """_rich_ask_user should call console.input when stdin is a TTY."""
+        from unittest.mock import patch
+        from thorn._cli import _rich_ask_user
+
+        with (
+            patch("thorn._cli.sys") as mock_sys,
+            patch("thorn._cli.console") as mock_console,
+        ):
+            mock_sys.stdin.isatty.return_value = True
+            mock_console.input.return_value = "user answer"
+            result = await _rich_ask_user("question?")
+            assert result == "user answer"
+            mock_console.input.assert_called_once()
+
+
+class TestProjectCoordinatorNoAskUser:
+    """Regression guard: ProjectCoordinator should not include ask_user."""
+
+    def test_coordinator_tools_exclude_ask_user(self):
+        from thorn.gateway._agents import ProjectCoordinator
+
+        tools = ProjectCoordinator._collect_tools()
+        tool_names = {getattr(t, "__name__", str(t)) for t in tools}
+        assert "ask_user" not in tool_names
+
+
 # ---------------------------------------------------------------------------
 # Workspace-aware path resolution in tools
 # ---------------------------------------------------------------------------

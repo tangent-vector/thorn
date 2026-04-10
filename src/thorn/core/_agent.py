@@ -9,6 +9,7 @@ calls with the role's context.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
@@ -78,8 +79,21 @@ class Agent:
         self._workspace_resolved: bool = workspace is not None
         self._home: Path | None = home
         self._home_resolved: bool = home is not None
+        self._lock: asyncio.Lock | None = None
         for k, v in kwargs.items():
             setattr(self, k, v)
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        """Per-agent concurrency lock, created lazily on first access.
+
+        Serializes event handling (and eventually delegate_task) for
+        this agent instance, protecting its workspace and session state
+        from concurrent mutation.
+        """
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     @property
     def workspace(self) -> Path | None:

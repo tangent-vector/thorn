@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -910,6 +911,31 @@ class TestAgentHome:
             assert agent.home == first_home
         finally:
             reset_context(token2)
+
+
+# ---------------------------------------------------------------------------
+# Agent.lock property
+# ---------------------------------------------------------------------------
+
+
+class TestAgentLock:
+    def test_lock_returns_same_instance(self):
+        agent = Agent()
+        lock1 = agent.lock
+        lock2 = agent.lock
+        assert lock1 is lock2
+        assert isinstance(lock1, asyncio.Lock)
+
+    def test_different_agents_have_independent_locks(self):
+        agent_a = Agent()
+        agent_b = Agent()
+        assert agent_a.lock is not agent_b.lock
+
+    def test_lock_is_none_before_first_access(self):
+        agent = Agent()
+        assert agent._lock is None
+        _ = agent.lock
+        assert agent._lock is not None
 
 
 # ---------------------------------------------------------------------------
