@@ -19,6 +19,7 @@ from thorn.tools.gitlab import (
     get_merge_request,
     gitlab_mark_todo_done,
     list_merge_requests,
+    list_notes,
     post_comment,
     read_issue,
     set_client,
@@ -183,6 +184,54 @@ class TestGitLabClientListMRs:
         assert result[0]["title"] == "MR one"
 
 
+class TestGitLabClientListNotes:
+    def _make_mock_note(self, **overrides: Any) -> MagicMock:
+        note = MagicMock()
+        note.id = overrides.get("id", 100)
+        note.author = overrides.get("author", {"username": "reviewer"})
+        note.body = overrides.get("body", "Please fix the naming.")
+        note.created_at = overrides.get("created_at", "2026-04-08T10:00:00Z")
+        note.system = overrides.get("system", False)
+        return note
+
+    def test_returns_list_of_dicts(self, mock_client: GitLabClient) -> None:
+        notes = [
+            self._make_mock_note(id=1, body="First comment"),
+            self._make_mock_note(id=2, body="Second comment"),
+        ]
+        mock_project = MagicMock()
+        mock_project.mergerequests.get.return_value.notes.list.return_value = notes
+        mock_client._gl.projects.get.return_value = mock_project
+
+        result = mock_client.list_notes(1, "MergeRequest", 7)
+        assert len(result) == 2
+        assert result[0]["body"] == "First comment"
+        assert result[1]["body"] == "Second comment"
+
+    def test_issue_notes(self, mock_client: GitLabClient) -> None:
+        notes = [self._make_mock_note(id=10, body="Issue comment")]
+        mock_project = MagicMock()
+        mock_project.issues.get.return_value.notes.list.return_value = notes
+        mock_client._gl.projects.get.return_value = mock_project
+
+        result = mock_client.list_notes(1, "Issue", 42)
+        assert len(result) == 1
+        assert result[0]["author"] == "reviewer"
+
+    def test_includes_system_flag(self, mock_client: GitLabClient) -> None:
+        notes = [self._make_mock_note(system=True, body="added label ~bug")]
+        mock_project = MagicMock()
+        mock_project.issues.get.return_value.notes.list.return_value = notes
+        mock_client._gl.projects.get.return_value = mock_project
+
+        result = mock_client.list_notes(1, "Issue", 42)
+        assert result[0]["system"] is True
+
+    def test_invalid_type_raises(self, mock_client: GitLabClient) -> None:
+        with pytest.raises(ValueError, match="Unsupported noteable_type"):
+            mock_client.list_notes(1, "Snippet", 1)
+
+
 # ---------------------------------------------------------------------------
 # @tool functions
 # ---------------------------------------------------------------------------
@@ -249,6 +298,86 @@ class TestListMergeRequestsTool:
         assert "No" in result
 
 
+class TestListNotesTool:
+    def _make_mock_note(self, **overrides: Any) -> MagicMock:
+        note = MagicMock()
+        note.id = overrides.get("id", 100)
+        note.author = overrides.get("author", {"username": "reviewer"})
+        note.body = overrides.get("body", "Please fix the naming.")
+        note.created_at = overrides.get("created_at", "2026-04-08T10:00:00Z")
+        note.system = overrides.get("system", False)
+        return note
+
+    async def test_formats_mr_notes(self, mock_client: GitLabClient) -> None:
+        notes = [
+            self._make_mock_note(id=1, body="Looks good overall."),
+            self._make_mock_note(
+                id=2,
+                body="Please rename the variable.",
+                author={"username": "alice"},
+            ),
+        ]
+        mock_project = MagicMock()
+        mock_project.mergerequests.get.return_value.notes.list.return_value = notes
+        mock_client._gl.projects.get.return_value = mock_project
+
+        result = await list_notes(1, "MergeRequest", 7)
+        assert "[reviewer]" in result
+        assert "Looks good overall." in result
+        assert "[alice]" in result
+        assert "Please rename the variable." in result
+
+    async def test_filters_system_notes_by_default(
+        self, mock_client: GitLabClient,
+    ) -> None:
+        notes = [
+            self._make_mock_note(id=1, body="Real comment", system=False),
+            self._make_mock_note(id=2, body="added label ~bug", system=True),
+        ]
+        mock_project = MagicMock()
+        mock_project.mergerequests.get.return_value.notes.list.return_value = notes
+        mock_client._gl.projects.get.return_value = mock_project
+
+        result = await list_notes(1, "MergeRequest", 7)
+        assert "Real comment" in result
+        assert "added label" not in result
+
+    async def test_includes_system_notes_when_requested(
+        self, mock_client: GitLabClient,
+    ) -> None:
+        notes = [
+            self._make_mock_note(id=1, body="Real comment", system=False),
+            self._make_mock_note(id=2, body="added label ~bug", system=True),
+        ]
+        mock_project = MagicMock()
+        mock_project.mergerequests.get.return_value.notes.list.return_value = notes
+        mock_client._gl.projects.get.return_value = mock_project
+
+        result = await list_notes(
+            1, "MergeRequest", 7, include_system_notes=True,
+        )
+        assert "Real comment" in result
+        assert "added label" in result
+
+    async def test_empty_notes(self, mock_client: GitLabClient) -> None:
+        mock_project = MagicMock()
+        mock_project.issues.get.return_value.notes.list.return_value = []
+        mock_client._gl.projects.get.return_value = mock_project
+
+        result = await list_notes(1, "Issue", 42)
+        assert "No comments" in result
+        assert "#42" in result
+
+    async def test_issue_notes(self, mock_client: GitLabClient) -> None:
+        notes = [self._make_mock_note(id=5, body="Issue feedback")]
+        mock_project = MagicMock()
+        mock_project.issues.get.return_value.notes.list.return_value = notes
+        mock_client._gl.projects.get.return_value = mock_project
+
+        result = await list_notes(1, "Issue", 42)
+        assert "Issue feedback" in result
+
+
 # ---------------------------------------------------------------------------
 # GITLAB_TOOLS list
 # ---------------------------------------------------------------------------
@@ -262,7 +391,7 @@ class TestGitLabToolsList:
             )
 
     def test_expected_count(self) -> None:
-        assert len(GITLAB_TOOLS) == 8
+        assert len(GITLAB_TOOLS) == 9
 
     def test_includes_project_info(self) -> None:
         names = [getattr(fn, "__name__", "?") for fn in GITLAB_TOOLS]

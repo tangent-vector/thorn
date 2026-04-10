@@ -72,6 +72,8 @@
 
 - Some kind of config file under `.thorn/` that can be used to specify options even for sub-tools (like the gateway server).
 
+- Agent should signal awareness of GitLab messages via emoji reactions, to help users have visibility into what it might be doing behind the scenes.
+
 ---
 
 ## Gateway & Multi-Agent System

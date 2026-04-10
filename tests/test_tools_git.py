@@ -18,7 +18,9 @@ from thorn.tools.git import (
     git_clone,
     git_commit,
     git_diff,
+    git_fetch,
     git_log,
+    git_pull,
     git_push,
     git_status,
     git_worktree_add,
@@ -291,6 +293,78 @@ class TestGitClone:
 
 
 # ---------------------------------------------------------------------------
+# git_fetch
+# ---------------------------------------------------------------------------
+
+
+class TestGitFetch:
+    async def test_fetch_updates_bare_repo(
+        self, bare_repo: Path, git_repo: Path,
+    ) -> None:
+        """Fetch into a bare clone picks up new commits from the source."""
+        import subprocess
+
+        (git_repo / "after_clone.txt").write_text("new\n")
+        subprocess.run(
+            ["git", "add", "-A"], cwd=git_repo, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "post-clone commit"],
+            cwd=git_repo, check=True, capture_output=True,
+        )
+
+        result = await git_fetch(str(bare_repo), remote="origin")
+        assert "Fetched" in result
+
+    async def test_fetch_nonexistent_remote_fails(self, git_repo: Path) -> None:
+        with pytest.raises(GitError):
+            await git_fetch(str(git_repo), remote="nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# git_pull
+# ---------------------------------------------------------------------------
+
+
+class TestGitPull:
+    async def test_pull_into_worktree(
+        self, bare_repo: Path, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        """Pull brings remote changes into a worktree's working tree."""
+        import subprocess
+
+        wt = tmp_path / "worktree"
+        branch_proc = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=git_repo, check=True, capture_output=True, text=True,
+        )
+        default_branch = branch_proc.stdout.strip()
+
+        await git_worktree_add(
+            str(bare_repo), str(wt), "pull-test", start_point=default_branch,
+        )
+
+        (git_repo / "pulled.txt").write_text("from upstream\n")
+        subprocess.run(
+            ["git", "add", "-A"], cwd=git_repo, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "upstream commit"],
+            cwd=git_repo, check=True, capture_output=True,
+        )
+
+        await git_fetch(str(bare_repo), remote="origin")
+        result = await git_pull(str(wt), remote="origin", branch=default_branch)
+        assert "Pulled" in result
+        assert (wt / "pulled.txt").exists()
+
+    async def test_pull_no_branch_tracking(self, git_repo: Path) -> None:
+        """Pull without explicit branch on a repo with no tracking raises."""
+        with pytest.raises(GitError):
+            await git_pull(str(git_repo))
+
+
+# ---------------------------------------------------------------------------
 # git_push
 # ---------------------------------------------------------------------------
 
@@ -358,7 +432,7 @@ class TestGitToolsList:
             )
 
     def test_expected_count(self) -> None:
-        assert len(GIT_TOOLS) == 9
+        assert len(GIT_TOOLS) == 11
 
 
 # ---------------------------------------------------------------------------

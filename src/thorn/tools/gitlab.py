@@ -250,6 +250,41 @@ class GitLabClient:
             "content": f.decode().decode("utf-8", errors="replace"),
         }
 
+    def list_notes(
+        self,
+        project_id: int,
+        noteable_type: str,
+        noteable_iid: int,
+    ) -> list[dict[str, Any]]:
+        """List notes (comments) on an issue or merge request.
+
+        Returns all notes in chronological order.  Each dict contains
+        ``id``, ``author`` (username string), ``body``, ``created_at``,
+        and ``system`` (bool -- ``True`` for auto-generated notes like
+        label changes).
+        """
+        project = self._gl.projects.get(project_id)
+        if noteable_type == "Issue":
+            noteable = project.issues.get(noteable_iid)
+        elif noteable_type == "MergeRequest":
+            noteable = project.mergerequests.get(noteable_iid)
+        else:
+            raise ValueError(f"Unsupported noteable_type: {noteable_type!r}")
+
+        raw_notes = noteable.notes.list(
+            sort="asc", order_by="created_at", iterator=True,
+        )
+        return [
+            {
+                "id": note.id,
+                "author": note.author["username"] if note.author else "unknown",
+                "body": note.body,
+                "created_at": note.created_at,
+                "system": getattr(note, "system", False),
+            }
+            for note in raw_notes
+        ]
+
     def mark_todo_done(self, todo_id: int) -> None:
         """Mark a GitLab TODO as done by its numeric ID.
 
@@ -446,6 +481,42 @@ async def gitlab_read_file(
 
 
 @tool
+async def list_notes(
+    project_id: int,
+    noteable_type: NoteableKind,
+    noteable_iid: int,
+    include_system_notes: bool = False,
+) -> str:
+    """List comments/notes on a GitLab issue or merge request.
+
+    Returns all human-authored notes in chronological order.  Useful
+    for reading reviewer feedback, discussion threads, and prior
+    comments.
+
+    *noteable_type* must be ``"Issue"`` or ``"MergeRequest"``.
+    Set *include_system_notes* to ``True`` to also show auto-generated
+    notes (label changes, assignments, etc.).
+    """
+    client = get_client()
+    notes = await asyncio.to_thread(
+        client.list_notes, project_id, noteable_type, noteable_iid,
+    )
+    if not include_system_notes:
+        notes = [n for n in notes if not n["system"]]
+
+    if not notes:
+        kind = "issue" if noteable_type == "Issue" else "MR"
+        return f"No comments on {kind} #{noteable_iid} in project {project_id}."
+
+    lines: list[str] = []
+    for note in notes:
+        lines.append(f"[{note['author']}] ({note['created_at']}):")
+        lines.append(note["body"])
+        lines.append("")
+    return "\n".join(lines)
+
+
+@tool
 async def gitlab_mark_todo_done(todo_id: int) -> str:
     """Mark a GitLab TODO item as done.
 
@@ -464,6 +535,7 @@ GITLAB_TOOLS: list[object] = [
     create_merge_request,
     get_merge_request,
     list_merge_requests,
+    list_notes,
     gitlab_get_project_info,
     gitlab_read_file,
     gitlab_mark_todo_done,
@@ -481,6 +553,7 @@ __all__ = [
     "create_merge_request",
     "get_merge_request",
     "list_merge_requests",
+    "list_notes",
     "gitlab_get_project_info",
     "gitlab_read_file",
     "gitlab_mark_todo_done",

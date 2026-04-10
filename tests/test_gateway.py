@@ -730,7 +730,7 @@ class TestGitLabToolsList:
     def test_expected_count(self):
         from thorn.tools.gitlab import GITLAB_TOOLS
 
-        assert len(GITLAB_TOOLS) == 8
+        assert len(GITLAB_TOOLS) == 9
 
 
 # ---------------------------------------------------------------------------

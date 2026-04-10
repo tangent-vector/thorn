@@ -259,6 +259,42 @@ async def git_diff(
 
 
 @tool
+async def git_fetch(
+    repo_path: str,
+    remote: str = "origin",
+) -> str:
+    """Fetch updates from a remote without modifying the working tree.
+
+    Retrieves new commits, branches, and tags from *remote* (default
+    ``origin``).  Works in both bare repositories and worktrees.
+    """
+    resolved = _resolve_tool_path(repo_path)
+    _, output = await _run_git("fetch", remote, cwd=resolved)
+    return f"Fetched from {remote}\n{output}".strip()
+
+
+@tool
+async def git_pull(
+    repo_path: str,
+    remote: str = "origin",
+    branch: str | None = None,
+) -> str:
+    """Pull changes from a remote into the current branch.
+
+    Runs ``git pull <remote> [<branch>]``.  When *branch* is not
+    specified, pulls the tracking branch.  Typically used inside a
+    worktree to incorporate upstream changes (e.g. reviewer-pushed
+    fixup commits or base-branch updates).
+    """
+    resolved = _resolve_tool_path(repo_path)
+    args = ["pull", remote]
+    if branch is not None:
+        args.append(branch)
+    _, output = await _run_git(*args, cwd=resolved)
+    return f"Pulled from {remote}\n{output}".strip()
+
+
+@tool
 async def git_worktree_add(
     bare_repo: str,
     worktree_path: str,
@@ -321,6 +357,8 @@ GIT_TOOLS: list[object] = [
     git_branch,
     git_commit,
     git_push,
+    git_fetch,
+    git_pull,
     git_status,
     git_diff,
     git_worktree_add,
@@ -335,6 +373,8 @@ __all__ = [
     "git_branch",
     "git_commit",
     "git_push",
+    "git_fetch",
+    "git_pull",
     "git_status",
     "git_diff",
     "git_worktree_add",

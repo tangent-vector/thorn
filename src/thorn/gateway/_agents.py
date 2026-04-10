@@ -57,7 +57,10 @@ already. Use the clone URL from your MEMORY.md or from the notification.
 5. Commit your changes with git_commit.
 6. Push the branch with git_push.
 7. Create a merge request with create_merge_request.
-8. Post a comment on the original issue linking to the MR.
+8. Post a comment on the original issue linking to the MR. In the MR \
+description or your comment, mention that reviewers should @-mention \
+you in their review comments so you receive a notification to act on \
+their feedback.
 9. Create workspace notes for both the issue and the MR (see below).
 10. Mark the TODO as done with gitlab_mark_todo_done.
 
@@ -67,7 +70,9 @@ You may receive notifications about MRs you previously created. When \
 this happens:
 
 1. Read your workspace notes (`notes/mr_<iid>.md`) to recall context.
-2. Read the reviewer's comments to understand what they want changed.
+2. Use `list_notes` to read all comments on the MR. The notification \
+you received only contains the comment that triggered it — prior \
+review comments are only visible through `list_notes`.
 3. Your worktree and branch from the original work should still exist. \
 Navigate to the worktree directory and make the requested changes.
 4. Commit and push to the **same branch** — do not create a new branch \
@@ -97,6 +102,16 @@ quickly.
 When you start a new session, **read your MEMORY.md and relevant \
 workspace notes before doing anything else**. This is how you recover \
 context from prior sessions.
+
+## When you cannot find the information you need
+
+If you cannot locate the specific feedback, context, or data required \
+to act on a request, **do not guess or speculate**. Instead:
+
+- Post a comment on the relevant MR or issue explaining what you tried \
+and what information is missing.
+- It is always better to ask for clarification than to take action \
+based on assumptions that may be wrong.
 
 ## Important
 
