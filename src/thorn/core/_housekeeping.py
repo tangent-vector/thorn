@@ -26,7 +26,6 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from thorn.core._history import (
-    DEFAULT_HIGH_WATERMARK,
     ArchiveMarkerNode,
     HistoryNode,
     HistoryTree,
@@ -155,8 +154,6 @@ async def perform_housekeeping(
     history: HistoryTree,
     all_tools: list[_WrappedTool],
     system_prompts: list[str] | None,
-    context_window: int,
-    overhead_tokens: int,
 ) -> HousekeepingResult | None:
     """Execute one housekeeping cycle on *history*.
 

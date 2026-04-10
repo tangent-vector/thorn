@@ -232,8 +232,6 @@ async def run_agent_loop(
                         history=history,
                         all_tools=all_tools,
                         system_prompts=system_prompts,
-                        context_window=context_window,
-                        overhead_tokens=overhead_tokens,
                     )
 
         if captured is not _RESULT_SENTINEL:

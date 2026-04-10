@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 
-import pytest
-
-from thorn.core._context import ExecutionContext, NullEventSink, set_context, reset_context
+from thorn.core._context import ExecutionContext, NullEventSink, Scope
 from thorn.core._history import (
     ArchiveMarkerNode,
     HistoryTree,
@@ -18,7 +15,6 @@ from thorn.core._history import (
 from thorn.core._housekeeping import (
     CONTEXT_BOUNDARY_TEXT,
     HOUSEKEEPING_PROMPT,
-    HousekeepingResult,
     _HOUSEKEEPING_TOOL_ALLOWLIST,
     filter_housekeeping_tools,
     perform_housekeeping,
@@ -96,7 +92,7 @@ class CaptureSink(NullEventSink):
     def __init__(self) -> None:
         self.messages: list[str] = []
 
-    async def on_status(self, message: str, scope: object = None) -> None:
+    async def on_status(self, message: str, scope: Scope | None = None) -> None:
         self.messages.append(message)
 
 
@@ -193,7 +189,7 @@ class TestFilterHousekeepingTools:
 class TestPerformHousekeeping:
     async def test_trims_and_restructures_history(self):
         """After housekeeping, the tree has [ArchiveMarker, tail, HousekeepingNode]."""
-        tree = _make_history(6)
+        tree = _make_history(12)
         original_count = len(tree.nodes)
 
         sink = CaptureSink()
@@ -220,12 +216,10 @@ class TestPerformHousekeeping:
                 _make_wrapped_tool("edit_file"),
             ],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
 
         assert result is not None
-        assert result.nodes_trimmed > 0
+        assert result.nodes_trimmed > 1
 
         assert isinstance(tree.nodes[0], ArchiveMarkerNode)
         assert isinstance(tree.nodes[-1], HousekeepingNode)
@@ -236,12 +230,13 @@ class TestPerformHousekeeping:
         hk_node = tree.nodes[-1]
         assert len(hk_node.inner_nodes) > 0
 
-        # Protected tail should be in the middle
         for node in tree.nodes[1:-1]:
             assert isinstance(node, (UserPromptNode, TurnNode))
 
         status_msgs = [m for m in sink.messages if "housekeeping" in m]
         assert len(status_msgs) > 0
+
+        assert len(tree.nodes) < original_count
 
     async def test_returns_none_when_all_protected(self):
         """When all nodes are protected, housekeeping cannot trim."""
@@ -257,8 +252,6 @@ class TestPerformHousekeeping:
             history=tree,
             all_tools=[],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
 
         assert result is None
@@ -292,8 +285,6 @@ class TestPerformHousekeeping:
             history=tree,
             all_tools=[],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
 
         assert len(received_messages) > 0
@@ -345,8 +336,6 @@ class TestPerformHousekeeping:
             history=tree,
             all_tools=[wj_tool],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
 
         assert result is not None
@@ -379,8 +368,6 @@ class TestPerformHousekeeping:
             history=tree,
             all_tools=[_make_wrapped_tool("write_journal")],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
 
         # Trim should still have happened despite the LoopLimitError
@@ -391,9 +378,7 @@ class TestPerformHousekeeping:
 
     async def test_protected_tail_preserved(self):
         """Nodes in the protected tail survive housekeeping intact."""
-        tree = _make_history(8)
-        # The protected indices will include the last N nodes.
-        # Record the content of the last few nodes before housekeeping.
+        tree = _make_history(12)
         protected = tree._protected_indices()
         protected_contents = {
             i: tree.nodes[i] for i in protected
@@ -415,8 +400,6 @@ class TestPerformHousekeeping:
             history=tree,
             all_tools=[],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
 
         assert result is not None
@@ -447,8 +430,6 @@ class TestPerformHousekeeping:
             history=tree,
             all_tools=[],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
 
         hk_node = tree.nodes[-1]
@@ -610,7 +591,7 @@ class TestHousekeepingInLoop:
 
 class TestPostHousekeepingStructure:
     async def test_archive_marker_has_correct_node_count(self):
-        tree = _make_history(8)
+        tree = _make_history(12)
         protected = tree._protected_indices()
         expected_trimmed = min(protected)
 
@@ -630,8 +611,6 @@ class TestPostHousekeepingStructure:
             history=tree,
             all_tools=[],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
 
         assert result is not None
@@ -640,7 +619,7 @@ class TestPostHousekeepingStructure:
 
     async def test_rendered_history_is_coherent(self):
         """Rendered messages after housekeeping form a valid sequence."""
-        tree = _make_history(8)
+        tree = _make_history(12)
 
         provider = MockProvider(
             canned_responses=[
@@ -658,8 +637,6 @@ class TestPostHousekeepingStructure:
             history=tree,
             all_tools=[],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
 
         rendered = tree.render()
@@ -689,8 +666,6 @@ class TestPostHousekeepingStructure:
             history=tree,
             all_tools=[],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
 
         hk_node = tree.nodes[-1]
@@ -706,7 +681,7 @@ class TestPostHousekeepingStructure:
 
     async def test_second_housekeeping_trims_archive_marker(self):
         """A second housekeeping cycle replaces the old ArchiveMarkerNode."""
-        tree = _make_history(10)
+        tree = _make_history(12)
 
         # First housekeeping
         provider1 = MockProvider(
@@ -724,8 +699,6 @@ class TestPostHousekeepingStructure:
             history=tree,
             all_tools=[],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
         assert result1 is not None
         assert isinstance(tree.nodes[0], ArchiveMarkerNode)
@@ -755,8 +728,6 @@ class TestPostHousekeepingStructure:
             history=tree,
             all_tools=[],
             system_prompts=None,
-            context_window=50000,
-            overhead_tokens=0,
         )
 
         assert result2 is not None
