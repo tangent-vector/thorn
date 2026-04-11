@@ -9,6 +9,10 @@ sources from ``.thorn/gateway.json``.
 from __future__ import annotations
 
 from thorn.gateway._event import EventSource
+from thorn.gateway.sources._github import (
+    GitHubNotificationsSource,
+    GitHubSourceConfig,
+)
 from thorn.gateway.sources._gitlab import GitLabSourceConfig, GitLabTODOsSource
 
 # ---------------------------------------------------------------------------
@@ -43,9 +47,12 @@ def get_registered_source(type_key: str) -> type[EventSource]:
 
 
 # Register built-in sources
+register_source("github", GitHubNotificationsSource)
 register_source("gitlab", GitLabTODOsSource)
 
 __all__ = [
+    "GitHubNotificationsSource",
+    "GitHubSourceConfig",
     "GitLabSourceConfig",
     "GitLabTODOsSource",
     "get_registered_source",
