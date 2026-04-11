@@ -946,17 +946,14 @@ class TestServeCliGroup:
         assert result.exit_code == 0
         assert "transport" in result.output.lower()
 
-    def test_serve_without_gitlab_config_fails_gracefully(self, monkeypatch: pytest.MonkeyPatch):
+    def test_serve_without_gateway_config_fails_gracefully(self):
         from click.testing import CliRunner
         from thorn._cli import main as cli_main
-
-        monkeypatch.delenv("GITLAB_URL", raising=False)
-        monkeypatch.delenv("GITLAB_TOKEN", raising=False)
 
         runner = CliRunner()
         result = runner.invoke(cli_main, ["serve"])
         assert result.exit_code != 0
-        assert "GITLAB_URL" in result.output or "GITLAB_TOKEN" in result.output
+        assert "gateway.json" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -1160,8 +1157,268 @@ class TestEndToEndWiring:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# expand_env_vars
+# ---------------------------------------------------------------------------
+
+
+class TestExpandEnvVars:
+    def test_expands_string_reference(self, monkeypatch: pytest.MonkeyPatch):
+        from thorn.gateway._config import expand_env_vars
+
+        monkeypatch.setenv("MY_VAR", "hello")
+        assert expand_env_vars("$MY_VAR") == "hello"
+
+    def test_leaves_plain_string_unchanged(self):
+        from thorn.gateway._config import expand_env_vars
+
+        assert expand_env_vars("no-dollar") == "no-dollar"
+
+    def test_raises_on_missing_env_var(self, monkeypatch: pytest.MonkeyPatch):
+        from thorn.gateway._config import expand_env_vars
+
+        monkeypatch.delenv("NONEXISTENT_VAR_12345", raising=False)
+        with pytest.raises(ValueError, match="NONEXISTENT_VAR_12345"):
+            expand_env_vars("$NONEXISTENT_VAR_12345")
+
+    def test_recurses_into_dict(self, monkeypatch: pytest.MonkeyPatch):
+        from thorn.gateway._config import expand_env_vars
+
+        monkeypatch.setenv("URL", "https://example.com")
+        monkeypatch.setenv("TOK", "secret")
+        result = expand_env_vars({"url": "$URL", "token": "$TOK", "count": 5})
+        assert result == {"url": "https://example.com", "token": "secret", "count": 5}
+
+    def test_recurses_into_list(self, monkeypatch: pytest.MonkeyPatch):
+        from thorn.gateway._config import expand_env_vars
+
+        monkeypatch.setenv("A", "aaa")
+        result = expand_env_vars(["$A", "plain", 42])
+        assert result == ["aaa", "plain", 42]
+
+    def test_nested_dict_in_list(self, monkeypatch: pytest.MonkeyPatch):
+        from thorn.gateway._config import expand_env_vars
+
+        monkeypatch.setenv("X", "expanded")
+        result = expand_env_vars([{"key": "$X"}])
+        assert result == [{"key": "expanded"}]
+
+    def test_passthrough_non_string_types(self):
+        from thorn.gateway._config import expand_env_vars
+
+        assert expand_env_vars(42) == 42
+        assert expand_env_vars(3.14) == 3.14
+        assert expand_env_vars(True) is True
+        assert expand_env_vars(None) is None
+
+
+# ---------------------------------------------------------------------------
+# Source registry
+# ---------------------------------------------------------------------------
+
+
+class TestSourceRegistry:
+    def test_gitlab_registered(self):
+        from thorn.gateway.sources import get_registered_source
+        from thorn.gateway.sources._gitlab import GitLabTODOsSource
+
+        assert get_registered_source("gitlab") is GitLabTODOsSource
+
+    def test_unknown_type_raises_key_error(self):
+        from thorn.gateway.sources import get_registered_source
+
+        with pytest.raises(KeyError, match="nonexistent"):
+            get_registered_source("nonexistent")
+
+    def test_register_and_retrieve(self):
+        from thorn.gateway.sources import (
+            _SOURCE_REGISTRY,
+            register_source,
+            get_registered_source,
+        )
+        from pydantic import BaseModel
+
+        class DummyConfig(BaseModel):
+            value: str = "test"
+
+        class DummySource(EventSource):
+            Config = DummyConfig
+
+            def __init__(self, config: DummyConfig) -> None:
+                self._config = config
+
+            async def start(self, on_event):
+                pass
+
+            async def stop(self):
+                pass
+
+        register_source("dummy_test", DummySource)
+        try:
+            assert get_registered_source("dummy_test") is DummySource
+        finally:
+            _SOURCE_REGISTRY.pop("dummy_test", None)
+
+    def test_duplicate_registration_raises(self):
+        from thorn.gateway.sources import register_source
+
+        with pytest.raises(ValueError, match="already registered"):
+            register_source("gitlab", EventSource)  # type: ignore[arg-type]
+
+    def test_gitlab_source_has_config_attribute(self):
+        from thorn.gateway.sources._gitlab import GitLabSourceConfig, GitLabTODOsSource
+
+        assert GitLabTODOsSource.Config is GitLabSourceConfig
+
+
+# ---------------------------------------------------------------------------
+# GatewayConfig loading
+# ---------------------------------------------------------------------------
+
+
+class TestGatewayConfigLoading:
+    def test_load_valid_config(self, tmp_path: Path):
+        import json
+        from thorn.gateway._config import load_gateway_config
+
+        thorn_dir = tmp_path / ".thorn"
+        thorn_dir.mkdir()
+        config_data = {
+            "services": [
+                {
+                    "name": "my-gitlab",
+                    "type": "gitlab",
+                    "config": {
+                        "url": "https://gitlab.example.com",
+                        "token": "test-token",
+                    },
+                }
+            ]
+        }
+        (thorn_dir / "gateway.json").write_text(
+            json.dumps(config_data), encoding="utf-8",
+        )
+
+        config = load_gateway_config(thorn_dir)
+        assert len(config.services) == 1
+        assert config.services[0].name == "my-gitlab"
+        assert config.services[0].type == "gitlab"
+        assert config.services[0].config["url"] == "https://gitlab.example.com"
+
+    def test_load_missing_file_raises(self, tmp_path: Path):
+        from thorn.gateway._config import load_gateway_config
+
+        thorn_dir = tmp_path / ".thorn"
+        thorn_dir.mkdir()
+        with pytest.raises(FileNotFoundError, match="gateway.json"):
+            load_gateway_config(thorn_dir)
+
+    def test_load_empty_services(self, tmp_path: Path):
+        import json
+        from thorn.gateway._config import load_gateway_config
+
+        thorn_dir = tmp_path / ".thorn"
+        thorn_dir.mkdir()
+        (thorn_dir / "gateway.json").write_text(
+            json.dumps({"services": []}), encoding="utf-8",
+        )
+
+        config = load_gateway_config(thorn_dir)
+        assert config.services == []
+
+    def test_load_defaults_to_empty_services(self, tmp_path: Path):
+        import json
+        from thorn.gateway._config import load_gateway_config
+
+        thorn_dir = tmp_path / ".thorn"
+        thorn_dir.mkdir()
+        (thorn_dir / "gateway.json").write_text(
+            json.dumps({}), encoding="utf-8",
+        )
+
+        config = load_gateway_config(thorn_dir)
+        assert config.services == []
+
+
+class TestInstantiateSources:
+    def test_instantiates_gitlab_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib"),
+        ):
+            from thorn.gateway._config import (
+                GatewayConfig,
+                ServiceSpec,
+                instantiate_sources,
+            )
+            from thorn.gateway.sources._gitlab import GitLabTODOsSource
+
+            monkeypatch.setenv("GITLAB_URL", "https://gitlab.example.com")
+            monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
+
+            config = GatewayConfig(services=[
+                ServiceSpec(
+                    name="test-gl",
+                    type="gitlab",
+                    config={"url": "$GITLAB_URL", "token": "$GITLAB_TOKEN"},
+                ),
+            ])
+            sources = instantiate_sources(config)
+            assert len(sources) == 1
+            assert isinstance(sources[0], GitLabTODOsSource)
+
+    def test_unknown_type_raises(self):
+        from thorn.gateway._config import (
+            GatewayConfig,
+            ServiceSpec,
+            instantiate_sources,
+        )
+
+        config = GatewayConfig(services=[
+            ServiceSpec(name="bad", type="nonexistent", config={}),
+        ])
+        with pytest.raises(KeyError, match="nonexistent"):
+            instantiate_sources(config)
+
+    def test_missing_env_var_raises(self, monkeypatch: pytest.MonkeyPatch):
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib"),
+        ):
+            from thorn.gateway._config import (
+                GatewayConfig,
+                ServiceSpec,
+                instantiate_sources,
+            )
+
+            monkeypatch.delenv("MISSING_VAR_XYZ", raising=False)
+
+            config = GatewayConfig(services=[
+                ServiceSpec(
+                    name="test",
+                    type="gitlab",
+                    config={"url": "$MISSING_VAR_XYZ", "token": "literal"},
+                ),
+            ])
+            with pytest.raises(ValueError, match="MISSING_VAR_XYZ"):
+                instantiate_sources(config)
+
+    def test_empty_config_returns_empty_list(self):
+        from thorn.gateway._config import GatewayConfig, instantiate_sources
+
+        config = GatewayConfig(services=[])
+        assert instantiate_sources(config) == []
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
+
+
 class TestBootstrapCoordinator:
-    def test_creates_identity_and_memory(self, tmp_path: Path):
+    def test_creates_identity_memory_and_gateway_config(self, tmp_path: Path):
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         aid = bootstrap_coordinator(
@@ -1190,6 +1447,83 @@ class TestBootstrapCoordinator:
         content = memory.read_text(encoding="utf-8")
         assert "my-project" in content
         assert "develop" in content
+
+        gateway_config = tmp_path / ".thorn" / "gateway.json"
+        assert gateway_config.is_file()
+        gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
+        assert len(gw_data["services"]) == 1
+        svc = gw_data["services"][0]
+        assert svc["name"] == "test-coord"
+        assert svc["type"] == "gitlab"
+        assert svc["config"]["url"] == "$GITLAB_URL"
+        assert svc["config"]["token"] == "$GITLAB_TOKEN"
+
+    def test_bootstrap_appends_to_existing_gateway_config(self, tmp_path: Path):
+        import json
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        bootstrap_coordinator(
+            runtime_root=tmp_path,
+            agent_id="first-coord",
+            project_name="proj-a",
+            clone_url="https://example.com/a.git",
+        )
+        bootstrap_coordinator(
+            runtime_root=tmp_path,
+            agent_id="second-coord",
+            project_name="proj-b",
+            clone_url="https://example.com/b.git",
+        )
+
+        gateway_config = tmp_path / ".thorn" / "gateway.json"
+        gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
+        assert len(gw_data["services"]) == 2
+        names = [s["name"] for s in gw_data["services"]]
+        assert "first-coord" in names
+        assert "second-coord" in names
+
+    def test_bootstrap_updates_existing_service_by_name(self, tmp_path: Path):
+        import json
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        bootstrap_coordinator(
+            runtime_root=tmp_path,
+            agent_id="my-coord",
+            project_name="proj",
+            clone_url="https://example.com/proj.git",
+            access_token_env="OLD_TOKEN",
+        )
+        bootstrap_coordinator(
+            runtime_root=tmp_path,
+            agent_id="my-coord",
+            project_name="proj",
+            clone_url="https://example.com/proj.git",
+            access_token_env="NEW_TOKEN",
+        )
+
+        gateway_config = tmp_path / ".thorn" / "gateway.json"
+        gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
+        assert len(gw_data["services"]) == 1
+        assert gw_data["services"][0]["config"]["token"] == "$NEW_TOKEN"
+
+    def test_bootstrap_custom_env_vars(self, tmp_path: Path):
+        import json
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        bootstrap_coordinator(
+            runtime_root=tmp_path,
+            agent_id="custom",
+            project_name="proj",
+            clone_url="https://example.com/proj.git",
+            access_token_env="MY_TOKEN",
+            gitlab_url_env="MY_URL",
+        )
+
+        gateway_config = tmp_path / ".thorn" / "gateway.json"
+        gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
+        svc = gw_data["services"][0]
+        assert svc["config"]["url"] == "$MY_URL"
+        assert svc["config"]["token"] == "$MY_TOKEN"
 
     def test_loads_via_session_store(self, tmp_path: Path):
         from thorn.gateway._agents import ProjectCoordinator
@@ -1224,6 +1558,8 @@ class TestBootstrapCoordinator:
         assert result.exit_code == 0
         assert "cli-test" in result.output
         assert (tmp_path / ".thorn" / "agents" / "cli-test.json").is_file()
+        assert (tmp_path / ".thorn" / "gateway.json").is_file()
+        assert "gateway.json" in result.output
 
 
 # ---------------------------------------------------------------------------

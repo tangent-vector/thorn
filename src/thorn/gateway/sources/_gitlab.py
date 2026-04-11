@@ -188,6 +188,8 @@ class GitLabTODOsSource(EventSource):
     ``gitlab_mark_todo_done``, etc.) work with the same credentials.
     """
 
+    Config = GitLabSourceConfig
+
     def __init__(self, config: GitLabSourceConfig) -> None:
         _require_gitlab()
         self._config = config

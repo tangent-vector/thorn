@@ -14,9 +14,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from thorn.runtime._session import AgentID, SessionKey
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
 
 @dataclass(frozen=True)
@@ -52,7 +55,14 @@ class EventSource(ABC):
     Implementations call the *on_event* callback supplied to
     :meth:`start` whenever a new event is detected.  The gateway
     handles routing and agent prompting.
+
+    Subclasses must define a ``Config`` class attribute pointing to a
+    :class:`pydantic.BaseModel` subclass that describes the source's
+    configuration.  The constructor must accept an instance of that
+    model as its sole positional argument.
     """
+
+    Config: ClassVar[type[BaseModel]]
 
     @abstractmethod
     async def start(

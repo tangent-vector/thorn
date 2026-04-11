@@ -514,8 +514,6 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except errors.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
 @click.option("--workspace", "workspace_path", type=click.Path(exists=True, file_okay=False), default=None, help="Override workspace root directory.")
-@click.option("--poll-interval", type=int, default=None, help="Override GitLab poll interval (seconds).")
-@click.option("--gitlab-username", default=None, help="Override GitLab bot username.")
 @click.pass_context
 def serve(
     ctx: click.Context,
@@ -523,8 +521,6 @@ def serve(
     quiet: bool,
     trace_path: str | None,
     workspace_path: str | None,
-    poll_interval: int | None,
-    gitlab_username: str | None,
 ) -> None:
     """Start the Thorn gateway daemon (or an MCP server via 'thorn serve mcp')."""
     ctx.ensure_object(dict)
@@ -532,8 +528,6 @@ def serve(
     ctx.obj["quiet"] = quiet
     ctx.obj["trace_path"] = trace_path
     ctx.obj["workspace_path"] = workspace_path
-    ctx.obj["poll_interval"] = poll_interval
-    ctx.obj["gitlab_username"] = gitlab_username
 
     if ctx.invoked_subcommand is not None:
         return
@@ -543,8 +537,6 @@ def serve(
         quiet=quiet,
         trace_path=trace_path,
         workspace_path=workspace_path,
-        poll_interval=poll_interval,
-        gitlab_username=gitlab_username,
     )
 
 
@@ -554,15 +546,17 @@ def _serve_gateway(
     quiet: bool,
     trace_path: str | None,
     workspace_path: str | None,
-    poll_interval: int | None,
-    gitlab_username: str | None,
 ) -> None:
-    """Run the gateway daemon (called when ``thorn serve`` has no subcommand)."""
+    """Run the gateway daemon (called when ``thorn serve`` has no subcommand).
+
+    Loads service configuration from ``.thorn/gateway.json`` and
+    instantiates event sources accordingly.
+    """
     import logging
     from rich.logging import RichHandler
 
-    from thorn.gateway import Gateway
-    from thorn.gateway.sources import GitLabSourceConfig, GitLabTODOsSource
+    from thorn import infer_workspace_root
+    from thorn.gateway import Gateway, instantiate_sources, load_gateway_config
 
     verbosity = _resolve_verbosity(verbose, quiet)
 
@@ -574,16 +568,27 @@ def _serve_gateway(
         handlers=[RichHandler(rich_tracebacks=True)],
     )
 
+    ws_root = Path(workspace_path).resolve() if workspace_path else infer_workspace_root()
+    thorn_dir = ws_root / ".thorn"
+
     try:
-        gl_config = GitLabSourceConfig.from_env()
-    except ValueError as exc:
+        gateway_config = load_gateway_config(thorn_dir)
+    except FileNotFoundError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
 
-    if poll_interval is not None:
-        gl_config = gl_config.model_copy(update={"poll_interval": poll_interval})
-    if gitlab_username is not None:
-        gl_config = gl_config.model_copy(update={"username": gitlab_username})
+    try:
+        sources = instantiate_sources(gateway_config)
+    except (KeyError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+
+    if not sources:
+        console.print(
+            "[yellow]Warning:[/yellow] No services configured in "
+            f"{thorn_dir / 'gateway.json'}. The gateway will start "
+            "but will not receive any events."
+        )
 
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
@@ -597,15 +602,11 @@ def _serve_gateway(
             trace_file.close()
         sys.exit(1)
 
-    source = GitLabTODOsSource(gl_config)
-    gateway = Gateway(
-        runtime=runtime,
-        sources=[source],
-    )
+    gateway = Gateway(runtime=runtime, sources=sources)
 
+    service_names = [s.name for s in gateway_config.services]
     console.print(
-        f"[bold]thorn serve[/bold]  GitLab: {gl_config.url}  "
-        f"poll: {gl_config.poll_interval}s  user: {gl_config.username}"
+        f"[bold]thorn serve[/bold]  services: {', '.join(service_names) or '(none)'}"
     )
 
     try:
@@ -627,6 +628,7 @@ def _serve_gateway(
 @click.option("--default-branch", default="main", help="Default branch name (default: main).")
 @click.option("--project-id", type=int, default=None, help="Numeric GitLab project ID.")
 @click.option("--token-env", default="GITLAB_TOKEN", help="Environment variable holding the access token.")
+@click.option("--url-env", default="GITLAB_URL", help="Environment variable holding the GitLab instance URL.")
 @click.option("--workspace", "workspace_path", type=click.Path(file_okay=False), default=".", help="Runtime root directory (default: current dir).")
 @click.pass_context
 def serve_bootstrap(
@@ -637,6 +639,7 @@ def serve_bootstrap(
     default_branch: str,
     project_id: int | None,
     token_env: str,
+    url_env: str,
     workspace_path: str,
 ) -> None:
     """Bootstrap a ProjectCoordinator agent in the runtime directory."""
@@ -652,13 +655,15 @@ def serve_bootstrap(
         default_branch=default_branch,
         project_id=project_id,
         access_token_env=token_env,
+        gitlab_url_env=url_env,
     )
     console.print(f"[green]Bootstrapped coordinator:[/green] {aid}")
     console.print(f"  Identity: {runtime_root / '.thorn' / 'agents' / f'{aid}.json'}")
+    console.print(f"  Gateway config: {runtime_root / '.thorn' / 'gateway.json'}")
     console.print(f"  Workspace: {runtime_root / '.thorn' / 'agents' / str(aid)}")
     console.print(
         "\nEnsure your .env file sets the required environment variables "
-        f"(e.g. {token_env}) before running 'thorn serve'."
+        f"(e.g. {url_env}, {token_env}) before running 'thorn serve'."
     )
 
 
