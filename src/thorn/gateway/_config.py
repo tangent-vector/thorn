@@ -119,6 +119,7 @@ class GatewayConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 _SERVICE_TYPE_REGISTRY: dict[str, Any] = {}
+_BUILTINS_REGISTERED = False
 
 
 def _register_service_type(
@@ -136,8 +137,10 @@ def _register_service_type(
 
 def _ensure_builtin_types() -> None:
     """Lazily register built-in service types on first use."""
-    if _SERVICE_TYPE_REGISTRY:
+    global _BUILTINS_REGISTERED  # noqa: PLW0603
+    if _BUILTINS_REGISTERED:
         return
+    _BUILTINS_REGISTERED = True
 
     from thorn.gateway.sources._github import GitHubNotificationsSource
     from thorn.gateway.sources._gitlab import GitLabTODOsSource

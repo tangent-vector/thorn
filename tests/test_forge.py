@@ -236,6 +236,37 @@ class TestGitHubForgeClient:
         assert result[0]["id"] == 1
         assert result[0]["state"] == "merged"
 
+    def test_list_change_requests_all_normalizes_merged(self):
+        client, mock_gh = self._make_client()
+        mock_gh.list_pull_requests.return_value = [
+            {"number": 1, "title": "Open PR", "state": "open",
+             "html_url": "u1", "head": "a", "author": "a", "merged": False},
+            {"number": 2, "title": "Merged PR", "state": "closed",
+             "html_url": "u2", "head": "b", "author": "b", "merged": True},
+            {"number": 3, "title": "Closed PR", "state": "closed",
+             "html_url": "u3", "head": "c", "author": "c", "merged": False},
+        ]
+        result = client.list_change_requests("org/repo", "all")
+        mock_gh.list_pull_requests.assert_called_once_with("org/repo", "all")
+        assert len(result) == 3
+        assert result[0]["state"] == "open"
+        assert result[1]["state"] == "merged"
+        assert result[2]["state"] == "closed"
+
+    def test_list_change_requests_closed_normalizes_merged(self):
+        client, mock_gh = self._make_client()
+        mock_gh.list_pull_requests.return_value = [
+            {"number": 2, "title": "Merged PR", "state": "closed",
+             "html_url": "u2", "head": "b", "author": "b", "merged": True},
+            {"number": 3, "title": "Closed PR", "state": "closed",
+             "html_url": "u3", "head": "c", "author": "c", "merged": False},
+        ]
+        result = client.list_change_requests("org/repo", "closed")
+        mock_gh.list_pull_requests.assert_called_once_with("org/repo", "closed")
+        assert len(result) == 2
+        assert result[0]["state"] == "merged"
+        assert result[1]["state"] == "closed"
+
     def test_post_comment(self):
         client, mock_gh = self._make_client()
         client.post_comment("org/repo", "ChangeRequest", 3, "looks good")

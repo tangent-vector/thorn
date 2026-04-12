@@ -561,7 +561,7 @@ class TestGitLabTODOsSourceEventFormatting:
         assert "mentioned" in event.content
         assert "Issue #42" in event.content
         assert "Please help" in event.content
-        assert "gitlab_mark_todo_done" in event.content
+        assert "forge_mark_notification_done" in event.content
         assert event.metadata["todo_id"] == 99
         assert event.metadata["project_id"] == 123
         assert event.metadata["clone_url"] == "https://gitlab.example.com/org/repo.git"
@@ -596,7 +596,7 @@ class TestGitLabTODOsSourceEventFormatting:
 
         todo = _make_mock_todo()
         content = _format_event_content(todo)
-        assert "gitlab_mark_todo_done" in content
+        assert "forge_mark_notification_done" in content
         assert "Clone URL:" in content
         assert "Default branch:" in content
         assert "Project URL:" in content
@@ -1157,7 +1157,7 @@ class TestEndToEndWiring:
 
         assert "Clone URL:" in content
         assert "Default branch:" in content
-        assert "gitlab_mark_todo_done" in content
+        assert "forge_mark_notification_done" in content
 
 
 # ---------------------------------------------------------------------------

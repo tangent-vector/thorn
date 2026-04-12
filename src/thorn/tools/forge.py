@@ -353,7 +353,7 @@ class GitHubForgeClient:
             {
                 "id": pr["number"],
                 "title": pr["title"],
-                "state": state if state == "merged" else pr["state"],
+                "state": self._normalize_cr_state(pr),
                 "url": pr["html_url"],
                 "source_branch": pr.get("head", ""),
                 "author": pr.get("author"),

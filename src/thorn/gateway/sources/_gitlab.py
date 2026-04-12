@@ -139,7 +139,7 @@ def _format_event_content(todo: Any) -> str:
 
     lines.extend([
         "Respond to the notification as appropriate, then mark the "
-        "TODO as done using gitlab_mark_todo_done.",
+        "notification as done using forge_mark_notification_done.",
     ])
     return "\n".join(lines)
 

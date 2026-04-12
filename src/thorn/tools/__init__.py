@@ -3,6 +3,7 @@
 This package provides both the built-in file/search tools (re-exported from
 ``thorn.core._tools``) and domain-specific toolsets as submodules:
 
+- ``thorn.tools.forge``  -- Unified forge abstraction (GitLab + GitHub)
 - ``thorn.tools.git``    -- Git subprocess operations
 - ``thorn.tools.github`` -- GitHub API operations (requires ``thorn[github]``)
 - ``thorn.tools.gitlab`` -- GitLab API operations (requires ``thorn[gitlab]``)
@@ -13,6 +14,7 @@ Built-in tools are available directly::
 
 Domain-specific toolsets are imported as submodules::
 
+    from thorn.tools import forge    # unified forge abstraction
     from thorn.tools import git
     from thorn.tools import github   # requires PyGithub
     from thorn.tools import gitlab   # requires python-gitlab

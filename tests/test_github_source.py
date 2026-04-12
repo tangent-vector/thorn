@@ -166,7 +166,7 @@ class TestGitHubSourceEventFormatting:
         assert "mention" in event.content
         assert "Issue #42" in event.content
         assert "Please fix this" in event.content
-        assert "github_mark_notification_read" in event.content
+        assert "forge_mark_notification_done" in event.content
         assert event.metadata["thread_id"] == "99"
         assert event.metadata["repo_id"] == 456
         assert event.metadata["repo_full_name"] == "octocat/hello-world"
@@ -186,14 +186,14 @@ class TestGitHubSourceEventFormatting:
 
         assert event.source == "github"
         assert "Comment body:" not in event.content
-        assert "github_mark_notification_read" in event.content
+        assert "forge_mark_notification_done" in event.content
 
     def test_format_event_content_includes_repo_info(self):
         from thorn.gateway.sources._github import _format_event_content
 
         notification = _make_mock_notification()
         content = _format_event_content(notification, comment_body=None)
-        assert "github_mark_notification_read" in content
+        assert "forge_mark_notification_done" in content
         assert "Clone URL:" in content
         assert "Default branch:" in content
         assert "Repository URL:" in content

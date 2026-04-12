@@ -234,7 +234,7 @@ def _format_event_content(
 
     lines.append(
         "Respond to the notification as appropriate, then mark the "
-        "notification as read using github_mark_notification_read."
+        "notification as done using forge_mark_notification_done."
     )
     return "\n".join(lines)
 
