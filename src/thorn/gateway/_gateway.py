@@ -68,17 +68,17 @@ class Gateway:
                 )
                 self._source_tasks.append(task)
 
+            if self._source_tasks:
+                asyncio.create_task(
+                    self._stop_when_sources_done(),
+                )
+
             log.info(
                 "Gateway started with %d source(s)", len(self._sources),
             )
 
             try:
-                if sys.platform != "win32":
-                    await self._stop_event.wait()
-                else:
-                    # On Windows, signal handlers are not reliable in
-                    # asyncio; we rely on KeyboardInterrupt instead.
-                    await asyncio.gather(*self._source_tasks)
+                await self._stop_event.wait()
             except (KeyboardInterrupt, asyncio.CancelledError):
                 pass
             finally:
@@ -141,6 +141,20 @@ class Gateway:
                 "Event handled (source=%s, session=%s)",
                 event.source, event.session_key,
             )
+
+    async def _stop_when_sources_done(self) -> None:
+        """Set the stop event when all source tasks have completed.
+
+        In production, polling sources loop forever and never return
+        from ``start()``, so this only fires on signal-driven shutdown
+        (where tasks are cancelled) or when a finite source is used
+        (e.g. in tests).  This ensures ``run()`` terminates cleanly on
+        all platforms without relying on platform-specific signal
+        behavior.
+        """
+        await asyncio.gather(*self._source_tasks, return_exceptions=True)
+        if self._stop_event is not None:
+            self._stop_event.set()
 
     async def shutdown(self) -> None:
         """Stop all sources and cancel background tasks."""
