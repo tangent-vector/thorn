@@ -2,8 +2,9 @@
 
 Creates the agent identity file (``<agent-id>.json``), workspace
 directory, a ``MEMORY.md`` containing project-specific knowledge, and
-a ``gateway.json`` service configuration (forge service + project
-service).  The result is a Runtime directory ready for ``thorn serve``.
+a ``gateway.json`` service configuration (forge service, project
+service, and event source).  The result is a Runtime directory ready
+for ``thorn serve``.
 
 Usage from code::
 
@@ -17,6 +18,17 @@ Usage from code::
         default_branch="main",
         native_project_id="214768",
         forge_type="gitlab",
+    )
+
+    bootstrap_coordinator(
+        runtime_root=Path("my-runtime"),
+        agent_id="gh-coordinator",
+        project_name="my-repo",
+        clone_url="https://github.com/owner/repo.git",
+        native_project_id="owner/repo",
+        forge_type="github",
+        access_token_env="GITHUB_TOKEN",
+        forge_url_env="GITHUB_URL",
     )
 """
 
@@ -74,6 +86,40 @@ def _ensure_gateway_config(
     log.info("Wrote gateway config: %s", config_path)
 
 
+def _build_event_source_entry(
+    *,
+    project_name: str,
+    forge_type: str,
+    access_token_env: str,
+    forge_url_env: str,
+    native_project_id: str,
+) -> dict[str, Any]:
+    """Build a ``gateway.json`` event source entry for the given forge type."""
+    source_name = f"{project_name}-events"
+
+    if forge_type == "github":
+        config: dict[str, Any] = {
+            "token": f"${access_token_env}",
+            "repository": native_project_id,
+        }
+        if forge_url_env:
+            config["base_url"] = f"${forge_url_env}"
+        return {
+            "name": source_name,
+            "type": "github-events",
+            "config": config,
+        }
+
+    return {
+        "name": source_name,
+        "type": "gitlab-events",
+        "config": {
+            "url": f"${forge_url_env}",
+            "token": f"${access_token_env}",
+        },
+    }
+
+
 def bootstrap_coordinator(
     *,
     runtime_root: Path,
@@ -99,8 +145,12 @@ def bootstrap_coordinator(
     - ``<runtime_root>/.thorn/agents/<agent_id>/MEMORY.md``
     - ``<runtime_root>/.thorn/gateway.json``
 
-    The gateway config includes a forge service and a project service.
-    The agent identity references the project service by name.
+    The gateway config includes a forge service, a project service,
+    and an event source so the gateway can start polling immediately.
+
+    The agent identity includes an ``access_token`` metadata entry
+    referencing the same env var as the forge, so the coordinator's
+    git tools can authenticate clone/push operations.
 
     Returns the ``AgentID`` of the created agent.
     """
@@ -125,6 +175,7 @@ def bootstrap_coordinator(
         "name": agent_id,
         "metadata": {
             "project": project_name,
+            "access_token": f"${access_token_env}",
         },
     }
 
@@ -181,7 +232,17 @@ def bootstrap_coordinator(
         },
     }
 
-    _ensure_gateway_config(thorn_dir, [forge_entry, project_entry])
+    event_source_entry = _build_event_source_entry(
+        project_name=project_name,
+        forge_type=forge_type,
+        access_token_env=access_token_env,
+        forge_url_env=forge_url_env,
+        native_project_id=native_project_id,
+    )
+
+    _ensure_gateway_config(
+        thorn_dir, [forge_entry, project_entry, event_source_entry],
+    )
 
     return aid
 

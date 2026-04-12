@@ -11,7 +11,7 @@
 #   --name NAME         Brev instance name      (default: thorn-gateway)
 #   --repo URL          Git clone URL for Thorn  (default: current remote origin)
 #   --gpu GPU_TYPE      Brev GPU spec            (omit for cheapest default)
-#   --env-file PATH     .env file to copy        (default: .env if it exists)
+#   --env-file PATH     Copy this .env file to the instance (optional; not defaulted)
 #   --agency-dir PATH   .thorn/ directory to copy (skips bootstrap if provided)
 #   --no-start          Don't start thorn serve after setup
 #
@@ -81,12 +81,6 @@ if [ -z "$REPO_URL" ]; then
     else
         die "No --repo URL given and no git remote origin found. Provide --repo."
     fi
-fi
-
-# Default env file to .env in repo root if it exists
-if [ -z "$ENV_FILE" ] && [ -f ".env" ]; then
-    ENV_FILE=".env"
-    log "Found .env file in repo root; will copy to instance"
 fi
 
 # --------------------------------------------------------------------------

@@ -11,6 +11,39 @@ Minimal scripts for running the Thorn gateway on an [NVIDIA Brev](https://brev.n
 | Brev account | Sign up at <https://brev.nvidia.com/> |
 | Authenticated CLI | Run `brev login` once after installing. |
 
+## Secrets (recommended)
+
+Configure credentials with [Brev secrets](https://docs.nvidia.com/brev/latest/cli/advanced-commands#secrets-management) so nothing sensitive is copied to the instance as a `.env` file. Each name becomes an environment variable on the instance. Create one secret per variable you need:
+
+**LLM (required for `thorn run` / `thorn serve`):**
+
+```bash
+brev secret create OPENAI_API_URL
+brev secret create OPENAI_API_KEY
+brev secret create OPENAI_API_MODEL_NAME
+# Optional:
+# brev secret create OPENAI_MAX_TOKENS
+```
+
+**GitHub (required for GitHub-based gateways):**
+
+```bash
+brev secret create GITHUB_TOKEN
+# Optional:
+# brev secret create GITHUB_URL
+```
+
+**GitLab (only if you use GitLab event sources or forge config):**
+
+```bash
+brev secret create GITLAB_URL
+brev secret create GITLAB_TOKEN
+```
+
+Each `brev secret create` prompts for the value. Secrets are encrypted at rest and **injected when the instance starts** ([Brev docs](https://docs.nvidia.com/brev/latest/cli/advanced-commands#secrets-management)). If you add or change secrets while the instance is already running, **stop and start** the instance (or restart it) so the new values appear in the environment before you rely on them for `thorn serve`.
+
+`deploy/brev/env.template` lists the same names with short comments.
+
 ## Quick start (one command)
 
 From the thorn repo root:
@@ -20,10 +53,14 @@ From the thorn repo root:
 ```
 
 This will:
+
 1. Create a Brev instance named `thorn-gateway`
 2. Clone the Thorn repo and run `pip install -e ".[github,gitlab]"` via the setup script
-3. Copy `.env` from the repo root (if present) to the instance
-4. Start `thorn serve` inside a tmux session on the instance
+3. Start `thorn serve` inside a tmux session on the instance (unless you pass `--no-start`)
+
+**Configure secrets** using the commands above, either before you run `deploy.sh` or afterward. Because injection happens at instance start, if you create or update secrets after the instance already exists, restart the instance, then start the gateway again (or re-run `deploy.sh` without `--no-start` if you use it to launch tmux).
+
+The deploy script **does not** copy a local `.env` file unless you pass `--env-file` explicitly (see below).
 
 ### Common options
 
@@ -34,7 +71,7 @@ This will:
 # Copy a pre-made agency directory instead of bootstrapping
 ./deploy/brev/deploy.sh --agency-dir /path/to/.thorn
 
-# Explicit .env file
+# Legacy: copy a .env file from your machine to the instance (not recommended for secrets)
 ./deploy/brev/deploy.sh --env-file ~/secrets/thorn.env
 
 # Don't auto-start the gateway
@@ -71,26 +108,20 @@ pip install -e ".[github,gitlab]"
 
 ### 2. Configure environment variables
 
-**Option A -- `.env` file** (simplest for testing):
+**Option A -- Brev secrets (recommended):**
+
+Use `brev secret create` as described in [Secrets (recommended)](#secrets-recommended). Restart the instance after adding or changing secrets so they are injected.
+
+**Option B -- `.env` file on the instance (quick tests only):**
+
+Avoid storing real secrets in a file on the VM when you can use Brev secrets instead.
 
 ```bash
-# Copy from your dev machine
+# On your dev machine
 cp deploy/brev/env.template .env
 # Edit .env with your values, then:
 brev copy .env thorn-gateway:/home/ubuntu/workspace/thorn/.env
 ```
-
-**Option B -- Brev secrets** (persists across instance restarts):
-
-```bash
-brev secret create OPENAI_API_URL
-brev secret create OPENAI_API_KEY
-brev secret create OPENAI_API_MODEL_NAME
-brev secret create GITHUB_TOKEN
-```
-
-Each command prompts for the value interactively.  The secrets are injected as
-environment variables every time the instance starts.
 
 ### 3. Set up the agency
 
@@ -174,8 +205,7 @@ The setup script installs into the system Python.  Run
 `pip install -e ".[github,gitlab]"` manually from `/home/ubuntu/workspace/thorn`.
 
 **Environment variable errors on `thorn serve`:**
-Make sure your `.env` is in the thorn repo directory (where you run `thorn serve`),
-or that Brev secrets are configured.  Run `env | grep OPENAI` to verify.
+Confirm required variables are set in the **same** environment where `thorn serve` runs (interactive shell or tmux). With Brev secrets, restart the instance after changing secrets. Check with `env | grep OPENAI`, `env | grep GITHUB`, or `env | grep GITLAB` as appropriate. If you use a `.env` file instead, it must live in the thorn repo directory (where you run `thorn serve`).
 
 **Instance IP changed after restart:**
 Run `brev refresh` on your dev machine to update SSH config.

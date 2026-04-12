@@ -82,6 +82,6 @@ fi
 log "Thorn Brev setup complete"
 log ""
 log "Next steps:"
-log "  1. Ensure environment variables are set (see deploy/brev/env.template)"
+log "  1. Set required environment variables: Brev secrets (recommended) or .env — see deploy/brev/README.md and deploy/brev/env.template"
 log "  2. Set up the agency:  copy a .thorn/ directory or run thorn serve bootstrap"
 log "  3. Start the gateway:  cd $THORN_DIR && thorn serve"

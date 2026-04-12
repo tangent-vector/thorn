@@ -630,14 +630,31 @@ def _serve_gateway(
             trace_file.close()
 
 
+_FORGE_ENV_DEFAULTS: dict[str, tuple[str, str]] = {
+    "gitlab": ("GITLAB_TOKEN", "GITLAB_URL"),
+    "github": ("GITHUB_TOKEN", "GITHUB_URL"),
+}
+
+
 @serve.command("bootstrap")
 @click.option("--agent-id", required=True, help="Unique identifier for the coordinator agent.")
 @click.option("--project-name", required=True, help="Human-readable project name.")
 @click.option("--clone-url", required=True, help="HTTPS clone URL for the project.")
 @click.option("--default-branch", default="main", help="Default branch name (default: main).")
-@click.option("--project-id", type=int, default=None, help="Numeric GitLab project ID.")
-@click.option("--token-env", default="GITLAB_TOKEN", help="Environment variable holding the access token.")
-@click.option("--url-env", default="GITLAB_URL", help="Environment variable holding the GitLab instance URL.")
+@click.option(
+    "--forge-type",
+    type=click.Choice(["gitlab", "github"], case_sensitive=False),
+    default="gitlab",
+    help="Forge type (default: gitlab).",
+)
+@click.option(
+    "--native-project-id",
+    default=None,
+    help="Forge-native project identifier (numeric ID for GitLab, owner/repo for GitHub).",
+)
+@click.option("--project-id", type=int, default=None, hidden=True, help="Deprecated: use --native-project-id.")
+@click.option("--token-env", default=None, help="Env var holding the access token (default: based on --forge-type).")
+@click.option("--url-env", default=None, help="Env var holding the forge URL (default: based on --forge-type).")
 @click.option("--workspace", "workspace_path", type=click.Path(file_okay=False), default=".", help="Runtime root directory (default: current dir).")
 @click.pass_context
 def serve_bootstrap(
@@ -646,14 +663,26 @@ def serve_bootstrap(
     project_name: str,
     clone_url: str,
     default_branch: str,
+    forge_type: str,
+    native_project_id: str | None,
     project_id: int | None,
-    token_env: str,
-    url_env: str,
+    token_env: str | None,
+    url_env: str | None,
     workspace_path: str,
 ) -> None:
     """Bootstrap a ProjectCoordinator agent in the runtime directory."""
     from pathlib import Path
     from thorn.gateway._bootstrap import bootstrap_coordinator
+
+    default_token, default_url = _FORGE_ENV_DEFAULTS[forge_type]
+    if token_env is None:
+        token_env = default_token
+    if url_env is None:
+        url_env = default_url
+
+    resolved_native_id = native_project_id or ""
+    if not resolved_native_id and project_id is not None:
+        resolved_native_id = str(project_id)
 
     runtime_root = Path(workspace_path).resolve()
     aid = bootstrap_coordinator(
@@ -662,17 +691,19 @@ def serve_bootstrap(
         project_name=project_name,
         clone_url=clone_url,
         default_branch=default_branch,
-        project_id=project_id,
+        native_project_id=resolved_native_id,
+        forge_type=forge_type,
         access_token_env=token_env,
-        gitlab_url_env=url_env,
+        forge_url_env=url_env,
     )
     console.print(f"[green]Bootstrapped coordinator:[/green] {aid}")
     console.print(f"  Identity: {runtime_root / '.thorn' / 'agents' / f'{aid}.json'}")
     console.print(f"  Gateway config: {runtime_root / '.thorn' / 'gateway.json'}")
     console.print(f"  Workspace: {runtime_root / '.thorn' / 'agents' / str(aid)}")
     console.print(
-        "\nEnsure your .env file sets the required environment variables "
-        f"(e.g. {url_env}, {token_env}) before running 'thorn serve'."
+        "\nEnsure the required environment variables are set (e.g. from a "
+        f".env file or your host environment, such as {url_env} and {token_env}) "
+        "before running 'thorn serve'."
     )
 
 
