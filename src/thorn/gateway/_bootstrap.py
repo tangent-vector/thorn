@@ -2,8 +2,8 @@
 
 Creates the agent identity file (``<agent-id>.json``), workspace
 directory, a ``MEMORY.md`` containing project-specific knowledge, and
-a ``gateway.json`` service configuration.  The result is a Runtime
-directory ready for ``thorn serve``.
+a ``gateway.json`` service configuration (forge service + project
+service).  The result is a Runtime directory ready for ``thorn serve``.
 
 Usage from code::
 
@@ -12,10 +12,11 @@ Usage from code::
     bootstrap_coordinator(
         runtime_root=Path("my-runtime"),
         agent_id="lace-coordinator",
-        project_name="lace-lang",
-        clone_url="https://gitlab.example.com/group/lace-lang.git",
+        project_name="lace",
+        clone_url="https://gitlab-master.nvidia.com/lace/lace.git",
         default_branch="main",
-        project_id=214768,
+        native_project_id="214768",
+        forge_type="gitlab",
     )
 """
 
@@ -32,19 +33,27 @@ from thorn.runtime._session import AgentID
 log = logging.getLogger(__name__)
 
 
+def _upsert_service(
+    services: list[dict[str, Any]],
+    entry: dict[str, Any],
+) -> None:
+    """Insert or replace a service entry by name."""
+    name = entry["name"]
+    for i, existing in enumerate(services):
+        if existing.get("name") == name:
+            services[i] = entry
+            return
+    services.append(entry)
+
+
 def _ensure_gateway_config(
     thorn_dir: Path,
-    *,
-    service_name: str,
-    source_type: str,
-    source_config: dict[str, Any],
+    entries: list[dict[str, Any]],
 ) -> None:
-    """Create or update ``gateway.json`` with a service entry.
+    """Create or update ``gateway.json`` with multiple service entries.
 
-    If the file already exists, the new entry is appended unless an
-    entry with the same ``name`` is already present (in which case
-    it is updated in place).  If the file does not exist, it is
-    created.
+    Each entry is upserted by name — existing entries with the same
+    name are replaced, new entries are appended.
     """
     config_path = thorn_dir / GATEWAY_CONFIG_FILENAME
 
@@ -55,18 +64,8 @@ def _ensure_gateway_config(
 
     services: list[dict[str, Any]] = data.setdefault("services", [])
 
-    new_entry = {
-        "name": service_name,
-        "type": source_type,
-        "config": source_config,
-    }
-
-    for i, existing in enumerate(services):
-        if existing.get("name") == service_name:
-            services[i] = new_entry
-            break
-    else:
-        services.append(new_entry)
+    for entry in entries:
+        _upsert_service(services, entry)
 
     config_path.write_text(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n",
@@ -82,9 +81,14 @@ def bootstrap_coordinator(
     project_name: str,
     clone_url: str,
     default_branch: str = "main",
-    project_id: int | None = None,
+    native_project_id: str = "",
+    forge_type: str = "gitlab",
     access_token_env: str = "GITLAB_TOKEN",
-    gitlab_url_env: str = "GITLAB_URL",
+    forge_url_env: str = "GITLAB_URL",
+    forge_service_name: str = "",
+    # Legacy parameters (accepted but mapped to new fields)
+    project_id: int | None = None,
+    gitlab_url_env: str = "",
 ) -> AgentID:
     """Create a ProjectCoordinator agent in the given Runtime directory.
 
@@ -95,8 +99,18 @@ def bootstrap_coordinator(
     - ``<runtime_root>/.thorn/agents/<agent_id>/MEMORY.md``
     - ``<runtime_root>/.thorn/gateway.json``
 
+    The gateway config includes a forge service and a project service.
+    The agent identity references the project service by name.
+
     Returns the ``AgentID`` of the created agent.
     """
+    if gitlab_url_env:
+        forge_url_env = gitlab_url_env
+    if project_id is not None and not native_project_id:
+        native_project_id = str(project_id)
+    if not forge_service_name:
+        forge_service_name = f"{project_name}-forge"
+
     aid = AgentID(agent_id)
     thorn_dir = runtime_root / ".thorn"
     agents_root = thorn_dir / "agents"
@@ -110,14 +124,9 @@ def bootstrap_coordinator(
         "agent_class": "ProjectCoordinator",
         "name": agent_id,
         "metadata": {
-            "access_token": f"${access_token_env}",
-            "project_name": project_name,
-            "clone_url": clone_url,
-            "default_branch": default_branch,
+            "project": project_name,
         },
     }
-    if project_id is not None:
-        agent_data["metadata"]["project_id"] = project_id
 
     identity_path.write_text(
         json.dumps(agent_data, indent=2, ensure_ascii=False) + "\n",
@@ -134,18 +143,16 @@ def bootstrap_coordinator(
     memory_lines = [
         f"# {project_name} Coordinator Memory",
         "",
-        f"- **Project name**: {project_name}",
+        f"- **Project service**: `{project_name}`",
         f"- **Clone URL**: {clone_url}",
         f"- **Default branch**: {default_branch}",
     ]
-    if project_id is not None:
-        memory_lines.append(f"- **Project ID**: {project_id}")
 
     memory_lines.extend([
         "",
         "## Active work",
         "",
-        "_No active issues or MRs yet._",
+        "_No active issues or change requests yet._",
     ])
 
     memory_path.write_text("\n".join(memory_lines) + "\n", encoding="utf-8")
@@ -153,15 +160,28 @@ def bootstrap_coordinator(
 
     # -- Gateway service configuration ---------------------------------------
 
-    _ensure_gateway_config(
-        thorn_dir,
-        service_name=agent_id,
-        source_type="gitlab",
-        source_config={
-            "url": f"${gitlab_url_env}",
+    forge_entry = {
+        "name": forge_service_name,
+        "type": forge_type,
+        "config": {
+            "url": f"${forge_url_env}",
             "token": f"${access_token_env}",
         },
-    )
+    }
+
+    project_entry: dict[str, Any] = {
+        "name": project_name,
+        "type": "project",
+        "config": {
+            "forge": forge_service_name,
+            "native_id": native_project_id,
+            "path": project_name,
+            "clone_url": clone_url,
+            "default_branch": default_branch,
+        },
+    }
+
+    _ensure_gateway_config(thorn_dir, [forge_entry, project_entry])
 
     return aid
 

@@ -1,10 +1,13 @@
 """Gateway configuration: loading services from ``.thorn/gateway.json``.
 
-The gateway configuration file declares which event sources to
-instantiate at startup, replacing the previous hard-coded GitLab
-source.  Each service entry specifies a ``type`` (looked up in the
-source registry) and a ``config`` dict validated through the source
-class's ``Config`` model.
+The gateway configuration file declares which services to instantiate
+at startup.  Services include forge connections (``"gitlab"``,
+``"github"``), project definitions (``"project"``), and event sources
+(``"gitlab-events"``, ``"github-events"``).
+
+Each service entry specifies a ``type`` (looked up in the service type
+registry) and a ``config`` dict validated through the service class's
+``Config`` model.
 
 String values in ``config`` that begin with ``$`` are treated as
 environment variable references and expanded at load time, keeping
@@ -15,12 +18,25 @@ Example ``gateway.json``::
     {
       "services": [
         {
-          "name": "my-gitlab",
+          "name": "gitlab-master",
           "type": "gitlab",
+          "config": { "url": "$GITLAB_URL", "token": "$GITLAB_TOKEN" }
+        },
+        {
+          "name": "lace",
+          "type": "project",
           "config": {
-            "url": "$GITLAB_URL",
-            "token": "$GITLAB_TOKEN"
+            "forge": "gitlab-master",
+            "native_id": "214768",
+            "path": "lace/lace",
+            "clone_url": "https://gitlab-master.nvidia.com/lace/lace.git",
+            "default_branch": "main"
           }
+        },
+        {
+          "name": "gitlab-poller",
+          "type": "gitlab-events",
+          "config": { "url": "$GITLAB_URL", "token": "$GITLAB_TOKEN" }
         }
       ]
     }
@@ -36,6 +52,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from thorn.core._service import Service
 from thorn.gateway._event import EventSource
 
 log = logging.getLogger(__name__)
@@ -98,6 +115,87 @@ class GatewayConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Service type registry
+# ---------------------------------------------------------------------------
+
+_SERVICE_TYPE_REGISTRY: dict[str, Any] = {}
+
+
+def _register_service_type(
+    type_key: str,
+    factory: Any,
+) -> None:
+    """Register a factory for a service type key.
+
+    *factory* is called as ``factory(config, service_name=name)``
+    where *config* is a validated instance of the service class's
+    ``Config`` model.
+    """
+    _SERVICE_TYPE_REGISTRY[type_key] = factory
+
+
+def _ensure_builtin_types() -> None:
+    """Lazily register built-in service types on first use."""
+    if _SERVICE_TYPE_REGISTRY:
+        return
+
+    from thorn.gateway.sources._github import GitHubNotificationsSource
+    from thorn.gateway.sources._gitlab import GitLabTODOsSource
+    from thorn.tools.forge import (
+        ForgeService,
+        ForgeServiceConfig,
+        ProjectService,
+        ProjectServiceConfig,
+    )
+
+    def _make_forge(
+        spec_config: dict[str, Any],
+        *,
+        service_name: str,
+        forge_type: str,
+    ) -> ForgeService:
+        cfg = ForgeServiceConfig(**spec_config)
+        return ForgeService(cfg, service_name=service_name, forge_type=forge_type)
+
+    _register_service_type(
+        "gitlab",
+        lambda config, service_name: _make_forge(
+            config, service_name=service_name, forge_type="gitlab",
+        ),
+    )
+    _register_service_type(
+        "github",
+        lambda config, service_name: _make_forge(
+            config, service_name=service_name, forge_type="github",
+        ),
+    )
+
+    def _make_project(
+        spec_config: dict[str, Any], *, service_name: str,
+    ) -> ProjectService:
+        cfg = ProjectServiceConfig(**spec_config)
+        return ProjectService(cfg, service_name=service_name)
+
+    _register_service_type("project", _make_project)
+
+    def _make_gitlab_events(
+        spec_config: dict[str, Any], *, service_name: str,
+    ) -> GitLabTODOsSource:
+        cfg = GitLabTODOsSource.Config(**spec_config)
+        return GitLabTODOsSource(cfg, service_name=service_name)
+
+    _register_service_type("gitlab-events", _make_gitlab_events)
+
+    def _make_github_events(
+        spec_config: dict[str, Any], *, service_name: str,
+    ) -> GitHubNotificationsSource:
+        cfg = GitHubNotificationsSource.Config(**spec_config)
+        return GitHubNotificationsSource(cfg, service_name=service_name)
+
+    _register_service_type("github-events", _make_github_events)
+
+
+# ---------------------------------------------------------------------------
 # Loading and instantiation
 # ---------------------------------------------------------------------------
 
@@ -117,28 +215,51 @@ def load_gateway_config(thorn_dir: Path) -> GatewayConfig:
     return GatewayConfig.model_validate(raw)
 
 
+def instantiate_services(config: GatewayConfig) -> list[Service]:
+    """Create :class:`Service` instances from a gateway configuration.
+
+    Handles all service types: forge connections (``"gitlab"``,
+    ``"github"``), projects (``"project"``), and event sources
+    (``"gitlab-events"``, ``"github-events"``).
+
+    For backward compatibility, the legacy type keys ``"gitlab"`` and
+    ``"github"`` (without ``-events`` suffix) are also tried against
+    the event source registry when no match is found in the new
+    service type registry.
+    """
+    _ensure_builtin_types()
+
+    services: list[Service] = []
+    for spec in config.services:
+        expanded = expand_env_vars(spec.config)
+
+        if spec.type in _SERVICE_TYPE_REGISTRY:
+            factory = _SERVICE_TYPE_REGISTRY[spec.type]
+            service = factory(expanded, service_name=spec.name)
+        else:
+            from thorn.gateway.sources import get_registered_source
+
+            source_class = get_registered_source(spec.type)
+            config_instance = source_class.Config(**expanded)
+            service = source_class(config_instance, service_name=spec.name)
+
+        log.info(
+            "Instantiated %s %r (type=%s)",
+            type(service).__name__, spec.name, spec.type,
+        )
+        services.append(service)
+    return services
+
+
 def instantiate_sources(config: GatewayConfig) -> list[EventSource]:
     """Create :class:`EventSource` instances from a gateway configuration.
 
-    For each service entry, looks up the source class in the registry,
-    expands ``$ENV_VAR`` references in the config dict, validates
-    through the source class's ``Config`` model, and constructs the
-    source instance.
+    This is the backward-compatible entry point.  It calls
+    :func:`instantiate_services` and filters to only return event
+    sources.
     """
-    from thorn.gateway.sources import get_registered_source
-
-    sources: list[EventSource] = []
-    for spec in config.services:
-        source_class = get_registered_source(spec.type)
-        expanded = expand_env_vars(spec.config)
-        config_instance = source_class.Config(**expanded)
-        source = source_class(config_instance)
-        log.info(
-            "Instantiated %s source %r (type=%s)",
-            type(source).__name__, spec.name, spec.type,
-        )
-        sources.append(source)
-    return sources
+    all_services = instantiate_services(config)
+    return [s for s in all_services if isinstance(s, EventSource)]
 
 
 __all__ = [
@@ -146,6 +267,7 @@ __all__ = [
     "GatewayConfig",
     "ServiceSpec",
     "expand_env_vars",
+    "instantiate_services",
     "instantiate_sources",
     "load_gateway_config",
 ]

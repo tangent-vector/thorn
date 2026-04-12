@@ -271,19 +271,14 @@ def _make_event(
 
 
 class GitHubNotificationsSource(EventSource):
-    """Polls the GitHub Notifications API and emits events for new items.
-
-    On :meth:`start`, also configures the ``thorn.tools.github``
-    module-level client so that agent tools (``github_post_comment``,
-    ``github_mark_notification_read``, etc.) work with the same
-    credentials.
-    """
+    """Polls the GitHub Notifications API and emits events for new items."""
 
     Config = GitHubSourceConfig
 
-    def __init__(self, config: GitHubSourceConfig) -> None:
+    def __init__(self, config: GitHubSourceConfig, *, service_name: str = "") -> None:
         _require_github()
         self._config = config
+        self._service_name = service_name
         self._gh = _Github(  # type: ignore[misc]
             base_url=config.base_url,
             auth=_GHAuth.Token(config.token),  # type: ignore[union-attr]
@@ -291,12 +286,15 @@ class GitHubNotificationsSource(EventSource):
         self._seen: set[str] = set()
         self._stop_event: asyncio.Event | None = None
 
+    @property
+    def name(self) -> str:
+        return self._service_name
+
     async def start(
         self,
         on_event: Callable[[IncomingEvent], Awaitable[None]],
     ) -> None:
         self._stop_event = asyncio.Event()
-        self._configure_tools_client()
 
         user_info = await asyncio.to_thread(self._check_connection)
         log.info(
@@ -335,21 +333,6 @@ class GitHubNotificationsSource(EventSource):
             "name": user.name,
             "html_url": user.html_url,
         }
-
-    def _configure_tools_client(self) -> None:
-        """Set up the ``thorn.tools.github`` module-level client.
-
-        This allows agent tools (``github_post_comment``, etc.) to use
-        the same GitHub credentials without requiring separate env-var
-        configuration.
-        """
-        from thorn.tools.github import GitHubClient, GitHubConfig, set_client
-
-        config = GitHubConfig(
-            base_url=self._config.base_url,
-            token=self._config.token,
-        )
-        set_client(GitHubClient(config))
 
     async def _poll_once(
         self,

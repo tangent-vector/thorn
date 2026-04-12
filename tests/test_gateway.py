@@ -79,9 +79,15 @@ class TestIncomingEvent:
 class StubSource(EventSource):
     """EventSource that emits a fixed list of events, then stops."""
 
+    Config = type("Config", (), {})  # type: ignore[assignment]
+
     def __init__(self, events: list[IncomingEvent]) -> None:
         self._events = events
         self._stop = asyncio.Event()
+
+    @property
+    def name(self) -> str:
+        return "stub"
 
     async def start(
         self,
@@ -100,8 +106,14 @@ class StubSource(EventSource):
 class SlowSource(EventSource):
     """EventSource that waits until stopped."""
 
+    Config = type("Config", (), {})  # type: ignore[assignment]
+
     def __init__(self) -> None:
         self._stop = asyncio.Event()
+
+    @property
+    def name(self) -> str:
+        return "slow"
 
     async def start(
         self,
@@ -628,8 +640,7 @@ class TestGitLabTODOsSourcePolling:
                 events.append(event)
                 await source.stop()
 
-            with patch.object(source, "_configure_tools_client"):
-                await asyncio.wait_for(source.start(on_event), timeout=5.0)
+            await asyncio.wait_for(source.start(on_event), timeout=5.0)
 
             assert len(events) == 1
             assert events[0].source == "gitlab"
@@ -675,8 +686,7 @@ class TestGitLabTODOsSourcePolling:
             async def on_event(event: IncomingEvent) -> None:
                 events.append(event)
 
-            with patch.object(source, "_configure_tools_client"):
-                await source._poll_once(on_event)
+            await source._poll_once(on_event)
 
             assert len(events) == 2
             assert events[0].session_key == events[1].session_key
@@ -726,9 +736,8 @@ class TestGitLabTODOsSourcePolling:
             async def on_event(event: IncomingEvent) -> None:
                 events.append(event)
 
-            with patch.object(source, "_configure_tools_client"):
-                await source._poll_once(on_event)
-                await source._poll_once(on_event)
+            await source._poll_once(on_event)
+            await source._poll_once(on_event)
 
             assert len(events) == 1
 
@@ -975,16 +984,16 @@ class TestProjectCoordinator:
         assert len(prompts) >= 1
         assert "project coordinator" in prompts[0].lower()
 
-    def test_has_gitlab_tools(self):
+    def test_has_forge_tools(self):
         from thorn.gateway._agents import ProjectCoordinator
 
         tools = ProjectCoordinator._collect_tools()
         tool_names = {getattr(t, "__name__", str(t)) for t in tools}
-        assert "gitlab_read_issue" in tool_names
-        assert "gitlab_post_comment" in tool_names
-        assert "gitlab_create_merge_request" in tool_names
-        assert "gitlab_mark_todo_done" in tool_names
-        assert "gitlab_get_project_info" in tool_names
+        assert "forge_read_issue" in tool_names
+        assert "forge_post_comment" in tool_names
+        assert "forge_create_change_request" in tool_names
+        assert "forge_mark_notification_done" in tool_names
+        assert "forge_get_project_info" in tool_names
 
     def test_has_git_tools(self):
         from thorn.gateway._agents import ProjectCoordinator
@@ -1077,9 +1086,9 @@ class TestEndToEndWiring:
             tool_names = {getattr(t, "__name__", str(t)) for t in tools}
 
         required = {
-            "gitlab_read_issue", "gitlab_post_comment",
-            "gitlab_create_merge_request", "gitlab_mark_todo_done",
-            "gitlab_get_project_info",
+            "forge_read_issue", "forge_post_comment",
+            "forge_create_change_request", "forge_mark_notification_done",
+            "forge_get_project_info",
             "git_clone", "git_push", "git_commit", "git_worktree_add",
             "read_file", "edit_file", "create_file",
         }
@@ -1088,7 +1097,7 @@ class TestEndToEndWiring:
         )
 
     @pytest.mark.asyncio
-    async def test_coordinator_metadata_has_credentials(self, tmp_path: Path):
+    async def test_coordinator_metadata_has_project_ref(self, tmp_path: Path):
         runtime = self._bootstrap_runtime(tmp_path)
         gateway = Gateway(runtime=runtime, sources=[])
         event = IncomingEvent(
@@ -1099,8 +1108,7 @@ class TestEndToEndWiring:
         async with runtime:
             agent = gateway._resolve_agent(event)
 
-        assert agent.metadata["access_token"] == "$GITLAB_TOKEN"
-        assert agent.metadata["clone_url"] == "https://gitlab.example.com/group/test-proj.git"
+        assert agent.metadata["project"] == "test-proj"
 
     @pytest.mark.asyncio
     async def test_coordinator_workspace_has_memory(self, tmp_path: Path):
@@ -1134,7 +1142,7 @@ class TestEndToEndWiring:
             prompts = agent._render_system_prompts()
 
         assert any("project coordinator" in p.lower() for p in prompts)
-        assert any("git_clone" in p for p in prompts)
+        assert any("forge_create_change_request" in p for p in prompts)
 
     @pytest.mark.asyncio
     async def test_event_content_includes_project_metadata(self):
@@ -1247,6 +1255,10 @@ class TestSourceRegistry:
             def __init__(self, config: DummyConfig) -> None:
                 self._config = config
 
+            @property
+            def name(self) -> str:
+                return "dummy"
+
             async def start(self, on_event):
                 pass
 
@@ -1341,7 +1353,7 @@ class TestGatewayConfigLoading:
 
 
 class TestInstantiateSources:
-    def test_instantiates_gitlab_source(
+    def test_instantiates_gitlab_event_source(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
         with (
@@ -1360,14 +1372,38 @@ class TestInstantiateSources:
 
             config = GatewayConfig(services=[
                 ServiceSpec(
-                    name="test-gl",
-                    type="gitlab",
+                    name="gl-poller",
+                    type="gitlab-events",
                     config={"url": "$GITLAB_URL", "token": "$GITLAB_TOKEN"},
                 ),
             ])
             sources = instantiate_sources(config)
             assert len(sources) == 1
             assert isinstance(sources[0], GitLabTODOsSource)
+
+    def test_forge_type_not_returned_by_instantiate_sources(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Forge services (type='gitlab') are not event sources and
+        should not appear in the list returned by instantiate_sources."""
+        monkeypatch.setenv("GITLAB_URL", "https://gitlab.example.com")
+        monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
+
+        from thorn.gateway._config import (
+            GatewayConfig,
+            ServiceSpec,
+            instantiate_sources,
+        )
+
+        config = GatewayConfig(services=[
+            ServiceSpec(
+                name="gl",
+                type="gitlab",
+                config={"url": "$GITLAB_URL", "token": "$GITLAB_TOKEN"},
+            ),
+        ])
+        sources = instantiate_sources(config)
+        assert sources == []
 
     def test_unknown_type_raises(self):
         from thorn.gateway._config import (
@@ -1383,6 +1419,87 @@ class TestInstantiateSources:
             instantiate_sources(config)
 
     def test_missing_env_var_raises(self, monkeypatch: pytest.MonkeyPatch):
+        from thorn.gateway._config import (
+            GatewayConfig,
+            ServiceSpec,
+            instantiate_sources,
+        )
+
+        monkeypatch.delenv("MISSING_VAR_XYZ", raising=False)
+
+        config = GatewayConfig(services=[
+            ServiceSpec(
+                name="test",
+                type="gitlab",
+                config={"url": "$MISSING_VAR_XYZ", "token": "literal"},
+            ),
+        ])
+        with pytest.raises(ValueError, match="MISSING_VAR_XYZ"):
+            instantiate_sources(config)
+
+    def test_empty_config_returns_empty_list(self):
+        from thorn.gateway._config import GatewayConfig, instantiate_sources
+
+        config = GatewayConfig(services=[])
+        assert instantiate_sources(config) == []
+
+
+class TestInstantiateServices:
+    def test_instantiates_forge_service(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from thorn.gateway._config import (
+            GatewayConfig,
+            ServiceSpec,
+            instantiate_services,
+        )
+        from thorn.tools.forge import ForgeService
+
+        monkeypatch.setenv("GL_URL", "https://gitlab.example.com")
+        monkeypatch.setenv("GL_TOKEN", "glpat-test")
+
+        config = GatewayConfig(services=[
+            ServiceSpec(
+                name="my-gl",
+                type="gitlab",
+                config={"url": "$GL_URL", "token": "$GL_TOKEN"},
+            ),
+        ])
+        services = instantiate_services(config)
+        assert len(services) == 1
+        assert isinstance(services[0], ForgeService)
+        assert services[0].name == "my-gl"
+        assert services[0].forge_type == "gitlab"
+
+    def test_instantiates_project_service(self):
+        from thorn.gateway._config import (
+            GatewayConfig,
+            ServiceSpec,
+            instantiate_services,
+        )
+        from thorn.tools.forge import ProjectService
+
+        config = GatewayConfig(services=[
+            ServiceSpec(
+                name="my-proj",
+                type="project",
+                config={
+                    "forge": "my-gl",
+                    "native_id": "42",
+                    "path": "org/repo",
+                    "clone_url": "https://example.com/repo.git",
+                    "default_branch": "main",
+                },
+            ),
+        ])
+        services = instantiate_services(config)
+        assert len(services) == 1
+        assert isinstance(services[0], ProjectService)
+        assert services[0].name == "my-proj"
+
+    def test_instantiates_mixed_services(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
         with (
             patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
             patch("thorn.gateway.sources._gitlab._gitlab_lib"),
@@ -1390,26 +1507,36 @@ class TestInstantiateSources:
             from thorn.gateway._config import (
                 GatewayConfig,
                 ServiceSpec,
-                instantiate_sources,
+                instantiate_services,
             )
+            from thorn.gateway.sources._gitlab import GitLabTODOsSource
+            from thorn.tools.forge import ForgeService, ProjectService
 
-            monkeypatch.delenv("MISSING_VAR_XYZ", raising=False)
+            monkeypatch.setenv("GL_URL", "https://gl.example.com")
+            monkeypatch.setenv("GL_TOKEN", "secret")
 
             config = GatewayConfig(services=[
                 ServiceSpec(
-                    name="test",
+                    name="gl",
                     type="gitlab",
-                    config={"url": "$MISSING_VAR_XYZ", "token": "literal"},
+                    config={"url": "$GL_URL", "token": "$GL_TOKEN"},
+                ),
+                ServiceSpec(
+                    name="proj",
+                    type="project",
+                    config={"forge": "gl", "native_id": "1"},
+                ),
+                ServiceSpec(
+                    name="gl-poller",
+                    type="gitlab-events",
+                    config={"url": "$GL_URL", "token": "$GL_TOKEN"},
                 ),
             ])
-            with pytest.raises(ValueError, match="MISSING_VAR_XYZ"):
-                instantiate_sources(config)
-
-    def test_empty_config_returns_empty_list(self):
-        from thorn.gateway._config import GatewayConfig, instantiate_sources
-
-        config = GatewayConfig(services=[])
-        assert instantiate_sources(config) == []
+            services = instantiate_services(config)
+            assert len(services) == 3
+            assert isinstance(services[0], ForgeService)
+            assert isinstance(services[1], ProjectService)
+            assert isinstance(services[2], GitLabTODOsSource)
 
 
 # ---------------------------------------------------------------------------
@@ -1427,7 +1554,7 @@ class TestBootstrapCoordinator:
             project_name="my-project",
             clone_url="https://gitlab.example.com/group/my-project.git",
             default_branch="develop",
-            project_id=42,
+            native_project_id="42",
         )
 
         assert str(aid) == "test-coord"
@@ -1438,9 +1565,7 @@ class TestBootstrapCoordinator:
         import json
         data = json.loads(identity.read_text(encoding="utf-8"))
         assert data["agent_class"] == "ProjectCoordinator"
-        assert data["metadata"]["clone_url"] == "https://gitlab.example.com/group/my-project.git"
-        assert data["metadata"]["access_token"] == "$GITLAB_TOKEN"
-        assert data["metadata"]["project_id"] == 42
+        assert data["metadata"]["project"] == "my-project"
 
         memory = tmp_path / ".thorn" / "agents" / "test-coord" / "MEMORY.md"
         assert memory.is_file()
@@ -1451,12 +1576,21 @@ class TestBootstrapCoordinator:
         gateway_config = tmp_path / ".thorn" / "gateway.json"
         assert gateway_config.is_file()
         gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
-        assert len(gw_data["services"]) == 1
-        svc = gw_data["services"][0]
-        assert svc["name"] == "test-coord"
-        assert svc["type"] == "gitlab"
-        assert svc["config"]["url"] == "$GITLAB_URL"
-        assert svc["config"]["token"] == "$GITLAB_TOKEN"
+        assert len(gw_data["services"]) == 2
+
+        types = {s["type"] for s in gw_data["services"]}
+        assert "gitlab" in types
+        assert "project" in types
+
+        proj_svc = next(s for s in gw_data["services"] if s["type"] == "project")
+        assert proj_svc["name"] == "my-project"
+        assert proj_svc["config"]["native_id"] == "42"
+        assert proj_svc["config"]["clone_url"] == "https://gitlab.example.com/group/my-project.git"
+        assert proj_svc["config"]["default_branch"] == "develop"
+
+        forge_svc = next(s for s in gw_data["services"] if s["type"] == "gitlab")
+        assert forge_svc["config"]["url"] == "$GITLAB_URL"
+        assert forge_svc["config"]["token"] == "$GITLAB_TOKEN"
 
     def test_bootstrap_appends_to_existing_gateway_config(self, tmp_path: Path):
         import json
@@ -1477,10 +1611,9 @@ class TestBootstrapCoordinator:
 
         gateway_config = tmp_path / ".thorn" / "gateway.json"
         gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
-        assert len(gw_data["services"]) == 2
         names = [s["name"] for s in gw_data["services"]]
-        assert "first-coord" in names
-        assert "second-coord" in names
+        assert "proj-a" in names
+        assert "proj-b" in names
 
     def test_bootstrap_updates_existing_service_by_name(self, tmp_path: Path):
         import json
@@ -1503,8 +1636,9 @@ class TestBootstrapCoordinator:
 
         gateway_config = tmp_path / ".thorn" / "gateway.json"
         gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
-        assert len(gw_data["services"]) == 1
-        assert gw_data["services"][0]["config"]["token"] == "$NEW_TOKEN"
+        forge_svcs = [s for s in gw_data["services"] if s["type"] == "gitlab"]
+        assert len(forge_svcs) == 1
+        assert forge_svcs[0]["config"]["token"] == "$NEW_TOKEN"
 
     def test_bootstrap_custom_env_vars(self, tmp_path: Path):
         import json
@@ -1521,9 +1655,9 @@ class TestBootstrapCoordinator:
 
         gateway_config = tmp_path / ".thorn" / "gateway.json"
         gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
-        svc = gw_data["services"][0]
-        assert svc["config"]["url"] == "$MY_URL"
-        assert svc["config"]["token"] == "$MY_TOKEN"
+        forge_svc = next(s for s in gw_data["services"] if s["type"] == "gitlab")
+        assert forge_svc["config"]["url"] == "$MY_URL"
+        assert forge_svc["config"]["token"] == "$MY_TOKEN"
 
     def test_loads_via_session_store(self, tmp_path: Path):
         from thorn.gateway._agents import ProjectCoordinator
@@ -1541,7 +1675,7 @@ class TestBootstrapCoordinator:
         agent = store.load_agent(AgentID("loadable"))
 
         assert isinstance(agent, ProjectCoordinator)
-        assert agent.metadata["project_name"] == "proj"
+        assert agent.metadata["project"] == "proj"
 
     def test_cli_bootstrap_command(self, tmp_path: Path):
         from click.testing import CliRunner
@@ -1560,6 +1694,25 @@ class TestBootstrapCoordinator:
         assert (tmp_path / ".thorn" / "agents" / "cli-test.json").is_file()
         assert (tmp_path / ".thorn" / "gateway.json").is_file()
         assert "gateway.json" in result.output
+
+    def test_legacy_project_id_parameter(self, tmp_path: Path):
+        """The legacy ``project_id: int`` parameter is accepted and
+        mapped to ``native_project_id``."""
+        import json
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        bootstrap_coordinator(
+            runtime_root=tmp_path,
+            agent_id="legacy",
+            project_name="proj",
+            clone_url="https://example.com/proj.git",
+            project_id=999,
+        )
+
+        gateway_config = tmp_path / ".thorn" / "gateway.json"
+        gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
+        proj_svc = next(s for s in gw_data["services"] if s["type"] == "project")
+        assert proj_svc["config"]["native_id"] == "999"
 
 
 # ---------------------------------------------------------------------------

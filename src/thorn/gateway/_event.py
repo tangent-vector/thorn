@@ -11,15 +11,13 @@ itself operate on:
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any
 
+from thorn.core._service import Service
 from thorn.runtime._session import AgentID, SessionKey
-
-if TYPE_CHECKING:
-    from pydantic import BaseModel
 
 
 @dataclass(frozen=True)
@@ -49,20 +47,18 @@ class IncomingEvent:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-class EventSource(ABC):
+class EventSource(Service):
     """Abstract base class for pluggable event inputs.
 
     Implementations call the *on_event* callback supplied to
     :meth:`start` whenever a new event is detected.  The gateway
     handles routing and agent prompting.
 
-    Subclasses must define a ``Config`` class attribute pointing to a
+    ``EventSource`` is a :class:`Service` subclass.  Subclasses must
+    define a ``Config`` class attribute pointing to a
     :class:`pydantic.BaseModel` subclass that describes the source's
-    configuration.  The constructor must accept an instance of that
-    model as its sole positional argument.
+    configuration, and implement :attr:`name`.
     """
-
-    Config: ClassVar[type[BaseModel]]
 
     @abstractmethod
     async def start(

@@ -181,18 +181,14 @@ def _make_event(todo: Any) -> IncomingEvent:
 
 
 class GitLabTODOsSource(EventSource):
-    """Polls the GitLab Todos API and emits events for new TODOs.
-
-    On :meth:`start`, also configures the ``thorn.tools.gitlab``
-    module-level client so that agent tools (``gitlab_post_comment``,
-    ``gitlab_mark_todo_done``, etc.) work with the same credentials.
-    """
+    """Polls the GitLab Todos API and emits events for new TODOs."""
 
     Config = GitLabSourceConfig
 
-    def __init__(self, config: GitLabSourceConfig) -> None:
+    def __init__(self, config: GitLabSourceConfig, *, service_name: str = "") -> None:
         _require_gitlab()
         self._config = config
+        self._service_name = service_name
         self._gl = _gitlab_lib.Gitlab(  # type: ignore[union-attr]
             url=config.url,
             private_token=config.token,
@@ -200,12 +196,15 @@ class GitLabTODOsSource(EventSource):
         self._seen: set[int] = set()
         self._stop_event: asyncio.Event | None = None
 
+    @property
+    def name(self) -> str:
+        return self._service_name
+
     async def start(
         self,
         on_event: Callable[[IncomingEvent], Awaitable[None]],
     ) -> None:
         self._stop_event = asyncio.Event()
-        self._configure_tools_client()
 
         user_info = await asyncio.to_thread(self._check_connection)
         log.info(
@@ -245,18 +244,6 @@ class GitLabTODOsSource(EventSource):
             "name": user.name,
             "web_url": user.web_url,
         }
-
-    def _configure_tools_client(self) -> None:
-        """Set up the ``thorn.tools.gitlab`` module-level client.
-
-        This allows agent tools (``gitlab_post_comment``, etc.) to use the
-        same GitLab credentials without requiring separate env-var
-        configuration.
-        """
-        from thorn.tools.gitlab import GitLabClient, GitLabConfig, set_client
-
-        config = GitLabConfig(url=self._config.url, token=self._config.token)
-        set_client(GitLabClient(config))
 
     async def _poll_once(
         self,

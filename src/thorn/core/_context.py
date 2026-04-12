@@ -555,6 +555,10 @@ class ExecutionContext:
                                Set once by the ``Runtime`` or
                                ``thorn.run()`` and inherited unchanged
                                by all child contexts.
+        runtime: Reference to the :class:`~thorn.runtime.Runtime` that
+                 owns this context.  ``None`` for bare contexts created
+                 without a runtime (e.g. unit tests).  Propagated
+                 unchanged through :meth:`push_scope`.
     """
 
     provider: LLMProvider
@@ -571,6 +575,7 @@ class ExecutionContext:
     context_window: int | None = None
     status_providers: list[StatusProvider] = field(default_factory=list)
     agency_root_directory: Path | None = None
+    runtime: Any = None
 
     def add_status_provider(self, provider: StatusProvider) -> None:
         """Register a ``StatusProvider`` for advisory injection."""
@@ -640,6 +645,7 @@ class ExecutionContext:
             context_window=self.context_window,
             status_providers=self.status_providers,
             agency_root_directory=self.agency_root_directory,
+            runtime=self.runtime,
         )
 
 

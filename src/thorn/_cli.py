@@ -556,7 +556,12 @@ def _serve_gateway(
     from rich.logging import RichHandler
 
     from thorn import infer_workspace_root
-    from thorn.gateway import Gateway, instantiate_sources, load_gateway_config
+    from thorn.gateway import (
+        EventSource,
+        Gateway,
+        instantiate_services,
+        load_gateway_config,
+    )
 
     verbosity = _resolve_verbosity(verbose, quiet)
 
@@ -578,14 +583,15 @@ def _serve_gateway(
         sys.exit(1)
 
     try:
-        sources = instantiate_sources(gateway_config)
+        all_services = instantiate_services(gateway_config)
     except (KeyError, ValueError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
 
+    sources = [s for s in all_services if isinstance(s, EventSource)]
     if not sources:
         console.print(
-            "[yellow]Warning:[/yellow] No services configured in "
+            "[yellow]Warning:[/yellow] No event sources configured in "
             f"{thorn_dir / 'gateway.json'}. The gateway will start "
             "but will not receive any events."
         )
@@ -601,6 +607,9 @@ def _serve_gateway(
         if trace_file:
             trace_file.close()
         sys.exit(1)
+
+    for service in all_services:
+        runtime.register_service(service)
 
     gateway = Gateway(runtime=runtime, sources=sources)
 

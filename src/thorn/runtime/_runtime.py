@@ -23,7 +23,7 @@ import contextvars
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from thorn.core._agent import Agent
 from thorn.core._context import (
@@ -36,6 +36,7 @@ from thorn.core._context import (
 )
 from thorn.core._provider import LLMProvider
 from thorn.core._session import Session
+from thorn.core._service import Service
 from thorn.runtime._session import AgentID, SessionKey
 from thorn.runtime._store import SessionStore
 
@@ -43,6 +44,8 @@ if TYPE_CHECKING:
     from thorn.core._context import StatusProvider
     from thorn.core._file_access import FileAccessPolicy
     from thorn.core._validation_tracker import ValidationTracker
+
+_S = TypeVar("_S", bound=Service)
 
 
 class Runtime:
@@ -90,8 +93,57 @@ class Runtime:
             session_store = SessionStore(agents_root)
         self.sessions = session_store
 
+        self._services: dict[str, Service] = {}
+
         self._context: ExecutionContext | None = None
         self._context_token: contextvars.Token[ExecutionContext] | None = None
+
+    # -- Service registry ---------------------------------------------------
+
+    def register_service(self, service: Service) -> None:
+        """Register a named service in the agency.
+
+        Raises :class:`ValueError` if a service with the same name is
+        already registered.
+        """
+        if service.name in self._services:
+            raise ValueError(
+                f"Service {service.name!r} is already registered"
+            )
+        self._services[service.name] = service
+
+    def get_service(self, name: str) -> Service:
+        """Look up a service by name.
+
+        Raises :class:`KeyError` if no service with that name exists.
+        """
+        try:
+            return self._services[name]
+        except KeyError:
+            registered = ", ".join(sorted(self._services)) or "(none)"
+            raise KeyError(
+                f"No service named {name!r}. "
+                f"Registered services: {registered}"
+            ) from None
+
+    def get_services_by_type(self, service_type: type[_S]) -> list[_S]:
+        """Return all registered services of the given type."""
+        return [
+            s for s in self._services.values()
+            if isinstance(s, service_type)
+        ]
+
+    def get_forge_for_project(
+        self, project_name: str,
+    ) -> tuple[Any, str]:
+        """Look up a project service and return ``(ForgeClient, native_id)``.
+
+        Convenience method for forge tools.  Delegates to
+        :func:`thorn.tools.forge.get_forge_for_project`.
+        """
+        from thorn.tools.forge import get_forge_for_project
+
+        return get_forge_for_project(self, project_name)
 
     # -- Context management -------------------------------------------------
 
@@ -117,6 +169,7 @@ class Runtime:
             system_prompts=list(system_prompts or []),
             status_providers=self.status_providers,
             agency_root_directory=self.workspace_root,
+            runtime=self,
         )
 
     @property

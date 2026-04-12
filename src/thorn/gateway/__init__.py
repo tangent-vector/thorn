@@ -10,6 +10,7 @@ from thorn.gateway._config import (
     GatewayConfig,
     ServiceSpec,
     expand_env_vars,
+    instantiate_services,
     instantiate_sources,
     load_gateway_config,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "ProjectCoordinator",
     "ServiceSpec",
     "expand_env_vars",
+    "instantiate_services",
     "instantiate_sources",
     "load_gateway_config",
 ]

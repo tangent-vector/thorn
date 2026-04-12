@@ -11,6 +11,7 @@ import pytest
 
 from thorn.core._agent import Agent
 from thorn.core._context import ExecutionContext, get_context
+from thorn.core._service import Service
 from thorn.core._history import (
     ArchiveMarkerNode,
     CollapseState,
@@ -1333,6 +1334,81 @@ class TestRuntime:
         ctx1.system_prompts.append("c")
         assert "c" not in ctx2.system_prompts
 
+    def test_create_context_sets_runtime_reference(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        ctx = rt.create_context()
+        assert ctx.runtime is rt
+
+
+# ---------------------------------------------------------------------------
+# Runtime service registry
+# ---------------------------------------------------------------------------
+
+
+class TestRuntimeServiceRegistry:
+    def _make_runtime(self, tmp_path: Path) -> Runtime:
+        return Runtime(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+        )
+
+    def _make_service(self, name: str) -> "StubService":
+        return StubService(name)
+
+    def test_register_and_get_service(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        svc = self._make_service("my-service")
+        rt.register_service(svc)
+        assert rt.get_service("my-service") is svc
+
+    def test_get_missing_service_raises_key_error(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        with pytest.raises(KeyError, match="no-such"):
+            rt.get_service("no-such")
+
+    def test_duplicate_registration_raises(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        rt.register_service(self._make_service("dup"))
+        with pytest.raises(ValueError, match="already registered"):
+            rt.register_service(self._make_service("dup"))
+
+    def test_get_services_by_type(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        svc_a = self._make_service("a")
+        svc_b = self._make_service("b")
+        rt.register_service(svc_a)
+        rt.register_service(svc_b)
+        results = rt.get_services_by_type(StubService)
+        assert set(results) == {svc_a, svc_b}
+
+    def test_get_services_by_type_empty(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        assert rt.get_services_by_type(StubService) == []
+
+    def test_empty_registry_on_creation(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        assert rt.get_services_by_type(StubService) == []
+
+    def test_key_error_message_lists_registered(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        rt.register_service(self._make_service("alpha"))
+        rt.register_service(self._make_service("beta"))
+        with pytest.raises(KeyError, match="alpha.*beta"):
+            rt.get_service("gamma")
+
+
+class StubService(Service):
+    """Minimal Service subclass for testing the registry."""
+
+    Config = type("Config", (), {})  # type: ignore[assignment]
+
+    def __init__(self, svc_name: str) -> None:
+        self._name = svc_name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
 
 # ---------------------------------------------------------------------------
 # Runtime as async context manager
@@ -1355,6 +1431,21 @@ class TestRuntimeContextManager:
             assert ctx is rt.context
             assert ctx.provider is rt.provider
             assert ctx.workspace_root == tmp_path
+
+    @pytest.mark.asyncio
+    async def test_ambient_context_has_runtime_ref(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        async with rt:
+            ctx = get_context()
+            assert ctx.runtime is rt
+
+    @pytest.mark.asyncio
+    async def test_runtime_propagated_through_push_scope(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        async with rt:
+            ctx = get_context()
+            child = ctx.push_scope("test")
+            assert child.runtime is rt
 
     @pytest.mark.asyncio
     async def test_clears_context_on_exit(self, tmp_path: Path):

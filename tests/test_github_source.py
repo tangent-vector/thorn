@@ -308,11 +308,10 @@ class TestGitHubNotificationsSourcePolling:
                 events.append(event)
                 await source.stop()
 
-            with patch.object(source, "_configure_tools_client"):
-                with patch.object(source, "_fetch_comment_body", return_value=None):
-                    await asyncio.wait_for(
-                        source.start(on_event), timeout=5.0,
-                    )
+            with patch.object(source, "_fetch_comment_body", return_value=None):
+                await asyncio.wait_for(
+                    source.start(on_event), timeout=5.0,
+                )
 
             assert len(events) == 1
             assert events[0].source == "github"
@@ -356,10 +355,9 @@ class TestGitHubNotificationsSourcePolling:
             async def on_event(event: IncomingEvent) -> None:
                 events.append(event)
 
-            with patch.object(source, "_configure_tools_client"):
-                with patch.object(source, "_fetch_comment_body", return_value=None):
-                    await source._poll_once(on_event)
-                    await source._poll_once(on_event)
+            with patch.object(source, "_fetch_comment_body", return_value=None):
+                await source._poll_once(on_event)
+                await source._poll_once(on_event)
 
             assert len(events) == 1
 
@@ -407,9 +405,8 @@ class TestGitHubNotificationsSourcePolling:
             async def on_event(event: IncomingEvent) -> None:
                 events.append(event)
 
-            with patch.object(source, "_configure_tools_client"):
-                with patch.object(source, "_fetch_comment_body", return_value=None):
-                    await source._poll_once(on_event)
+            with patch.object(source, "_fetch_comment_body", return_value=None):
+                await source._poll_once(on_event)
 
             assert len(events) == 2
             assert events[0].session_key == events[1].session_key
@@ -462,9 +459,8 @@ class TestGitHubNotificationsSourcePolling:
             async def on_event(event: IncomingEvent) -> None:
                 events.append(event)
 
-            with patch.object(source, "_configure_tools_client"):
-                with patch.object(source, "_fetch_comment_body", return_value=None):
-                    await source._poll_once(on_event)
+            with patch.object(source, "_fetch_comment_body", return_value=None):
+                await source._poll_once(on_event)
 
             assert len(events) == 1
             assert events[0].metadata["repo_full_name"] == (
@@ -509,13 +505,12 @@ class TestGitHubNotificationsSourcePolling:
             async def on_event(event: IncomingEvent) -> None:
                 events.append(event)
 
-            with patch.object(source, "_configure_tools_client"):
-                with patch.object(
-                    source,
-                    "_fetch_comment_body",
-                    return_value="@thorn-app please fix this",
-                ):
-                    await source._poll_once(on_event)
+            with patch.object(
+                source,
+                "_fetch_comment_body",
+                return_value="@thorn-app please fix this",
+            ):
+                await source._poll_once(on_event)
 
             assert len(events) == 1
             assert "@thorn-app please fix this" in events[0].content
@@ -714,7 +709,7 @@ class TestGitHubSourceRegistry:
 
 
 class TestGitHubInstantiateSources:
-    def test_instantiates_github_source(
+    def test_instantiates_github_event_source(
         self, monkeypatch: pytest.MonkeyPatch,
     ):
         with (
@@ -736,7 +731,7 @@ class TestGitHubInstantiateSources:
             config = GatewayConfig(services=[
                 ServiceSpec(
                     name="test-gh",
-                    type="github",
+                    type="github-events",
                     config={
                         "token": "$GITHUB_TOKEN",
                         "repository": "owner/repo",
