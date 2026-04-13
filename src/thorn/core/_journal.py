@@ -330,7 +330,10 @@ async def write_journal(content: str) -> str:
     conversation.
 
     The entry is automatically timestamped and attributed to the
-    current session.
+    current session.  Do **not** add your own top-level markdown
+    headings (e.g. ``## ...``) that duplicate that header; write the
+    body in plain paragraphs, or use deeper headings (``###`` and
+    below) for structure inside the entry.
 
     Args:
         content: The text to write to the journal entry.

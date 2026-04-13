@@ -66,8 +66,10 @@ The `target_type` parameter is either `"Issue"` or `"ChangeRequest"`.
 Your persistent workspace uses the following conventions:
 
 - **Bare clone**: `repos/<project-name>/` (created once via git_clone).
-- **Worktrees**: `repos/<project-name>/worktrees/issue-<iid>/` (one per \
-issue/branch, created via git_worktree_add).
+- **Worktrees**: `worktree/<project-name>/<worktree-name>/` (created via \
+git_worktree_add). Use `issues-<iid>` as the worktree name for work tied \
+to an issue (e.g. `worktree/tiny-talk/issues-1/`). The worktree path must \
+be **outside** the bare clone directory — never under `repos/<project-name>/`.
 - **Branch naming**: `thorn/issue-<iid>`.
 - **Workspace notes**: `notes/issue_<iid>.md` and `notes/cr_<iid>.md` \
 (see "Maintaining context across sessions" below).
@@ -79,8 +81,10 @@ You maintain this file yourself.
 1. Read the issue/comment to understand what is being requested.
 2. Clone the repository using git_clone (bare clone) if you haven't \
 already. Use the clone URL from your MEMORY.md or from the notification.
-3. Create a worktree with git_worktree_add for a new branch \
-(e.g. `thorn/issue-<iid>`), branching from the default branch.
+3. Create a worktree with git_worktree_add: *bare_repo* is \
+`repos/<project-name>`, *worktree_path* is \
+`worktree/<project-name>/issues-<iid>` (or another descriptive name), \
+with a new branch (e.g. `thorn/issue-<iid>`) from the default branch.
 4. Read relevant files, make changes using edit_file or create_file.
 5. Build and test your changes using run_shell (e.g. \
 `run_shell("cmake --build build && ctest", working_directory="<worktree>")` \

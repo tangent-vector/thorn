@@ -343,6 +343,9 @@ async def git_worktree_add(
     Useful for working on multiple branches in parallel.  The
     worktree is created at *worktree_path* with a new branch
     named *branch_name* starting from *start_point*.
+
+    The worktree directory must **not** be located inside the bare
+    repository path; nesting it there produces a broken checkout.
     """
     resolved_repo = _resolve_tool_path(bare_repo)
     resolved_wt = _resolve_tool_path(worktree_path)
