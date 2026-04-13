@@ -107,16 +107,29 @@ class GitHubClient:
         raise TypeError(f"Unsupported auth type: {type(auth)!r}")
 
     def check_connection(self) -> dict[str, Any]:
-        """Authenticate and return info about the current user.
+        """Verify credentials and return a small identity dict for logging.
 
-        Raises on bad tokens.
+        Personal access tokens use ``GET /user``. GitHub App *installation*
+        tokens cannot call that endpoint (403); we use ``GET /rate_limit``
+        instead, which installation tokens may access.
         """
-        user = self._gh.get_user()
-        return {
-            "login": user.login,
-            "name": user.name,
-            "html_url": user.html_url,
-        }
+        gh_auth = self._github_auth_module
+        auth = self._auth
+        if isinstance(auth, gh_auth.Token):
+            user = self._gh.get_user()
+            return {
+                "login": user.login,
+                "name": user.name,
+                "html_url": user.html_url,
+            }
+        if isinstance(auth, gh_auth.AppInstallationAuth):
+            self._gh.get_rate_limit()
+            return {
+                "login": "(GitHub App installation)",
+                "name": "",
+                "html_url": "",
+            }
+        raise TypeError(f"Unsupported auth type: {type(auth)!r}")
 
     def get_issue(self, repo: str, issue_number: int) -> dict[str, Any]:
         """Fetch a single issue and return its key fields as a dict."""

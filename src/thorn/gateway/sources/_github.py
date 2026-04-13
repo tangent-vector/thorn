@@ -109,6 +109,27 @@ def _extract_subject_number(subject_url: str) -> int | None:
     return None
 
 
+def _notification_json_to_simple_namespace(data: dict[str, Any]) -> Any:
+    """Convert a GitHub notifications API JSON object for attribute access.
+
+    Mirrors the shape expected by :func:`_make_event` / PyGithub's
+    notification objects (``repository``, ``subject``, ``id``, etc.).
+    """
+    from types import SimpleNamespace
+
+    def _walk(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            ns = SimpleNamespace()
+            for key, value in obj.items():
+                setattr(ns, key, _walk(value))
+            return ns
+        if isinstance(obj, list):
+            return [_walk(item) for item in obj]
+        return obj
+
+    return _walk(data)
+
+
 def _fetch_body(url: str, bearer_token: str) -> str | None:
     """Fetch the ``body`` field from a GitHub API URL.
 
@@ -282,10 +303,16 @@ class GitHubNotificationsSource(EventSource):
         self._stop_event = asyncio.Event()
 
         user_info = await asyncio.to_thread(self._check_connection)
-        log.info(
-            "GitHub source authenticated as %s (%s)",
-            user_info["login"], user_info["name"],
-        )
+        if user_info.get("name"):
+            log.info(
+                "GitHub source authenticated as %s (%s)",
+                user_info["login"], user_info["name"],
+            )
+        else:
+            log.info(
+                "GitHub source authenticated: %s",
+                user_info["login"],
+            )
         log.info(
             "Polling GitHub notifications every %ds (repo=%s)",
             self._config.poll_interval,
@@ -312,12 +339,32 @@ class GitHubNotificationsSource(EventSource):
             self._stop_event.set()
 
     def _check_connection(self) -> dict[str, Any]:
-        user = self._gh.get_user()
-        return {
-            "login": user.login,
-            "name": user.name,
-            "html_url": user.html_url,
-        }
+        """Verify credentials.
+
+        ``GET /user`` works for PATs but returns 403 for GitHub App
+        *installation* tokens ("Resource not accessible by integration").
+        For installation auth we instead confirm we can read the configured
+        repository (the same scope needed for notifications on that repo).
+        """
+        assert _GHAuth is not None
+        auth = self._pygithub_auth
+        if isinstance(auth, _GHAuth.Token):
+            user = self._gh.get_user()
+            return {
+                "login": user.login,
+                "name": user.name or "",
+                "html_url": user.html_url,
+            }
+        if isinstance(auth, _GHAuth.AppInstallationAuth):
+            repo = self._gh.get_repo(self._config.repository)
+            return {
+                "login": (
+                    f"app installation — verified read access to {repo.full_name}"
+                ),
+                "name": "",
+                "html_url": "",
+            }
+        raise TypeError(f"Unsupported PyGithub auth: {type(auth)!r}")
 
     async def _poll_once(
         self,
@@ -341,16 +388,60 @@ class GitHubNotificationsSource(EventSource):
             await on_event(event)
 
     def _get_notifications(self) -> list[Any]:
-        """Fetch unread, participating notifications filtered by repository."""
-        all_notifications = list(
-            self._gh.get_user().get_notifications(participating=True),
+        """Fetch unread, participating notifications filtered by repository.
+
+        PATs use PyGithub's ``get_user().get_notifications()``. GitHub App
+        *installation* tokens cannot use ``GET /user``, so we call
+        ``GET /notifications`` over HTTP instead (same as the web UI; requires
+        the app to have **Notifications** permission).
+        """
+        assert _GHAuth is not None
+        if isinstance(self._pygithub_auth, _GHAuth.Token):
+            all_notifications = list(
+                self._gh.get_user().get_notifications(participating=True),
+            )
+            if self._config.repository:
+                return [
+                    n for n in all_notifications
+                    if n.repository.full_name == self._config.repository
+                ]
+            return all_notifications
+        if isinstance(self._pygithub_auth, _GHAuth.AppInstallationAuth):
+            return self._get_notifications_via_rest()
+        raise TypeError(f"Unsupported PyGithub auth: {type(self._pygithub_auth)!r}")
+
+    def _get_notifications_via_rest(self) -> list[Any]:
+        base = self._config.base_url.rstrip("/")
+        url = f"{base}/notifications"
+        response = httpx.get(
+            url,
+            params={"participating": "true"},
+            headers={
+                "Authorization": f"Bearer {self._bearer_token()}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=30.0,
         )
+        response.raise_for_status()
+        raw = response.json()
+        if not isinstance(raw, list):
+            return []
+        notifications = [
+            _notification_json_to_simple_namespace(item)
+            for item in raw
+            if isinstance(item, dict)
+        ]
         if self._config.repository:
             return [
-                n for n in all_notifications
-                if n.repository.full_name == self._config.repository
+                n for n in notifications
+                if getattr(
+                    getattr(n, "repository", None),
+                    "full_name",
+                    "",
+                )
+                == self._config.repository
             ]
-        return all_notifications
+        return notifications
 
     def _fetch_comment_body(self, notification: Any) -> str | None:
         """Retrieve the body text associated with a notification.
