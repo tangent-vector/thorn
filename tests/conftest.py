@@ -13,12 +13,23 @@ _GITHUB_APP_ENV_KEYS = (
     "GITHUB_APP_PRIVATE_KEY",
     "GITHUB_APP_PRIVATE_KEY_PATH",
 )
+_GITHUB_API_URL_KEYS = (
+    "GITHUB_API_URL",
+    "GITHUB_URL",
+)
 
 
 @pytest.fixture
 def github_pat_only_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unset GitHub App variables so :meth:`~thorn.tools._github_connection.GitHubConnectionConfig.from_env` uses PAT mode."""
     for key in _GITHUB_APP_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture
+def clear_github_api_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset API base URL env vars so tests can set deterministic ``GITHUB_URL`` / ``GITHUB_API_URL``."""
+    for key in _GITHUB_API_URL_KEYS:
         monkeypatch.delenv(key, raising=False)
 
 

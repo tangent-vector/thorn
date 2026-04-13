@@ -1,8 +1,9 @@
-"""GitHub Notifications polling event source.
+"""GitHub repository activity event source.
 
-Polls the GitHub Notifications API for new notifications (e.g.
-@-mentions, assignments, review requests) and converts them into
-:class:`~thorn.gateway._event.IncomingEvent` objects for the gateway.
+Polls ``GET /repos/{owner}/{repo}/events``, which works with GitHub App
+installation access tokens. The Notifications API does not.
+
+See `Repository events <https://docs.github.com/en/rest/activity/events#list-repository-events>`_.
 
 Requires ``PyGithub`` (install via ``pip install thorn[github]``).
 """
@@ -10,12 +11,12 @@ Requires ``PyGithub`` (install via ``pip install thorn[github]``).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-import httpx
 from pydantic import Field
 
 from thorn.gateway._event import EventSource, IncomingEvent
@@ -54,10 +55,10 @@ def _require_github() -> None:
 
 
 class GitHubNotificationsSourceConfig(GitHubConnectionConfig):
-    """GitHub API auth plus notifications poller settings."""
+    """GitHub API auth plus repository events poller settings."""
 
     repository: str = Field(
-        description="Repository in owner/repo format to filter notifications",
+        description="Repository in owner/repo format (events are listed for this repo)",
     )
     app_slug: str = Field(
         default="",
@@ -92,123 +93,78 @@ class GitHubNotificationsSourceConfig(GitHubConnectionConfig):
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Formatting repository events
 # ---------------------------------------------------------------------------
 
 
-def _extract_subject_number(subject_url: str) -> int | None:
-    """Extract the issue/PR number from a notification subject URL.
-
-    URLs look like ``https://api.github.com/repos/owner/repo/issues/42``
-    or ``https://api.github.com/repos/owner/repo/pulls/7``.
-    Returns ``None`` if the trailing segment is not numeric.
-    """
-    segment = subject_url.rstrip("/").rsplit("/", 1)[-1]
-    if segment.isdigit():
-        return int(segment)
-    return None
+def _session_key_for_event(repo_id: int, event_type: str, event_id: str) -> SessionKey:
+    """Stable key for deduplication: one IncomingEvent per REST event id."""
+    safe_type = event_type.replace(" ", "_")
+    return SessionKey(f"github_{repo_id}_{safe_type}_{event_id}")
 
 
-def _notification_json_to_simple_namespace(data: dict[str, Any]) -> Any:
-    """Convert a GitHub notifications API JSON object for attribute access.
+def _payload_summary(event_type: str, payload: dict[str, Any]) -> str:
+    """Short human-readable summary of the event payload (best-effort)."""
+    if not payload:
+        return "(no payload details)"
 
-    Mirrors the shape expected by :func:`_make_event` / PyGithub's
-    notification objects (``repository``, ``subject``, ``id``, etc.).
-    """
-    from types import SimpleNamespace
-
-    def _walk(obj: Any) -> Any:
-        if isinstance(obj, dict):
-            ns = SimpleNamespace()
-            for key, value in obj.items():
-                setattr(ns, key, _walk(value))
-            return ns
-        if isinstance(obj, list):
-            return [_walk(item) for item in obj]
-        return obj
-
-    return _walk(data)
-
-
-def _fetch_body(url: str, bearer_token: str) -> str | None:
-    """Fetch the ``body`` field from a GitHub API URL.
-
-    Used to retrieve comment or issue/PR bodies from
-    ``latest_comment_url`` or ``subject.url``.  Returns ``None``
-    on any failure so callers can fall back gracefully.
-    """
     try:
-        response = httpx.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {bearer_token}",
-                "Accept": "application/vnd.github+json",
-            },
-            timeout=15.0,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("body") or None
+        if event_type == "IssuesEvent" and "issue" in payload:
+            issue = payload["issue"]
+            num = issue.get("number")
+            title = issue.get("title", "")
+            action = payload.get("action", "")
+            return f"Issue #{num} {action}: {title}".strip()
+        if event_type == "IssueCommentEvent" and "comment" in payload:
+            body = (payload.get("comment") or {}).get("body") or ""
+            preview = body.replace("\n", " ")[:200]
+            return f"Comment: {preview}" + ("…" if len(body) > 200 else "")
+        if event_type == "PullRequestEvent" and "pull_request" in payload:
+            pr = payload["pull_request"]
+            num = pr.get("number")
+            title = pr.get("title", "")
+            action = payload.get("action", "")
+            return f"Pull request #{num} {action}: {title}".strip()
+        if event_type == "PushEvent":
+            ref = payload.get("ref", "")
+            commits = payload.get("commits") or []
+            return f"Push to {ref} ({len(commits)} commit(s))"
+        if event_type == "CreateEvent":
+            return f"Created {payload.get('ref_type', '')} {payload.get('ref', '')}"
+        if event_type == "DeleteEvent":
+            return f"Deleted {payload.get('ref_type', '')} {payload.get('ref', '')}"
     except Exception:
-        log.debug("Failed to fetch body from %s", url, exc_info=True)
-        return None
+        pass
+
+    # Fallback: compact JSON (truncated)
+    raw = json.dumps(payload, default=str)[:500]
+    return raw + ("…" if len(json.dumps(payload, default=str)) > 500 else "")
 
 
-# ---------------------------------------------------------------------------
-# Event formatting
-# ---------------------------------------------------------------------------
-
-
-def _make_session_key(notification: Any) -> SessionKey:
-    """Derive a filesystem-safe session key from a GitHub notification.
-
-    Format: ``github_{repo_id}_{subject_type}_{number}``
-
-    Falls back to the thread ID when the subject URL does not contain
-    a numeric issue/PR number.
-    """
-    repo_id = notification.repository.id
-    subject_type = notification.subject.type
-    subject_url = notification.subject.url or ""
-    number = _extract_subject_number(subject_url)
-    if number is None:
-        return SessionKey(
-            f"github_{repo_id}_{subject_type}_{notification.id}"
-        )
-    return SessionKey(f"github_{repo_id}_{subject_type}_{number}")
-
-
-def _format_event_content(
-    notification: Any,
-    comment_body: str | None,
+def _format_repo_event_content(
+    *,
+    full_name: str,
+    repo_id: int,
+    clone_url: str,
+    default_branch: str,
+    html_url: str,
+    event_type: str,
+    event_id: str,
+    actor_login: str,
+    created_at: str,
+    payload: dict[str, Any],
 ) -> str:
-    """Build a human-readable prompt from a GitHub notification."""
-    repo = notification.repository
-    repo_id = repo.id
-    full_name = repo.full_name
-    clone_url = getattr(repo, "clone_url", "")
-    default_branch = getattr(repo, "default_branch", "main")
-    html_url = getattr(repo, "html_url", "")
-    subject_type = notification.subject.type
-    subject_url = notification.subject.url or ""
-    number = _extract_subject_number(subject_url)
-    reason = notification.reason
-    thread_id = str(notification.id)
-
-    target_label = (
-        f"{subject_type} #{number}"
-        if number is not None
-        else f"{subject_type} (thread {thread_id})"
-    )
-
+    summary = _payload_summary(event_type, payload)
     lines = [
-        f"GitHub notification: you were {reason} on "
-        f"{target_label} in repository {full_name} "
-        f"(repo_id={repo_id}).",
+        f"GitHub repository activity ({event_type}) in {full_name} (repo_id={repo_id}).",
         "",
-        f"Thread ID: {thread_id}",
-        f"Reason: {reason}",
-        f"Target: {target_label}",
+        f"Event ID: {event_id}",
+        f"Actor: {actor_login}",
+        f"Time: {created_at}",
+        "",
+        "Details:",
+        summary,
+        "",
     ]
     if clone_url:
         lines.append(f"Clone URL: {clone_url}")
@@ -216,42 +172,55 @@ def _format_event_content(
         lines.append(f"Default branch: {default_branch}")
     if html_url:
         lines.append(f"Repository URL: {html_url}")
-    lines.append("")
-
-    if comment_body:
-        lines.append("Comment body:")
-        lines.append(comment_body)
-        lines.append("")
-
-    lines.append(
-        "Respond to the notification as appropriate, then mark the "
-        "notification as done using forge_mark_notification_done."
-    )
+    lines.extend([
+        "",
+        "Review and respond as appropriate for your project workflow.",
+    ])
     return "\n".join(lines)
 
 
-def _make_event(
-    notification: Any,
-    comment_body: str | None,
+def _make_incoming_event(
+    *,
+    repo: Any,
+    event_type: str,
+    event_id: str,
+    actor_login: str,
+    created_at: str,
+    payload: dict[str, Any],
 ) -> IncomingEvent:
-    """Convert a GitHub notification into an ``IncomingEvent``."""
-    repo = notification.repository
-    subject_url = notification.subject.url or ""
-    number = _extract_subject_number(subject_url)
+    repo_id = repo.id
+    full_name = repo.full_name
+    clone_url = getattr(repo, "clone_url", "") or ""
+    default_branch = getattr(repo, "default_branch", "main") or "main"
+    html_url = getattr(repo, "html_url", "") or ""
+
+    content = _format_repo_event_content(
+        full_name=full_name,
+        repo_id=repo_id,
+        clone_url=clone_url,
+        default_branch=default_branch,
+        html_url=html_url,
+        event_type=event_type,
+        event_id=event_id,
+        actor_login=actor_login,
+        created_at=created_at,
+        payload=payload,
+    )
+
     return IncomingEvent(
         source="github",
-        session_key=_make_session_key(notification),
-        content=_format_event_content(notification, comment_body),
+        session_key=_session_key_for_event(repo_id, event_type, event_id),
+        content=content,
         metadata={
-            "thread_id": str(notification.id),
-            "repo_full_name": repo.full_name,
-            "repo_id": repo.id,
-            "subject_type": notification.subject.type,
-            "subject_number": number,
-            "reason": notification.reason,
-            "clone_url": getattr(repo, "clone_url", ""),
-            "default_branch": getattr(repo, "default_branch", "main"),
-            "html_url": getattr(repo, "html_url", ""),
+            "event_id": event_id,
+            "event_type": event_type,
+            "repo_full_name": full_name,
+            "repo_id": repo_id,
+            "actor_login": actor_login,
+            "created_at": created_at,
+            "clone_url": clone_url,
+            "default_branch": default_branch,
+            "html_url": html_url,
         },
     )
 
@@ -262,7 +231,7 @@ def _make_event(
 
 
 class GitHubNotificationsSource(EventSource):
-    """Polls the GitHub Notifications API and emits events for new items."""
+    """Polls repository events (compatible with GitHub App installation tokens)."""
 
     Config = GitHubNotificationsSourceConfig
 
@@ -280,17 +249,9 @@ class GitHubNotificationsSource(EventSource):
             base_url=config.base_url,
             auth=self._pygithub_auth,
         )
-        self._seen: set[str] = set()
+        self._seen_event_ids: set[str] = set()
+        self._primed: bool = False
         self._stop_event: asyncio.Event | None = None
-
-    def _bearer_token(self) -> str:
-        assert _GHAuth is not None
-        auth = self._pygithub_auth
-        if isinstance(auth, _GHAuth.Token):
-            return auth.token
-        if isinstance(auth, _GHAuth.AppInstallationAuth):
-            return auth.token
-        raise TypeError(f"Unsupported PyGithub auth: {type(auth)!r}")
 
     @property
     def name(self) -> str:
@@ -302,21 +263,11 @@ class GitHubNotificationsSource(EventSource):
     ) -> None:
         self._stop_event = asyncio.Event()
 
-        user_info = await asyncio.to_thread(self._check_connection)
-        if user_info.get("name"):
-            log.info(
-                "GitHub source authenticated as %s (%s)",
-                user_info["login"], user_info["name"],
-            )
-        else:
-            log.info(
-                "GitHub source authenticated: %s",
-                user_info["login"],
-            )
+        await asyncio.to_thread(self._check_connection)
         log.info(
-            "Polling GitHub notifications every %ds (repo=%s)",
-            self._config.poll_interval,
+            "GitHub source ready (repo=%s); polling repository events every %ds",
             self._config.repository,
+            self._config.poll_interval,
         )
 
         while not self._stop_event.is_set():
@@ -338,132 +289,85 @@ class GitHubNotificationsSource(EventSource):
         if self._stop_event is not None:
             self._stop_event.set()
 
-    def _check_connection(self) -> dict[str, Any]:
-        """Verify credentials.
-
-        ``GET /user`` works for PATs but returns 403 for GitHub App
-        *installation* tokens ("Resource not accessible by integration").
-        For installation auth we instead confirm we can read the configured
-        repository (the same scope needed for notifications on that repo).
-        """
+    def _check_connection(self) -> None:
+        """Confirm we can read the configured repository (installation tokens)."""
         assert _GHAuth is not None
         auth = self._pygithub_auth
         if isinstance(auth, _GHAuth.Token):
-            user = self._gh.get_user()
-            return {
-                "login": user.login,
-                "name": user.name or "",
-                "html_url": user.html_url,
-            }
+            # PAT: optional sanity check on the same repo we will poll.
+            _ = self._gh.get_repo(self._config.repository)
+            log.info("GitHub source: PAT verified; repository %s is readable", self._config.repository)
+            return
         if isinstance(auth, _GHAuth.AppInstallationAuth):
             repo = self._gh.get_repo(self._config.repository)
-            return {
-                "login": (
-                    f"app installation — verified read access to {repo.full_name}"
-                ),
-                "name": "",
-                "html_url": "",
-            }
+            log.info(
+                "GitHub source: app installation verified read access to %s",
+                repo.full_name,
+            )
+            return
         raise TypeError(f"Unsupported PyGithub auth: {type(auth)!r}")
 
     async def _poll_once(
         self,
         on_event: Callable[[IncomingEvent], Awaitable[None]],
     ) -> None:
-        notifications = await asyncio.to_thread(self._get_notifications)
-        new_notifications = [
-            n for n in notifications if str(n.id) not in self._seen
-        ]
-        if new_notifications:
+        new_events = await asyncio.to_thread(self._fetch_new_events)
+        if new_events:
             log.info(
-                "Found %d new notification(s) out of %d unread",
-                len(new_notifications), len(notifications),
+                "Found %d new repository event(s)",
+                len(new_events),
             )
-        for notification in new_notifications:
-            self._seen.add(str(notification.id))
-            comment_body = await asyncio.to_thread(
-                self._fetch_comment_body, notification,
+        for ev in new_events:
+            await on_event(ev)
+
+    def _fetch_new_events(self) -> list[IncomingEvent]:
+        """Return new events since last poll (newest-first API order)."""
+        repo = self._gh.get_repo(self._config.repository)
+        # Up to 100 recent events (paginated list first slice).
+        paginated = repo.get_events()
+        try:
+            batch = list(paginated[:100])
+        except Exception:
+            batch = []
+            for i, ev in enumerate(paginated):
+                if i >= 100:
+                    break
+                batch.append(ev)
+
+        if not self._primed:
+            for ev in batch:
+                self._seen_event_ids.add(ev.id)
+            self._primed = True
+            log.info(
+                "GitHub source: primed with %d existing event id(s); "
+                "only newer activity will be delivered",
+                len(self._seen_event_ids),
             )
-            event = _make_event(notification, comment_body)
-            await on_event(event)
-
-    def _get_notifications(self) -> list[Any]:
-        """Fetch unread, participating notifications filtered by repository.
-
-        PATs use PyGithub's ``get_user().get_notifications()``. GitHub App
-        *installation* tokens cannot use ``GET /user``, so we call
-        ``GET /notifications`` over HTTP instead (same as the web UI; requires
-        the app to have **Notifications** permission).
-        """
-        assert _GHAuth is not None
-        if isinstance(self._pygithub_auth, _GHAuth.Token):
-            all_notifications = list(
-                self._gh.get_user().get_notifications(participating=True),
-            )
-            if self._config.repository:
-                return [
-                    n for n in all_notifications
-                    if n.repository.full_name == self._config.repository
-                ]
-            return all_notifications
-        if isinstance(self._pygithub_auth, _GHAuth.AppInstallationAuth):
-            return self._get_notifications_via_rest()
-        raise TypeError(f"Unsupported PyGithub auth: {type(self._pygithub_auth)!r}")
-
-    def _get_notifications_via_rest(self) -> list[Any]:
-        base = self._config.base_url.rstrip("/")
-        url = f"{base}/notifications"
-        response = httpx.get(
-            url,
-            params={"participating": "true"},
-            headers={
-                "Authorization": f"Bearer {self._bearer_token()}",
-                "Accept": "application/vnd.github+json",
-            },
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        raw = response.json()
-        if not isinstance(raw, list):
             return []
-        notifications = [
-            _notification_json_to_simple_namespace(item)
-            for item in raw
-            if isinstance(item, dict)
-        ]
-        if self._config.repository:
-            return [
-                n for n in notifications
-                if getattr(
-                    getattr(n, "repository", None),
-                    "full_name",
-                    "",
-                )
-                == self._config.repository
-            ]
-        return notifications
 
-    def _fetch_comment_body(self, notification: Any) -> str | None:
-        """Retrieve the body text associated with a notification.
+        incoming: list[IncomingEvent] = []
+        for raw in batch:
+            eid = raw.id
+            if eid in self._seen_event_ids:
+                continue
+            self._seen_event_ids.add(eid)
+            actor_login = raw.actor.login if raw.actor else "unknown"
+            created = raw.created_at.isoformat() if raw.created_at else ""
+            payload = raw.payload if isinstance(raw.payload, dict) else {}
+            incoming.append(
+                _make_incoming_event(
+                    repo=repo,
+                    event_type=raw.type or "UnknownEvent",
+                    event_id=eid,
+                    actor_login=actor_login,
+                    created_at=created,
+                    payload=payload,
+                ),
+            )
 
-        Tries ``latest_comment_url`` first, then falls back to
-        ``subject.url``.
-        """
-        latest_url = getattr(
-            notification.subject, "latest_comment_url", None,
-        )
-        if latest_url:
-            body = _fetch_body(latest_url, self._bearer_token())
-            if body:
-                return body
-
-        subject_url = getattr(notification.subject, "url", None)
-        if subject_url:
-            body = _fetch_body(subject_url, self._bearer_token())
-            if body:
-                return body
-
-        return None
+        # Process oldest-first so prompts follow chronological order.
+        incoming.sort(key=lambda e: e.metadata.get("created_at", ""))
+        return incoming
 
 
 __all__ = [
