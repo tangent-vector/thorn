@@ -11,6 +11,7 @@ import pytest
 
 from thorn.gateway._event import EventSource, IncomingEvent
 from thorn.runtime import SessionKey
+from thorn.tools._github_connection import GitHubPatAuth
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +276,6 @@ class TestGitHubNotificationsSourcePolling:
     async def test_polls_and_emits_events(self):
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._GHAuth") as mock_auth_mod,
             patch("thorn.gateway.sources._github._Github") as mock_gh_cls,
         ):
             mock_gh = MagicMock()
@@ -292,11 +292,11 @@ class TestGitHubNotificationsSourcePolling:
 
             from thorn.gateway.sources._github import (
                 GitHubNotificationsSource,
-                GitHubSourceConfig,
+                GitHubNotificationsSourceConfig,
             )
 
-            config = GitHubSourceConfig(
-                token="ghp_test",
+            config = GitHubNotificationsSourceConfig(
+                auth=GitHubPatAuth(token="ghp_test"),
                 repository="octocat/hello-world",
                 poll_interval=5,
             )
@@ -323,7 +323,6 @@ class TestGitHubNotificationsSourcePolling:
     async def test_deduplicates_notifications(self):
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._GHAuth"),
             patch("thorn.gateway.sources._github._Github") as mock_gh_cls,
         ):
             mock_gh = MagicMock()
@@ -340,11 +339,11 @@ class TestGitHubNotificationsSourcePolling:
 
             from thorn.gateway.sources._github import (
                 GitHubNotificationsSource,
-                GitHubSourceConfig,
+                GitHubNotificationsSourceConfig,
             )
 
-            config = GitHubSourceConfig(
-                token="ghp_test",
+            config = GitHubNotificationsSourceConfig(
+                auth=GitHubPatAuth(token="ghp_test"),
                 repository="octocat/hello-world",
                 poll_interval=5,
             )
@@ -368,7 +367,6 @@ class TestGitHubNotificationsSourcePolling:
         by notification ID, not by session key."""
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._GHAuth"),
             patch("thorn.gateway.sources._github._Github") as mock_gh_cls,
         ):
             mock_gh = MagicMock()
@@ -390,11 +388,11 @@ class TestGitHubNotificationsSourcePolling:
 
             from thorn.gateway.sources._github import (
                 GitHubNotificationsSource,
-                GitHubSourceConfig,
+                GitHubNotificationsSourceConfig,
             )
 
-            config = GitHubSourceConfig(
-                token="ghp_test",
+            config = GitHubNotificationsSourceConfig(
+                auth=GitHubPatAuth(token="ghp_test"),
                 repository="octocat/hello-world",
                 poll_interval=5,
             )
@@ -420,7 +418,6 @@ class TestGitHubNotificationsSourcePolling:
         """Notifications from other repos are filtered out."""
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._GHAuth"),
             patch("thorn.gateway.sources._github._Github") as mock_gh_cls,
         ):
             mock_gh = MagicMock()
@@ -444,11 +441,11 @@ class TestGitHubNotificationsSourcePolling:
 
             from thorn.gateway.sources._github import (
                 GitHubNotificationsSource,
-                GitHubSourceConfig,
+                GitHubNotificationsSourceConfig,
             )
 
-            config = GitHubSourceConfig(
-                token="ghp_test",
+            config = GitHubNotificationsSourceConfig(
+                auth=GitHubPatAuth(token="ghp_test"),
                 repository="octocat/hello-world",
                 poll_interval=5,
             )
@@ -473,7 +470,6 @@ class TestGitHubNotificationsSourcePolling:
         notification and include the result in the event."""
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._GHAuth"),
             patch("thorn.gateway.sources._github._Github") as mock_gh_cls,
         ):
             mock_gh = MagicMock()
@@ -490,11 +486,11 @@ class TestGitHubNotificationsSourcePolling:
 
             from thorn.gateway.sources._github import (
                 GitHubNotificationsSource,
-                GitHubSourceConfig,
+                GitHubNotificationsSourceConfig,
             )
 
-            config = GitHubSourceConfig(
-                token="ghp_test",
+            config = GitHubNotificationsSourceConfig(
+                auth=GitHubPatAuth(token="ghp_test"),
                 repository="octocat/hello-world",
                 poll_interval=5,
             )
@@ -522,7 +518,6 @@ class TestGitHubNotificationsSourceFetchCommentBody:
     def test_prefers_latest_comment_url(self):
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._GHAuth"),
             patch("thorn.gateway.sources._github._Github") as mock_gh_cls,
             patch("thorn.gateway.sources._github._fetch_body") as mock_fetch,
         ):
@@ -530,11 +525,11 @@ class TestGitHubNotificationsSourceFetchCommentBody:
 
             from thorn.gateway.sources._github import (
                 GitHubNotificationsSource,
-                GitHubSourceConfig,
+                GitHubNotificationsSourceConfig,
             )
 
-            config = GitHubSourceConfig(
-                token="ghp_test",
+            config = GitHubNotificationsSourceConfig(
+                auth=GitHubPatAuth(token="ghp_test"),
                 repository="octocat/hello-world",
             )
             source = GitHubNotificationsSource(config)
@@ -557,7 +552,6 @@ class TestGitHubNotificationsSourceFetchCommentBody:
     def test_falls_back_to_subject_url(self):
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._GHAuth"),
             patch("thorn.gateway.sources._github._Github") as mock_gh_cls,
             patch("thorn.gateway.sources._github._fetch_body") as mock_fetch,
         ):
@@ -565,11 +559,11 @@ class TestGitHubNotificationsSourceFetchCommentBody:
 
             from thorn.gateway.sources._github import (
                 GitHubNotificationsSource,
-                GitHubSourceConfig,
+                GitHubNotificationsSourceConfig,
             )
 
-            config = GitHubSourceConfig(
-                token="ghp_test",
+            config = GitHubNotificationsSourceConfig(
+                auth=GitHubPatAuth(token="ghp_test"),
                 repository="octocat/hello-world",
             )
             source = GitHubNotificationsSource(config)
@@ -590,7 +584,6 @@ class TestGitHubNotificationsSourceFetchCommentBody:
     def test_returns_none_when_all_fail(self):
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._GHAuth"),
             patch("thorn.gateway.sources._github._Github") as mock_gh_cls,
             patch("thorn.gateway.sources._github._fetch_body") as mock_fetch,
         ):
@@ -598,11 +591,11 @@ class TestGitHubNotificationsSourceFetchCommentBody:
 
             from thorn.gateway.sources._github import (
                 GitHubNotificationsSource,
-                GitHubSourceConfig,
+                GitHubNotificationsSourceConfig,
             )
 
-            config = GitHubSourceConfig(
-                token="ghp_test",
+            config = GitHubNotificationsSourceConfig(
+                auth=GitHubPatAuth(token="ghp_test"),
                 repository="octocat/hello-world",
             )
             source = GitHubNotificationsSource(config)
@@ -616,18 +609,17 @@ class TestGitHubNotificationsSourceFetchCommentBody:
 
 
 # ---------------------------------------------------------------------------
-# GitHubSourceConfig
+# GitHubNotificationsSourceConfig
 # ---------------------------------------------------------------------------
 
 
-class TestGitHubSourceConfig:
+class TestGitHubNotificationsSourceConfig:
     def test_from_env(self, monkeypatch: pytest.MonkeyPatch):
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._GHAuth"),
             patch("thorn.gateway.sources._github._Github"),
         ):
-            from thorn.gateway.sources._github import GitHubSourceConfig
+            from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
 
             monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
             monkeypatch.setenv("GITHUB_URL", "https://gh.corp.example.com")
@@ -635,8 +627,9 @@ class TestGitHubSourceConfig:
             monkeypatch.setenv("THORN_GITHUB_APP_SLUG", "my-bot")
             monkeypatch.setenv("THORN_POLL_INTERVAL", "15")
 
-            config = GitHubSourceConfig.from_env()
-            assert config.token == "ghp_secret"
+            config = GitHubNotificationsSourceConfig.from_env()
+            assert config.auth.kind == "pat"
+            assert config.auth.token == "ghp_secret"
             assert config.base_url == "https://gh.corp.example.com"
             assert config.repository == "org/repo"
             assert config.app_slug == "my-bot"
@@ -645,10 +638,9 @@ class TestGitHubSourceConfig:
     def test_from_env_defaults(self, monkeypatch: pytest.MonkeyPatch):
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._GHAuth"),
             patch("thorn.gateway.sources._github._Github"),
         ):
-            from thorn.gateway.sources._github import GitHubSourceConfig
+            from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
 
             monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
             monkeypatch.setenv("THORN_GITHUB_REPOSITORY", "org/repo")
@@ -656,7 +648,7 @@ class TestGitHubSourceConfig:
             monkeypatch.delenv("THORN_GITHUB_APP_SLUG", raising=False)
             monkeypatch.delenv("THORN_POLL_INTERVAL", raising=False)
 
-            config = GitHubSourceConfig.from_env()
+            config = GitHubNotificationsSourceConfig.from_env()
             assert config.base_url == "https://api.github.com"
             assert config.app_slug == ""
             assert config.poll_interval == 30
@@ -664,22 +656,22 @@ class TestGitHubSourceConfig:
     def test_from_env_missing_token_raises(
         self, monkeypatch: pytest.MonkeyPatch,
     ):
-        from thorn.gateway.sources._github import GitHubSourceConfig
+        from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
 
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         monkeypatch.setenv("THORN_GITHUB_REPOSITORY", "org/repo")
         with pytest.raises(ValueError, match="GITHUB_TOKEN"):
-            GitHubSourceConfig.from_env()
+            GitHubNotificationsSourceConfig.from_env()
 
     def test_from_env_missing_repository_raises(
         self, monkeypatch: pytest.MonkeyPatch,
     ):
-        from thorn.gateway.sources._github import GitHubSourceConfig
+        from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
 
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
         monkeypatch.delenv("THORN_GITHUB_REPOSITORY", raising=False)
         with pytest.raises(ValueError, match="THORN_GITHUB_REPOSITORY"):
-            GitHubSourceConfig.from_env()
+            GitHubNotificationsSourceConfig.from_env()
 
 
 # ---------------------------------------------------------------------------
@@ -697,10 +689,10 @@ class TestGitHubSourceRegistry:
     def test_github_source_has_config_attribute(self):
         from thorn.gateway.sources._github import (
             GitHubNotificationsSource,
-            GitHubSourceConfig,
+            GitHubNotificationsSourceConfig,
         )
 
-        assert GitHubNotificationsSource.Config is GitHubSourceConfig
+        assert GitHubNotificationsSource.Config is GitHubNotificationsSourceConfig
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +706,6 @@ class TestGitHubInstantiateSources:
     ):
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._GHAuth"),
             patch("thorn.gateway.sources._github._Github"),
         ):
             from thorn.gateway._config import (
@@ -733,7 +724,10 @@ class TestGitHubInstantiateSources:
                     name="test-gh",
                     type="github-events",
                     config={
-                        "token": "$GITHUB_TOKEN",
+                        "auth": {
+                            "kind": "pat",
+                            "token": "$GITHUB_TOKEN",
+                        },
                         "repository": "owner/repo",
                     },
                 ),

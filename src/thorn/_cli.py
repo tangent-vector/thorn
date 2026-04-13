@@ -632,7 +632,8 @@ def _serve_gateway(
 
 _FORGE_ENV_DEFAULTS: dict[str, tuple[str, str]] = {
     "gitlab": ("GITLAB_TOKEN", "GITLAB_URL"),
-    "github": ("GITHUB_TOKEN", "GITHUB_URL"),
+    # GitHub bootstrap uses GitHub App env vars; token-env is only for GitLab.
+    "github": ("GITHUB_APP_ID", "GITHUB_URL"),
 }
 
 
@@ -675,10 +676,15 @@ def serve_bootstrap(
     from thorn.gateway._bootstrap import bootstrap_coordinator
 
     default_token, default_url = _FORGE_ENV_DEFAULTS[forge_type]
-    if token_env is None:
-        token_env = default_token
-    if url_env is None:
-        url_env = default_url
+    if forge_type == "gitlab":
+        if token_env is None:
+            token_env = default_token
+        if url_env is None:
+            url_env = default_url
+    else:
+        token_env = token_env or "GITHUB_APP_ID"
+        if url_env is None:
+            url_env = default_url
 
     resolved_native_id = native_project_id or ""
     if not resolved_native_id and project_id is not None:
@@ -700,11 +706,19 @@ def serve_bootstrap(
     console.print(f"  Identity: {runtime_root / '.thorn' / 'agents' / f'{aid}.json'}")
     console.print(f"  Gateway config: {runtime_root / '.thorn' / 'gateway.json'}")
     console.print(f"  Workspace: {runtime_root / '.thorn' / 'agents' / str(aid)}")
-    console.print(
-        "\nEnsure the required environment variables are set (e.g. from a "
-        f".env file or your host environment, such as {url_env} and {token_env}) "
-        "before running 'thorn serve'."
-    )
+    if forge_type == "github":
+        console.print(
+            "\nSet GitHub App credentials before running 'thorn serve': "
+            "GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, and "
+            "GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH "
+            f"(optional: {url_env}).",
+        )
+    else:
+        console.print(
+            "\nEnsure the required environment variables are set (e.g. from a "
+            f".env file or your host environment, such as {url_env} and {token_env}) "
+            "before running 'thorn serve'."
+        )
 
 
 @serve.command("mcp")

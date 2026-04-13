@@ -11,7 +11,7 @@ from __future__ import annotations
 from thorn.gateway._event import EventSource
 from thorn.gateway.sources._github import (
     GitHubNotificationsSource,
-    GitHubSourceConfig,
+    GitHubNotificationsSourceConfig,
 )
 from thorn.gateway.sources._gitlab import GitLabSourceConfig, GitLabTODOsSource
 
@@ -52,7 +52,7 @@ register_source("gitlab", GitLabTODOsSource)
 
 __all__ = [
     "GitHubNotificationsSource",
-    "GitHubSourceConfig",
+    "GitHubNotificationsSourceConfig",
     "GitLabSourceConfig",
     "GitLabTODOsSource",
     "get_registered_source",

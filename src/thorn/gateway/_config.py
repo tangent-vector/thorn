@@ -40,6 +40,22 @@ Example ``gateway.json``::
         }
       ]
     }
+
+A ``github`` forge service uses :class:`~thorn.tools._github_connection.GitHubConnectionConfig` — for example a GitHub App installation::
+
+    {
+      "name": "my-gh",
+      "type": "github",
+      "config": {
+        "base_url": "$GITHUB_URL",
+        "auth": {
+          "kind": "app",
+          "app_id": "$GITHUB_APP_ID",
+          "installation_id": "$GITHUB_APP_INSTALLATION_ID",
+          "private_key_pem": "$GITHUB_APP_PRIVATE_KEY"
+        }
+      }
+    }
 """
 
 from __future__ import annotations
@@ -144,32 +160,41 @@ def _ensure_builtin_types() -> None:
 
     from thorn.gateway.sources._github import GitHubNotificationsSource
     from thorn.gateway.sources._gitlab import GitLabTODOsSource
+    from thorn.tools._github_connection import GitHubConnectionConfig
     from thorn.tools.forge import (
-        ForgeService,
-        ForgeServiceConfig,
+        GitHubForgeService,
+        GitLabForgeService,
+        GitLabForgeServiceConfig,
         ProjectService,
         ProjectServiceConfig,
     )
 
-    def _make_forge(
+    def _make_gitlab_forge(
         spec_config: dict[str, Any],
         *,
         service_name: str,
-        forge_type: str,
-    ) -> ForgeService:
-        cfg = ForgeServiceConfig(**spec_config)
-        return ForgeService(cfg, service_name=service_name, forge_type=forge_type)
+    ) -> GitLabForgeService:
+        cfg = GitLabForgeServiceConfig(**spec_config)
+        return GitLabForgeService(cfg, service_name=service_name)
+
+    def _make_github_forge(
+        spec_config: dict[str, Any],
+        *,
+        service_name: str,
+    ) -> GitHubForgeService:
+        cfg = GitHubConnectionConfig(**spec_config)
+        return GitHubForgeService(cfg, service_name=service_name)
 
     _register_service_type(
         "gitlab",
-        lambda config, service_name: _make_forge(
-            config, service_name=service_name, forge_type="gitlab",
+        lambda config, service_name: _make_gitlab_forge(
+            config, service_name=service_name,
         ),
     )
     _register_service_type(
         "github",
-        lambda config, service_name: _make_forge(
-            config, service_name=service_name, forge_type="github",
+        lambda config, service_name: _make_github_forge(
+            config, service_name=service_name,
         ),
     )
 

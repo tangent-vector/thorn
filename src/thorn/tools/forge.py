@@ -15,7 +15,7 @@ Architecture:
         GitLabForgeClient  (wraps thorn.tools.gitlab.GitLabClient)
         GitHubForgeClient  (wraps thorn.tools.github.GitHubClient)
 
-    ForgeService (Service)  -- represents a forge host (URL + creds)
+    ForgeHostService (Service)  -- GitLabForgeService or GitHubForgeService
     ProjectService (Service)  -- represents a project on a forge
 """
 
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Literal, Protocol
 
 from pydantic import BaseModel, Field
@@ -30,6 +31,7 @@ from pydantic import BaseModel, Field
 from thorn.core._context import get_context
 from thorn.core._func import tool
 from thorn.core._service import Service
+from thorn.tools._github_connection import GitHubConnectionConfig
 
 log = logging.getLogger(__name__)
 
@@ -401,36 +403,38 @@ class GitHubForgeClient:
 
 
 # ---------------------------------------------------------------------------
-# ForgeService
+# Forge host services (GitLab vs GitHub)
 # ---------------------------------------------------------------------------
 
 
-class ForgeServiceConfig(BaseModel):
-    """Configuration for a forge service (GitLab or GitHub host)."""
+class GitLabForgeServiceConfig(BaseModel):
+    """Configuration for a ``gitlab`` forge service."""
 
-    url: str = Field(description="API base URL for the forge instance")
-    token: str = Field(description="Access token with API scope")
+    url: str = Field(description="GitLab API base URL")
+    token: str = Field(description="Personal access token with API scope")
 
 
-class ForgeService(Service):
-    """A named connection to a forge host (GitLab or GitHub).
+class ForgeHostService(Service, ABC):
+    """API client plus credentials for HTTPS git against this forge host."""
 
-    Owns a ``ForgeClient`` that provides the unified API for all
-    operations against this forge instance.
-    """
+    @property
+    @abstractmethod
+    def client(self) -> ForgeClient:
+        """Forge-neutral client for issues, MRs/PRs, etc."""
 
-    Config: ClassVar[type[BaseModel]] = ForgeServiceConfig
+    @abstractmethod
+    def git_https_password(self) -> str:
+        """Password (or token) for embedding in HTTPS git URLs."""
 
-    def __init__(
-        self,
-        config: ForgeServiceConfig,
-        *,
-        service_name: str,
-        forge_type: str,
-    ) -> None:
+
+class GitLabForgeService(ForgeHostService):
+    """Connection to a GitLab instance."""
+
+    Config: ClassVar[type[BaseModel]] = GitLabForgeServiceConfig
+
+    def __init__(self, config: GitLabForgeServiceConfig, *, service_name: str) -> None:
         self._config = config
         self._service_name = service_name
-        self._forge_type = forge_type
         self._client: ForgeClient | None = None
 
     @property
@@ -438,36 +442,48 @@ class ForgeService(Service):
         return self._service_name
 
     @property
-    def forge_type(self) -> str:
-        return self._forge_type
-
-    @property
     def client(self) -> ForgeClient:
-        """Lazily-constructed ``ForgeClient`` for this forge."""
         if self._client is None:
-            self._client = self._build_client()
-        return self._client
-
-    def _build_client(self) -> ForgeClient:
-        if self._forge_type == "gitlab":
             from thorn.tools.gitlab import GitLabClient, GitLabConfig
 
             gl_config = GitLabConfig(
                 url=self._config.url, token=self._config.token,
             )
-            return GitLabForgeClient(GitLabClient(gl_config))
-        elif self._forge_type == "github":
-            from thorn.tools.github import GitHubClient, GitHubConfig
+            self._client = GitLabForgeClient(GitLabClient(gl_config))
+        return self._client
 
-            gh_config = GitHubConfig(
-                base_url=self._config.url, token=self._config.token,
-            )
-            return GitHubForgeClient(GitHubClient(gh_config))
-        else:
-            raise ValueError(
-                f"Unknown forge type: {self._forge_type!r}. "
-                f"Expected 'gitlab' or 'github'."
-            )
+    def git_https_password(self) -> str:
+        return self._config.token
+
+
+class GitHubForgeService(ForgeHostService):
+    """Connection to GitHub or GitHub Enterprise (PAT or GitHub App)."""
+
+    Config: ClassVar[type[BaseModel]] = GitHubConnectionConfig
+
+    def __init__(self, config: GitHubConnectionConfig, *, service_name: str) -> None:
+        self._config = config
+        self._service_name = service_name
+        self._forge_client: ForgeClient | None = None
+        self._github_client: Any = None
+
+    @property
+    def name(self) -> str:
+        return self._service_name
+
+    @property
+    def client(self) -> ForgeClient:
+        if self._forge_client is None:
+            from thorn.tools.github import GitHubClient
+
+            self._github_client = GitHubClient(self._config)
+            self._forge_client = GitHubForgeClient(self._github_client)
+        return self._forge_client
+
+    def git_https_password(self) -> str:
+        _ = self.client
+        assert self._github_client is not None
+        return self._github_client.bearer_token_for_http()
 
 
 # ---------------------------------------------------------------------------
@@ -551,11 +567,11 @@ class ProjectService(Service):
         Returns ``(client, native_id)`` so callers can make API calls
         using the forge-native project identifier.
         """
-        forge_service: ForgeService = runtime.get_service(self.forge_name)
-        if not isinstance(forge_service, ForgeService):
+        forge_service: ForgeHostService = runtime.get_service(self.forge_name)
+        if not isinstance(forge_service, ForgeHostService):
             raise TypeError(
                 f"Service {self.forge_name!r} is a "
-                f"{type(forge_service).__name__}, not a ForgeService"
+                f"{type(forge_service).__name__}, not a ForgeHostService"
             )
         return forge_service.client, self.native_id
 
@@ -832,10 +848,12 @@ __all__ = [
     "CommentTargetKind",
     "FORGE_TOOLS",
     "ForgeClient",
-    "ForgeService",
-    "ForgeServiceConfig",
+    "ForgeHostService",
+    "GitHubForgeService",
+    "GitLabForgeService",
     "GitHubForgeClient",
     "GitLabForgeClient",
+    "GitLabForgeServiceConfig",
     "ProjectService",
     "ProjectServiceConfig",
     "forge_create_change_request",

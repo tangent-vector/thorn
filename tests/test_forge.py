@@ -1,7 +1,7 @@
 """Tests for the unified forge abstraction layer (thorn.tools.forge).
 
-Covers the ForgeClient adapters, ForgeService/ProjectService service
-types, the FORGE_TOOLS toolset, and the runtime integration.
+Covers the ForgeClient adapters, forge host services, ProjectService,
+the FORGE_TOOLS toolset, and the runtime integration.
 """
 
 from __future__ import annotations
@@ -14,13 +14,15 @@ import pytest
 
 from thorn.core._provider import MockProvider
 from thorn.runtime import Runtime
+from thorn.tools._github_connection import GitHubConnectionConfig, GitHubPatAuth
 from thorn.tools.forge import (
     FORGE_TOOLS,
     CommentTargetKind,
-    ForgeService,
-    ForgeServiceConfig,
     GitHubForgeClient,
+    GitHubForgeService,
     GitLabForgeClient,
+    GitLabForgeService,
+    GitLabForgeServiceConfig,
     ProjectService,
     ProjectServiceConfig,
     get_forge_for_project,
@@ -279,26 +281,15 @@ class TestGitHubForgeClient:
 
 
 # ---------------------------------------------------------------------------
-# ForgeService
+# Forge host services
 # ---------------------------------------------------------------------------
 
 
-class TestForgeService:
-    def test_name_and_type(self):
-        config = ForgeServiceConfig(url="https://gl.example.com", token="t")
-        svc = ForgeService(
-            config, service_name="my-gitlab", forge_type="gitlab",
-        )
+class TestGitLabForgeService:
+    def test_name(self):
+        config = GitLabForgeServiceConfig(url="https://gl.example.com", token="t")
+        svc = GitLabForgeService(config, service_name="my-gitlab")
         assert svc.name == "my-gitlab"
-        assert svc.forge_type == "gitlab"
-
-    def test_unknown_forge_type_raises(self):
-        config = ForgeServiceConfig(url="https://example.com", token="t")
-        svc = ForgeService(
-            config, service_name="bad", forge_type="mercurial",
-        )
-        with pytest.raises(ValueError, match="mercurial"):
-            _ = svc.client
 
 
 # ---------------------------------------------------------------------------
@@ -325,11 +316,11 @@ class TestProjectService:
 
     def test_get_forge_client_resolves_via_runtime(self, tmp_path: Path):
         mock_forge_client = MagicMock()
-        forge_config = ForgeServiceConfig(
+        forge_config = GitLabForgeServiceConfig(
             url="https://gl.example.com", token="t",
         )
-        forge_svc = ForgeService(
-            forge_config, service_name="gl", forge_type="gitlab",
+        forge_svc = GitLabForgeService(
+            forge_config, service_name="gl",
         )
         forge_svc._client = mock_forge_client
 
@@ -357,11 +348,11 @@ class TestProjectService:
 class TestGetForgeForProject:
     def test_resolves_project_and_forge(self, tmp_path: Path):
         mock_forge_client = MagicMock()
-        forge_config = ForgeServiceConfig(
+        forge_config = GitLabForgeServiceConfig(
             url="https://gl.example.com", token="t",
         )
-        forge_svc = ForgeService(
-            forge_config, service_name="gl", forge_type="gitlab",
+        forge_svc = GitLabForgeService(
+            forge_config, service_name="gl",
         )
         forge_svc._client = mock_forge_client
 
@@ -416,12 +407,13 @@ class TestGetForgeForProject:
 class TestRuntimeGetForgeForProject:
     def test_delegates_to_module_function(self, tmp_path: Path):
         mock_client = MagicMock()
-        forge_svc = ForgeService(
-            ForgeServiceConfig(url="https://example.com", token="t"),
+        forge_svc = GitHubForgeService(
+            GitHubConnectionConfig(
+                auth=GitHubPatAuth(token="ghp_x"),
+            ),
             service_name="gh",
-            forge_type="github",
         )
-        forge_svc._client = mock_client
+        forge_svc._forge_client = mock_client
 
         proj_svc = ProjectService(
             ProjectServiceConfig(forge="gh", native_id="org/repo"),
@@ -477,10 +469,9 @@ class TestForgeToolsIntegration:
     ) -> tuple[Runtime, MagicMock]:
         mock_forge_client = MagicMock()
 
-        forge_svc = ForgeService(
-            ForgeServiceConfig(url="https://gl.example.com", token="t"),
+        forge_svc = GitLabForgeService(
+            GitLabForgeServiceConfig(url="https://gl.example.com", token="t"),
             service_name="gl",
-            forge_type="gitlab",
         )
         forge_svc._client = mock_forge_client
 

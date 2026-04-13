@@ -16,10 +16,12 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from thorn.gateway._event import EventSource, IncomingEvent
 from thorn.runtime._session import SessionKey
+from thorn.tools._github_connection import GitHubConnectionConfig
+from thorn.tools.github import build_pygithub_auth
 
 log = logging.getLogger(__name__)
 
@@ -50,24 +52,10 @@ def _require_github() -> None:
 # Configuration
 # ---------------------------------------------------------------------------
 
-_DEFAULT_BASE_URL = "https://api.github.com"
 
+class GitHubNotificationsSourceConfig(GitHubConnectionConfig):
+    """GitHub API auth plus notifications poller settings."""
 
-class GitHubSourceConfig(BaseModel):
-    """Configuration for the GitHub Notifications event source.
-
-    Typically loaded from ``gateway.json`` via
-    :func:`~thorn.gateway._config.instantiate_sources`, or from
-    environment variables via :meth:`from_env`.
-    """
-
-    token: str = Field(
-        description="Personal Access Token with 'notifications' and 'repo' scopes",
-    )
-    base_url: str = Field(
-        default=_DEFAULT_BASE_URL,
-        description="GitHub API base URL (override for GitHub Enterprise)",
-    )
     repository: str = Field(
         description="Repository in owner/repo format to filter notifications",
     )
@@ -85,37 +73,19 @@ class GitHubSourceConfig(BaseModel):
     )
 
     @classmethod
-    def from_env(cls) -> GitHubSourceConfig:
-        """Load configuration from environment variables.
-
-        - ``GITHUB_TOKEN`` -- Personal Access Token (required)
-        - ``GITHUB_URL`` -- API base URL (default ``https://api.github.com``)
-        - ``THORN_GITHUB_REPOSITORY`` -- repository in ``owner/repo``
-          format (required)
-        - ``THORN_GITHUB_APP_SLUG`` -- GitHub App slug (default empty)
-        - ``THORN_POLL_INTERVAL`` -- seconds between polls (default ``30``)
-        """
-        token = os.environ.get("GITHUB_TOKEN")
+    def from_env(cls) -> GitHubNotificationsSourceConfig:
+        """Load from environment (same auth rules as :meth:`GitHubConnectionConfig.from_env`)."""
+        conn = GitHubConnectionConfig.from_env()
         repository = os.environ.get("THORN_GITHUB_REPOSITORY")
-        missing = [
-            name
-            for name, val in [
-                ("GITHUB_TOKEN", token),
-                ("THORN_GITHUB_REPOSITORY", repository),
-            ]
-            if not val
-        ]
-        if missing:
+        if not repository:
             raise ValueError(
-                f"Missing required environment variable(s): "
-                f"{', '.join(missing)}. "
-                "Set GITHUB_TOKEN and THORN_GITHUB_REPOSITORY "
-                "to use the GitHub event source."
+                "THORN_GITHUB_REPOSITORY is required for the GitHub event source "
+                "(repository in owner/repo format).",
             )
         return cls(
-            token=token,  # type: ignore[arg-type]
-            base_url=os.environ.get("GITHUB_URL", _DEFAULT_BASE_URL),
-            repository=repository,  # type: ignore[arg-type]
+            base_url=conn.base_url,
+            auth=conn.auth,
+            repository=repository,
             app_slug=os.environ.get("THORN_GITHUB_APP_SLUG", ""),
             poll_interval=int(os.environ.get("THORN_POLL_INTERVAL", "30")),
         )
@@ -139,7 +109,7 @@ def _extract_subject_number(subject_url: str) -> int | None:
     return None
 
 
-def _fetch_body(url: str, token: str) -> str | None:
+def _fetch_body(url: str, bearer_token: str) -> str | None:
     """Fetch the ``body`` field from a GitHub API URL.
 
     Used to retrieve comment or issue/PR bodies from
@@ -150,7 +120,7 @@ def _fetch_body(url: str, token: str) -> str | None:
         response = httpx.get(
             url,
             headers={
-                "Authorization": f"Bearer {token}",
+                "Authorization": f"Bearer {bearer_token}",
                 "Accept": "application/vnd.github+json",
             },
             timeout=15.0,
@@ -273,18 +243,33 @@ def _make_event(
 class GitHubNotificationsSource(EventSource):
     """Polls the GitHub Notifications API and emits events for new items."""
 
-    Config = GitHubSourceConfig
+    Config = GitHubNotificationsSourceConfig
 
-    def __init__(self, config: GitHubSourceConfig, *, service_name: str = "") -> None:
+    def __init__(
+        self,
+        config: GitHubNotificationsSourceConfig,
+        *,
+        service_name: str = "",
+    ) -> None:
         _require_github()
         self._config = config
         self._service_name = service_name
+        self._pygithub_auth = build_pygithub_auth(config.auth)
         self._gh = _Github(  # type: ignore[misc]
             base_url=config.base_url,
-            auth=_GHAuth.Token(config.token),  # type: ignore[union-attr]
+            auth=self._pygithub_auth,
         )
         self._seen: set[str] = set()
         self._stop_event: asyncio.Event | None = None
+
+    def _bearer_token(self) -> str:
+        assert _GHAuth is not None
+        auth = self._pygithub_auth
+        if isinstance(auth, _GHAuth.Token):
+            return auth.token
+        if isinstance(auth, _GHAuth.AppInstallationAuth):
+            return auth.token
+        raise TypeError(f"Unsupported PyGithub auth: {type(auth)!r}")
 
     @property
     def name(self) -> str:
@@ -377,13 +362,13 @@ class GitHubNotificationsSource(EventSource):
             notification.subject, "latest_comment_url", None,
         )
         if latest_url:
-            body = _fetch_body(latest_url, self._config.token)
+            body = _fetch_body(latest_url, self._bearer_token())
             if body:
                 return body
 
         subject_url = getattr(notification.subject, "url", None)
         if subject_url:
-            body = _fetch_body(subject_url, self._config.token)
+            body = _fetch_body(subject_url, self._bearer_token())
             if body:
                 return body
 
@@ -391,6 +376,6 @@ class GitHubNotificationsSource(EventSource):
 
 
 __all__ = [
-    "GitHubSourceConfig",
+    "GitHubNotificationsSourceConfig",
     "GitHubNotificationsSource",
 ]

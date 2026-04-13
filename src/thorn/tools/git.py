@@ -71,39 +71,20 @@ async def _run_git(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_env_reference(value: str) -> str:
-    """Resolve a value that may reference an environment variable.
-
-    If *value* starts with ``$``, the remainder is treated as an
-    environment variable name whose value is returned.  Otherwise
-    *value* is returned as-is.
-
-    Raises ``ValueError`` if the referenced variable is not set.
-    """
-    if value.startswith("$"):
-        env_name = value[1:]
-        result = os.environ.get(env_name)
-        if result is None:
-            raise ValueError(
-                f"Environment variable {env_name!r} is not set "
-                f"(referenced by agent metadata)"
-            )
-        return result
-    return value
-
-
 def _inject_url_credentials(url: str) -> str:
     """Rewrite a git HTTPS URL to embed credentials from the current agent.
 
-    Looks up ``access_token`` in the agent's ``metadata`` (via the
-    ambient ``ExecutionContext``).  If the token value starts with
-    ``$``, it is resolved as an environment variable reference.
-
-    The URL is rewritten to ``https://oauth2:{token}@host/path`` so
-    that git operations authenticate transparently.  Non-HTTPS URLs
-    and agents without an ``access_token`` are returned unchanged.
+    Uses ``metadata.project`` (project service name) to find the forge
+    service on the ambient :class:`~thorn.runtime.Runtime`, then embeds
+    the current HTTPS password or token.  GitHub uses the
+    ``x-access-token`` username; GitLab uses ``oauth2``.
     """
     from thorn.core._context import get_context
+    from thorn.tools.forge import (
+        ForgeHostService,
+        GitHubForgeService,
+        ProjectService,
+    )
 
     try:
         ctx = get_context()
@@ -111,21 +92,38 @@ def _inject_url_credentials(url: str) -> str:
         return url
 
     agent = ctx.agent
-    if agent is None:
+    if agent is None or ctx.runtime is None:
         return url
 
-    token_ref = agent.metadata.get("access_token")
-    if not token_ref:
+    project_name = agent.metadata.get("project")
+    if not project_name:
         return url
 
-    token = _resolve_env_reference(token_ref)
+    try:
+        project_svc = ctx.runtime.get_service(project_name)
+    except KeyError:
+        return url
+
+    if not isinstance(project_svc, ProjectService):
+        return url
+
+    try:
+        forge_svc = ctx.runtime.get_service(project_svc.forge_name)
+    except KeyError:
+        return url
+
+    if not isinstance(forge_svc, ForgeHostService):
+        return url
+
+    token = forge_svc.git_https_password()
 
     if url.startswith("https://"):
         parsed = urlparse(url)
         host = parsed.hostname or ""
         port_suffix = f":{parsed.port}" if parsed.port else ""
+        user = "x-access-token" if isinstance(forge_svc, GitHubForgeService) else "oauth2"
         rewritten = parsed._replace(
-            netloc=f"oauth2:{token}@{host}{port_suffix}",
+            netloc=f"{user}:{token}@{host}{port_suffix}",
         )
         return urlunparse(rewritten)
 

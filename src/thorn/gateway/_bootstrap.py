@@ -27,7 +27,6 @@ Usage from code::
         clone_url="https://github.com/owner/repo.git",
         native_project_id="owner/repo",
         forge_type="github",
-        access_token_env="GITHUB_TOKEN",
         forge_url_env="GITHUB_URL",
     )
 """
@@ -98,8 +97,13 @@ def _build_event_source_entry(
     source_name = f"{project_name}-events"
 
     if forge_type == "github":
-        config: dict[str, Any] = {
-            "token": f"${access_token_env}",
+        config = {
+            "auth": {
+                "kind": "app",
+                "app_id": "$GITHUB_APP_ID",
+                "installation_id": "$GITHUB_APP_INSTALLATION_ID",
+                "private_key_pem": "$GITHUB_APP_PRIVATE_KEY",
+            },
             "repository": native_project_id,
         }
         if forge_url_env:
@@ -148,9 +152,9 @@ def bootstrap_coordinator(
     The gateway config includes a forge service, a project service,
     and an event source so the gateway can start polling immediately.
 
-    The agent identity includes an ``access_token`` metadata entry
-    referencing the same env var as the forge, so the coordinator's
-    git tools can authenticate clone/push operations.
+    The agent identity includes a ``project`` metadata entry (project
+    service name) so git tools can resolve HTTPS credentials from the
+    registered forge service.
 
     Returns the ``AgentID`` of the created agent.
     """
@@ -175,7 +179,6 @@ def bootstrap_coordinator(
         "name": agent_id,
         "metadata": {
             "project": project_name,
-            "access_token": f"${access_token_env}",
         },
     }
 
@@ -211,14 +214,31 @@ def bootstrap_coordinator(
 
     # -- Gateway service configuration ---------------------------------------
 
-    forge_entry = {
-        "name": forge_service_name,
-        "type": forge_type,
-        "config": {
-            "url": f"${forge_url_env}",
-            "token": f"${access_token_env}",
-        },
-    }
+    if forge_type == "github":
+        gh_forge_config: dict[str, Any] = {
+            "auth": {
+                "kind": "app",
+                "app_id": "$GITHUB_APP_ID",
+                "installation_id": "$GITHUB_APP_INSTALLATION_ID",
+                "private_key_pem": "$GITHUB_APP_PRIVATE_KEY",
+            },
+        }
+        if forge_url_env:
+            gh_forge_config["base_url"] = f"${forge_url_env}"
+        forge_entry = {
+            "name": forge_service_name,
+            "type": "github",
+            "config": gh_forge_config,
+        }
+    else:
+        forge_entry = {
+            "name": forge_service_name,
+            "type": "gitlab",
+            "config": {
+                "url": f"${forge_url_env}",
+                "token": f"${access_token_env}",
+            },
+        }
 
     project_entry: dict[str, Any] = {
         "name": project_name,

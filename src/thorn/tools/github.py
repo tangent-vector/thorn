@@ -13,24 +13,26 @@ Usage::
 
     agent = Agent(..., tools=[github.GITHUB_TOOLS, ...])
 
-Configuration is loaded from environment variables:
-
-- ``GITHUB_TOKEN`` -- Personal Access Token or GitHub App token
-- ``GITHUB_URL``   -- API base URL (default ``https://api.github.com``;
-  override for GitHub Enterprise)
+Configuration is loaded from environment variables — either PAT mode
+(``GITHUB_TOKEN``) or GitHub App mode (``GITHUB_APP_ID``,
+``GITHUB_APP_INSTALLATION_ID``, and a private key). See
+:class:`~thorn.tools._github_connection.GitHubConnectionConfig`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel, Field
 
 from thorn.core._func import tool
+from thorn.tools._github_connection import (
+    GitHubAppAuth,
+    GitHubConnectionConfig,
+    GitHubPatAuth,
+)
 
 log = logging.getLogger(__name__)
 
@@ -58,43 +60,19 @@ def _require_github() -> None:
         )
 
 
+def build_pygithub_auth(auth: GitHubPatAuth | GitHubAppAuth) -> Any:
+    """Build a PyGithub ``Auth`` object (PAT or app installation)."""
+    _require_github()
+    assert _GHAuth is not None
+    if auth.kind == "pat":
+        return _GHAuth.Token(auth.token)
+    app = _GHAuth.AppAuth(auth.app_id, auth.private_key_pem)
+    return app.get_installation_auth(auth.installation_id)
+
+
 # ---------------------------------------------------------------------------
-# Configuration and client
+# Client
 # ---------------------------------------------------------------------------
-
-_DEFAULT_BASE_URL = "https://api.github.com"
-
-
-class GitHubConfig(BaseModel):
-    """Configuration for connecting to a GitHub instance.
-
-    Typically loaded from environment variables via
-    ``GitHubConfig.from_env()``.
-    """
-
-    base_url: str = Field(
-        default=_DEFAULT_BASE_URL,
-        description="GitHub API base URL (override for GitHub Enterprise)",
-    )
-    token: str = Field(description="Personal Access Token or GitHub App token")
-
-    @classmethod
-    def from_env(cls) -> GitHubConfig:
-        """Load configuration from environment variables.
-
-        - ``GITHUB_TOKEN`` (required)
-        - ``GITHUB_URL`` (optional; defaults to ``https://api.github.com``)
-
-        Raises ``ValueError`` if ``GITHUB_TOKEN`` is not set.
-        """
-        token = os.environ.get("GITHUB_TOKEN")
-        if not token:
-            raise ValueError(
-                "Missing required environment variable: GITHUB_TOKEN. "
-                "Set GITHUB_TOKEN to use GitHub tools."
-            )
-        base_url = os.environ.get("GITHUB_URL", _DEFAULT_BASE_URL)
-        return cls(base_url=base_url, token=token)
 
 
 class GitHubClient:
@@ -104,12 +82,28 @@ class GitHubClient:
     ``PyGithub`` objects directly.
     """
 
-    def __init__(self, config: GitHubConfig) -> None:
+    def __init__(self, config: GitHubConnectionConfig) -> None:
         _require_github()
-        auth = _GHAuth.Token(config.token)
-        self._gh = _Github(base_url=config.base_url, auth=auth)
+        assert _GHAuth is not None
+        assert _Github is not None
+        self._auth = build_pygithub_auth(config.auth)
+        self._gh = _Github(base_url=config.base_url, auth=self._auth)
         self._base_url = config.base_url
-        self._token = config.token
+        self._github_auth_module = _GHAuth
+
+    def bearer_token_for_http(self) -> str:
+        """Return the current bearer token for REST calls outside PyGithub.
+
+        For installation auth, PyGithub refreshes the installation token
+        as needed; this reads the latest value.
+        """
+        auth = self._auth
+        gh_auth = self._github_auth_module
+        if isinstance(auth, gh_auth.Token):
+            return auth.token
+        if isinstance(auth, gh_auth.AppInstallationAuth):
+            return auth.token
+        raise TypeError(f"Unsupported auth type: {type(auth)!r}")
 
     def check_connection(self) -> dict[str, Any]:
         """Authenticate and return info about the current user.
@@ -289,7 +283,7 @@ class GitHubClient:
         response = httpx.patch(
             f"{self._base_url}/notifications/threads/{thread_id}",
             headers={
-                "Authorization": f"Bearer {self._token}",
+                "Authorization": f"Bearer {self.bearer_token_for_http()}",
                 "Accept": "application/vnd.github+json",
             },
         )
@@ -311,7 +305,7 @@ def get_client() -> GitHubClient:
     """
     global _client
     if _client is None:
-        config = GitHubConfig.from_env()
+        config = GitHubConnectionConfig.from_env()
         _client = GitHubClient(config)
     return _client
 
@@ -558,8 +552,9 @@ GITHUB_TOOLS: list[object] = [
 """All GitHub tools as a list, suitable for use in ``tools=[GITHUB_TOOLS, ...]``."""
 
 __all__ = [
-    "GitHubConfig",
+    "GitHubConnectionConfig",
     "GitHubClient",
+    "build_pygithub_auth",
     "get_client",
     "set_client",
     "CommentableKind",

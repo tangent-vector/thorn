@@ -1020,7 +1020,7 @@ class TestProjectCoordinator:
         agent = ProjectCoordinator(
             id=AgentID("test-coordinator"),
             name="test",
-            metadata={"access_token": "$GL_TOKEN"},
+            metadata={"project": "my-proj"},
         )
         serializer = JsonSessionSerializer()
         path = tmp_path / "agent.json"
@@ -1029,7 +1029,7 @@ class TestProjectCoordinator:
 
         assert isinstance(loaded, ProjectCoordinator)
         assert loaded.id == AgentID("test-coordinator")
-        assert loaded.metadata["access_token"] == "$GL_TOKEN"
+        assert loaded.metadata["project"] == "my-proj"
 
 
 # ---------------------------------------------------------------------------
@@ -1453,7 +1453,7 @@ class TestInstantiateServices:
             ServiceSpec,
             instantiate_services,
         )
-        from thorn.tools.forge import ForgeService
+        from thorn.tools.forge import GitLabForgeService
 
         monkeypatch.setenv("GL_URL", "https://gitlab.example.com")
         monkeypatch.setenv("GL_TOKEN", "glpat-test")
@@ -1467,9 +1467,8 @@ class TestInstantiateServices:
         ])
         services = instantiate_services(config)
         assert len(services) == 1
-        assert isinstance(services[0], ForgeService)
+        assert isinstance(services[0], GitLabForgeService)
         assert services[0].name == "my-gl"
-        assert services[0].forge_type == "gitlab"
 
     def test_instantiates_project_service(self):
         from thorn.gateway._config import (
@@ -1510,7 +1509,7 @@ class TestInstantiateServices:
                 instantiate_services,
             )
             from thorn.gateway.sources._gitlab import GitLabTODOsSource
-            from thorn.tools.forge import ForgeService, ProjectService
+            from thorn.tools.forge import GitLabForgeService, ProjectService
 
             monkeypatch.setenv("GL_URL", "https://gl.example.com")
             monkeypatch.setenv("GL_TOKEN", "secret")
@@ -1534,7 +1533,7 @@ class TestInstantiateServices:
             ])
             services = instantiate_services(config)
             assert len(services) == 3
-            assert isinstance(services[0], ForgeService)
+            assert isinstance(services[0], GitLabForgeService)
             assert isinstance(services[1], ProjectService)
             assert isinstance(services[2], GitLabTODOsSource)
 
@@ -1566,7 +1565,7 @@ class TestBootstrapCoordinator:
         data = json.loads(identity.read_text(encoding="utf-8"))
         assert data["agent_class"] == "ProjectCoordinator"
         assert data["metadata"]["project"] == "my-project"
-        assert data["metadata"]["access_token"] == "$GITLAB_TOKEN"
+        assert "access_token" not in data["metadata"]
 
         memory = tmp_path / ".thorn" / "agents" / "test-coord" / "MEMORY.md"
         assert memory.is_file()
@@ -1734,7 +1733,6 @@ class TestBootstrapCoordinator:
             clone_url="https://github.com/owner/repo.git",
             native_project_id="owner/repo",
             forge_type="github",
-            access_token_env="GITHUB_TOKEN",
             forge_url_env="GITHUB_URL",
         )
 
@@ -1746,8 +1744,9 @@ class TestBootstrapCoordinator:
         assert "github-events" in types
 
         forge_svc = next(s for s in gw_data["services"] if s["type"] == "github")
-        assert forge_svc["config"]["url"] == "$GITHUB_URL"
-        assert forge_svc["config"]["token"] == "$GITHUB_TOKEN"
+        assert forge_svc["config"]["base_url"] == "$GITHUB_URL"
+        assert forge_svc["config"]["auth"]["kind"] == "app"
+        assert forge_svc["config"]["auth"]["app_id"] == "$GITHUB_APP_ID"
 
         proj_svc = next(s for s in gw_data["services"] if s["type"] == "project")
         assert proj_svc["config"]["native_id"] == "owner/repo"
@@ -1755,13 +1754,14 @@ class TestBootstrapCoordinator:
 
         events_svc = next(s for s in gw_data["services"] if s["type"] == "github-events")
         assert events_svc["name"] == "my-repo-events"
-        assert events_svc["config"]["token"] == "$GITHUB_TOKEN"
+        assert events_svc["config"]["auth"]["kind"] == "app"
         assert events_svc["config"]["repository"] == "owner/repo"
         assert events_svc["config"]["base_url"] == "$GITHUB_URL"
 
         identity = tmp_path / ".thorn" / "agents" / "gh-coord.json"
         data = json.loads(identity.read_text(encoding="utf-8"))
-        assert data["metadata"]["access_token"] == "$GITHUB_TOKEN"
+        assert data["metadata"]["project"] == "my-repo"
+        assert "access_token" not in data["metadata"]
 
     def test_github_bootstrap_without_custom_url(self, tmp_path: Path):
         """When forge_url_env is empty, the github-events config omits
@@ -1776,7 +1776,6 @@ class TestBootstrapCoordinator:
             clone_url="https://github.com/owner/repo.git",
             native_project_id="owner/repo",
             forge_type="github",
-            access_token_env="GITHUB_TOKEN",
             forge_url_env="",
         )
 
@@ -1810,8 +1809,7 @@ class TestBootstrapCoordinator:
         assert "github-events" in types
 
         forge_svc = next(s for s in gw_data["services"] if s["type"] == "github")
-        assert forge_svc["config"]["token"] == "$GITHUB_TOKEN"
-        assert forge_svc["config"]["url"] == "$GITHUB_URL"
+        assert forge_svc["config"]["auth"]["kind"] == "app"
 
     def test_cli_bootstrap_defaults_to_gitlab(self, tmp_path: Path):
         """Without --forge-type, the CLI defaults to gitlab env vars."""

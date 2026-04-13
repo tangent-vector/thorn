@@ -11,10 +11,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from thorn.tools._github_connection import GitHubConnectionConfig, GitHubPatAuth
 from thorn.tools.github import (
     GITHUB_TOOLS,
     GitHubClient,
-    GitHubConfig,
     github_create_pull_request,
     github_get_pull_request,
     github_get_repo_info,
@@ -29,29 +29,30 @@ from thorn.tools.github import (
 
 
 # ---------------------------------------------------------------------------
-# GitHubConfig
+# GitHubConnectionConfig
 # ---------------------------------------------------------------------------
 
 
-class TestGitHubConfig:
+class TestGitHubConnectionConfig:
     def test_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
         monkeypatch.delenv("GITHUB_URL", raising=False)
-        config = GitHubConfig.from_env()
-        assert config.token == "ghp_secret"
+        config = GitHubConnectionConfig.from_env()
+        assert config.auth.kind == "pat"
+        assert config.auth.token == "ghp_secret"
         assert config.base_url == "https://api.github.com"
 
     def test_from_env_custom_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
         monkeypatch.setenv("GITHUB_URL", "https://github.example.com/api/v3")
-        config = GitHubConfig.from_env()
+        config = GitHubConnectionConfig.from_env()
         assert config.base_url == "https://github.example.com/api/v3"
 
     def test_from_env_missing_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         monkeypatch.delenv("GITHUB_URL", raising=False)
         with pytest.raises(ValueError, match="GITHUB_TOKEN"):
-            GitHubConfig.from_env()
+            GitHubConnectionConfig.from_env()
 
 
 # ---------------------------------------------------------------------------
@@ -152,15 +153,14 @@ def mock_client() -> GitHubClient:
     """
     with (
         patch("thorn.tools.github._Github") as mock_gh_cls,
-        patch("thorn.tools.github._GHAuth") as mock_auth_mod,
         patch("thorn.tools.github._HAS_GITHUB", True),
     ):
         mock_gh_instance = MagicMock()
         mock_gh_cls.return_value = mock_gh_instance
-        mock_auth_mod.Token.return_value = MagicMock()
 
-        config = GitHubConfig(
-            base_url="https://api.github.com", token="test-token",
+        config = GitHubConnectionConfig(
+            base_url="https://api.github.com",
+            auth=GitHubPatAuth(token="test-token"),
         )
         client = GitHubClient(config)
     return client
