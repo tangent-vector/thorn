@@ -38,6 +38,7 @@ class TestGitHubConnectionConfig:
         self, monkeypatch: pytest.MonkeyPatch, github_pat_only_env: None,
     ) -> None:
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+        monkeypatch.delenv("GITHUB_API_URL", raising=False)
         monkeypatch.delenv("GITHUB_URL", raising=False)
         config = GitHubConnectionConfig.from_env()
         assert config.auth.kind == "pat"
@@ -48,14 +49,33 @@ class TestGitHubConnectionConfig:
         self, monkeypatch: pytest.MonkeyPatch, github_pat_only_env: None,
     ) -> None:
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
-        monkeypatch.setenv("GITHUB_URL", "https://github.example.com/api/v3")
+        monkeypatch.setenv("GITHUB_API_URL", "https://github.example.com/api/v3")
         config = GitHubConnectionConfig.from_env()
         assert config.base_url == "https://github.example.com/api/v3"
+
+    def test_from_env_github_api_url_overrides_legacy_github_url(
+        self, monkeypatch: pytest.MonkeyPatch, github_pat_only_env: None,
+    ) -> None:
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+        monkeypatch.setenv("GITHUB_API_URL", "https://api.preferred.example.com")
+        monkeypatch.setenv("GITHUB_URL", "https://legacy.ignored.example.com")
+        config = GitHubConnectionConfig.from_env()
+        assert config.base_url == "https://api.preferred.example.com"
+
+    def test_from_env_legacy_github_url_only(
+        self, monkeypatch: pytest.MonkeyPatch, github_pat_only_env: None,
+    ) -> None:
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+        monkeypatch.delenv("GITHUB_API_URL", raising=False)
+        monkeypatch.setenv("GITHUB_URL", "https://ghe.example.com/api/v3")
+        config = GitHubConnectionConfig.from_env()
+        assert config.base_url == "https://ghe.example.com/api/v3"
 
     def test_from_env_missing_token(
         self, monkeypatch: pytest.MonkeyPatch, github_pat_only_env: None,
     ) -> None:
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_API_URL", raising=False)
         monkeypatch.delenv("GITHUB_URL", raising=False)
         with pytest.raises(ValueError, match="GITHUB_TOKEN"):
             GitHubConnectionConfig.from_env()

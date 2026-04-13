@@ -27,7 +27,7 @@ Usage from code::
         clone_url="https://github.com/owner/repo.git",
         native_project_id="owner/repo",
         forge_type="github",
-        forge_url_env="GITHUB_URL",
+        forge_url_env="GITHUB_API_URL",
     )
 """
 

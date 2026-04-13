@@ -28,9 +28,12 @@ brev secret create OPENAI_API_MODEL_NAME
 **GitHub (required for GitHub-based gateways):**
 
 ```bash
-brev secret create GITHUB_TOKEN
-# Optional:
-# brev secret create GITHUB_URL
+# GitHub App auth (typical for the gateway); see deploy/brev/env.template.
+# brev secret create GITHUB_APP_ID
+# brev secret create GITHUB_APP_INSTALLATION_ID
+# brev secret create GITHUB_APP_PRIVATE_KEY
+# Optional REST API base (defaults to https://api.github.com):
+# brev secret create GITHUB_API_URL
 ```
 
 **GitLab (only if you use GitLab event sources or forge config):**
@@ -143,8 +146,9 @@ thorn serve bootstrap \
     --agent-id my-coordinator \
     --project-name my-project \
     --clone-url https://github.com/org/repo.git \
-    --token-env GITHUB_TOKEN \
-    --url-env GITHUB_URL
+    --forge-type github \
+    --native-project-id org/repo \
+    --url-env GITHUB_API_URL
 ```
 
 **Clone from a state repo** (future; not yet implemented):

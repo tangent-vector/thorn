@@ -16,6 +16,23 @@ from pydantic import BaseModel, Field, field_validator
 _DEFAULT_API_BASE = "https://api.github.com"
 
 
+def github_api_base_url_from_env() -> str:
+    """Return the GitHub REST API base URL from the environment.
+
+    Prefer ``GITHUB_API_URL`` (the REST API root, e.g.
+    ``https://api.github.com`` or ``https://ghe.example.com/api/v3``).
+    ``GITHUB_URL`` is still read if set, for older configs — that name
+    was misleading because GitHub's website URL is not the API base.
+    """
+    primary = os.environ.get("GITHUB_API_URL")
+    if primary is not None and str(primary).strip():
+        return str(primary).strip().rstrip("/")
+    legacy = os.environ.get("GITHUB_URL")
+    if legacy is not None and str(legacy).strip():
+        return str(legacy).strip().rstrip("/")
+    return _DEFAULT_API_BASE
+
+
 class GitHubPatAuth(BaseModel):
     """Authenticate with a personal access token or other static bearer token."""
 
@@ -82,8 +99,10 @@ class GitHubConnectionConfig(BaseModel):
         (GitHub documents both for the JWT issuer).
 
         Otherwise requires ``GITHUB_TOKEN`` (PAT or other bearer token).
+
+        API host: ``GITHUB_API_URL`` (or legacy ``GITHUB_URL``).
         """
-        base_url = os.environ.get("GITHUB_URL", _DEFAULT_API_BASE)
+        base_url = github_api_base_url_from_env()
         app_id_raw = os.environ.get("GITHUB_APP_ID")
         if app_id_raw:
             inst_raw = os.environ.get("GITHUB_APP_INSTALLATION_ID")

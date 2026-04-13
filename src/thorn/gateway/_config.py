@@ -47,7 +47,7 @@ A ``github`` forge service uses :class:`~thorn.tools._github_connection.GitHubCo
       "name": "my-gh",
       "type": "github",
       "config": {
-        "base_url": "$GITHUB_URL",
+        "base_url": "$GITHUB_API_URL",
         "auth": {
           "kind": "app",
           "app_id": "$GITHUB_APP_ID",

@@ -1733,7 +1733,7 @@ class TestBootstrapCoordinator:
             clone_url="https://github.com/owner/repo.git",
             native_project_id="owner/repo",
             forge_type="github",
-            forge_url_env="GITHUB_URL",
+            forge_url_env="GITHUB_API_URL",
         )
 
         gateway_config = tmp_path / ".thorn" / "gateway.json"
@@ -1744,7 +1744,7 @@ class TestBootstrapCoordinator:
         assert "github-events" in types
 
         forge_svc = next(s for s in gw_data["services"] if s["type"] == "github")
-        assert forge_svc["config"]["base_url"] == "$GITHUB_URL"
+        assert forge_svc["config"]["base_url"] == "$GITHUB_API_URL"
         assert forge_svc["config"]["auth"]["kind"] == "app"
         assert forge_svc["config"]["auth"]["app_id"] == "$GITHUB_APP_ID"
 
@@ -1756,7 +1756,7 @@ class TestBootstrapCoordinator:
         assert events_svc["name"] == "my-repo-events"
         assert events_svc["config"]["auth"]["kind"] == "app"
         assert events_svc["config"]["repository"] == "owner/repo"
-        assert events_svc["config"]["base_url"] == "$GITHUB_URL"
+        assert events_svc["config"]["base_url"] == "$GITHUB_API_URL"
 
         identity = tmp_path / ".thorn" / "agents" / "gh-coord.json"
         data = json.loads(identity.read_text(encoding="utf-8"))

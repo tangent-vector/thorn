@@ -633,7 +633,7 @@ def _serve_gateway(
 _FORGE_ENV_DEFAULTS: dict[str, tuple[str, str]] = {
     "gitlab": ("GITLAB_TOKEN", "GITLAB_URL"),
     # GitHub bootstrap uses GitHub App env vars; token-env is only for GitLab.
-    "github": ("GITHUB_APP_ID", "GITHUB_URL"),
+    "github": ("GITHUB_APP_ID", "GITHUB_API_URL"),
 }
 
 

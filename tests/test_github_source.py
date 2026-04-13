@@ -624,7 +624,7 @@ class TestGitHubNotificationsSourceConfig:
             from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
 
             monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
-            monkeypatch.setenv("GITHUB_URL", "https://gh.corp.example.com")
+            monkeypatch.setenv("GITHUB_API_URL", "https://gh.corp.example.com")
             monkeypatch.setenv("THORN_GITHUB_REPOSITORY", "org/repo")
             monkeypatch.setenv("THORN_GITHUB_APP_SLUG", "my-bot")
             monkeypatch.setenv("THORN_POLL_INTERVAL", "15")
@@ -648,6 +648,7 @@ class TestGitHubNotificationsSourceConfig:
 
             monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
             monkeypatch.setenv("THORN_GITHUB_REPOSITORY", "org/repo")
+            monkeypatch.delenv("GITHUB_API_URL", raising=False)
             monkeypatch.delenv("GITHUB_URL", raising=False)
             monkeypatch.delenv("THORN_GITHUB_APP_SLUG", raising=False)
             monkeypatch.delenv("THORN_POLL_INTERVAL", raising=False)

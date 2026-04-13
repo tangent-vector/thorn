@@ -15,7 +15,8 @@ Usage::
 
 Configuration is loaded from environment variables — either PAT mode
 (``GITHUB_TOKEN``) or GitHub App mode (``GITHUB_APP_ID``,
-``GITHUB_APP_INSTALLATION_ID``, and a private key). See
+``GITHUB_APP_INSTALLATION_ID``, and a private key). Use
+``GITHUB_API_URL`` for the REST API base (not the website URL); see
 :class:`~thorn.tools._github_connection.GitHubConnectionConfig`.
 """
 
