@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 _DEFAULT_API_BASE = "https://api.github.com"
 
@@ -27,13 +27,33 @@ class GitHubAppAuth(BaseModel):
     """Authenticate as a GitHub App installation (JWT + installation token)."""
 
     kind: Literal["app"] = "app"
-    app_id: int = Field(description="Numeric GitHub App ID (JWT iss claim)")
+    app_id: str = Field(
+        description=(
+            "GitHub App ID (digits) or OAuth Client ID — both are valid for the "
+            "JWT ``iss`` claim; see GitHub App authentication docs."
+        ),
+    )
     installation_id: int = Field(
         description="Installation ID for the org or user account",
     )
     private_key_pem: str = Field(
         description="PEM-encoded RSA private key for the GitHub App",
     )
+
+    @field_validator("app_id", mode="before")
+    @classmethod
+    def _normalize_app_id(cls, value: object) -> str:
+        """Accept numeric App ID from JSON integers or Client ID / App ID strings."""
+        if isinstance(value, bool):
+            raise TypeError("app_id must not be a boolean")
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                raise ValueError("app_id must not be empty")
+            return s
+        raise TypeError(f"app_id must be str or int, got {type(value).__name__}")
 
 
 GitHubAuthUnion = Annotated[
@@ -58,6 +78,8 @@ class GitHubConnectionConfig(BaseModel):
         If ``GITHUB_APP_ID`` is set, builds app auth (requires
         ``GITHUB_APP_INSTALLATION_ID`` and a private key via
         ``GITHUB_APP_PRIVATE_KEY`` or ``GITHUB_APP_PRIVATE_KEY_PATH``).
+        ``GITHUB_APP_ID`` may be the numeric App ID or the app's Client ID
+        (GitHub documents both for the JWT issuer).
 
         Otherwise requires ``GITHUB_TOKEN`` (PAT or other bearer token).
         """
@@ -73,7 +95,7 @@ class GitHubConnectionConfig(BaseModel):
             return cls(
                 base_url=base_url,
                 auth=GitHubAppAuth(
-                    app_id=int(app_id_raw),
+                    app_id=app_id_raw.strip(),
                     installation_id=int(inst_raw),
                     private_key_pem=pem,
                 ),

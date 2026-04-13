@@ -614,7 +614,9 @@ class TestGitHubNotificationsSourceFetchCommentBody:
 
 
 class TestGitHubNotificationsSourceConfig:
-    def test_from_env(self, monkeypatch: pytest.MonkeyPatch):
+    def test_from_env(
+        self, monkeypatch: pytest.MonkeyPatch, github_pat_only_env: None,
+    ):
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
             patch("thorn.gateway.sources._github._Github"),
@@ -635,7 +637,9 @@ class TestGitHubNotificationsSourceConfig:
             assert config.app_slug == "my-bot"
             assert config.poll_interval == 15
 
-    def test_from_env_defaults(self, monkeypatch: pytest.MonkeyPatch):
+    def test_from_env_defaults(
+        self, monkeypatch: pytest.MonkeyPatch, github_pat_only_env: None,
+    ):
         with (
             patch("thorn.gateway.sources._github._HAS_GITHUB", True),
             patch("thorn.gateway.sources._github._Github"),
@@ -654,7 +658,7 @@ class TestGitHubNotificationsSourceConfig:
             assert config.poll_interval == 30
 
     def test_from_env_missing_token_raises(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self, monkeypatch: pytest.MonkeyPatch, github_pat_only_env: None,
     ):
         from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
 
@@ -664,7 +668,7 @@ class TestGitHubNotificationsSourceConfig:
             GitHubNotificationsSourceConfig.from_env()
 
     def test_from_env_missing_repository_raises(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self, monkeypatch: pytest.MonkeyPatch, github_pat_only_env: None,
     ):
         from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
 
