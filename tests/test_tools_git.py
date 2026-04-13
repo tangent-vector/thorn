@@ -11,6 +11,7 @@ import pytest
 from thorn.tools.git import (
     GIT_TOOLS,
     GitError,
+    _git_identity_env,
     _inject_url_credentials,
     _run_git,
     git_branch,
@@ -232,6 +233,145 @@ class TestRunGit:
     async def test_check_false_returns_nonzero(self, tmp_path: Path) -> None:
         code, _ = await _run_git("log", cwd=str(tmp_path), check=False)
         assert code != 0
+
+
+# ---------------------------------------------------------------------------
+# _git_identity_env
+# ---------------------------------------------------------------------------
+
+
+class TestGitIdentityEnv:
+    _CTX_PATH = "thorn.core._context.get_context"
+
+    def test_returns_none_without_context(self) -> None:
+        with patch(self._CTX_PATH, side_effect=RuntimeError):
+            assert _git_identity_env() is None
+
+    def test_returns_none_without_agent(self, tmp_path: Path) -> None:
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=None, runtime=None,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            assert _git_identity_env() is None
+
+    def test_returns_none_when_agent_has_no_git_metadata(
+        self, tmp_path: Path,
+    ) -> None:
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        agent = Agent(metadata={"project": "foo"})
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=None,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            assert _git_identity_env() is None
+
+    def test_injects_name_and_email(self, tmp_path: Path) -> None:
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        agent = Agent(metadata={
+            "git_user_name": "thorn-bot",
+            "git_user_email": "bot@thorn.dev",
+        })
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=None,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            env = _git_identity_env()
+
+        assert env is not None
+        assert env["GIT_AUTHOR_NAME"] == "thorn-bot"
+        assert env["GIT_COMMITTER_NAME"] == "thorn-bot"
+        assert env["GIT_AUTHOR_EMAIL"] == "bot@thorn.dev"
+        assert env["GIT_COMMITTER_EMAIL"] == "bot@thorn.dev"
+
+    def test_injects_name_only(self, tmp_path: Path) -> None:
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        agent = Agent(metadata={"git_user_name": "thorn-bot"})
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=None,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            env = _git_identity_env()
+
+        assert env is not None
+        assert env["GIT_AUTHOR_NAME"] == "thorn-bot"
+        assert "GIT_AUTHOR_EMAIL" not in env
+
+    def test_inherits_existing_env(self, tmp_path: Path) -> None:
+        """The returned env dict should be a copy of os.environ plus the
+        git identity vars, not *only* the git identity vars."""
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        agent = Agent(metadata={
+            "git_user_name": "bot",
+            "git_user_email": "bot@x",
+        })
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=None,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            env = _git_identity_env()
+
+        assert env is not None
+        assert "PATH" in env
+
+
+class TestGitCommitWithIdentity:
+    """Verify that git_commit works when identity comes from agent metadata
+    rather than the local git config."""
+
+    async def test_commit_with_agent_identity(self, tmp_path: Path) -> None:
+        """A repo with no local user.name/email still commits successfully
+        when the agent has git identity metadata."""
+        import subprocess
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext, set_context, reset_context
+        from thorn.core._provider import MockProvider
+
+        repo = tmp_path / "id-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+
+        agent = Agent(metadata={
+            "git_user_name": "test-bot",
+            "git_user_email": "test-bot@thorn",
+        })
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=None,
+            workspace_root=tmp_path,
+        )
+        token = set_context(ctx)
+        try:
+            (repo / "file.txt").write_text("hello\n")
+            result = await git_commit(str(repo), "identity test commit")
+            assert "identity test" in result.lower()
+
+            log_output = subprocess.run(
+                ["git", "log", "--format=%an <%ae>", "-1"],
+                cwd=repo, check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            assert "test-bot" in log_output
+            assert "test-bot@thorn" in log_output
+        finally:
+            reset_context(token)
 
 
 # ---------------------------------------------------------------------------

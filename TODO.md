@@ -86,6 +86,8 @@
 
 - **Data-driven persona/role definitions**: Allow agent roles to be loaded from configuration files rather than requiring Python `Agent` subclasses. The `Agent.role` property (returning `self._role` if set, else `type(self)`) is the seam where this plugs in. See also: Claude Code's `.claude/agents/` markdown-file-based agent definitions.
 
+- **Per-agent subprocess environment injection**: A mechanism on `Agent` or `Session` to declare environment variables that should be injected into all subprocesses spawned during tool execution (both `_run_git` and `run_shell`). Currently `_run_git` injects git identity from agent metadata, but `run_shell` inherits only the gateway process's ambient environment — so agents calling `git commit` via `run_shell` depend on OS-level `git config`. A unified injection layer would allow per-agent git identity, credentials, and other env customization without requiring global OS-level config.
+
 - **Credential store via `contextvars`**: Replace the current metadata/$ENV_VAR approach for git authentication with a gateway-level credential store accessible via `contextvars`. Decide whether to keep bundling ambient state into `ExecutionContext` or use separate `contextvars` for different concerns.
 
 - **ChannelRegistry / ChannelID**: The architecture plan designed a generic channel abstraction for routing replies from agents back through event sources, but it was never built — the gateway currently posts responses via GitLab tools directly. This becomes important when adding a second event source (Slack, etc.) that needs a uniform reply mechanism.

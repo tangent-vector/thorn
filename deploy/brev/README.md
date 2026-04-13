@@ -28,12 +28,17 @@ brev secret create OPENAI_API_MODEL_NAME
 **GitHub (required for GitHub-based gateways):**
 
 ```bash
-# GitHub App auth (typical for the gateway); see deploy/brev/env.template.
+# Bot user PAT (recommended):
+brev secret create GITHUB_TOKEN
+# Repository to monitor (owner/repo):
+brev secret create THORN_GITHUB_REPOSITORY
+# Optional REST API base (defaults to https://api.github.com):
+# brev secret create GITHUB_API_URL
+
+# Alternative: GitHub App auth (higher rate limits).
 # brev secret create GITHUB_APP_ID
 # brev secret create GITHUB_APP_INSTALLATION_ID
 # brev secret create GITHUB_APP_PRIVATE_KEY
-# Optional REST API base (defaults to https://api.github.com):
-# brev secret create GITHUB_API_URL
 ```
 
 **GitLab (only if you use GitLab event sources or forge config):**
@@ -158,7 +163,21 @@ cd /home/ubuntu/workspace/thorn
 git clone https://github.com/org/thorn-agency.git .thorn
 ```
 
-### 4. Start the gateway
+### 4. Configure git identity
+
+Thorn's structured git tools inject identity via environment variables,
+but agents may also run git via `run_shell`, which inherits the OS-level
+git config.  Set these for the user that runs the gateway:
+
+```bash
+git config --global user.name "thorn-bot"
+git config --global user.email "thorn-bot@users.noreply.github.com"
+git config --global credential.helper store
+```
+
+If using `bootstrap-instance.sh`, this step is done automatically.
+
+### 5. Start the gateway
 
 ```bash
 brev shell thorn-gateway

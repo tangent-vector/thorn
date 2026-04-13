@@ -85,6 +85,28 @@ def _ensure_gateway_config(
     log.info("Wrote gateway config: %s", config_path)
 
 
+def _build_github_auth_block(
+    auth_mode: str,
+    token_env: str,
+) -> dict[str, str]:
+    """Build the ``auth`` sub-object for a GitHub service in ``gateway.json``.
+
+    *auth_mode* is ``"pat"`` (default -- uses ``$<token_env>``) or
+    ``"app"`` (uses ``$GITHUB_APP_*`` env var references).
+    """
+    if auth_mode == "app":
+        return {
+            "kind": "app",
+            "app_id": "$GITHUB_APP_ID",
+            "installation_id": "$GITHUB_APP_INSTALLATION_ID",
+            "private_key_pem": "$GITHUB_APP_PRIVATE_KEY",
+        }
+    return {
+        "kind": "pat",
+        "token": f"${token_env}",
+    }
+
+
 def _build_event_source_entry(
     *,
     project_name: str,
@@ -92,18 +114,14 @@ def _build_event_source_entry(
     access_token_env: str,
     forge_url_env: str,
     native_project_id: str,
+    github_auth_mode: str = "pat",
 ) -> dict[str, Any]:
     """Build a ``gateway.json`` event source entry for the given forge type."""
     source_name = f"{project_name}-events"
 
     if forge_type == "github":
-        config = {
-            "auth": {
-                "kind": "app",
-                "app_id": "$GITHUB_APP_ID",
-                "installation_id": "$GITHUB_APP_INSTALLATION_ID",
-                "private_key_pem": "$GITHUB_APP_PRIVATE_KEY",
-            },
+        config: dict[str, Any] = {
+            "auth": _build_github_auth_block(github_auth_mode, access_token_env),
             "repository": native_project_id,
         }
         if forge_url_env:
@@ -124,6 +142,12 @@ def _build_event_source_entry(
     }
 
 
+_FORGE_DEFAULTS: dict[str, tuple[str, str]] = {
+    "gitlab": ("GITLAB_TOKEN", "GITLAB_URL"),
+    "github": ("GITHUB_TOKEN", "GITHUB_API_URL"),
+}
+
+
 def bootstrap_coordinator(
     *,
     runtime_root: Path,
@@ -133,9 +157,12 @@ def bootstrap_coordinator(
     default_branch: str = "main",
     native_project_id: str = "",
     forge_type: str = "gitlab",
-    access_token_env: str = "GITLAB_TOKEN",
-    forge_url_env: str = "GITLAB_URL",
+    access_token_env: str | None = None,
+    forge_url_env: str | None = None,
     forge_service_name: str = "",
+    git_user_name: str = "",
+    git_user_email: str = "",
+    github_auth_mode: str = "pat",
     # Legacy parameters (accepted but mapped to new fields)
     project_id: int | None = None,
     gitlab_url_env: str = "",
@@ -152,9 +179,13 @@ def bootstrap_coordinator(
     The gateway config includes a forge service, a project service,
     and an event source so the gateway can start polling immediately.
 
-    The agent identity includes a ``project`` metadata entry (project
-    service name) so git tools can resolve HTTPS credentials from the
-    registered forge service.
+    The agent identity includes ``project`` (for forge credential
+    resolution), ``git_user_name``, and ``git_user_email`` (for git
+    commit authorship) metadata entries.
+
+    For GitHub, *github_auth_mode* selects between ``"pat"``
+    (``$GITHUB_TOKEN``, the default) and ``"app"``
+    (``$GITHUB_APP_*``).
 
     Returns the ``AgentID`` of the created agent.
     """
@@ -165,10 +196,21 @@ def bootstrap_coordinator(
     if not forge_service_name:
         forge_service_name = f"{project_name}-forge"
 
+    default_token, default_url = _FORGE_DEFAULTS.get(
+        forge_type, ("GITLAB_TOKEN", "GITLAB_URL"),
+    )
+    if access_token_env is None:
+        access_token_env = default_token
+    if forge_url_env is None:
+        forge_url_env = default_url
+
     aid = AgentID(agent_id)
     thorn_dir = runtime_root / ".thorn"
     agents_root = thorn_dir / "agents"
     agents_root.mkdir(parents=True, exist_ok=True)
+
+    resolved_git_name = git_user_name or agent_id
+    resolved_git_email = git_user_email or f"{agent_id}@thorn"
 
     # -- Agent identity ------------------------------------------------------
 
@@ -179,6 +221,8 @@ def bootstrap_coordinator(
         "name": agent_id,
         "metadata": {
             "project": project_name,
+            "git_user_name": resolved_git_name,
+            "git_user_email": resolved_git_email,
         },
     }
 
@@ -216,12 +260,7 @@ def bootstrap_coordinator(
 
     if forge_type == "github":
         gh_forge_config: dict[str, Any] = {
-            "auth": {
-                "kind": "app",
-                "app_id": "$GITHUB_APP_ID",
-                "installation_id": "$GITHUB_APP_INSTALLATION_ID",
-                "private_key_pem": "$GITHUB_APP_PRIVATE_KEY",
-            },
+            "auth": _build_github_auth_block(github_auth_mode, access_token_env),
         }
         if forge_url_env:
             gh_forge_config["base_url"] = f"${forge_url_env}"
@@ -258,6 +297,7 @@ def bootstrap_coordinator(
         access_token_env=access_token_env,
         forge_url_env=forge_url_env,
         native_project_id=native_project_id,
+        github_auth_mode=github_auth_mode,
     )
 
     _ensure_gateway_config(

@@ -39,12 +39,51 @@ class GitError(Exception):
         super().__init__(f"git command failed (exit {returncode}): {cmd_str}\n{output}")
 
 
+def _git_identity_env() -> dict[str, str] | None:
+    """Build a subprocess environment with git author/committer identity.
+
+    Reads ``git_user_name`` and ``git_user_email`` from the current
+    agent's metadata.  Returns ``None`` when no identity is available,
+    in which case callers should let the subprocess inherit the ambient
+    environment (which may or may not have git identity configured).
+    """
+    from thorn.core._context import get_context
+
+    try:
+        ctx = get_context()
+    except RuntimeError:
+        return None
+
+    agent = ctx.agent
+    if agent is None:
+        return None
+
+    name = agent.metadata.get("git_user_name")
+    email = agent.metadata.get("git_user_email")
+    if not name and not email:
+        return None
+
+    env = os.environ.copy()
+    if name:
+        env["GIT_AUTHOR_NAME"] = name
+        env["GIT_COMMITTER_NAME"] = name
+    if email:
+        env["GIT_AUTHOR_EMAIL"] = email
+        env["GIT_COMMITTER_EMAIL"] = email
+    return env
+
+
 async def _run_git(
     *args: str,
     cwd: str | None = None,
     check: bool = True,
 ) -> tuple[int, str]:
     """Run a git command asynchronously, returning (returncode, combined output).
+
+    When the current agent has ``git_user_name`` / ``git_user_email``
+    in its metadata, those are injected as ``GIT_AUTHOR_*`` and
+    ``GIT_COMMITTER_*`` environment variables so commits succeed even
+    when the system git config has no identity set.
 
     Raises ``GitError`` when *check* is True and the process exits non-zero.
     """
@@ -55,6 +94,7 @@ async def _run_git(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=cwd,
+        env=_git_identity_env(),
     )
     raw_stdout, _ = await proc.communicate()
     output = raw_stdout.decode(errors="replace") if raw_stdout else ""
@@ -211,9 +251,8 @@ async def git_push(
     """Push a branch to a remote repository.
 
     Pushes the specified *branch_name* to *remote* (default ``origin``).
-    If the remote URL requires authentication and the agent has an
-    ``access_token`` in its metadata, the push will authenticate
-    transparently.
+    Authentication is handled transparently via the forge service
+    registered for the agent's project (see ``_inject_url_credentials``).
     """
     resolved = _resolve_tool_path(repo_path)
     _, output = await _run_git("push", remote, branch_name, cwd=resolved)

@@ -632,8 +632,7 @@ def _serve_gateway(
 
 _FORGE_ENV_DEFAULTS: dict[str, tuple[str, str]] = {
     "gitlab": ("GITLAB_TOKEN", "GITLAB_URL"),
-    # GitHub bootstrap uses GitHub App env vars; token-env is only for GitLab.
-    "github": ("GITHUB_APP_ID", "GITHUB_API_URL"),
+    "github": ("GITHUB_TOKEN", "GITHUB_API_URL"),
 }
 
 
@@ -656,6 +655,14 @@ _FORGE_ENV_DEFAULTS: dict[str, tuple[str, str]] = {
 @click.option("--project-id", type=int, default=None, hidden=True, help="Deprecated: use --native-project-id.")
 @click.option("--token-env", default=None, help="Env var holding the access token (default: based on --forge-type).")
 @click.option("--url-env", default=None, help="Env var holding the forge URL (default: based on --forge-type).")
+@click.option("--git-user-name", default=None, help="Git author/committer name for this agent (default: agent-id).")
+@click.option("--git-user-email", default=None, help="Git author/committer email for this agent (default: <agent-id>@thorn).")
+@click.option(
+    "--github-auth-mode",
+    type=click.Choice(["pat", "app"], case_sensitive=False),
+    default="pat",
+    help="GitHub auth mode: 'pat' (default, uses GITHUB_TOKEN) or 'app' (uses GITHUB_APP_* env vars).",
+)
 @click.option("--workspace", "workspace_path", type=click.Path(file_okay=False), default=".", help="Runtime root directory (default: current dir).")
 @click.pass_context
 def serve_bootstrap(
@@ -669,6 +676,9 @@ def serve_bootstrap(
     project_id: int | None,
     token_env: str | None,
     url_env: str | None,
+    git_user_name: str | None,
+    git_user_email: str | None,
+    github_auth_mode: str,
     workspace_path: str,
 ) -> None:
     """Bootstrap a ProjectCoordinator agent in the runtime directory."""
@@ -676,15 +686,10 @@ def serve_bootstrap(
     from thorn.gateway._bootstrap import bootstrap_coordinator
 
     default_token, default_url = _FORGE_ENV_DEFAULTS[forge_type]
-    if forge_type == "gitlab":
-        if token_env is None:
-            token_env = default_token
-        if url_env is None:
-            url_env = default_url
-    else:
-        token_env = token_env or "GITHUB_APP_ID"
-        if url_env is None:
-            url_env = default_url
+    if token_env is None:
+        token_env = default_token
+    if url_env is None:
+        url_env = default_url
 
     resolved_native_id = native_project_id or ""
     if not resolved_native_id and project_id is not None:
@@ -701,18 +706,27 @@ def serve_bootstrap(
         forge_type=forge_type,
         access_token_env=token_env,
         forge_url_env=url_env,
+        git_user_name=git_user_name or "",
+        git_user_email=git_user_email or "",
+        github_auth_mode=github_auth_mode,
     )
     console.print(f"[green]Bootstrapped coordinator:[/green] {aid}")
     console.print(f"  Identity: {runtime_root / '.thorn' / 'agents' / f'{aid}.json'}")
     console.print(f"  Gateway config: {runtime_root / '.thorn' / 'gateway.json'}")
     console.print(f"  Workspace: {runtime_root / '.thorn' / 'agents' / str(aid)}")
     if forge_type == "github":
-        console.print(
-            "\nSet GitHub App credentials before running 'thorn serve': "
-            "GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, and "
-            "GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH "
-            f"(optional: {url_env}).",
-        )
+        if github_auth_mode == "app":
+            console.print(
+                "\nSet GitHub App credentials before running 'thorn serve': "
+                "GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, and "
+                "GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH "
+                f"(optional: {url_env}).",
+            )
+        else:
+            console.print(
+                f"\nSet {token_env} (bot user PAT) before running 'thorn serve'."
+                f"  Optional: {url_env} (defaults to https://api.github.com).",
+            )
     else:
         console.print(
             "\nEnsure the required environment variables are set (e.g. from a "

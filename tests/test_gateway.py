@@ -1565,7 +1565,8 @@ class TestBootstrapCoordinator:
         data = json.loads(identity.read_text(encoding="utf-8"))
         assert data["agent_class"] == "ProjectCoordinator"
         assert data["metadata"]["project"] == "my-project"
-        assert "access_token" not in data["metadata"]
+        assert data["metadata"]["git_user_name"] == "test-coord"
+        assert data["metadata"]["git_user_email"] == "test-coord@thorn"
 
         memory = tmp_path / ".thorn" / "agents" / "test-coord" / "MEMORY.md"
         assert memory.is_file()
@@ -1720,9 +1721,8 @@ class TestBootstrapCoordinator:
         proj_svc = next(s for s in gw_data["services"] if s["type"] == "project")
         assert proj_svc["config"]["native_id"] == "999"
 
-    def test_github_bootstrap(self, tmp_path: Path):
-        """Bootstrap with forge_type='github' produces correct service
-        types and env var references."""
+    def test_github_bootstrap_pat_default(self, tmp_path: Path):
+        """Bootstrap with forge_type='github' defaults to PAT auth."""
         import json
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
@@ -1745,8 +1745,8 @@ class TestBootstrapCoordinator:
 
         forge_svc = next(s for s in gw_data["services"] if s["type"] == "github")
         assert forge_svc["config"]["base_url"] == "$GITHUB_API_URL"
-        assert forge_svc["config"]["auth"]["kind"] == "app"
-        assert forge_svc["config"]["auth"]["app_id"] == "$GITHUB_APP_ID"
+        assert forge_svc["config"]["auth"]["kind"] == "pat"
+        assert forge_svc["config"]["auth"]["token"] == "$GITHUB_TOKEN"
 
         proj_svc = next(s for s in gw_data["services"] if s["type"] == "project")
         assert proj_svc["config"]["native_id"] == "owner/repo"
@@ -1754,14 +1754,41 @@ class TestBootstrapCoordinator:
 
         events_svc = next(s for s in gw_data["services"] if s["type"] == "github-events")
         assert events_svc["name"] == "my-repo-events"
-        assert events_svc["config"]["auth"]["kind"] == "app"
+        assert events_svc["config"]["auth"]["kind"] == "pat"
         assert events_svc["config"]["repository"] == "owner/repo"
         assert events_svc["config"]["base_url"] == "$GITHUB_API_URL"
 
         identity = tmp_path / ".thorn" / "agents" / "gh-coord.json"
         data = json.loads(identity.read_text(encoding="utf-8"))
         assert data["metadata"]["project"] == "my-repo"
-        assert "access_token" not in data["metadata"]
+        assert data["metadata"]["git_user_name"] == "gh-coord"
+        assert data["metadata"]["git_user_email"] == "gh-coord@thorn"
+
+    def test_github_bootstrap_app_mode(self, tmp_path: Path):
+        """Bootstrap with github_auth_mode='app' produces App auth blocks."""
+        import json
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        bootstrap_coordinator(
+            runtime_root=tmp_path,
+            agent_id="gh-app-coord",
+            project_name="my-repo",
+            clone_url="https://github.com/owner/repo.git",
+            native_project_id="owner/repo",
+            forge_type="github",
+            forge_url_env="GITHUB_API_URL",
+            github_auth_mode="app",
+        )
+
+        gateway_config = tmp_path / ".thorn" / "gateway.json"
+        gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
+
+        forge_svc = next(s for s in gw_data["services"] if s["type"] == "github")
+        assert forge_svc["config"]["auth"]["kind"] == "app"
+        assert forge_svc["config"]["auth"]["app_id"] == "$GITHUB_APP_ID"
+
+        events_svc = next(s for s in gw_data["services"] if s["type"] == "github-events")
+        assert events_svc["config"]["auth"]["kind"] == "app"
 
     def test_github_bootstrap_without_custom_url(self, tmp_path: Path):
         """When forge_url_env is empty, the github-events config omits
@@ -1784,7 +1811,45 @@ class TestBootstrapCoordinator:
         events_svc = next(s for s in gw_data["services"] if s["type"] == "github-events")
         assert "base_url" not in events_svc["config"]
 
-    def test_cli_bootstrap_github(self, tmp_path: Path):
+    def test_bootstrap_writes_git_identity(self, tmp_path: Path):
+        """Bootstrap writes git_user_name and git_user_email into
+        agent metadata, defaulting to agent_id and agent_id@thorn."""
+        import json
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        bootstrap_coordinator(
+            runtime_root=tmp_path,
+            agent_id="id-test",
+            project_name="proj",
+            clone_url="https://example.com/proj.git",
+        )
+
+        identity = tmp_path / ".thorn" / "agents" / "id-test.json"
+        data = json.loads(identity.read_text(encoding="utf-8"))
+        assert data["metadata"]["git_user_name"] == "id-test"
+        assert data["metadata"]["git_user_email"] == "id-test@thorn"
+
+    def test_bootstrap_custom_git_identity(self, tmp_path: Path):
+        """Explicit git_user_name/email override the defaults."""
+        import json
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        bootstrap_coordinator(
+            runtime_root=tmp_path,
+            agent_id="custom-id",
+            project_name="proj",
+            clone_url="https://example.com/proj.git",
+            git_user_name="My Bot",
+            git_user_email="bot@example.com",
+        )
+
+        identity = tmp_path / ".thorn" / "agents" / "custom-id.json"
+        data = json.loads(identity.read_text(encoding="utf-8"))
+        assert data["metadata"]["git_user_name"] == "My Bot"
+        assert data["metadata"]["git_user_email"] == "bot@example.com"
+
+    def test_cli_bootstrap_github_pat_default(self, tmp_path: Path):
+        """CLI GitHub bootstrap defaults to PAT auth."""
         from click.testing import CliRunner
         from thorn._cli import main as cli_main
 
@@ -1800,6 +1865,7 @@ class TestBootstrapCoordinator:
         ])
         assert result.exit_code == 0, result.output
         assert "gh-cli-test" in result.output
+        assert "GITHUB_TOKEN" in result.output
 
         import json
         gateway_config = tmp_path / ".thorn" / "gateway.json"
@@ -1808,6 +1874,31 @@ class TestBootstrapCoordinator:
         assert "github" in types
         assert "github-events" in types
 
+        forge_svc = next(s for s in gw_data["services"] if s["type"] == "github")
+        assert forge_svc["config"]["auth"]["kind"] == "pat"
+
+    def test_cli_bootstrap_github_app_mode(self, tmp_path: Path):
+        """CLI --github-auth-mode app produces App auth blocks."""
+        from click.testing import CliRunner
+        from thorn._cli import main as cli_main
+
+        runner = CliRunner()
+        result = runner.invoke(cli_main, [
+            "serve", "bootstrap",
+            "--agent-id", "gh-app-cli",
+            "--project-name", "test-repo",
+            "--clone-url", "https://github.com/owner/repo.git",
+            "--forge-type", "github",
+            "--native-project-id", "owner/repo",
+            "--github-auth-mode", "app",
+            "--workspace", str(tmp_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "GITHUB_APP_ID" in result.output
+
+        import json
+        gateway_config = tmp_path / ".thorn" / "gateway.json"
+        gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
         forge_svc = next(s for s in gw_data["services"] if s["type"] == "github")
         assert forge_svc["config"]["auth"]["kind"] == "app"
 
