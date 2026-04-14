@@ -6,6 +6,7 @@ import pytest
 
 from pathlib import Path
 
+from thorn.core._agent import Agent
 from thorn.core._context import (
     ExecutionContext,
     NullEventSink,
@@ -14,6 +15,7 @@ from thorn.core._context import (
     reset_context,
     resolve_path,
     set_context,
+    shell_env,
 )
 from thorn.core._provider import MockProvider
 
@@ -202,5 +204,173 @@ class TestResolvePath:
         try:
             result = resolve_path(Path("foo/bar"))
             assert result == (tmp_path / "foo" / "bar").resolve()
+        finally:
+            reset_context(token)
+
+    # -- tilde expansion ---------------------------------------------------
+
+    def test_tilde_resolves_to_agent_home(self, tmp_path: Path):
+        """Bare ``~`` resolves to agent.home when an agent is active."""
+        home = tmp_path / "agent-home"
+        home.mkdir()
+        agent = Agent(home=home)
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agent=agent,
+        )
+        token = set_context(ctx)
+        try:
+            assert resolve_path("~") == home.resolve()
+        finally:
+            reset_context(token)
+
+    def test_tilde_slash_resolves_to_agent_home_subpath(self, tmp_path: Path):
+        """``~/subdir/file.txt`` resolves under agent.home."""
+        home = tmp_path / "agent-home"
+        home.mkdir()
+        agent = Agent(home=home)
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agent=agent,
+        )
+        token = set_context(ctx)
+        try:
+            result = resolve_path("~/subdir/file.txt")
+            assert result == (home / "subdir" / "file.txt").resolve()
+        finally:
+            reset_context(token)
+
+    def test_tilde_without_agent_falls_back_to_os_home(self, tmp_path: Path):
+        """When no agent is active, ~ falls back to OS-level expansion."""
+        import os
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+        )
+        token = set_context(ctx)
+        try:
+            result = resolve_path("~/somefile")
+            expected = Path(os.path.expanduser("~/somefile")).resolve()
+            assert result == expected
+        finally:
+            reset_context(token)
+
+    def test_tilde_without_agent_home_falls_back_to_os(self, tmp_path: Path):
+        """Agent with home=None falls back to OS tilde expansion."""
+        import os
+        agent = Agent()  # no home set, no context to derive from
+        agent._home_resolved = True  # prevent lazy resolution
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agent=agent,
+        )
+        token = set_context(ctx)
+        try:
+            result = resolve_path("~/somefile")
+            expected = Path(os.path.expanduser("~/somefile")).resolve()
+            assert result == expected
+        finally:
+            reset_context(token)
+
+    def test_tilde_in_middle_of_path_not_expanded(self, tmp_path: Path):
+        """A ``~`` that is not at the start should not trigger expansion."""
+        home = tmp_path / "agent-home"
+        home.mkdir()
+        agent = Agent(home=home)
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agent=agent,
+        )
+        token = set_context(ctx)
+        try:
+            result = resolve_path("foo~bar")
+            assert result == (tmp_path / "foo~bar").resolve()
+        finally:
+            reset_context(token)
+
+    def test_tilde_no_context_falls_back_to_os(self):
+        """When no context is active at all, ~ still uses OS expansion."""
+        import os
+        result = resolve_path("~/test")
+        expected = Path(os.path.expanduser("~/test")).resolve()
+        assert result == expected
+
+    def test_relative_path_not_affected_by_tilde(self, tmp_path: Path):
+        """A relative path without ~ is still resolved against workspace."""
+        home = tmp_path / "agent-home"
+        home.mkdir()
+        agent = Agent(home=home)
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agent=agent,
+        )
+        token = set_context(ctx)
+        try:
+            result = resolve_path("subdir/file.txt")
+            assert result == (tmp_path / "subdir" / "file.txt").resolve()
+        finally:
+            reset_context(token)
+
+
+# ---------------------------------------------------------------------------
+# shell_env
+# ---------------------------------------------------------------------------
+
+
+class TestShellEnv:
+    def test_returns_none_without_context(self):
+        """No context → inherit process environment unchanged."""
+        assert shell_env() is None
+
+    def test_returns_none_without_agent(self, tmp_path: Path):
+        """Context without an agent → no HOME override."""
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+        )
+        token = set_context(ctx)
+        try:
+            assert shell_env() is None
+        finally:
+            reset_context(token)
+
+    def test_returns_none_when_agent_has_no_home(self, tmp_path: Path):
+        """Agent with home=None → no HOME override."""
+        agent = Agent()
+        agent._home_resolved = True
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agent=agent,
+        )
+        token = set_context(ctx)
+        try:
+            assert shell_env() is None
+        finally:
+            reset_context(token)
+
+    def test_overrides_home_when_agent_has_home(self, tmp_path: Path):
+        """Agent with a home directory → HOME is overridden."""
+        import os
+        home = tmp_path / "agent-home"
+        home.mkdir()
+        agent = Agent(home=home)
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agent=agent,
+        )
+        token = set_context(ctx)
+        try:
+            env = shell_env()
+            assert env is not None
+            assert env["HOME"] == str(home)
+            # Other env vars should still be present.
+            assert env.get("PATH") == os.environ.get("PATH")
         finally:
             reset_context(token)

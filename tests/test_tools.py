@@ -843,6 +843,52 @@ class TestRunShell:
         )
         assert "[output truncated:" in result
 
+    async def test_home_env_set_to_agent_home(self, tmp_path):
+        """When an agent with a home dir is active, $HOME in the
+        subprocess should point to that directory."""
+        from thorn.core._agent import Agent
+
+        home = tmp_path / "agent-home"
+        home.mkdir()
+        agent = Agent(home=home)
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agent=agent,
+        )
+        token = set_context(ctx)
+        try:
+            result = await run_shell('echo "$HOME"')
+            assert str(home) in result
+        finally:
+            reset_context(token)
+
+    async def test_tilde_expansion_in_shell_matches_agent_home(self, tmp_path):
+        """Shell tilde expansion should resolve to agent.home, matching
+        the built-in file tools' resolve_path behavior."""
+        from thorn.core._agent import Agent
+
+        home = tmp_path / "agent-home"
+        home.mkdir()
+        (home / "marker.txt").write_text("found-it", encoding="utf-8")
+        agent = Agent(home=home)
+        ctx = ExecutionContext(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            agent=agent,
+        )
+        token = set_context(ctx)
+        try:
+            result = await run_shell("cat ~/marker.txt")
+            assert "found-it" in result
+        finally:
+            reset_context(token)
+
+    async def test_home_env_not_set_without_agent(self, tmp_path):
+        """Without an active agent, $HOME should be the process HOME."""
+        result = await run_shell('echo "$HOME"')
+        assert os.environ["HOME"] in result
+
 
 # ---------------------------------------------------------------------------
 # ask_user

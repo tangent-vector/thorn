@@ -702,6 +702,25 @@ def scoped_status_provider(provider: StatusProvider):
             pass
 
 
+def _agent_home() -> Path | None:
+    """Return the current agent's home directory, or ``None``.
+
+    Used by :func:`resolve_path` and :func:`shell_env` to map ``~`` to
+    the agent's personal state directory rather than the OS-level
+    ``$HOME``.
+    """
+    try:
+        ctx = get_context()
+        agent = ctx.agent
+        if agent is not None:
+            home = getattr(agent, "home", None)
+            if home is not None:
+                return home
+    except RuntimeError:
+        pass
+    return None
+
+
 def resolve_path(raw: str | Path) -> Path:
     """Resolve *raw* against the active workspace, returning an absolute path.
 
@@ -711,17 +730,36 @@ def resolve_path(raw: str | Path) -> Path:
 
     Resolution rules:
 
-    1. **Absolute paths** are returned as-is (canonicalized via
+    1. **Tilde paths** (``~`` or ``~/…``) are expanded against the
+       current agent's :attr:`~Agent.home` directory when one is
+       available.  This makes ``~/MEMORY.md`` refer to the agent's
+       personal state regardless of the workspace.  When no agent home
+       is available, falls back to :func:`os.path.expanduser`.
+    2. **Absolute paths** are returned as-is (canonicalized via
        :meth:`~pathlib.Path.resolve`).
-    2. **Relative paths** are joined to the current
+    3. **Relative paths** are joined to the current
        ``ExecutionContext.workspace_root`` when a context is active and
        a workspace is set.
-    3. If no context or workspace is available, the path is resolved
+    4. If no context or workspace is available, the path is resolved
        against the process CWD (matching default ``pathlib`` behavior).
     """
     from pathlib import Path as _Path
 
-    p = _Path(raw)
+    s = str(raw)
+
+    if s == "~" or s.startswith("~/"):
+        home = _agent_home()
+        if home is not None:
+            if s == "~":
+                return home.resolve()
+            return (home / s[2:]).resolve()
+        # No agent home — fall back to OS-level tilde expansion so
+        # that ~/… is still meaningful rather than treated as a
+        # literal relative path component named "~".
+        import os
+        s = os.path.expanduser(s)
+
+    p = _Path(s)
     if p.is_absolute():
         return p.resolve()
 
@@ -733,3 +771,20 @@ def resolve_path(raw: str | Path) -> Path:
         pass
 
     return (_Path.cwd() / p).resolve()
+
+
+def shell_env() -> dict[str, str] | None:
+    """Build an environment dict for agent shell subprocesses.
+
+    When an agent with a home directory is active, overrides ``$HOME``
+    so that shell tilde expansion (``~``) agrees with the built-in file
+    tools' :func:`resolve_path`.  Returns ``None`` (inherit the process
+    environment unchanged) when no agent home is available.
+    """
+    home = _agent_home()
+    if home is None:
+        return None
+    import os
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    return env

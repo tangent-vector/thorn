@@ -835,6 +835,11 @@ async def run_shell(
     Not included in ``ALL_BUILTIN_TOOLS`` — add it explicitly to
     specific agents or ``prompt()`` calls when needed.
 
+    When an agent with a home directory is active, the subprocess's
+    ``$HOME`` is overridden so that shell tilde expansion (``~``)
+    points at the agent's :attr:`~Agent.home` directory, consistent
+    with the built-in file tools' :func:`resolve_path`.
+
     Args:
         command: Shell command to execute.
         working_directory: Directory to run the command in.  When
@@ -843,11 +848,13 @@ async def run_shell(
             Defaults to 120.
     """
     resolved_cwd = str(_resolve(working_directory or "."))
+    from thorn.core._context import shell_env
     proc = await asyncio.create_subprocess_shell(
         command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=resolved_cwd,
+        env=shell_env(),
     )
     timed_out = False
     try:

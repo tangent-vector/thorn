@@ -116,11 +116,18 @@ class Agent:
 
     @property
     def home(self) -> Path | None:
-        """The agent's personal state directory (analogous to ``~``).
+        """The agent's personal state directory — its ``~``.
 
         Where the agent stores ``MEMORY.md``, ``journal/``, and any
-        other instance-specific scratch state.  Always at
-        ``<agency_root>/.thorn/agents/<agent-id>/``.
+        other instance-specific scratch state.  Both built-in file
+        tools and shell subprocesses map ``~`` to this directory, so
+        the agent can use ``~/MEMORY.md`` regardless of the current
+        workspace.
+
+        By default, derived as
+        ``<agency_root>/.thorn/agents/<agent-id>/``, but callers may
+        supply an explicit *home* at construction to place it anywhere
+        on the filesystem.
 
         Resolved lazily from the ambient ``ExecutionContext`` on first
         access.  If the agent has no ``id``, a stable one is derived
