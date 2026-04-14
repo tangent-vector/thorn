@@ -1987,9 +1987,18 @@ class TestRouteGithubEvent:
             repo_id=42, event_type="Push", event_id="e1",
             workspaces_root=tmp_path,
         )
-        assert route.workspace_root == tmp_path / "github_42"
+        assert route.workspace_root == tmp_path / "github_42_Push_e1"
 
-    def test_same_repo_different_events_share_workspace(self, tmp_path: Path):
+    def test_workspace_matches_session_key(self, tmp_path: Path):
+        from thorn.gateway._routing import route_github_event
+
+        route = route_github_event(
+            repo_id=42, event_type="PushEvent", event_id="abc",
+            workspaces_root=tmp_path,
+        )
+        assert route.workspace_root == tmp_path / str(route.session_key)
+
+    def test_different_events_get_distinct_workspaces(self, tmp_path: Path):
         from thorn.gateway._routing import route_github_event
 
         r1 = route_github_event(
@@ -2000,7 +2009,7 @@ class TestRouteGithubEvent:
             repo_id=99, event_type="Issue", event_id="e2",
             workspaces_root=tmp_path,
         )
-        assert r1.workspace_root == r2.workspace_root
+        assert r1.workspace_root != r2.workspace_root
         assert r1.session_key != r2.session_key
 
 
@@ -2028,9 +2037,18 @@ class TestRouteGitlabTodo:
             project_id=10, noteable_type="Issue", noteable_iid=5,
             workspaces_root=tmp_path,
         )
-        assert route.workspace_root == tmp_path / "gitlab_10"
+        assert route.workspace_root == tmp_path / "gitlab_10_Issue_5"
 
-    def test_same_project_different_noteables_share_workspace(self, tmp_path: Path):
+    def test_workspace_matches_session_key(self, tmp_path: Path):
+        from thorn.gateway._routing import route_gitlab_todo
+
+        route = route_gitlab_todo(
+            project_id=10, noteable_type="Issue", noteable_iid=5,
+            workspaces_root=tmp_path,
+        )
+        assert route.workspace_root == tmp_path / str(route.session_key)
+
+    def test_different_noteables_get_distinct_workspaces(self, tmp_path: Path):
         from thorn.gateway._routing import route_gitlab_todo
 
         r1 = route_gitlab_todo(
@@ -2041,7 +2059,7 @@ class TestRouteGitlabTodo:
             project_id=10, noteable_type="MergeRequest", noteable_iid=2,
             workspaces_root=tmp_path,
         )
-        assert r1.workspace_root == r2.workspace_root
+        assert r1.workspace_root != r2.workspace_root
         assert r1.session_key != r2.session_key
 
 

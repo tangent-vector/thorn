@@ -43,17 +43,18 @@ def route_github_event(
     Session key: ``github_<repo_id>_<event_type>_<event_id>``
     (spaces in *event_type* are replaced with underscores).
 
-    Workspace: ``<workspaces_root>/github_<repo_id>/`` when
-    *workspaces_root* is provided; ``None`` otherwise.  All events for
-    the same repository share a workspace so that issue work and PR
-    review can operate on the same clone.
+    Workspace: ``<workspaces_root>/github_<repo_id>_<event_type>_<event_id>/``
+    when *workspaces_root* is provided; ``None`` otherwise.  Each event
+    gets its own workspace directory so that concurrent sessions (e.g.
+    two different issues, or an issue and a PR review) cannot clobber
+    one another's working tree.
     """
     safe_type = event_type.replace(" ", "_")
     key = SessionKey(f"github_{repo_id}_{safe_type}_{event_id}")
 
     workspace: Path | None = None
     if workspaces_root is not None:
-        workspace = workspaces_root / f"github_{repo_id}"
+        workspace = workspaces_root / str(key)
 
     return SessionRoute(session_key=key, workspace_root=workspace)
 
@@ -73,15 +74,16 @@ def route_gitlab_todo(
 
     Session key: ``gitlab_<project_id>_<noteable_type>_<iid>``
 
-    Workspace: ``<workspaces_root>/gitlab_<project_id>/`` when
-    *workspaces_root* is provided; ``None`` otherwise.  All TODOs for
-    the same project share a workspace.
+    Workspace: ``<workspaces_root>/gitlab_<project_id>_<noteable_type>_<iid>/``
+    when *workspaces_root* is provided; ``None`` otherwise.  Each
+    noteable gets its own workspace directory so that concurrent
+    sessions cannot clobber one another's working tree.
     """
     key = SessionKey(f"gitlab_{project_id}_{noteable_type}_{noteable_iid}")
 
     workspace: Path | None = None
     if workspaces_root is not None:
-        workspace = workspaces_root / f"gitlab_{project_id}"
+        workspace = workspaces_root / str(key)
 
     return SessionRoute(session_key=key, workspace_root=workspace)
 
