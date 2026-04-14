@@ -11,6 +11,7 @@ the unit of identity persistence.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -30,6 +31,14 @@ class Session:
     The ``prompt`` accessor works identically to the ``Agent.prompt``
     accessor — ``session.prompt("text")`` and ``session.prompt[T]("text")``
     both work.
+
+    Attributes:
+        workspace_root: When set, overrides both ``agent.workspace`` and
+            the ambient ``ExecutionContext.workspace_root`` for this
+            session's turns.  Used for file tools, ``AGENTS.md``
+            loading, and ``RelativeTo.WORKSPACE`` policy resolution.
+            Immutable after the session's first persisted turn —
+            subsequent events reuse the stored value.
     """
 
     def __init__(
@@ -40,6 +49,7 @@ class Session:
         created_at: datetime | None = None,
         last_active: datetime | None = None,
         metadata: dict[str, Any] | None = None,
+        workspace_root: Path | None = None,
     ) -> None:
         from thorn.core._history import HistoryTree
 
@@ -49,6 +59,7 @@ class Session:
         self.created_at: datetime | None = created_at
         self.last_active: datetime | None = last_active
         self.metadata: dict[str, Any] = metadata if metadata is not None else {}
+        self.workspace_root: Path | None = workspace_root
 
     def touch(self) -> None:
         """Update ``last_active`` to the current UTC time."""

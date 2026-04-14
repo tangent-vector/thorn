@@ -15,11 +15,13 @@ import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from pydantic import Field
 
 from thorn.gateway._event import EventSource, IncomingEvent
+from thorn.gateway._routing import route_github_event
 from thorn.runtime._session import SessionKey
 from thorn.tools._github_connection import GitHubConnectionConfig
 from thorn.tools.github import build_pygithub_auth
@@ -72,6 +74,14 @@ class GitHubNotificationsSourceConfig(GitHubConnectionConfig):
         ge=5,
         description="Seconds between polling cycles",
     )
+    workspaces_root: str | None = Field(
+        default=None,
+        description=(
+            "Absolute path to the root directory under which per-repo "
+            "workspace directories are created.  When unset, sessions "
+            "inherit the agent's default workspace."
+        ),
+    )
 
     @classmethod
     def from_env(cls) -> GitHubNotificationsSourceConfig:
@@ -89,6 +99,7 @@ class GitHubNotificationsSourceConfig(GitHubConnectionConfig):
             repository=repository,
             app_slug=os.environ.get("THORN_GITHUB_APP_SLUG", ""),
             poll_interval=int(os.environ.get("THORN_POLL_INTERVAL", "30")),
+            workspaces_root=os.environ.get("THORN_WORKSPACES_ROOT"),
         )
 
 
@@ -98,9 +109,16 @@ class GitHubNotificationsSourceConfig(GitHubConnectionConfig):
 
 
 def _session_key_for_event(repo_id: int, event_type: str, event_id: str) -> SessionKey:
-    """Stable key for deduplication: one IncomingEvent per REST event id."""
-    safe_type = event_type.replace(" ", "_")
-    return SessionKey(f"github_{repo_id}_{safe_type}_{event_id}")
+    """Stable key for deduplication: one IncomingEvent per REST event id.
+
+    Thin wrapper kept for backward compatibility; delegates to the
+    centralized :func:`route_github_event` helper.
+    """
+    return route_github_event(
+        repo_id=repo_id,
+        event_type=event_type,
+        event_id=event_id,
+    ).session_key
 
 
 def _payload_summary(event_type: str, payload: dict[str, Any]) -> str:
@@ -187,6 +205,7 @@ def _make_incoming_event(
     actor_login: str,
     created_at: str,
     payload: dict[str, Any],
+    workspaces_root: Path | None = None,
 ) -> IncomingEvent:
     repo_id = repo.id
     full_name = repo.full_name
@@ -207,10 +226,20 @@ def _make_incoming_event(
         payload=payload,
     )
 
+    route = route_github_event(
+        repo_id=repo_id,
+        event_type=event_type,
+        event_id=event_id,
+        workspaces_root=workspaces_root,
+    )
+
     return IncomingEvent(
         source="github",
-        session_key=_session_key_for_event(repo_id, event_type, event_id),
+        session_key=route.session_key,
         content=content,
+        workspace_root=(
+            str(route.workspace_root) if route.workspace_root else None
+        ),
         metadata={
             "event_id": event_id,
             "event_type": event_type,
@@ -320,6 +349,11 @@ class GitHubNotificationsSource(EventSource):
         for ev in new_events:
             await on_event(ev)
 
+    @property
+    def _workspaces_root(self) -> Path | None:
+        ws = self._config.workspaces_root
+        return Path(ws) if ws else None
+
     def _fetch_new_events(self) -> list[IncomingEvent]:
         """Return new events since last poll (newest-first API order)."""
         repo = self._gh.get_repo(self._config.repository)
@@ -362,6 +396,7 @@ class GitHubNotificationsSource(EventSource):
                     actor_login=actor_login,
                     created_at=created,
                     payload=payload,
+                    workspaces_root=self._workspaces_root,
                 ),
             )
 

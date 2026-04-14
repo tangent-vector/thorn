@@ -301,6 +301,8 @@ class JsonSessionSerializer:
             "last_active": session.last_active.isoformat() if session.last_active else None,
             "metadata": session.metadata,
         }
+        if session.workspace_root is not None:
+            session_data["workspace_root"] = str(session.workspace_root)
         session_path = directory / _SESSION_FILE
         session_path.write_text(
             json.dumps(session_data, indent=2, ensure_ascii=False) + "\n",
@@ -327,12 +329,16 @@ class JsonSessionSerializer:
         last_raw = session_data.get("last_active")
         last_active = datetime.fromisoformat(last_raw) if last_raw else None
 
+        ws_raw = session_data.get("workspace_root")
+        workspace_root = Path(ws_raw) if ws_raw is not None else None
+
         session = Session(
             agent=agent,
             key=key,
             created_at=created_at,
             last_active=last_active,
             metadata=session_data.get("metadata", {}),
+            workspace_root=workspace_root,
         )
 
         history_path = directory / _HISTORY_FILE

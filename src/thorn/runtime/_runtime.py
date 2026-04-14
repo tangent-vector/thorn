@@ -261,10 +261,18 @@ class Runtime:
         self,
         agent: Agent,
         key: SessionKey | str,
+        *,
+        workspace_root: Path | None = None,
     ) -> Session:
         """Retrieve a persisted session, or create a new one if not found.
 
         The session is scoped under the given agent instance.
+
+        *workspace_root* is applied **only when creating** a new session.
+        Existing sessions retain the workspace they were created with;
+        passing a different value on a subsequent load is a no-op so
+        that later events cannot silently drift the session's working
+        tree.
         """
         if not isinstance(key, SessionKey):
             key = SessionKey(key)
@@ -278,6 +286,7 @@ class Runtime:
             key=key,
             created_at=now,
             last_active=now,
+            workspace_root=workspace_root,
         )
 
     def save_session(self, session: Session) -> None:

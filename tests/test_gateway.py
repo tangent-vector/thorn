@@ -1948,3 +1948,213 @@ class TestGatewayReExports:
 
             assert GitLabSourceConfig is not None
             assert GitLabTODOsSource is not None
+
+
+# ---------------------------------------------------------------------------
+# Routing helpers
+# ---------------------------------------------------------------------------
+
+
+class TestRouteGithubEvent:
+    def test_session_key_matches_legacy_format(self):
+        from thorn.gateway._routing import route_github_event
+
+        route = route_github_event(
+            repo_id=42, event_type="PushEvent", event_id="abc123",
+        )
+        assert route.session_key == SessionKey("github_42_PushEvent_abc123")
+
+    def test_session_key_with_spaces_in_event_type(self):
+        from thorn.gateway._routing import route_github_event
+
+        route = route_github_event(
+            repo_id=1, event_type="My Event", event_id="e1",
+        )
+        assert route.session_key == SessionKey("github_1_My_Event_e1")
+
+    def test_workspace_none_when_root_unset(self):
+        from thorn.gateway._routing import route_github_event
+
+        route = route_github_event(
+            repo_id=42, event_type="Push", event_id="e1",
+        )
+        assert route.workspace_root is None
+
+    def test_workspace_deterministic_under_root(self, tmp_path: Path):
+        from thorn.gateway._routing import route_github_event
+
+        route = route_github_event(
+            repo_id=42, event_type="Push", event_id="e1",
+            workspaces_root=tmp_path,
+        )
+        assert route.workspace_root == tmp_path / "github_42"
+
+    def test_same_repo_different_events_share_workspace(self, tmp_path: Path):
+        from thorn.gateway._routing import route_github_event
+
+        r1 = route_github_event(
+            repo_id=99, event_type="Push", event_id="e1",
+            workspaces_root=tmp_path,
+        )
+        r2 = route_github_event(
+            repo_id=99, event_type="Issue", event_id="e2",
+            workspaces_root=tmp_path,
+        )
+        assert r1.workspace_root == r2.workspace_root
+        assert r1.session_key != r2.session_key
+
+
+class TestRouteGitlabTodo:
+    def test_session_key_matches_legacy_format(self):
+        from thorn.gateway._routing import route_gitlab_todo
+
+        route = route_gitlab_todo(
+            project_id=10, noteable_type="Issue", noteable_iid=5,
+        )
+        assert route.session_key == SessionKey("gitlab_10_Issue_5")
+
+    def test_workspace_none_when_root_unset(self):
+        from thorn.gateway._routing import route_gitlab_todo
+
+        route = route_gitlab_todo(
+            project_id=10, noteable_type="Issue", noteable_iid=5,
+        )
+        assert route.workspace_root is None
+
+    def test_workspace_deterministic_under_root(self, tmp_path: Path):
+        from thorn.gateway._routing import route_gitlab_todo
+
+        route = route_gitlab_todo(
+            project_id=10, noteable_type="Issue", noteable_iid=5,
+            workspaces_root=tmp_path,
+        )
+        assert route.workspace_root == tmp_path / "gitlab_10"
+
+    def test_same_project_different_noteables_share_workspace(self, tmp_path: Path):
+        from thorn.gateway._routing import route_gitlab_todo
+
+        r1 = route_gitlab_todo(
+            project_id=10, noteable_type="Issue", noteable_iid=1,
+            workspaces_root=tmp_path,
+        )
+        r2 = route_gitlab_todo(
+            project_id=10, noteable_type="MergeRequest", noteable_iid=2,
+            workspaces_root=tmp_path,
+        )
+        assert r1.workspace_root == r2.workspace_root
+        assert r1.session_key != r2.session_key
+
+
+# ---------------------------------------------------------------------------
+# IncomingEvent workspace_root field
+# ---------------------------------------------------------------------------
+
+
+class TestIncomingEventWorkspaceRoot:
+    def test_defaults_to_none(self):
+        event = IncomingEvent(
+            source="test", session_key=SessionKey("k"), content="hi",
+        )
+        assert event.workspace_root is None
+
+    def test_preserves_value(self):
+        event = IncomingEvent(
+            source="test",
+            session_key=SessionKey("k"),
+            content="hi",
+            workspace_root="/tmp/ws",
+        )
+        assert event.workspace_root == "/tmp/ws"
+
+
+# ---------------------------------------------------------------------------
+# Gateway: workspace_root flows through to session creation
+# ---------------------------------------------------------------------------
+
+
+class TestGatewayWorkspaceRouting:
+    def _make_runtime(self, tmp_path: Path) -> Runtime:
+        return Runtime(provider=MockProvider(), workspace_root=tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_event_workspace_stored_on_new_session(self, tmp_path: Path):
+        """When an event carries a workspace_root, the newly created
+        session persists that path.
+        """
+        ws = tmp_path / "workspaces" / "repo1"
+        event = IncomingEvent(
+            source="test",
+            session_key=SessionKey("ws_key"),
+            content="Hello",
+            workspace_root=str(ws),
+        )
+        source = StubSource([event])
+        runtime = self._make_runtime(tmp_path)
+
+        with patch.object(
+            _SessionPromptAccessor, "__call__", return_value="ok",
+        ):
+            gateway = Gateway(runtime=runtime, sources=[source])
+            await gateway.run()
+
+        agent_ids = runtime.sessions.list_agent_ids()
+        assert agent_ids
+        agent = runtime.sessions.load_agent(agent_ids[0])
+        loaded = runtime.sessions.load_session(agent, SessionKey("ws_key"))
+        assert loaded.workspace_root == ws
+
+    @pytest.mark.asyncio
+    async def test_event_without_workspace_creates_none(self, tmp_path: Path):
+        """Events without workspace_root create sessions with None."""
+        event = IncomingEvent(
+            source="test",
+            session_key=SessionKey("no_ws"),
+            content="Hello",
+        )
+        source = StubSource([event])
+        runtime = self._make_runtime(tmp_path)
+
+        with patch.object(
+            _SessionPromptAccessor, "__call__", return_value="ok",
+        ):
+            gateway = Gateway(runtime=runtime, sources=[source])
+            await gateway.run()
+
+        agent_ids = runtime.sessions.list_agent_ids()
+        agent = runtime.sessions.load_agent(agent_ids[0])
+        loaded = runtime.sessions.load_session(agent, SessionKey("no_ws"))
+        assert loaded.workspace_root is None
+
+    @pytest.mark.asyncio
+    async def test_existing_session_workspace_not_overwritten(self, tmp_path: Path):
+        """A second event with a different workspace_root for the same
+        session key does not change the persisted workspace.
+        """
+        runtime = self._make_runtime(tmp_path)
+        ws_original = tmp_path / "ws" / "original"
+        ws_different = tmp_path / "ws" / "different"
+
+        event1 = IncomingEvent(
+            source="test",
+            session_key=SessionKey("stable_ws"),
+            content="First",
+            workspace_root=str(ws_original),
+        )
+        event2 = IncomingEvent(
+            source="test",
+            session_key=SessionKey("stable_ws"),
+            content="Second",
+            workspace_root=str(ws_different),
+        )
+        source = StubSource([event1, event2])
+
+        with patch.object(
+            _SessionPromptAccessor, "__call__", return_value="ok",
+        ):
+            gateway = Gateway(runtime=runtime, sources=[source])
+            await gateway.run()
+
+        agent_ids = runtime.sessions.list_agent_ids()
+        agent = runtime.sessions.load_agent(agent_ids[0])
+        loaded = runtime.sessions.load_session(agent, SessionKey("stable_ws"))
+        assert loaded.workspace_root == ws_original

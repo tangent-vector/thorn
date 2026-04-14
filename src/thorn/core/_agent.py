@@ -398,7 +398,11 @@ async def _run_session_prompt(
 
     ctx = get_context()
 
-    workspace = agent.workspace if agent.workspace is not None else ctx.workspace_root
+    workspace = (
+        session.workspace_root
+        or agent.workspace
+        or ctx.workspace_root
+    )
 
     rules = type(agent)._collect_file_access()
     rules = list(rules)

@@ -17,6 +17,7 @@ import contextlib
 import logging
 import signal
 import sys
+from pathlib import Path
 from typing import Any
 
 from thorn.core._agent import Agent
@@ -126,7 +127,10 @@ class Gateway:
 
         async with agent.lock:
             self._runtime.save_agent(agent)
-            session = self._runtime.get_or_create_session(agent, event.session_key)
+            ws = Path(event.workspace_root) if event.workspace_root else None
+            session = self._runtime.get_or_create_session(
+                agent, event.session_key, workspace_root=ws,
+            )
             try:
                 await session.prompt(event.content)
             except Exception:

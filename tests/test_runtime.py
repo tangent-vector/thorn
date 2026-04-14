@@ -895,6 +895,57 @@ class TestJsonSessionSerializerSession:
         restored = serializer.load_session(session_dir, agent)
         assert restored.key is None
 
+    def test_workspace_root_roundtrip(self, tmp_path: Path):
+        agent = self._make_agent()
+        ws = tmp_path / "checkout" / "repo"
+        session = Session(
+            agent=agent,
+            key=SessionKey("ws-test"),
+            workspace_root=ws,
+        )
+
+        serializer = JsonSessionSerializer()
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+
+        raw = json.loads((session_dir / "session.json").read_text())
+        assert raw["workspace_root"] == str(ws)
+
+        restored = serializer.load_session(session_dir, agent)
+        assert restored.workspace_root == ws
+
+    def test_workspace_root_none_omitted_from_json(self, tmp_path: Path):
+        agent = self._make_agent()
+        session = Session(agent=agent, key=SessionKey("no-ws"))
+
+        serializer = JsonSessionSerializer()
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+
+        raw = json.loads((session_dir / "session.json").read_text())
+        assert "workspace_root" not in raw
+
+        restored = serializer.load_session(session_dir, agent)
+        assert restored.workspace_root is None
+
+    def test_legacy_session_without_workspace_root_loads(self, tmp_path: Path):
+        """Sessions persisted before workspace_root was added still load."""
+        agent = self._make_agent()
+        session_dir = tmp_path / "legacy"
+        session_dir.mkdir()
+        (session_dir / "session.json").write_text(json.dumps({
+            "key": "old-session",
+            "created_at": None,
+            "last_active": None,
+            "metadata": {},
+        }))
+        (session_dir / "history.json").write_text("[]")
+
+        serializer = JsonSessionSerializer()
+        restored = serializer.load_session(session_dir, agent)
+        assert restored.workspace_root is None
+        assert restored.key == SessionKey("old-session")
+
     def test_compacted_history_render_survives_roundtrip(self, tmp_path: Path):
         """Save a session with mixed collapse states, reload it, and
         verify that rendered messages match exactly.
@@ -1326,6 +1377,27 @@ class TestRuntime:
         agent = Agent(name="no-id")
         with pytest.raises(ValueError, match="without an id"):
             rt.get_or_create_session(agent, "s1")
+
+    def test_get_or_create_session_with_workspace_root(self, tmp_path: Path):
+        rt = self._make_runtime(tmp_path)
+        agent = rt.create_agent(id="a1")
+        ws = tmp_path / "workspaces" / "repo1"
+        session = rt.get_or_create_session(agent, "s1", workspace_root=ws)
+        assert session.workspace_root == ws
+
+    def test_get_or_create_session_ignores_workspace_on_load(self, tmp_path: Path):
+        """Workspace root is set only at creation time; loading an
+        existing session uses the persisted value, not the new argument.
+        """
+        rt = self._make_runtime(tmp_path)
+        agent = rt.create_agent(id="a1")
+        ws_original = tmp_path / "workspaces" / "original"
+        session = rt.get_or_create_session(agent, "s1", workspace_root=ws_original)
+        rt.save_session(session)
+
+        ws_different = tmp_path / "workspaces" / "different"
+        reloaded = rt.get_or_create_session(agent, "s1", workspace_root=ws_different)
+        assert reloaded.workspace_root == ws_original
 
     def test_create_context_system_prompts_are_independent(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
