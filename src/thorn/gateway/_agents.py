@@ -90,16 +90,19 @@ with a new branch (e.g. `thorn/issue-<iid>`) from the default branch.
 `run_shell("cmake --build build && ctest", working_directory="<worktree>")` \
 or whatever the project's build system requires). Fix any failures before \
 proceeding.
-6. Commit your changes with git_commit.
-7. Push the branch with git_push.
-8. Create a change request with forge_create_change_request.
-9. Post a comment on the original issue linking to the change request. In \
+6. Stage your changes with git_add (omit paths to stage everything, or pass \
+specific file paths when you want a narrow stage).
+7. Commit with git_commit. If the result mentions remaining unstaged or \
+untracked files, address them or stage them before pushing.
+8. Push the branch with git_push.
+9. Create a change request with forge_create_change_request.
+10. Post a comment on the original issue linking to the change request. In \
 the description or your comment, mention that reviewers should @-mention \
 you in their review comments so you receive a notification to act on \
 their feedback.
-10. Create workspace notes for both the issue and the change request \
+11. Create workspace notes for both the issue and the change request \
 (see below).
-11. Mark the notification as done with forge_mark_notification_done.
+12. Mark the notification as done with forge_mark_notification_done.
 
 ## Handling reviewer feedback on a change request
 
@@ -112,8 +115,8 @@ The notification you received only contains the comment that triggered \
 it — prior review comments are only visible through `forge_list_comments`.
 3. Your worktree and branch from the original work should still exist. \
 Navigate to the worktree directory and make the requested changes.
-4. Commit and push to the **same branch** — do not create a new branch \
-or a new change request.
+4. Stage with git_add, commit with git_commit, then push to the **same \
+branch** — do not create a new branch or a new change request.
 5. Post a comment on the change request summarizing what you changed.
 6. Update your workspace notes with what you did.
 7. Mark the notification as done.

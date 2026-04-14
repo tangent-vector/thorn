@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse, urlunparse
 
@@ -185,6 +186,40 @@ def _resolve_tool_path(path: str) -> str:
     return str(resolve_path(path))
 
 
+def _safe_paths_under_repo(repo_resolved: str, paths: list[str]) -> list[str]:
+    """Return *paths* unchanged if each resolves under *repo_resolved*.
+
+    Rejects absolute paths and paths that escape the repository via ``..``.
+    """
+    root = Path(repo_resolved).resolve()
+    for raw in paths:
+        if os.path.isabs(raw):
+            raise ValueError(
+                "git_add paths must be relative to the repository, "
+                f"got absolute path: {raw!r}",
+            )
+        joined = (root / raw).resolve()
+        try:
+            joined.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                f"git_add path escapes repository root: {raw!r}",
+            ) from exc
+    return paths
+
+
+async def _remaining_changes_note(resolved_repo: str) -> str:
+    """Non-empty string to append after a successful commit if the tree is not clean."""
+    _, output = await _run_git("status", "--short", cwd=resolved_repo)
+    text = output.strip()
+    if not text:
+        return ""
+    return (
+        "\n\nRemaining changes after commit (unstaged and/or untracked):\n"
+        + text
+    )
+
+
 # ---------------------------------------------------------------------------
 # @tool functions
 # ---------------------------------------------------------------------------
@@ -230,16 +265,55 @@ async def git_branch(
 
 
 @tool
-async def git_commit(repo_path: str, message: str) -> str:
-    """Stage all changes and create a commit.
+async def git_add(repo_path: str, paths: list[str] | None = None) -> str:
+    """Stage changes in the repository index.
 
-    Equivalent to ``git add -A && git commit -m <message>``.
-    Returns the commit summary.
+    When *paths* is omitted (or ``None``), runs ``git add -A`` in the
+    repository — stage all new, modified, and deleted paths. Prefer
+    passing an explicit *paths* list when you know which files changed,
+    to avoid accidentally staging unrelated files.
+
+    Paths are relative to the repository root. Path segments must not
+    escape the repository (no ``..`` traversal to outside the repo).
+
+    Args:
+        repo_path: Root of the git repository or worktree.
+        paths: Files or directories to stage; omit for ``git add -A``.
     """
     resolved = _resolve_tool_path(repo_path)
-    await _run_git("add", "-A", cwd=resolved)
+    if paths is None:
+        _, output = await _run_git("add", "-A", cwd=resolved)
+    else:
+        if not paths:
+            return (
+                "Error: when provided, paths must be non-empty, "
+                "or omit paths entirely to stage all changes."
+            )
+        _safe_paths_under_repo(resolved, paths)
+        _, output = await _run_git("add", "--", *paths, cwd=resolved)
+    return output.strip() if output.strip() else "Staged changes."
+
+
+@tool
+async def git_commit(repo_path: str, message: str) -> str:
+    """Create a commit from the current index.
+
+    Runs ``git commit -m <message>`` only. Stage changes first with
+    ``git_add``. If nothing is staged, git exits with an error
+    (same as the CLI).
+
+    On success, if the working tree still has unstaged or untracked
+    changes, that status is appended so you can notice missed files.
+
+    Args:
+        repo_path: Root of the git repository or worktree.
+        message: Commit message.
+    """
+    resolved = _resolve_tool_path(repo_path)
     _, output = await _run_git("commit", "-m", message, cwd=resolved)
-    return output.strip()
+    body = output.strip()
+    remainder = await _remaining_changes_note(resolved)
+    return body + remainder
 
 
 @tool
@@ -395,6 +469,7 @@ async def git_log(
 GIT_TOOLS: list[object] = [
     git_clone,
     git_branch,
+    git_add,
     git_commit,
     git_push,
     git_fetch,
@@ -411,6 +486,7 @@ __all__ = [
     "GitError",
     "git_clone",
     "git_branch",
+    "git_add",
     "git_commit",
     "git_push",
     "git_fetch",

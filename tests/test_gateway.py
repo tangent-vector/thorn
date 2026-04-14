@@ -1003,6 +1003,7 @@ class TestProjectCoordinator:
         assert "git_clone" in tool_names
         assert "git_push" in tool_names
         assert "git_worktree_add" in tool_names
+        assert "git_add" in tool_names
         assert "git_commit" in tool_names
 
     def test_has_file_tools(self):
@@ -1089,7 +1090,7 @@ class TestEndToEndWiring:
             "forge_read_issue", "forge_post_comment",
             "forge_create_change_request", "forge_mark_notification_done",
             "forge_get_project_info",
-            "git_clone", "git_push", "git_commit", "git_worktree_add",
+            "git_clone", "git_push", "git_add", "git_commit", "git_worktree_add",
             "read_file", "edit_file", "create_file",
         }
         assert required.issubset(tool_names), (

@@ -14,6 +14,7 @@ from thorn.tools.git import (
     _git_identity_env,
     _inject_url_credentials,
     _run_git,
+    git_add,
     git_branch,
     git_clone,
     git_commit,
@@ -361,6 +362,7 @@ class TestGitCommitWithIdentity:
         token = set_context(ctx)
         try:
             (repo / "file.txt").write_text("hello\n")
+            await git_add(str(repo))
             result = await git_commit(str(repo), "identity test commit")
             assert "identity test" in result.lower()
 
@@ -434,6 +436,38 @@ class TestGitBranch:
 
 
 # ---------------------------------------------------------------------------
+# git_add
+# ---------------------------------------------------------------------------
+
+
+class TestGitAdd:
+    async def test_add_all_stages_new_file(self, git_repo: Path) -> None:
+        (git_repo / "staged.txt").write_text("x\n")
+        result = await git_add(str(git_repo))
+        assert "staged" in result.lower() or result == "Staged changes."
+
+    async def test_add_explicit_paths(self, git_repo: Path) -> None:
+        (git_repo / "keep.txt").write_text("k\n")
+        (git_repo / "skip.txt").write_text("s\n")
+        await git_add(str(git_repo), paths=["keep.txt"])
+        result = await git_status(str(git_repo))
+        assert "keep.txt" in result
+        assert "skip.txt" in result
+
+    async def test_empty_paths_returns_error_message(self, git_repo: Path) -> None:
+        result = await git_add(str(git_repo), paths=[])
+        assert "Error" in result
+
+    async def test_path_escapes_repo_rejected(self, git_repo: Path) -> None:
+        with pytest.raises(ValueError, match="escapes"):
+            await git_add(str(git_repo), paths=["../outside"])
+
+    async def test_absolute_path_rejected(self, git_repo: Path) -> None:
+        with pytest.raises(ValueError, match="relative"):
+            await git_add(str(git_repo), paths=["/absolute/path"])
+
+
+# ---------------------------------------------------------------------------
 # git_commit
 # ---------------------------------------------------------------------------
 
@@ -441,12 +475,23 @@ class TestGitBranch:
 class TestGitCommit:
     async def test_commit_new_file(self, git_repo: Path) -> None:
         (git_repo / "new.txt").write_text("content\n")
+        await git_add(str(git_repo))
         result = await git_commit(str(git_repo), "add new file")
         assert "new file" in result.lower() or "add new" in result.lower()
 
     async def test_nothing_to_commit_fails(self, git_repo: Path) -> None:
         with pytest.raises(GitError):
             await git_commit(str(git_repo), "empty")
+
+    async def test_commit_appends_remainder_when_untracked_remain(
+        self, git_repo: Path,
+    ) -> None:
+        (git_repo / "in_commit.txt").write_text("in\n")
+        (git_repo / "left_out.txt").write_text("out\n")
+        await git_add(str(git_repo), paths=["in_commit.txt"])
+        result = await git_commit(str(git_repo), "partial")
+        assert "Remaining changes after commit" in result
+        assert "left_out.txt" in result
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +506,7 @@ class TestGitLog:
 
     async def test_max_count(self, git_repo: Path) -> None:
         (git_repo / "a.txt").write_text("a\n")
+        await git_add(str(git_repo))
         await git_commit(str(git_repo), "second commit")
         result = await git_log(str(git_repo), max_count=1)
         assert "second" in result
@@ -579,6 +625,7 @@ class TestGitPush:
             cwd=git_repo, check=True, capture_output=True,
         )
         (git_repo / "push_test.txt").write_text("push me\n")
+        await git_add(str(git_repo))
         await git_commit(str(git_repo), "for push test")
 
         current_branch_proc = subprocess.run(
@@ -626,7 +673,7 @@ class TestGitToolsList:
             )
 
     def test_expected_count(self) -> None:
-        assert len(GIT_TOOLS) == 11
+        assert len(GIT_TOOLS) == 12
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +745,7 @@ class TestGitWorkspaceResolution:
     ) -> None:
         workspace, repo = workspace_repo
         (repo / "new.txt").write_text("hello\n")
+        await git_add("myrepo")
         result = await git_commit("myrepo", "add new file")
         assert "new file" in result.lower() or "add new" in result.lower()
 
