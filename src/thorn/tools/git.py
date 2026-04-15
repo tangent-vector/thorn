@@ -226,12 +226,19 @@ async def _remaining_changes_note(resolved_repo: str) -> str:
 
 
 @tool
-async def git_clone(remote_url: str, local_path: str) -> str:
-    """Clone a git repository (bare) or fetch updates if it already exists.
+async def git_clone(
+    remote_url: str,
+    local_path: str,
+    bare: bool = False,
+) -> str:
+    """Clone a git repository, or fetch updates if it already exists.
 
-    Uses ``--bare`` clones so that worktrees can be created from the
-    clone for parallel work on multiple branches.  Credentials are
-    injected transparently from the agent's metadata when available.
+    By default, performs a normal clone that produces a working tree
+    (checked-out files you can edit directly).  Pass ``bare=True`` for
+    a bare clone suitable for managing multiple worktrees.
+
+    Credentials are injected transparently from the agent's metadata
+    when available.
 
     Returns a confirmation message with the local path.
     """
@@ -242,7 +249,12 @@ async def git_clone(remote_url: str, local_path: str) -> str:
         _, output = await _run_git("fetch", "--all", cwd=resolved)
         return f"Fetched updates in {local_path}\n{output}".strip()
 
-    _, output = await _run_git("clone", "--bare", authenticated_url, resolved)
+    clone_args = ["clone"]
+    if bare:
+        clone_args.append("--bare")
+    clone_args.extend([authenticated_url, resolved])
+
+    _, output = await _run_git(*clone_args)
     return f"Cloned {remote_url} -> {local_path}\n{output}".strip()
 
 
