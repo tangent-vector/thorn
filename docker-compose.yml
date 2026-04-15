@@ -1,0 +1,19 @@
+# docker compose up --build
+#
+# Expects:
+#   - .env at the repo root with LLM + forge credentials (see deploy/brev/env.template)
+#   - .thorn/ directory with gateway.json and agent identity
+#     (create via: docker compose run --rm gateway thorn serve bootstrap ...)
+
+services:
+  gateway:
+    build: .
+    env_file: .env
+    environment:
+      GIT_AUTHOR_NAME: thorn-bot
+      GIT_COMMITTER_NAME: thorn-bot
+      GIT_AUTHOR_EMAIL: thorn-bot@users.noreply.github.com
+      GIT_COMMITTER_EMAIL: thorn-bot@users.noreply.github.com
+    volumes:
+      - ./.thorn:/workspace/.thorn
+    restart: unless-stopped
