@@ -45,6 +45,14 @@ notification metadata.
 
 Key tools:
 - `forge_read_issue(project, issue_id)` — read an issue.
+- `forge_create_issue(project, title, description, labels, assignees)` \
+— create a new issue. Labels and assignees are optional.
+- `forge_list_issues(project, state, labels)` — list issues filtered \
+by state (`"open"`, `"closed"`, `"all"`) and optionally by labels.
+- `forge_update_issue(project, issue_id, ...)` — update an issue's \
+title, description, state, labels, or assignees. Supports \
+`add_labels`/`remove_labels` and `add_assignees`/`remove_assignees` \
+for incremental changes.
 - `forge_post_comment(project, target_type, target_id, body)` — post \
 a comment on an Issue or ChangeRequest.
 - `forge_create_change_request(project, source_branch, title, ...)` — \

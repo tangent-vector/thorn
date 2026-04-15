@@ -145,6 +145,104 @@ class GitHubClient:
             "html_url": issue.html_url,
         }
 
+    def create_issue(
+        self,
+        repo: str,
+        title: str,
+        body: str = "",
+        labels: list[str] | None = None,
+        assignees: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create an issue and return its key fields as a dict."""
+        repository = self._gh.get_repo(repo)
+        kwargs: dict[str, Any] = {"title": title, "body": body}
+        if labels:
+            kwargs["labels"] = labels
+        if assignees:
+            kwargs["assignees"] = assignees
+        issue = repository.create_issue(**kwargs)
+        log.info("Created issue #%d in %s", issue.number, repo)
+        return {
+            "number": issue.number,
+            "title": issue.title,
+            "state": issue.state,
+            "body": issue.body or "",
+            "labels": [label.name for label in issue.labels],
+            "assignees": [a.login for a in issue.assignees],
+            "html_url": issue.html_url,
+        }
+
+    def list_issues(
+        self,
+        repo: str,
+        state: str = "open",
+        labels: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """List issues in a repository filtered by *state* and optionally *labels*.
+
+        Only returns actual issues (excludes pull requests, which GitHub
+        co-mingles in the issues endpoint).
+        """
+        repository = self._gh.get_repo(repo)
+        kwargs: dict[str, Any] = {"state": state, "sort": "created", "direction": "desc"}
+        if labels:
+            kwargs["labels"] = labels
+        issues = repository.get_issues(**kwargs)
+        return [
+            {
+                "number": issue.number,
+                "title": issue.title,
+                "state": issue.state,
+                "html_url": issue.html_url,
+                "labels": [label.name for label in issue.labels],
+                "assignees": [a.login for a in issue.assignees],
+                "author": issue.user.login if issue.user else None,
+            }
+            for issue in issues
+            if issue.pull_request is None
+        ]
+
+    def update_issue(
+        self,
+        repo: str,
+        issue_number: int,
+        title: str | None = None,
+        body: str | None = None,
+        state: str | None = None,
+        labels: list[str] | None = None,
+        assignees: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Edit an issue's fields and return the updated issue as a dict.
+
+        Only the fields that are not ``None`` are changed.  *labels* and
+        *assignees* are **replacement** sets (not additive); callers that
+        want add/remove semantics should merge before calling.
+        """
+        repository = self._gh.get_repo(repo)
+        issue = repository.get_issue(number=issue_number)
+        kwargs: dict[str, Any] = {}
+        if title is not None:
+            kwargs["title"] = title
+        if body is not None:
+            kwargs["body"] = body
+        if state is not None:
+            kwargs["state"] = state
+        if labels is not None:
+            kwargs["labels"] = labels
+        if assignees is not None:
+            kwargs["assignees"] = assignees
+        issue.edit(**kwargs)
+        log.info("Updated issue #%d in %s", issue_number, repo)
+        return {
+            "number": issue.number,
+            "title": issue.title,
+            "state": issue.state,
+            "body": issue.body or "",
+            "labels": [label.name for label in issue.labels],
+            "assignees": [a.login for a in issue.assignees],
+            "html_url": issue.html_url,
+        }
+
     def post_comment(
         self,
         repo: str,

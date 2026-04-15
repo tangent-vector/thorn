@@ -164,6 +164,84 @@ class TestGitLabForgeClient:
         mock_gl.read_file.assert_called_once_with(42, "README.md", "main")
         assert result["content"] == "# Hello"
 
+    def test_create_issue(self):
+        client, mock_gl = self._make_client()
+        mock_gl.create_issue.return_value = {
+            "iid": 10,
+            "title": "New feature",
+            "state": "opened",
+            "web_url": "https://gl.example.com/p/issues/10",
+            "description": "Please add X",
+            "labels": ["enhancement"],
+            "assignees": ["alice"],
+        }
+        result = client.create_issue(
+            "42", "New feature", "Please add X", ["enhancement"], ["alice"],
+        )
+        mock_gl.create_issue.assert_called_once_with(
+            42, title="New feature", description="Please add X",
+            labels=["enhancement"], assignees=["alice"],
+        )
+        assert result["id"] == 10
+        assert result["state"] == "open"
+        assert result["url"] == "https://gl.example.com/p/issues/10"
+
+    def test_list_issues_maps_state(self):
+        client, mock_gl = self._make_client()
+        mock_gl.list_issues.return_value = [
+            {
+                "iid": 1, "title": "Bug", "state": "opened",
+                "web_url": "https://gl.example.com/p/issues/1",
+                "labels": ["bug"], "assignees": ["bob"],
+                "author": "alice",
+            },
+        ]
+        result = client.list_issues("42", "open", None)
+        mock_gl.list_issues.assert_called_once_with(42, "opened", None)
+        assert len(result) == 1
+        assert result[0]["state"] == "open"
+        assert result[0]["id"] == 1
+
+    def test_list_issues_passes_labels(self):
+        client, mock_gl = self._make_client()
+        mock_gl.list_issues.return_value = []
+        client.list_issues("42", "all", ["bug", "urgent"])
+        mock_gl.list_issues.assert_called_once_with(42, "all", ["bug", "urgent"])
+
+    def test_update_issue_maps_state_to_event(self):
+        client, mock_gl = self._make_client()
+        mock_gl.update_issue.return_value = {
+            "iid": 7, "title": "Fixed", "state": "closed",
+            "web_url": "https://gl.example.com/p/issues/7",
+            "description": "", "labels": [], "assignees": [],
+        }
+        result = client.update_issue(
+            "42", 7, title="Fixed", description=None,
+            state="closed", labels=None, assignees=None,
+        )
+        mock_gl.update_issue.assert_called_once_with(
+            42, 7, title="Fixed", description=None,
+            state="close", labels=None, assignees=None,
+        )
+        assert result["id"] == 7
+        assert result["title"] == "Fixed"
+
+    def test_update_issue_maps_open_to_reopen(self):
+        client, mock_gl = self._make_client()
+        mock_gl.update_issue.return_value = {
+            "iid": 7, "title": "Bug", "state": "opened",
+            "web_url": "https://gl.example.com/p/issues/7",
+            "description": "", "labels": [], "assignees": [],
+        }
+        client.update_issue(
+            "42", 7, title=None, description=None,
+            state="open", labels=None, assignees=None,
+        )
+        mock_gl.update_issue.assert_called_once_with(
+            42, 7, title=None, description=None,
+            state="reopen", labels=None, assignees=None,
+        )
+
 
 # ---------------------------------------------------------------------------
 # GitHubForgeClient
@@ -279,6 +357,62 @@ class TestGitHubForgeClient:
         client, mock_gh = self._make_client()
         client.mark_notification_done("12345")
         mock_gh.mark_notification_read.assert_not_called()
+
+    def test_create_issue(self):
+        client, mock_gh = self._make_client()
+        mock_gh.create_issue.return_value = {
+            "number": 15,
+            "title": "Add tests",
+            "state": "open",
+            "html_url": "https://github.com/org/repo/issues/15",
+            "body": "We need tests",
+            "labels": ["testing"],
+            "assignees": ["bob"],
+        }
+        result = client.create_issue(
+            "org/repo", "Add tests", "We need tests",
+            ["testing"], ["bob"],
+        )
+        mock_gh.create_issue.assert_called_once_with(
+            "org/repo", title="Add tests", body="We need tests",
+            labels=["testing"], assignees=["bob"],
+        )
+        assert result["id"] == 15
+        assert result["state"] == "open"
+        assert result["url"] == "https://github.com/org/repo/issues/15"
+
+    def test_list_issues(self):
+        client, mock_gh = self._make_client()
+        mock_gh.list_issues.return_value = [
+            {
+                "number": 1, "title": "Bug", "state": "open",
+                "html_url": "https://github.com/org/repo/issues/1",
+                "labels": ["bug"], "assignees": ["alice"],
+                "author": "bob",
+            },
+        ]
+        result = client.list_issues("org/repo", "open", None)
+        mock_gh.list_issues.assert_called_once_with("org/repo", "open", None)
+        assert len(result) == 1
+        assert result[0]["id"] == 1
+
+    def test_update_issue(self):
+        client, mock_gh = self._make_client()
+        mock_gh.update_issue.return_value = {
+            "number": 7, "title": "Renamed", "state": "open",
+            "html_url": "https://github.com/org/repo/issues/7",
+            "body": "updated", "labels": [], "assignees": [],
+        }
+        result = client.update_issue(
+            "org/repo", 7, title="Renamed", description="updated",
+            state=None, labels=None, assignees=None,
+        )
+        mock_gh.update_issue.assert_called_once_with(
+            "org/repo", 7, title="Renamed", body="updated",
+            state=None, labels=None, assignees=None,
+        )
+        assert result["id"] == 7
+        assert result["title"] == "Renamed"
 
 
 # ---------------------------------------------------------------------------
@@ -438,13 +572,16 @@ class TestRuntimeGetForgeForProject:
 
 
 class TestFORGE_TOOLS:
-    def test_has_nine_tools(self):
-        assert len(FORGE_TOOLS) == 9
+    def test_has_twelve_tools(self):
+        assert len(FORGE_TOOLS) == 12
 
     def test_tool_names(self):
         names = {getattr(t, "__name__", str(t)) for t in FORGE_TOOLS}
         expected = {
             "forge_read_issue",
+            "forge_create_issue",
+            "forge_list_issues",
+            "forge_update_issue",
             "forge_post_comment",
             "forge_create_change_request",
             "forge_get_change_request",
@@ -561,6 +698,129 @@ class TestForgeToolsIntegration:
 
         assert "99" in result
         mock_client.mark_notification_done.assert_called_once_with("99")
+
+    @pytest.mark.asyncio
+    async def test_forge_create_issue(self, tmp_path: Path):
+        from thorn.tools.forge import forge_create_issue
+
+        runtime, mock_client = self._setup_runtime(tmp_path)
+        mock_client.create_issue.return_value = {
+            "id": 10,
+            "title": "New feature",
+            "state": "open",
+            "url": "https://gl.example.com/issues/10",
+            "description": "Please add X",
+            "labels": ["enhancement"],
+            "assignees": ["alice"],
+        }
+
+        async with runtime:
+            result = await forge_create_issue(
+                "test-proj", "New feature", "Please add X",
+                ["enhancement"], ["alice"],
+            )
+
+        assert "New feature" in result
+        assert "#10" in result
+        mock_client.create_issue.assert_called_once_with(
+            "42", title="New feature", description="Please add X",
+            labels=["enhancement"], assignees=["alice"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_forge_list_issues(self, tmp_path: Path):
+        from thorn.tools.forge import forge_list_issues
+
+        runtime, mock_client = self._setup_runtime(tmp_path)
+        mock_client.list_issues.return_value = [
+            {
+                "id": 1, "title": "Bug", "state": "open",
+                "url": "https://gl.example.com/issues/1",
+                "labels": ["bug"], "assignees": ["bob"],
+                "author": "alice",
+            },
+            {
+                "id": 2, "title": "Feature", "state": "open",
+                "url": "https://gl.example.com/issues/2",
+                "labels": [], "assignees": [],
+                "author": "carol",
+            },
+        ]
+
+        async with runtime:
+            result = await forge_list_issues("test-proj", "open")
+
+        assert "2 open issue(s)" in result
+        assert "Bug" in result
+        assert "Feature" in result
+        mock_client.list_issues.assert_called_once_with("42", "open", None)
+
+    @pytest.mark.asyncio
+    async def test_forge_list_issues_empty(self, tmp_path: Path):
+        from thorn.tools.forge import forge_list_issues
+
+        runtime, mock_client = self._setup_runtime(tmp_path)
+        mock_client.list_issues.return_value = []
+
+        async with runtime:
+            result = await forge_list_issues("test-proj", "closed")
+
+        assert "No closed issues" in result
+
+    @pytest.mark.asyncio
+    async def test_forge_update_issue_simple(self, tmp_path: Path):
+        from thorn.tools.forge import forge_update_issue
+
+        runtime, mock_client = self._setup_runtime(tmp_path)
+        mock_client.update_issue.return_value = {
+            "id": 7, "title": "Renamed", "state": "open",
+            "url": "https://gl.example.com/issues/7",
+            "description": "", "labels": [], "assignees": [],
+        }
+
+        async with runtime:
+            result = await forge_update_issue(
+                "test-proj", 7, title="Renamed",
+            )
+
+        assert "Renamed" in result
+        assert "#7" in result
+        mock_client.update_issue.assert_called_once_with(
+            "42", 7, title="Renamed", description=None,
+            state=None, labels=None, assignees=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_forge_update_issue_add_remove_labels(self, tmp_path: Path):
+        from thorn.tools.forge import forge_update_issue
+
+        runtime, mock_client = self._setup_runtime(tmp_path)
+        mock_client.get_issue.return_value = {
+            "id": 7, "title": "Bug", "state": "open",
+            "url": "https://gl.example.com/issues/7",
+            "description": "", "labels": ["bug", "triage"],
+            "assignees": ["alice"],
+        }
+        mock_client.update_issue.return_value = {
+            "id": 7, "title": "Bug", "state": "open",
+            "url": "https://gl.example.com/issues/7",
+            "description": "", "labels": ["bug", "confirmed"],
+            "assignees": ["alice"],
+        }
+
+        async with runtime:
+            result = await forge_update_issue(
+                "test-proj", 7,
+                add_labels=["confirmed"],
+                remove_labels=["triage"],
+            )
+
+        assert "confirmed" in result
+        call_kwargs = mock_client.update_issue.call_args
+        labels_arg = call_kwargs[1]["labels"] if call_kwargs[1] else call_kwargs[0][5]
+        assert "bug" in labels_arg
+        assert "confirmed" in labels_arg
+        assert "triage" not in labels_arg
 
     @pytest.mark.asyncio
     async def test_tool_without_runtime_raises(self, tmp_path: Path):

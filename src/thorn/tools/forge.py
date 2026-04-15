@@ -4,7 +4,7 @@ Provides a forge-neutral interface (``ForgeClient``) with GitLab and
 GitHub adapter implementations, plus the service types that represent
 forge connections and project definitions in a Thorn agency.
 
-The ``FORGE_TOOLS`` toolset exposes nine ``@tool`` functions that
+The ``FORGE_TOOLS`` toolset exposes twelve ``@tool`` functions that
 resolve the backing ``ForgeClient`` through the ambient
 ``ExecutionContext.runtime`` -- agents never need to know which forge
 backend is in use.
@@ -44,6 +44,9 @@ CommentTargetKind = Literal["Issue", "ChangeRequest"]
 
 ChangeRequestState = Literal["open", "closed", "merged", "all"]
 """Normalized state vocabulary for change requests."""
+
+IssueState = Literal["open", "closed", "all"]
+"""Normalized state vocabulary for issues."""
 
 
 class ForgeClient(Protocol):
@@ -91,6 +94,23 @@ class ForgeClient(Protocol):
     def mark_notification_done(
         self, notification_id: str,
     ) -> None: ...
+
+    def create_issue(
+        self, native_project_id: str, title: str, description: str,
+        labels: list[str], assignees: list[str],
+    ) -> dict[str, Any]: ...
+
+    def list_issues(
+        self, native_project_id: str, state: str,
+        labels: list[str] | None,
+    ) -> list[dict[str, Any]]: ...
+
+    def update_issue(
+        self, native_project_id: str, issue_id: int,
+        title: str | None, description: str | None,
+        state: str | None, labels: list[str] | None,
+        assignees: list[str] | None,
+    ) -> dict[str, Any]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +274,72 @@ class GitLabForgeClient:
     def mark_notification_done(self, notification_id: str) -> None:
         self._gl.mark_todo_done(int(notification_id))
 
+    def create_issue(
+        self, native_project_id: str, title: str, description: str,
+        labels: list[str], assignees: list[str],
+    ) -> dict[str, Any]:
+        raw = self._gl.create_issue(
+            self._pid(native_project_id),
+            title=title,
+            description=description,
+            labels=labels or None,
+            assignees=assignees or None,
+        )
+        return {
+            "id": raw["iid"],
+            "title": raw["title"],
+            "state": self._to_normalized_state(raw["state"]),
+            "url": raw["web_url"],
+            "description": raw.get("description", ""),
+            "labels": raw.get("labels", []),
+            "assignees": raw.get("assignees", []),
+        }
+
+    def list_issues(
+        self, native_project_id: str, state: str,
+        labels: list[str] | None,
+    ) -> list[dict[str, Any]]:
+        gl_state = self._from_normalized_state(state)
+        raw_list = self._gl.list_issues(
+            self._pid(native_project_id), gl_state, labels,
+        )
+        return [
+            {
+                "id": issue["iid"],
+                "title": issue["title"],
+                "state": self._to_normalized_state(issue["state"]),
+                "url": issue["web_url"],
+                "labels": issue.get("labels", []),
+                "assignees": issue.get("assignees", []),
+                "author": issue.get("author"),
+            }
+            for issue in raw_list
+        ]
+
+    def update_issue(
+        self, native_project_id: str, issue_id: int,
+        title: str | None, description: str | None,
+        state: str | None, labels: list[str] | None,
+        assignees: list[str] | None,
+    ) -> dict[str, Any]:
+        gl_state = None
+        if state is not None:
+            gl_state = {"open": "reopen", "closed": "close"}.get(state, state)
+        raw = self._gl.update_issue(
+            self._pid(native_project_id), issue_id,
+            title=title, description=description,
+            state=gl_state, labels=labels, assignees=assignees,
+        )
+        return {
+            "id": raw["iid"],
+            "title": raw["title"],
+            "state": self._to_normalized_state(raw["state"]),
+            "url": raw["web_url"],
+            "description": raw.get("description", ""),
+            "labels": raw.get("labels", []),
+            "assignees": raw.get("assignees", []),
+        }
+
 
 # ---------------------------------------------------------------------------
 # GitHub adapter
@@ -408,6 +494,66 @@ class GitHubForgeClient:
             "(notification_id=%s)",
             notification_id,
         )
+
+    def create_issue(
+        self, native_project_id: str, title: str, description: str,
+        labels: list[str], assignees: list[str],
+    ) -> dict[str, Any]:
+        raw = self._gh.create_issue(
+            native_project_id,
+            title=title,
+            body=description,
+            labels=labels or None,
+            assignees=assignees or None,
+        )
+        return {
+            "id": raw["number"],
+            "title": raw["title"],
+            "state": raw["state"],
+            "url": raw["html_url"],
+            "description": raw.get("body", ""),
+            "labels": raw.get("labels", []),
+            "assignees": raw.get("assignees", []),
+        }
+
+    def list_issues(
+        self, native_project_id: str, state: str,
+        labels: list[str] | None,
+    ) -> list[dict[str, Any]]:
+        raw_list = self._gh.list_issues(native_project_id, state, labels)
+        return [
+            {
+                "id": issue["number"],
+                "title": issue["title"],
+                "state": issue["state"],
+                "url": issue["html_url"],
+                "labels": issue.get("labels", []),
+                "assignees": issue.get("assignees", []),
+                "author": issue.get("author"),
+            }
+            for issue in raw_list
+        ]
+
+    def update_issue(
+        self, native_project_id: str, issue_id: int,
+        title: str | None, description: str | None,
+        state: str | None, labels: list[str] | None,
+        assignees: list[str] | None,
+    ) -> dict[str, Any]:
+        raw = self._gh.update_issue(
+            native_project_id, issue_id,
+            title=title, body=description,
+            state=state, labels=labels, assignees=assignees,
+        )
+        return {
+            "id": raw["number"],
+            "title": raw["title"],
+            "state": raw["state"],
+            "url": raw["html_url"],
+            "description": raw.get("body", ""),
+            "labels": raw.get("labels", []),
+            "assignees": raw.get("assignees", []),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +791,124 @@ async def forge_read_issue(project: str, issue_id: int) -> str:
 
 
 @tool
+async def forge_create_issue(
+    project: str,
+    title: str,
+    description: str = "",
+    labels: list[str] | None = None,
+    assignees: list[str] | None = None,
+) -> str:
+    """Create a new issue in a project.
+
+    *project* is the name of the project service.  *labels* and
+    *assignees* are optional lists of label names and usernames.
+    """
+    client, native_id = _resolve(project)
+    info = await asyncio.to_thread(
+        client.create_issue,
+        native_id,
+        title=title,
+        description=description,
+        labels=labels or [],
+        assignees=assignees or [],
+    )
+    lines = [
+        f"Created issue #{info['id']}: {info['title']}",
+        f"State: {info['state']}",
+        f"URL: {info['url']}",
+    ]
+    if info.get("labels"):
+        lines.append(f"Labels: {', '.join(info['labels'])}")
+    if info.get("assignees"):
+        lines.append(f"Assignees: {', '.join(info['assignees'])}")
+    return "\n".join(lines)
+
+
+@tool
+async def forge_list_issues(
+    project: str,
+    state: IssueState = "open",
+    labels: list[str] | None = None,
+) -> str:
+    """List issues in a project.
+
+    Filters by *state* (default ``"open"``).  Optionally filter by
+    *labels* (list of label names -- issues must have **all** listed
+    labels).
+    """
+    client, native_id = _resolve(project)
+    issues = await asyncio.to_thread(
+        client.list_issues, native_id, state, labels,
+    )
+    if not issues:
+        return f"No {state} issues in project {project!r}."
+    lines: list[str] = []
+    for issue in issues:
+        author = issue.get("author") or "unknown"
+        lines.append(
+            f"  #{issue['id']}: {issue['title']} ({issue['state']}, by {author})"
+        )
+    header = f"{len(issues)} {state} issue(s) in project {project!r}:"
+    return "\n".join([header, *lines])
+
+
+@tool
+async def forge_update_issue(
+    project: str,
+    issue_id: int,
+    title: str | None = None,
+    description: str | None = None,
+    state: IssueState | None = None,
+    add_labels: list[str] | None = None,
+    remove_labels: list[str] | None = None,
+    add_assignees: list[str] | None = None,
+    remove_assignees: list[str] | None = None,
+) -> str:
+    """Update an existing issue.
+
+    All fields are optional -- only the ones provided are changed.
+    Labels and assignees support add/remove semantics: the tool reads
+    the current values and merges the requested changes before sending
+    the update.
+    """
+    client, native_id = _resolve(project)
+
+    labels: list[str] | None = None
+    assignees: list[str] | None = None
+    if add_labels or remove_labels or add_assignees or remove_assignees:
+        current = await asyncio.to_thread(
+            client.get_issue, native_id, issue_id,
+        )
+        if add_labels or remove_labels:
+            current_labels = set(current.get("labels", []))
+            current_labels |= set(add_labels or [])
+            current_labels -= set(remove_labels or [])
+            labels = sorted(current_labels)
+        if add_assignees or remove_assignees:
+            current_assignees = set(current.get("assignees", []))
+            current_assignees |= set(add_assignees or [])
+            current_assignees -= set(remove_assignees or [])
+            assignees = sorted(current_assignees)
+
+    info = await asyncio.to_thread(
+        client.update_issue,
+        native_id, issue_id,
+        title=title, description=description,
+        state=state, labels=labels, assignees=assignees,
+    )
+    lines = [
+        f"Updated issue #{info['id']}: {info['title']}",
+        f"State: {info['state']}",
+        f"URL: {info['url']}",
+    ]
+    if info.get("labels"):
+        lines.append(f"Labels: {', '.join(info['labels'])}")
+    if info.get("assignees"):
+        lines.append(f"Assignees: {', '.join(info['assignees'])}")
+    return "\n".join(lines)
+
+
+@tool
 async def forge_post_comment(
     project: str,
     target_type: CommentTargetKind,
@@ -839,6 +1103,9 @@ async def forge_mark_notification_done(
 
 FORGE_TOOLS: list[object] = [
     forge_read_issue,
+    forge_create_issue,
+    forge_list_issues,
+    forge_update_issue,
     forge_post_comment,
     forge_create_change_request,
     forge_get_change_request,
@@ -862,16 +1129,20 @@ __all__ = [
     "GitHubForgeClient",
     "GitLabForgeClient",
     "GitLabForgeServiceConfig",
+    "IssueState",
     "ProjectService",
     "ProjectServiceConfig",
     "forge_create_change_request",
+    "forge_create_issue",
     "forge_get_change_request",
     "forge_get_project_info",
     "forge_list_change_requests",
     "forge_list_comments",
+    "forge_list_issues",
     "forge_mark_notification_done",
     "forge_post_comment",
     "forge_read_file",
     "forge_read_issue",
+    "forge_update_issue",
     "get_forge_for_project",
 ]

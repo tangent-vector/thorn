@@ -137,6 +137,116 @@ class GitLabClient:
             "web_url": issue.web_url,
         }
 
+    def create_issue(
+        self,
+        project_id: int,
+        title: str,
+        description: str = "",
+        labels: list[str] | None = None,
+        assignees: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create an issue and return its key fields as a dict.
+
+        *assignees* should be a list of usernames.  GitLab's create-issue
+        endpoint accepts ``assignee_ids``, so we look up each username
+        via the project's members (or broader user search) to resolve IDs.
+        For simplicity, we pass ``labels`` as a comma-separated string
+        (which GitLab's API accepts).
+        """
+        project = self._gl.projects.get(project_id)
+        data: dict[str, Any] = {"title": title, "description": description}
+        if labels:
+            data["labels"] = ",".join(labels)
+        if assignees:
+            user_ids: list[int] = []
+            for username in assignees:
+                users = self._gl.users.list(username=username)
+                if users:
+                    user_ids.append(users[0].id)
+            if user_ids:
+                data["assignee_ids"] = user_ids
+        issue: ProjectIssue = project.issues.create(data)  # type: ignore[assignment]
+        log.info("Created issue #%d in project %d", issue.iid, project_id)
+        return {
+            "iid": issue.iid,
+            "title": issue.title,
+            "state": issue.state,
+            "description": issue.description or "",
+            "labels": list(issue.labels),
+            "assignees": [a["username"] for a in issue.assignees],
+            "web_url": issue.web_url,
+        }
+
+    def list_issues(
+        self,
+        project_id: int,
+        state: str = "opened",
+        labels: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """List issues in a project filtered by *state* and optionally *labels*."""
+        project = self._gl.projects.get(project_id)
+        kwargs: dict[str, Any] = {"state": state, "order_by": "created_at", "sort": "desc"}
+        if labels:
+            kwargs["labels"] = ",".join(labels)
+        issues = project.issues.list(**kwargs, iterator=True)
+        return [
+            {
+                "iid": issue.iid,
+                "title": issue.title,
+                "state": issue.state,
+                "web_url": issue.web_url,
+                "labels": list(issue.labels),
+                "assignees": [a["username"] for a in issue.assignees],
+                "author": issue.author["username"] if issue.author else None,
+            }
+            for issue in issues
+        ]
+
+    def update_issue(
+        self,
+        project_id: int,
+        issue_iid: int,
+        title: str | None = None,
+        description: str | None = None,
+        state: str | None = None,
+        labels: list[str] | None = None,
+        assignees: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Edit an issue's fields and return the updated issue as a dict.
+
+        Only the fields that are not ``None`` are changed.  *labels* and
+        *assignees* are **replacement** sets.  *state* should be a
+        GitLab-native state event (``"close"`` or ``"reopen"``).
+        """
+        project = self._gl.projects.get(project_id)
+        issue: ProjectIssue = project.issues.get(issue_iid)  # type: ignore[assignment]
+        if title is not None:
+            issue.title = title
+        if description is not None:
+            issue.description = description
+        if state is not None:
+            issue.state_event = state
+        if labels is not None:
+            issue.labels = labels
+        if assignees is not None:
+            user_ids: list[int] = []
+            for username in assignees:
+                users = self._gl.users.list(username=username)
+                if users:
+                    user_ids.append(users[0].id)
+            issue.assignee_ids = user_ids
+        issue.save()
+        log.info("Updated issue #%d in project %d", issue_iid, project_id)
+        return {
+            "iid": issue.iid,
+            "title": issue.title,
+            "state": issue.state,
+            "description": issue.description or "",
+            "labels": list(issue.labels),
+            "assignees": [a["username"] for a in issue.assignees],
+            "web_url": issue.web_url,
+        }
+
     def post_note(
         self,
         project_id: int,

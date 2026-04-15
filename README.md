@@ -1,251 +1,217 @@
-Thorn: A Tool for Building Agent Workflows
-============================================
+Thorn
+=====
 
-Thorn is a command-line tool and Python library for creating agent workflows that flexibly mix deterministic code with AI prompts:
+Thorn is an autonomous coding agent that monitors your GitHub or GitLab
+repositories, responds to @-mentions and assignments, and carries out
+development tasks: reading issues, cloning repos, making changes,
+pushing branches, and opening pull requests.
 
-- **Typed AI calls as a primitive**: Use `await prompt[list[str]](...)` to get structured data back from an LLM -- no parsing boilerplate, no schema wrangling, just the type you asked for.
+It runs as a long-lived **gateway** daemon -- typically inside a Docker
+container -- that polls a forge for activity and dispatches work to an
+LLM-powered agent.
 
-- **Composable building blocks**: Tools, skills, and agent roles all nest naturally. A skill can call tools; a role aggregates skills; your Python code orchestrates everything.
+Quick Start (Docker)
+--------------------
 
-- **Write tools once, use them everywhere**: Define project-specific tools in a `.thorn/` directory and they're instantly available to the built-in Thorn agent. Run `thorn serve` to expose the same tools to any MCP-compatible agent (Cursor, Claude Code, etc.).
+### Prerequisites
 
-Quick Start
------------
+- Docker (and optionally Docker Compose)
+- An LLM provider exposing an OpenAI-compatible API
+- A GitHub personal access token (PAT), or a GitHub App installation
 
-Thorn is a Python package, but is not currently distributed via any package registries.
-Clone this repository and install it locally:
-
-```console
-$ cd path/to/thorn/
-$ pip install -e .
-```
-
-Thorn uses a few environment variables to determine how it accesses your LLM provider:
-
-- `OPENAI_API_URL`: the URL to your model provider (e.g., `https://api.openai.com/v1`)
-- `OPENAI_API_KEY`: your access key with the provider
-- `OPENAI_API_MODEL_NAME`: the name of the model you would like to use (e.g., `claude-4.6-opus-high`)
-
-Thorn currently only supports providers that expose an OpenAI-compatible web API.
-
-Once installed and configured, verify with:
+### 1. Clone the repository
 
 ```console
-$ thorn run "say hello, Thorn"
-Hello! 👋 I'm Thorn, ...
+$ git clone https://github.com/tangent-vector/thorn.git
+$ cd thorn
 ```
 
-Overview
---------
+### 2. Create a `.env` file
 
-Thorn provides a toolbox rather than a singular solution, so we'll start by overviewing the most important utilities that Thorn provides.
+The gateway reads credentials and configuration from environment
+variables. Create a `.env` file at the repository root:
 
-### The Library
+```dotenv
+# LLM provider (any OpenAI-compatible API)
+OPENAI_API_URL=https://api.openai.com/v1
+OPENAI_API_KEY=sk-...
+OPENAI_API_MODEL_NAME=gpt-4o
 
-#### Defining Tools
-
-Decorate an ordinary Python function with `@tool` to make it available to agents as a tool:
-
-```python
-@tool
-def build_project() -> None:
-    """Build the project. If the build fails, the response will include a summary of diagnostic messages."""
-    ...
-
-@tool
-def list_contributors_currently_active_on_slack() -> list[str]:
-    """List the (human) project contributors who are currently online/active on Slack."""
-    ...
+# GitHub (PAT auth)
+GITHUB_TOKEN=ghp_...
+GITHUB_API_URL=https://api.github.com
+THORN_GITHUB_REPOSITORY=owner/repo
 ```
 
-Thorn uses Pydantic to expose the parameter types and result type of your function as part of the generated tool description.
+> **Do not commit `.env` to version control.** It contains secrets.
 
-If your `@tool` function raises a Python exception, it will be surfaced to the agent as a tool-call failure.
-
-#### Running Prompts From Python
-
-Within any async Python function, use `await prompt(...)` to send a prompt to a fresh agent.
-Provide it an explicit list of the `tools` you want it to have access to:
-
-```python
-issues = await prompt[list[str]]("""
-    Build the project and provide a list of issues you can identify, if any.
-    """,
-    tools=[read_file, list_directory, build_project])
-```
-
-The `prompt[T](...)` syntax uses Python's subscript operator to specify the expected return type.
-Thorn ensures that the value returned by `await prompt[T](...)` has the requested type `T`;
-you don't need to do any extra work to get structured data like lists back from agents.
-
-The agent that `prompt` runs will only have access to the tools you explicitly give it.
-The tools can be any Python function decorated with `@tool` or `@skill`, including functions that Thorn provides for common operations like file reading.
-
-Thorn's API is async. For synchronous scripts, wrap your workflow with `thorn.run()`:
-
-```python
-import thorn
-from thorn import prompt
-
-async def main():
-    issues = await prompt[list[str]]("List code issues.", tools=[build_project])
-    print(issues)
-
-thorn.run(main())
-```
-
-#### Defining Skills
-
-If you want to pull a `prompt`-based operation out as its own reusable function -- whether to call it from various places in your Python code, or to expose it as a tool to other agents -- you can use the `@skill` decorator:
-
-```python
-@skill(tools=[github_reading])
-async def review_pull_request(pull_request_number: int) -> list[str]:
-    """
-Review pull request #{pull_request_number} and provide a list of
-concerns or issues that should be addressed before it is committed.
-If you approve of the pull request, then return an empty list.
-"""
-```
-
-The `@skill` decorator gives the function an implementation that passes its docstring (with parameter values filled in) through to `prompt()`.
-A `@skill` function can be called from your Python code like any other async function.
-When an agent is unable to perform the requested task, it raises a `SkillError`, which you can handle like any other exception:
-
-```python
-for pr in open_pull_requests:
-    try:
-        concerns = await review_pull_request(pr.number)
-        if concerns:
-            await post_review_comments(pr.number, concerns)
-    except SkillError as e:
-        await notify_team(f"Could not review PR #{pr.number}: {e.detail}")
-```
-
-#### Defining Agent Roles
-
-All of our prompting examples so far have had some clear limitations:
-
-- No custom system prompts are being defined (only user prompts), and adding recurring/shared context to all the `prompt` calls in a project could result in tedious duplication.
-
-- The available tools had to be stated explicitly for every `prompt` or `@skill`.
-
-- All of the prompts have been one-and-done, with no persistent agent history. (Often this is actually a good choice, but being able to use history when it makes sense is also important.)
-
-These limitations can be addressed by using Thorn to define custom agent *roles*.
-An agent role is a Python `class` that extends `thorn.Agent`:
-
-```python
-from thorn import Agent
-
-class MyProjectDeveloper(Agent):
-    system_prompts = [
-"""You are a developer working on `my-project`.
-
-Your responsibilities are ...
-"""
-    ]
-    tools = [
-        read_file,
-        write_file,
-        list_directory,
-        build_project,
-        github_reading,
-    ]
-```
-
-Roles can inherit from one another, and the complete system prompt and tool list for an agent is accumulated from all the roles it transitively inherits from.
-
-A `@skill` decorator or a `prompt` call can be passed a `role=` argument to use that role's system prompts and tools:
-
-```python
-@skill(role=MyProjectDeveloper)
-async def review_pull_request(pull_request_number: int) -> list[str]:
-    ...
-```
-
-```python
-issues = await prompt[list[str]]("""
-    Build the project and provide a list of issues you can identify, if any.
-    """,
-    role=MyProjectDeveloper)
-```
-
-You can also construct agent instances directly and use their `prompt` method:
-
-```python
-developer = MyProjectDeveloper()
-summary = await developer.prompt[str]("""
-    Build the project and summarize any issues you find.
-""")
-```
-
-Creating explicit `Agent` instances allows your code to make thoughtful decisions about when to retain history in a persistent agent, and when to start fresh.
-For example, here is a loop that uses one long-lived agent to pick tasks and a fresh agent for each task:
-
-```python
-prioritizer = MyProjectDeveloper()
-while True:
-    task = await prioritizer.prompt[str]("""
-Pick a development task from `TODO.md` that makes sense to do next.
-""")
-    developer = MyProjectDeveloper()
-    await developer.prompt[str](f"""
-Do the following development task:
-{task}
-""")
-    ...
-```
-
-### The Tool
-
-The `thorn` command-line tool can help you run the tasks and workflows you've defined.
-
-#### Basic Usage
-
-Use `thorn run "..."` to execute a single prompt, or `thorn chat` to start an interactive CLI chat session.
-
-#### Providing Tools and Skills
-
-When you run `thorn`, it automatically searches for any `.thorn/` directories in the current working directory (or its ancestors), as well as any `.thorn/` directory in your user home directory.
-Any `.py` files in a `.thorn/` directory are automatically loaded, and any `@tool` or `@skill` functions defined in them will be available to the top-level Thorn agent.
-
-As an example, if you have defined a file `.thorn/dev_tools.py` in your repository, and it contains:
-
-```python
-@tool
-def build_project() -> None:
-    """Build the project. ..."""
-    ...
-
-@tool
-def run_tests() -> None:
-    """Run the test suite. ..."""
-    ...
-```
-
-Then you should be able to prompt `thorn` and have it use those tools:
+### 3. Build the Docker image
 
 ```console
-$ thorn run "build and test the project, and summarize any failures"
-...
+$ docker build -t thorn-gateway .
 ```
 
-#### Serving Tools to Other Agents via MCP
+The image includes development toolchains for C/C++ (gcc, cmake),
+Rust (rustup), Python, and Node.js/TypeScript so the agent can build
+and test code in these languages.
 
-While you can use `thorn` directly as a coding agent, it is a small tool and not as full-featured as popular coding agents like Cursor or Claude Code.
-Luckily, you don't have to choose; you can define project-specific tools using Thorn and serve them to your preferred agent via MCP:
+### 4. Bootstrap the agent
+
+Before the gateway can run, it needs an agent identity and service
+configuration. The `thorn serve bootstrap` command creates these inside
+a `.thorn/` directory:
 
 ```console
-$ thorn serve --transport streamable-http
+$ docker run --rm --env-file .env \
+    -v "$(pwd)/.thorn:/workspace/.thorn" \
+    thorn-gateway \
+    thorn serve bootstrap \
+      --agent-id my-coordinator \
+      --project-name my-repo \
+      --clone-url https://github.com/owner/repo.git \
+      --native-project-id owner/repo \
+      --forge-type github
 ```
 
-This means you can define a `build_project` tool in your `.thorn/` directory once, and immediately use it from Cursor, Claude Code, or any other MCP client -- without any of those tools needing to know how your project's build system works.
+This writes three files under `.thorn/`:
 
-The `--transport` option selects between `streamable-http` or `stdio`, depending on what your MCP client supports.
+| File | Purpose |
+|------|---------|
+| `agents/my-coordinator.json` | Agent identity and metadata |
+| `agents/my-coordinator/MEMORY.md` | Persistent memory (project facts, active work) |
+| `gateway.json` | Service config (forge credentials, event source, project) |
 
-Example Project
+### 5. Start the gateway
+
+Using Docker Compose (recommended):
+
+```console
+$ docker compose up --build
+```
+
+Or directly:
+
+```console
+$ docker run --env-file .env \
+    -v "$(pwd)/.thorn:/workspace/.thorn" \
+    thorn-gateway
+```
+
+The gateway will poll the configured repository for events. When it
+sees activity (an @-mention on an issue, a new assignment, etc.), it
+dispatches the event to the agent, which reads the issue, clones the
+repo, and does the requested work.
+
+### 6. Talk to the agent
+
+Open an issue on the configured repository and @-mention the bot
+account (the GitHub user whose PAT you provided, or the GitHub App).
+The agent will pick up the event on its next poll cycle, read the
+issue, and respond.
+
+Configuration
+-------------
+
+### Environment variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `OPENAI_API_URL` | Yes | Base URL of an OpenAI-compatible LLM API |
+| `OPENAI_API_KEY` | Yes | API key for the LLM provider |
+| `OPENAI_API_MODEL_NAME` | Yes | Model name (e.g. `gpt-4o`, `claude-sonnet-4-20250514`) |
+| `GITHUB_TOKEN` | For GitHub (PAT) | Personal access token with repo scope |
+| `GITHUB_API_URL` | For GitHub | GitHub API base URL (default: `https://api.github.com`) |
+| `THORN_GITHUB_REPOSITORY` | For GitHub | Repository to monitor (`owner/repo`) |
+| `GITLAB_URL` | For GitLab | GitLab instance URL |
+| `GITLAB_TOKEN` | For GitLab | Personal access token with API scope |
+| `THORN_POLL_INTERVAL` | No | Seconds between poll cycles (default: 30) |
+
+### GitHub App authentication
+
+Instead of a PAT, you can authenticate as a GitHub App installation.
+Pass `--github-auth-mode app` to `thorn serve bootstrap` and set
+these environment variables:
+
+```dotenv
+GITHUB_APP_ID=...
+GITHUB_APP_INSTALLATION_ID=...
+GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n"
+```
+
+### Docker Compose
+
+The included `docker-compose.yml` is the simplest way to run the
+gateway. It reads `.env`, mounts `.thorn/` as a volume (so agent state
+persists across restarts), and configures the git identity for commits:
+
+```yaml
+services:
+  gateway:
+    build: .
+    env_file: .env
+    environment:
+      GIT_AUTHOR_NAME: my-bot
+      GIT_COMMITTER_NAME: my-bot
+      GIT_AUTHOR_EMAIL: my-bot@users.noreply.github.com
+      GIT_COMMITTER_EMAIL: my-bot@users.noreply.github.com
+    volumes:
+      - ./.thorn:/workspace/.thorn
+    restart: unless-stopped
+```
+
+Customize `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` to match the
+identity you want on the agent's commits.
+
+Development Toolchains
+----------------------
+
+The Docker image includes the following toolchains so the agent can
+build and test projects without needing elevated privileges:
+
+| Language | Tools | Notes |
+|----------|-------|-------|
+| C / C++ | gcc, g++, make, cmake, pkg-config | Via `build-essential` |
+| Rust | rustc, cargo | Via `rustup` (stable channel) |
+| Python | python3, pip | From base image (`python:3.12-slim`) |
+| JavaScript / TypeScript | node, npm, tsc, ts-node | Node.js 22 LTS via NodeSource |
+
+Architecture
+------------
+
+```
+┌──────────────────────────────────────────────────┐
+│  Docker container                                │
+│                                                  │
+│  ┌──────────────┐    ┌────────────────────────┐  │
+│  │ Event Source  │───>│  ProjectCoordinator    │  │
+│  │ (polls forge)│    │  (LLM-powered agent)   │  │
+│  └──────────────┘    │                        │  │
+│                      │  Tools:                │  │
+│                      │  - forge_* (issues,    │  │
+│                      │    PRs, comments)      │  │
+│                      │  - git_* (clone, push) │  │
+│                      │  - file I/O            │  │
+│                      │  - run_shell           │  │
+│                      └────────────────────────┘  │
+│                                                  │
+│  ┌──────────────┐    ┌────────────────────────┐  │
+│  │ .thorn/      │    │ Agent workspaces       │  │
+│  │ gateway.json │    │ (cloned repos, state)  │  │
+│  └──────────────┘    └────────────────────────┘  │
+└──────────────────────────────────────────────────┘
+         │                        │
+         ▼                        ▼
+   GitHub / GitLab API      LLM Provider API
+```
+
+The gateway is forge-agnostic: the agent uses a unified set of
+`forge_*` tools that work identically against GitHub and GitLab.
+
+Further Reading
 ---------------
 
-The `examples/calc/` directory demonstrates a non-trivial Thorn setup: a C++ calculator project with `.thorn/` tools for building, testing, and a multi-agent development workflow with distinct `Architect`, `APIDesigner`, `Implementer`, and `TestEngineer` roles.
-It's a good starting point for understanding how the pieces fit together in practice.
+- [Python library and CLI reference](docs/library.md) -- using Thorn
+  as a Python library for building custom agent workflows with
+  `@tool`, `@skill`, prompt orchestration, and MCP tool serving.
+- `examples/calc/` -- a demonstration project with `.thorn/` tools for
+  building, testing, and a multi-agent development workflow.
