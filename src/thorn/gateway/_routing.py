@@ -1,30 +1,45 @@
-"""Centralized session-key and workspace derivation for gateway event sources.
+"""Centralized session-key derivation for gateway event sources.
 
 Each event source (GitHub, GitLab, etc.) has a ``route_*`` function that
-returns **both** a ``SessionKey`` and an optional workspace path in a
-single call, keeping the two concerns co-located rather than scattered
-across formatting helpers.
+returns a ``SessionKey``.  Workspace paths are **not** computed here —
+they are derived mechanically from the session key by the gateway (see
+``Gateway._handle_event``).
 
-When ``workspaces_root`` is ``None``, workspace is always ``None``
-(events behave as before the per-session workspace feature).  When
-set, workspace paths are deterministic subdirectories under that root
-using a documented naming scheme per source.
+Session keys use ``/`` separators and lowercase, forge-agnostic
+terminology so that they double as a relative directory layout when the
+gateway constructs per-session workspace paths.
 """
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass
-from pathlib import Path
 
 from thorn.runtime._session import SessionKey
 
 
-@dataclass(frozen=True)
-class SessionRoute:
-    """The key + workspace pair determined for an incoming event."""
+# ---------------------------------------------------------------------------
+# Forge-agnostic noteable identity
+# ---------------------------------------------------------------------------
 
-    session_key: SessionKey
-    workspace_root: Path | None
+class NoteableKind(enum.Enum):
+    """The kind of forge object a session is scoped to."""
+
+    ISSUE = "issue"
+    CHANGE_REQUEST = "change-request"
+
+
+@dataclass(frozen=True)
+class Noteable:
+    """Identity of a forge noteable (issue or change request).
+
+    Used by event sources to tell routing which conversation thread an
+    event belongs to, so that multiple events about the same noteable
+    share a single session.
+    """
+
+    kind: NoteableKind
+    number: int
 
 
 # ---------------------------------------------------------------------------
@@ -34,29 +49,31 @@ class SessionRoute:
 def route_github_event(
     *,
     repo_id: int,
+    noteable: Noteable | None = None,
     event_type: str,
     event_id: str,
-    workspaces_root: Path | None = None,
-) -> SessionRoute:
-    """Derive session key and workspace for a GitHub repository event.
+) -> SessionKey:
+    """Derive a session key for a GitHub repository event.
 
-    Session key: ``github_<repo_id>_<event_type>_<event_id>``
-    (spaces in *event_type* are replaced with underscores).
+    When *noteable* is provided (issue or pull request), the key is
+    scoped to that noteable so that all events about the same issue or
+    PR share one session::
 
-    Workspace: ``<workspaces_root>/github_<repo_id>_<event_type>_<event_id>/``
-    when *workspaces_root* is provided; ``None`` otherwise.  Each event
-    gets its own workspace directory so that concurrent sessions (e.g.
-    two different issues, or an issue and a PR review) cannot clobber
-    one another's working tree.
+        github/<repo_id>/issue/<number>
+        github/<repo_id>/change-request/<number>
+
+    When *noteable* is ``None`` (e.g. ``PushEvent``, ``CreateEvent``),
+    the key falls back to a per-event identifier::
+
+        github/<repo_id>/<event_type>/<event_id>
     """
-    safe_type = event_type.replace(" ", "_")
-    key = SessionKey(f"github_{repo_id}_{safe_type}_{event_id}")
+    if noteable is not None:
+        return SessionKey(
+            f"github/{repo_id}/{noteable.kind.value}/{noteable.number}"
+        )
 
-    workspace: Path | None = None
-    if workspaces_root is not None:
-        workspace = workspaces_root / str(key)
-
-    return SessionRoute(session_key=key, workspace_root=workspace)
+    safe_type = event_type.lower().replace(" ", "_")
+    return SessionKey(f"github/{repo_id}/{safe_type}/{event_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -66,30 +83,24 @@ def route_github_event(
 def route_gitlab_todo(
     *,
     project_id: int,
-    noteable_type: str,
-    noteable_iid: int,
-    workspaces_root: Path | None = None,
-) -> SessionRoute:
-    """Derive session key and workspace for a GitLab TODO.
+    noteable: Noteable,
+) -> SessionKey:
+    """Derive a session key for a GitLab TODO.
 
-    Session key: ``gitlab_<project_id>_<noteable_type>_<iid>``
+    GitLab TODOs are always tied to a noteable (issue or merge
+    request), so *noteable* is required::
 
-    Workspace: ``<workspaces_root>/gitlab_<project_id>_<noteable_type>_<iid>/``
-    when *workspaces_root* is provided; ``None`` otherwise.  Each
-    noteable gets its own workspace directory so that concurrent
-    sessions cannot clobber one another's working tree.
+        gitlab/<project_id>/issue/<iid>
+        gitlab/<project_id>/change-request/<iid>
     """
-    key = SessionKey(f"gitlab_{project_id}_{noteable_type}_{noteable_iid}")
-
-    workspace: Path | None = None
-    if workspaces_root is not None:
-        workspace = workspaces_root / str(key)
-
-    return SessionRoute(session_key=key, workspace_root=workspace)
+    return SessionKey(
+        f"gitlab/{project_id}/{noteable.kind.value}/{noteable.number}"
+    )
 
 
 __all__ = [
-    "SessionRoute",
+    "Noteable",
+    "NoteableKind",
     "route_github_event",
     "route_gitlab_todo",
 ]

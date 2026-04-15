@@ -20,17 +20,12 @@ from thorn.tools._github_connection import GitHubPatAuth
 
 class TestSessionKeyForEvent:
     def test_stable_key(self) -> None:
-        from thorn.gateway.sources._github import _session_key_for_event
+        from thorn.gateway._routing import route_github_event
 
-        k = _session_key_for_event(42, "IssuesEvent", "evt-123")
-        assert k == SessionKey("github_42_IssuesEvent_evt-123")
-
-    def test_filesystem_safe(self) -> None:
-        from thorn.gateway.sources._github import _session_key_for_event
-
-        k = _session_key_for_event(1, "PullRequestEvent", "999")
-        forbidden = set('/:*?"<>|\\')
-        assert not any(c in forbidden for c in str(k))
+        k = route_github_event(
+            repo_id=42, event_type="IssuesEvent", event_id="evt-123",
+        )
+        assert k == SessionKey("github/42/issuesevent/evt-123")
 
 
 class TestPayloadSummary:

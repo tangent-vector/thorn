@@ -532,16 +532,8 @@ class TestGitLabTODOsSourceEventFormatting:
 
         todo = _make_mock_todo(project_id=456, noteable_type="MergeRequest", noteable_iid=7)
         key = _make_session_key(todo)
-        assert key == SessionKey("gitlab_456_MergeRequest_7")
+        assert key == SessionKey("gitlab/456/change-request/7")
         assert isinstance(key, SessionKey)
-
-    def test_session_key_is_filesystem_safe(self):
-        from thorn.gateway.sources._gitlab import _make_session_key
-
-        todo = _make_mock_todo()
-        key = _make_session_key(todo)
-        forbidden = set('/:*?"<>|\\')
-        assert not any(c in forbidden for c in str(key))
 
     def test_make_event(self):
         from thorn.gateway.sources._gitlab import _make_event
@@ -557,7 +549,7 @@ class TestGitLabTODOsSourceEventFormatting:
         event = _make_event(todo)
 
         assert event.source == "gitlab"
-        assert event.session_key == SessionKey("gitlab_123_Issue_42")
+        assert event.session_key == SessionKey("gitlab/123/issue/42")
         assert "mentioned" in event.content
         assert "Issue #42" in event.content
         assert "Please help" in event.content
@@ -644,7 +636,7 @@ class TestGitLabTODOsSourcePolling:
 
             assert len(events) == 1
             assert events[0].source == "gitlab"
-            assert events[0].session_key == SessionKey("gitlab_123_Issue_42")
+            assert events[0].session_key == SessionKey("gitlab/123/issue/42")
 
     @pytest.mark.asyncio
     async def test_emits_both_todos_with_same_session_key(self):
@@ -1956,111 +1948,104 @@ class TestGatewayReExports:
 
 
 class TestRouteGithubEvent:
-    def test_session_key_matches_legacy_format(self):
+    def test_non_noteable_event_key_format(self):
         from thorn.gateway._routing import route_github_event
 
-        route = route_github_event(
+        key = route_github_event(
             repo_id=42, event_type="PushEvent", event_id="abc123",
         )
-        assert route.session_key == SessionKey("github_42_PushEvent_abc123")
+        assert key == SessionKey("github/42/pushevent/abc123")
 
-    def test_session_key_with_spaces_in_event_type(self):
+    def test_non_noteable_event_type_lowercased(self):
         from thorn.gateway._routing import route_github_event
 
-        route = route_github_event(
+        key = route_github_event(
             repo_id=1, event_type="My Event", event_id="e1",
         )
-        assert route.session_key == SessionKey("github_1_My_Event_e1")
+        assert key == SessionKey("github/1/my_event/e1")
 
-    def test_workspace_none_when_root_unset(self):
-        from thorn.gateway._routing import route_github_event
+    def test_noteable_issue_key_format(self):
+        from thorn.gateway._routing import Noteable, NoteableKind, route_github_event
 
-        route = route_github_event(
-            repo_id=42, event_type="Push", event_id="e1",
+        key = route_github_event(
+            repo_id=42,
+            noteable=Noteable(NoteableKind.ISSUE, 7),
+            event_type="IssuesEvent",
+            event_id="e1",
         )
-        assert route.workspace_root is None
+        assert key == SessionKey("github/42/issue/7")
 
-    def test_workspace_deterministic_under_root(self, tmp_path: Path):
-        from thorn.gateway._routing import route_github_event
+    def test_noteable_change_request_key_format(self):
+        from thorn.gateway._routing import Noteable, NoteableKind, route_github_event
 
-        route = route_github_event(
-            repo_id=42, event_type="Push", event_id="e1",
-            workspaces_root=tmp_path,
+        key = route_github_event(
+            repo_id=42,
+            noteable=Noteable(NoteableKind.CHANGE_REQUEST, 3),
+            event_type="PullRequestEvent",
+            event_id="e1",
         )
-        assert route.workspace_root == tmp_path / "github_42_Push_e1"
+        assert key == SessionKey("github/42/change-request/3")
 
-    def test_workspace_matches_session_key(self, tmp_path: Path):
+    def test_different_non_noteable_events_get_distinct_keys(self):
         from thorn.gateway._routing import route_github_event
 
-        route = route_github_event(
-            repo_id=42, event_type="PushEvent", event_id="abc",
-            workspaces_root=tmp_path,
-        )
-        assert route.workspace_root == tmp_path / str(route.session_key)
-
-    def test_different_events_get_distinct_workspaces(self, tmp_path: Path):
-        from thorn.gateway._routing import route_github_event
-
-        r1 = route_github_event(
+        k1 = route_github_event(
             repo_id=99, event_type="Push", event_id="e1",
-            workspaces_root=tmp_path,
         )
-        r2 = route_github_event(
+        k2 = route_github_event(
             repo_id=99, event_type="Issue", event_id="e2",
-            workspaces_root=tmp_path,
         )
-        assert r1.workspace_root != r2.workspace_root
-        assert r1.session_key != r2.session_key
+        assert k1 != k2
+
+    def test_returns_session_key_type(self):
+        from thorn.gateway._routing import route_github_event
+
+        key = route_github_event(
+            repo_id=42, event_type="PushEvent", event_id="abc",
+        )
+        assert isinstance(key, SessionKey)
 
 
 class TestRouteGitlabTodo:
-    def test_session_key_matches_legacy_format(self):
-        from thorn.gateway._routing import route_gitlab_todo
+    def test_issue_key_format(self):
+        from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
 
-        route = route_gitlab_todo(
-            project_id=10, noteable_type="Issue", noteable_iid=5,
+        key = route_gitlab_todo(
+            project_id=10,
+            noteable=Noteable(NoteableKind.ISSUE, 5),
         )
-        assert route.session_key == SessionKey("gitlab_10_Issue_5")
+        assert key == SessionKey("gitlab/10/issue/5")
 
-    def test_workspace_none_when_root_unset(self):
-        from thorn.gateway._routing import route_gitlab_todo
+    def test_change_request_key_format(self):
+        from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
 
-        route = route_gitlab_todo(
-            project_id=10, noteable_type="Issue", noteable_iid=5,
+        key = route_gitlab_todo(
+            project_id=10,
+            noteable=Noteable(NoteableKind.CHANGE_REQUEST, 2),
         )
-        assert route.workspace_root is None
+        assert key == SessionKey("gitlab/10/change-request/2")
 
-    def test_workspace_deterministic_under_root(self, tmp_path: Path):
-        from thorn.gateway._routing import route_gitlab_todo
+    def test_different_noteables_get_distinct_keys(self):
+        from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
 
-        route = route_gitlab_todo(
-            project_id=10, noteable_type="Issue", noteable_iid=5,
-            workspaces_root=tmp_path,
+        k1 = route_gitlab_todo(
+            project_id=10,
+            noteable=Noteable(NoteableKind.ISSUE, 1),
         )
-        assert route.workspace_root == tmp_path / "gitlab_10_Issue_5"
-
-    def test_workspace_matches_session_key(self, tmp_path: Path):
-        from thorn.gateway._routing import route_gitlab_todo
-
-        route = route_gitlab_todo(
-            project_id=10, noteable_type="Issue", noteable_iid=5,
-            workspaces_root=tmp_path,
+        k2 = route_gitlab_todo(
+            project_id=10,
+            noteable=Noteable(NoteableKind.CHANGE_REQUEST, 2),
         )
-        assert route.workspace_root == tmp_path / str(route.session_key)
+        assert k1 != k2
 
-    def test_different_noteables_get_distinct_workspaces(self, tmp_path: Path):
-        from thorn.gateway._routing import route_gitlab_todo
+    def test_returns_session_key_type(self):
+        from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
 
-        r1 = route_gitlab_todo(
-            project_id=10, noteable_type="Issue", noteable_iid=1,
-            workspaces_root=tmp_path,
+        key = route_gitlab_todo(
+            project_id=10,
+            noteable=Noteable(NoteableKind.ISSUE, 5),
         )
-        r2 = route_gitlab_todo(
-            project_id=10, noteable_type="MergeRequest", noteable_iid=2,
-            workspaces_root=tmp_path,
-        )
-        assert r1.workspace_root != r2.workspace_root
-        assert r1.session_key != r2.session_key
+        assert isinstance(key, SessionKey)
 
 
 # ---------------------------------------------------------------------------

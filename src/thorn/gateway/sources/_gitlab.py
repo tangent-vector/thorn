@@ -16,12 +16,10 @@ import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from pathlib import Path
-
 from pydantic import BaseModel, Field
 
 from thorn.gateway._event import EventSource, IncomingEvent
-from thorn.gateway._routing import route_gitlab_todo
+from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
 from thorn.runtime._session import SessionKey
 
 log = logging.getLogger(__name__)
@@ -70,14 +68,6 @@ class GitLabSourceConfig(BaseModel):
         ge=5,
         description="Seconds between polling cycles",
     )
-    workspaces_root: str | None = Field(
-        default=None,
-        description=(
-            "Absolute path to the root directory under which per-project "
-            "workspace directories are created.  When unset, sessions "
-            "inherit the agent's default workspace."
-        ),
-    )
 
     @classmethod
     def from_env(cls) -> GitLabSourceConfig:
@@ -87,7 +77,6 @@ class GitLabSourceConfig(BaseModel):
         - ``GITLAB_TOKEN`` -- Personal Access Token
         - ``THORN_GITLAB_USERNAME`` -- bot username (default ``thorn-bot``)
         - ``THORN_POLL_INTERVAL`` -- seconds between polls (default ``30``)
-        - ``THORN_WORKSPACES_ROOT`` -- per-session workspace root (optional)
         """
         url = os.environ.get("GITLAB_URL")
         token = os.environ.get("GITLAB_TOKEN")
@@ -106,7 +95,6 @@ class GitLabSourceConfig(BaseModel):
             token=token,  # type: ignore[arg-type]
             username=os.environ.get("THORN_GITLAB_USERNAME", "thorn-bot"),
             poll_interval=int(os.environ.get("THORN_POLL_INTERVAL", "30")),
-            workspaces_root=os.environ.get("THORN_WORKSPACES_ROOT"),
         )
 
 
@@ -157,41 +145,45 @@ def _format_event_content(todo: Any) -> str:
     return "\n".join(lines)
 
 
+_GITLAB_NOTEABLE_KINDS: dict[str, NoteableKind] = {
+    "Issue": NoteableKind.ISSUE,
+    "MergeRequest": NoteableKind.CHANGE_REQUEST,
+}
+
+
+def _noteable_from_todo(todo: Any) -> Noteable:
+    """Extract a :class:`Noteable` from a GitLab TODO object."""
+    kind = _GITLAB_NOTEABLE_KINDS.get(todo.target_type)
+    if kind is None:
+        raise ValueError(
+            f"Unsupported GitLab noteable type: {todo.target_type!r}"
+        )
+    return Noteable(kind=kind, number=todo.target["iid"])
+
+
 def _make_session_key(todo: Any) -> SessionKey:
-    """Derive a filesystem-safe session key from a TODO.
+    """Derive a session key from a TODO.
 
-    Thin wrapper kept for backward compatibility; delegates to
-    :func:`route_gitlab_todo`.
-
-    Format: ``gitlab_<project_id>_<noteable_type>_<iid>``
+    Thin wrapper for backward compatibility with tests that call this
+    directly; delegates to :func:`route_gitlab_todo`.
     """
     return route_gitlab_todo(
         project_id=todo.project["id"],
-        noteable_type=todo.target_type,
-        noteable_iid=todo.target["iid"],
-    ).session_key
+        noteable=_noteable_from_todo(todo),
+    )
 
 
-def _make_event(
-    todo: Any,
-    *,
-    workspaces_root: Path | None = None,
-) -> IncomingEvent:
+def _make_event(todo: Any) -> IncomingEvent:
     """Convert a GitLab TODO into an ``IncomingEvent``."""
     project = todo.project
-    route = route_gitlab_todo(
+    session_key = route_gitlab_todo(
         project_id=project["id"],
-        noteable_type=todo.target_type,
-        noteable_iid=todo.target["iid"],
-        workspaces_root=workspaces_root,
+        noteable=_noteable_from_todo(todo),
     )
     return IncomingEvent(
         source="gitlab",
-        session_key=route.session_key,
+        session_key=session_key,
         content=_format_event_content(todo),
-        workspace_root=(
-            str(route.workspace_root) if route.workspace_root else None
-        ),
         metadata={
             "todo_id": todo.id,
             "project_id": project["id"],
@@ -275,11 +267,6 @@ class GitLabTODOsSource(EventSource):
             "web_url": user.web_url,
         }
 
-    @property
-    def _workspaces_root(self) -> Path | None:
-        ws = self._config.workspaces_root
-        return Path(ws) if ws else None
-
     async def _poll_once(
         self,
         on_event: Callable[[IncomingEvent], Awaitable[None]],
@@ -293,7 +280,7 @@ class GitLabTODOsSource(EventSource):
             )
         for todo in new_todos:
             self._seen.add(todo.id)
-            event = _make_event(todo, workspaces_root=self._workspaces_root)
+            event = _make_event(todo)
             await on_event(event)
 
     def _get_pending_todos(self) -> list[Any]:
