@@ -7,6 +7,12 @@
 #   2. Exec into `thorn serve` (or whatever command the user passed).
 set -euo pipefail
 
+# -- Tool paths --------------------------------------------------------------
+# Rust (rustup) and npm global installs live under the thorn user's home.
+# These are also set via ENV in the Dockerfile, but we re-export here so
+# that interactive `docker exec` sessions pick them up too.
+export PATH="$HOME/.cargo/bin:$HOME/.npm-global/bin:$PATH"
+
 # -- Git identity -----------------------------------------------------------
 # Git reads GIT_AUTHOR_NAME / GIT_COMMITTER_NAME from the environment for
 # commits, but `git config` is still needed for operations that consult the

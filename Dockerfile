@@ -20,11 +20,27 @@ COPY src/ src/
 RUN uv venv /opt/thorn-venv \
  && VIRTUAL_ENV=/opt/thorn-venv uv pip install ".[github,gitlab]"
 
-# ---- runtime: slim image with only what the gateway needs -----------------
+# ---- runtime: development-ready image for the gateway agent ---------------
 FROM python:3.12-slim
 
+# System packages: version control, C/C++ toolchain, and Node.js (LTS via
+# NodeSource).  Rust is installed per-user below via rustup.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git \
+ && apt-get install -y --no-install-recommends \
+        git \
+        build-essential \
+        cmake \
+        pkg-config \
+        curl \
+        ca-certificates \
+        gnupg \
+ && mkdir -p /etc/apt/keyrings \
+ && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+ && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/thorn-venv /opt/thorn-venv
@@ -32,6 +48,16 @@ ENV PATH="/opt/thorn-venv/bin:$PATH"
 
 RUN useradd --create-home thorn
 USER thorn
+
+# Rust toolchain (installed as the unprivileged thorn user).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile default
+ENV PATH="/home/thorn/.cargo/bin:$PATH"
+
+# TypeScript support (global install into the user's npm prefix).
+RUN npm config set prefix /home/thorn/.npm-global \
+ && npm install -g typescript ts-node
+ENV PATH="/home/thorn/.npm-global/bin:$PATH"
 
 WORKDIR /workspace
 
