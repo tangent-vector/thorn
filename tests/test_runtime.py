@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -772,6 +773,275 @@ class TestJsonSessionSerializerAgent:
         restored = serializer.load_agent(agent_path)
         assert restored.id is None
         assert restored.name == "no-id"
+
+
+# ---------------------------------------------------------------------------
+# JsonSessionSerializer -- agent accounts (save/load with credentials)
+# ---------------------------------------------------------------------------
+
+
+class TestJsonSessionSerializerAgentAccounts:
+    def test_save_and_load_accounts_roundtrip(self, tmp_path: Path):
+        from thorn.core._account import (
+            AgentAccountsConfig,
+            ForgeAccountConfig,
+            GitLabCredentials,
+        )
+
+        accounts = AgentAccountsConfig(forge_accounts=[
+            ForgeAccountConfig(
+                forge="my-forge",
+                credentials=GitLabCredentials(token="glpat-secret"),
+                git_user_name="bot",
+                git_user_email="bot@thorn",
+            ),
+        ])
+        agent = Agent(
+            id=AgentID("acct-test"),
+            name="bot",
+            metadata={},
+            accounts=accounts,
+        )
+
+        serializer = JsonSessionSerializer()
+        agent_path = tmp_path / "agent.json"
+        serializer.save_agent(agent, agent_path)
+
+        restored = serializer.load_agent(agent_path)
+
+        restored_accounts = getattr(restored, "accounts", None)
+        assert restored_accounts is not None
+        assert len(restored_accounts.forge_accounts) == 1
+
+        acct = restored_accounts.forge_accounts[0]
+        assert acct.forge == "my-forge"
+        assert acct.git_user_name == "bot"
+        assert acct.git_user_email == "bot@thorn"
+        assert acct.credentials.token == "glpat-secret"
+
+    def test_accounts_written_to_json(self, tmp_path: Path):
+        """Verify the on-disk JSON structure includes 'accounts'."""
+        from thorn.core._account import (
+            AgentAccountsConfig,
+            ForgeAccountConfig,
+            GitLabCredentials,
+        )
+
+        accounts = AgentAccountsConfig(forge_accounts=[
+            ForgeAccountConfig(
+                forge="gl",
+                credentials=GitLabCredentials(token="t"),
+            ),
+        ])
+        agent = Agent(id=AgentID("a"), name="a", accounts=accounts)
+
+        serializer = JsonSessionSerializer()
+        path = tmp_path / "agent.json"
+        serializer.save_agent(agent, path)
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert "accounts" in data
+        assert len(data["accounts"]["forge_accounts"]) == 1
+        assert data["accounts"]["forge_accounts"][0]["forge"] == "gl"
+
+    def test_no_accounts_key_when_empty(self, tmp_path: Path):
+        """Agents without accounts should not have an 'accounts' key in JSON."""
+        agent = Agent(id=AgentID("plain"), name="plain", metadata={})
+
+        serializer = JsonSessionSerializer()
+        path = tmp_path / "agent.json"
+        serializer.save_agent(agent, path)
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert "accounts" not in data
+
+    def test_env_var_expansion_in_credential_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """$ENV_VAR in credential fields should be expanded on load."""
+        monkeypatch.setenv("MY_GL_TOKEN", "expanded-secret")
+
+        agent_data = {
+            "id": "env-test",
+            "agent_class": "Agent",
+            "name": "env-test",
+            "metadata": {},
+            "accounts": {
+                "forge_accounts": [
+                    {
+                        "forge": "gl",
+                        "credentials": {
+                            "kind": "gitlab-pat",
+                            "token": "$MY_GL_TOKEN",
+                        },
+                        "git_user_name": "bot",
+                        "git_user_email": "bot@thorn",
+                    },
+                ],
+            },
+        }
+        path = tmp_path / "agent.json"
+        path.write_text(json.dumps(agent_data), encoding="utf-8")
+
+        serializer = JsonSessionSerializer()
+        restored = serializer.load_agent(path)
+
+        acct = restored.accounts.forge_accounts[0]
+        assert acct.credentials.token == "expanded-secret"
+
+    def test_env_var_not_expanded_in_non_secret_fields(
+        self, tmp_path: Path,
+    ):
+        """git_user_name etc. should NOT be treated as env var references."""
+        agent_data = {
+            "id": "no-expand",
+            "agent_class": "Agent",
+            "name": "no-expand",
+            "metadata": {},
+            "accounts": {
+                "forge_accounts": [
+                    {
+                        "forge": "gl",
+                        "credentials": {
+                            "kind": "gitlab-pat",
+                            "token": "literal-token",
+                        },
+                        "git_user_name": "$NOT_AN_ENV_VAR",
+                        "git_user_email": "$ALSO_NOT",
+                    },
+                ],
+            },
+        }
+        path = tmp_path / "agent.json"
+        path.write_text(json.dumps(agent_data), encoding="utf-8")
+
+        serializer = JsonSessionSerializer()
+        restored = serializer.load_agent(path)
+
+        acct = restored.accounts.forge_accounts[0]
+        assert acct.git_user_name == "$NOT_AN_ENV_VAR"
+        assert acct.git_user_email == "$ALSO_NOT"
+
+    def test_github_pat_env_var_expansion(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("GH_TOKEN", "ghp-expanded")
+
+        agent_data = {
+            "id": "gh-env",
+            "agent_class": "Agent",
+            "name": "gh-env",
+            "metadata": {},
+            "accounts": {
+                "forge_accounts": [
+                    {
+                        "forge": "gh",
+                        "credentials": {
+                            "kind": "pat",
+                            "token": "$GH_TOKEN",
+                        },
+                    },
+                ],
+            },
+        }
+        path = tmp_path / "agent.json"
+        path.write_text(json.dumps(agent_data), encoding="utf-8")
+
+        serializer = JsonSessionSerializer()
+        restored = serializer.load_agent(path)
+        assert restored.accounts.forge_accounts[0].credentials.token == "ghp-expanded"
+
+    def test_github_app_private_key_env_var_expansion(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("GH_APP_KEY", "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----")
+
+        agent_data = {
+            "id": "gh-app",
+            "agent_class": "Agent",
+            "name": "gh-app",
+            "metadata": {},
+            "accounts": {
+                "forge_accounts": [
+                    {
+                        "forge": "gh",
+                        "credentials": {
+                            "kind": "app",
+                            "app_id": "12345",
+                            "installation_id": 67890,
+                            "private_key_pem": "$GH_APP_KEY",
+                        },
+                    },
+                ],
+            },
+        }
+        path = tmp_path / "agent.json"
+        path.write_text(json.dumps(agent_data), encoding="utf-8")
+
+        serializer = JsonSessionSerializer()
+        restored = serializer.load_agent(path)
+
+        creds = restored.accounts.forge_accounts[0].credentials
+        assert creds.kind == "app"
+        assert "BEGIN RSA PRIVATE KEY" in creds.private_key_pem
+
+    def test_legacy_metadata_emits_deprecation_warning(self, tmp_path: Path):
+        agent_data = {
+            "id": "legacy",
+            "agent_class": "Agent",
+            "name": "legacy",
+            "metadata": {
+                "project": "my-proj",
+                "git_user_name": "bot",
+                "git_user_email": "bot@thorn",
+            },
+        }
+        path = tmp_path / "agent.json"
+        path.write_text(json.dumps(agent_data), encoding="utf-8")
+
+        serializer = JsonSessionSerializer()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            restored = serializer.load_agent(path)
+
+        assert restored.metadata["project"] == "my-proj"
+        assert not hasattr(restored, "accounts") or restored.accounts is None
+
+        deprecation_warnings = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert len(deprecation_warnings) == 1
+        assert "legacy identity key" in str(deprecation_warnings[0].message)
+
+    def test_no_warning_when_accounts_present(self, tmp_path: Path):
+        """No deprecation warning when 'accounts' key is in the JSON,
+        even if metadata also has legacy keys."""
+        agent_data = {
+            "id": "new-style",
+            "agent_class": "Agent",
+            "name": "new-style",
+            "metadata": {"project": "my-proj"},
+            "accounts": {
+                "forge_accounts": [
+                    {
+                        "forge": "gl",
+                        "credentials": {"kind": "gitlab-pat", "token": "t"},
+                    },
+                ],
+            },
+        }
+        path = tmp_path / "agent.json"
+        path.write_text(json.dumps(agent_data), encoding="utf-8")
+
+        serializer = JsonSessionSerializer()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            serializer.load_agent(path)
+
+        deprecation_warnings = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert len(deprecation_warnings) == 0
 
 
 # ---------------------------------------------------------------------------

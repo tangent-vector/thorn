@@ -13,7 +13,7 @@ JSON serializer should set the same expectation.
 
 Agent identity is stored separately from session data:
 
-    <agent-id>.json       -- agent class, name, metadata, id
+    <agent-id>.json       -- agent class, name, metadata, id, accounts
     <session-dir>/
         session.json      -- session timestamps, metadata
         history.json      -- conversation history (HistoryTree nodes)
@@ -22,6 +22,8 @@ Agent identity is stored separately from session data:
 from __future__ import annotations
 
 import json
+import logging
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -252,6 +254,93 @@ def _resolve_agent_class(class_name: str) -> type[Agent]:
     return Agent
 
 
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Agent accounts serialization
+# ---------------------------------------------------------------------------
+
+_SECRET_CREDENTIAL_FIELDS = frozenset({"token", "private_key_pem"})
+"""Credential dict keys that may hold ``$ENV_VAR`` references."""
+
+
+def _expand_credentials(cred_data: dict[str, Any]) -> dict[str, Any]:
+    """Expand ``$ENV_VAR`` references in secret credential fields only.
+
+    Non-secret fields (``kind``, ``app_id``, ``installation_id``) are
+    passed through unchanged so that literal values in the config are
+    not misinterpreted as env-var references.
+    """
+    from thorn.gateway._config import expand_env_vars
+
+    result: dict[str, Any] = {}
+    for key, value in cred_data.items():
+        if key in _SECRET_CREDENTIAL_FIELDS:
+            result[key] = expand_env_vars(value)
+        else:
+            result[key] = value
+    return result
+
+
+def _deserialize_accounts(
+    raw_accounts: dict[str, Any],
+) -> Any:
+    """Parse the ``"accounts"`` dict from an agent JSON file.
+
+    Applies env-var expansion only to secret credential fields.
+    Returns an :class:`AgentAccountsConfig` instance.
+    """
+    from thorn.core._account import AgentAccountsConfig
+
+    forge_accounts_raw = raw_accounts.get("forge_accounts", [])
+    expanded: list[dict[str, Any]] = []
+    for acct in forge_accounts_raw:
+        acct_copy = dict(acct)
+        if "credentials" in acct_copy and isinstance(acct_copy["credentials"], dict):
+            acct_copy["credentials"] = _expand_credentials(acct_copy["credentials"])
+        expanded.append(acct_copy)
+
+    return AgentAccountsConfig.model_validate({"forge_accounts": expanded})
+
+
+def _serialize_accounts(agent: Agent) -> dict[str, Any] | None:
+    """Serialize the agent's accounts to a JSON-safe dict.
+
+    Returns ``None`` when the agent has no accounts configured,
+    so the key can be omitted from the output JSON entirely.
+
+    Credential fields that originated from ``$ENV_VAR`` references
+    are written as their *expanded* values — the original ``$``
+    reference is not preserved.  Users are expected to keep the
+    ``$ENV_VAR`` form in their hand-edited config files; the
+    serializer round-trips the resolved values.
+    """
+    from thorn.core._account import AgentAccountsConfig
+
+    accounts: AgentAccountsConfig | None = getattr(agent, "accounts", None)
+    if accounts is None or not accounts.forge_accounts:
+        return None
+    return accounts.model_dump(mode="json")
+
+
+_LEGACY_IDENTITY_KEYS = {"git_user_name", "git_user_email", "project"}
+
+
+def _warn_legacy_agent_metadata(metadata: dict[str, Any]) -> None:
+    """Emit a deprecation warning when legacy identity keys are in metadata."""
+    found = _LEGACY_IDENTITY_KEYS & metadata.keys()
+    if found:
+        warnings.warn(
+            f"Agent metadata contains legacy identity key(s) "
+            f"{sorted(found)!r}. Migrate to the 'accounts' section "
+            f"of the agent JSON file. Legacy metadata keys will stop "
+            f"being honored in a future release.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
 # ---------------------------------------------------------------------------
 # JSON serializer
 # ---------------------------------------------------------------------------
@@ -272,6 +361,9 @@ class JsonSessionSerializer:
             "name": agent.name,
             "metadata": agent.metadata,
         }
+        accounts_data = _serialize_accounts(agent)
+        if accounts_data is not None:
+            agent_data["accounts"] = accounts_data
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps(agent_data, indent=2, ensure_ascii=False) + "\n",
@@ -286,10 +378,20 @@ class JsonSessionSerializer:
         id_raw = agent_data.get("id")
         agent_id = AgentID(id_raw) if id_raw is not None else None
 
+        metadata = agent_data.get("metadata") or {}
+
+        kwargs: dict[str, Any] = {}
+        raw_accounts = agent_data.get("accounts")
+        if raw_accounts is not None:
+            kwargs["accounts"] = _deserialize_accounts(raw_accounts)
+        elif metadata:
+            _warn_legacy_agent_metadata(metadata)
+
         return agent_cls(
             id=agent_id,
             name=agent_data.get("name"),
-            metadata=agent_data.get("metadata"),
+            metadata=metadata,
+            **kwargs,
         )
 
     def save_session(self, session: Session, directory: Path) -> None:
