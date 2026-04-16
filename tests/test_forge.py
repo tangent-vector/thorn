@@ -353,11 +353,10 @@ class TestGitHubForgeClient:
         client.post_comment("org/repo", "ChangeRequest", 3, "looks good")
         mock_gh.post_comment.assert_called_once_with("org/repo", 3, "looks good")
 
-    def test_mark_notification_done_is_noop(self):
-        """GitHub has no usable 'mark done' API for event-based polling."""
+    def test_mark_notification_done_delegates(self):
         client, mock_gh = self._make_client()
         client.mark_notification_done("12345")
-        mock_gh.mark_notification_read.assert_not_called()
+        mock_gh.mark_notification_done.assert_called_once_with("12345")
 
     def test_create_issue(self):
         client, mock_gh = self._make_client()

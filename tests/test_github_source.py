@@ -1,20 +1,64 @@
-"""Tests for GitHubNotificationsSource (repository events API)."""
+"""Tests for GitHubNotificationsSource (Notifications API)."""
 
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from thorn.gateway._event import IncomingEvent
+from thorn.gateway._routing import NoteableKind
 from thorn.runtime import SessionKey
-from thorn.tools._github_connection import GitHubPatAuth
 
 
 # ---------------------------------------------------------------------------
-# Helpers under test (private but stable for unit tests)
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_notification_thread(
+    *,
+    thread_id: str = "100",
+    repo_id: int = 456,
+    repo_full_name: str = "octocat/hello-world",
+    subject_type: str = "Issue",
+    subject_title: str = "Found a bug",
+    subject_url: str = "https://api.github.com/repos/octocat/hello-world/issues/7",
+    latest_comment_url: str = "https://api.github.com/repos/octocat/hello-world/issues/comments/999",
+    reason: str = "mention",
+    updated_at: str = "2026-04-15T10:00:00Z",
+    clone_url: str = "https://github.com/octocat/hello-world.git",
+    default_branch: str = "main",
+    html_url: str = "https://github.com/octocat/hello-world",
+) -> dict[str, Any]:
+    return {
+        "id": thread_id,
+        "repository": {
+            "id": repo_id,
+            "full_name": repo_full_name,
+            "clone_url": clone_url,
+            "default_branch": default_branch,
+            "html_url": html_url,
+        },
+        "subject": {
+            "title": subject_title,
+            "url": subject_url,
+            "latest_comment_url": latest_comment_url,
+            "type": subject_type,
+        },
+        "reason": reason,
+        "unread": True,
+        "updated_at": updated_at,
+        "last_read_at": None,
+        "url": f"https://api.github.com/notifications/threads/{thread_id}",
+        "subscription_url": f"https://api.github.com/notifications/threads/{thread_id}/subscription",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Session key (routing -- unchanged, just verify it still works)
 # ---------------------------------------------------------------------------
 
 
@@ -28,282 +72,145 @@ class TestSessionKeyForEvent:
         assert k == SessionKey("github/42/issuesevent/evt-123")
 
 
-class TestPayloadSummary:
-    def test_issues_event(self) -> None:
-        from thorn.gateway.sources._github import _payload_summary
-
-        payload = {
-            "action": "opened",
-            "issue": {"number": 3, "title": "Bug"},
-        }
-        s = _payload_summary("IssuesEvent", payload)
-        assert "3" in s and "Bug" in s
-
-    def test_empty_payload(self) -> None:
-        from thorn.gateway.sources._github import _payload_summary
-
-        assert "no payload" in _payload_summary("X", {}).lower()
+# ---------------------------------------------------------------------------
+# _extract_noteable_from_notification
+# ---------------------------------------------------------------------------
 
 
-class TestExtractNoteable:
-    """Test _extract_noteable for each GitHub event type."""
+class TestExtractNoteableFromNotification:
+    def test_issue(self) -> None:
+        from thorn.gateway.sources._github import _extract_noteable_from_notification
 
-    def test_issues_event(self) -> None:
-        from thorn.gateway._routing import NoteableKind
-        from thorn.gateway.sources._github import _extract_noteable
-
-        n = _extract_noteable("IssuesEvent", {
-            "action": "opened",
-            "issue": {"number": 7, "title": "Bug"},
-        })
+        n = _extract_noteable_from_notification(
+            "Issue", "https://api.github.com/repos/o/r/issues/7",
+        )
         assert n is not None
         assert n.kind is NoteableKind.ISSUE
         assert n.number == 7
 
-    def test_issue_comment_on_issue(self) -> None:
-        from thorn.gateway._routing import NoteableKind
-        from thorn.gateway.sources._github import _extract_noteable
+    def test_pull_request(self) -> None:
+        from thorn.gateway.sources._github import _extract_noteable_from_notification
 
-        n = _extract_noteable("IssueCommentEvent", {
-            "comment": {"body": "hello"},
-            "issue": {"number": 3},
-        })
-        assert n is not None
-        assert n.kind is NoteableKind.ISSUE
-        assert n.number == 3
-
-    def test_issue_comment_on_pull_request(self) -> None:
-        from thorn.gateway._routing import NoteableKind
-        from thorn.gateway.sources._github import _extract_noteable
-
-        n = _extract_noteable("IssueCommentEvent", {
-            "comment": {"body": "lgtm"},
-            "issue": {
-                "number": 5,
-                "pull_request": {"url": "https://..."},
-            },
-        })
-        assert n is not None
-        assert n.kind is NoteableKind.CHANGE_REQUEST
-        assert n.number == 5
-
-    def test_pull_request_event(self) -> None:
-        from thorn.gateway._routing import NoteableKind
-        from thorn.gateway.sources._github import _extract_noteable
-
-        n = _extract_noteable("PullRequestEvent", {
-            "action": "opened",
-            "pull_request": {"number": 10, "title": "Fix"},
-        })
+        n = _extract_noteable_from_notification(
+            "PullRequest", "https://api.github.com/repos/o/r/pulls/10",
+        )
         assert n is not None
         assert n.kind is NoteableKind.CHANGE_REQUEST
         assert n.number == 10
 
-    def test_pull_request_review_event(self) -> None:
-        from thorn.gateway._routing import NoteableKind
-        from thorn.gateway.sources._github import _extract_noteable
+    def test_commit_returns_none(self) -> None:
+        from thorn.gateway.sources._github import _extract_noteable_from_notification
 
-        n = _extract_noteable("PullRequestReviewEvent", {
-            "review": {"state": "approved"},
-            "pull_request": {"number": 10},
-        })
-        assert n is not None
-        assert n.kind is NoteableKind.CHANGE_REQUEST
-        assert n.number == 10
+        assert _extract_noteable_from_notification(
+            "Commit", "https://api.github.com/repos/o/r/commits/abc",
+        ) is None
 
-    def test_pull_request_review_comment_event(self) -> None:
-        from thorn.gateway._routing import NoteableKind
-        from thorn.gateway.sources._github import _extract_noteable
+    def test_release_returns_none(self) -> None:
+        from thorn.gateway.sources._github import _extract_noteable_from_notification
 
-        n = _extract_noteable("PullRequestReviewCommentEvent", {
-            "comment": {"body": "nit"},
-            "pull_request": {"number": 10},
-        })
-        assert n is not None
-        assert n.kind is NoteableKind.CHANGE_REQUEST
-        assert n.number == 10
+        assert _extract_noteable_from_notification(
+            "Release", "https://api.github.com/repos/o/r/releases/42",
+        ) is None
 
-    def test_push_event_returns_none(self) -> None:
-        from thorn.gateway.sources._github import _extract_noteable
+    def test_empty_url_returns_none(self) -> None:
+        from thorn.gateway.sources._github import _extract_noteable_from_notification
 
-        assert _extract_noteable("PushEvent", {"ref": "refs/heads/main"}) is None
+        assert _extract_noteable_from_notification("Issue", "") is None
 
-    def test_create_event_returns_none(self) -> None:
-        from thorn.gateway.sources._github import _extract_noteable
+    def test_url_without_number_returns_none(self) -> None:
+        from thorn.gateway.sources._github import _extract_noteable_from_notification
 
-        assert _extract_noteable("CreateEvent", {"ref_type": "branch"}) is None
+        assert _extract_noteable_from_notification(
+            "Issue", "https://api.github.com/repos/o/r/issues",
+        ) is None
 
-    def test_delete_event_returns_none(self) -> None:
-        from thorn.gateway.sources._github import _extract_noteable
 
-        assert _extract_noteable("DeleteEvent", {"ref_type": "branch"}) is None
-
-    def test_malformed_payload_returns_none(self) -> None:
-        from thorn.gateway.sources._github import _extract_noteable
-
-        assert _extract_noteable("IssuesEvent", {}) is None
-        assert _extract_noteable("IssuesEvent", {"issue": {}}) is None
-        assert _extract_noteable("PullRequestEvent", {}) is None
+# ---------------------------------------------------------------------------
+# _make_incoming_event
+# ---------------------------------------------------------------------------
 
 
 class TestMakeIncomingEvent:
     def test_metadata(self) -> None:
         from thorn.gateway.sources._github import _make_incoming_event
 
-        repo = MagicMock()
-        repo.id = 99
-        repo.full_name = "o/r"
-        repo.clone_url = "https://github.com/o/r.git"
-        repo.default_branch = "main"
-        repo.html_url = "https://github.com/o/r"
-
+        thread = _make_notification_thread()
         ev = _make_incoming_event(
-            repo=repo,
-            event_type="IssuesEvent",
-            event_id="e1",
-            actor_login="alice",
-            created_at="2020-01-01T00:00:00Z",
-            payload={"action": "opened", "issue": {"number": 1, "title": "Hi"}},
+            thread=thread,
+            comment_body="Please fix this",
+            native_id_to_project_name={},
         )
         assert ev.source == "github"
-        assert ev.metadata["event_id"] == "e1"
-        assert ev.metadata["event_type"] == "IssuesEvent"
-        assert ev.metadata["repo_id"] == 99
-        assert ev.metadata["actor_login"] == "alice"
-        assert "GitHub repository activity" in ev.content
+        assert ev.metadata["notification_id"] == "100"
+        assert ev.metadata["reason"] == "mention"
+        assert ev.metadata["repo_id"] == 456
+        assert ev.metadata["repo_full_name"] == "octocat/hello-world"
+        assert "Please fix this" in ev.content
 
-    def test_issues_event_routes_to_issue_session(self) -> None:
+    def test_issue_routes_to_issue_session(self) -> None:
         from thorn.gateway.sources._github import _make_incoming_event
 
-        repo = MagicMock()
-        repo.id = 42
-        repo.full_name = "o/r"
-        repo.clone_url = "https://github.com/o/r.git"
-        repo.default_branch = "main"
-        repo.html_url = "https://github.com/o/r"
-
+        thread = _make_notification_thread(repo_id=42)
         ev = _make_incoming_event(
-            repo=repo,
-            event_type="IssuesEvent",
-            event_id="e1",
-            actor_login="alice",
-            created_at="2020-01-01T00:00:00Z",
-            payload={"action": "opened", "issue": {"number": 5, "title": "Bug"}},
+            thread=thread,
+            comment_body="",
+            native_id_to_project_name={},
         )
-        assert ev.session_key == SessionKey("github/42/issue/5")
+        assert ev.session_key == SessionKey("github/42/issue/7")
 
-    def test_pull_request_event_routes_to_change_request_session(self) -> None:
+    def test_pull_request_routes_to_change_request_session(self) -> None:
         from thorn.gateway.sources._github import _make_incoming_event
 
-        repo = MagicMock()
-        repo.id = 42
-        repo.full_name = "o/r"
-        repo.clone_url = "https://github.com/o/r.git"
-        repo.default_branch = "main"
-        repo.html_url = "https://github.com/o/r"
-
+        thread = _make_notification_thread(
+            repo_id=42,
+            subject_type="PullRequest",
+            subject_url="https://api.github.com/repos/o/r/pulls/3",
+        )
         ev = _make_incoming_event(
-            repo=repo,
-            event_type="PullRequestEvent",
-            event_id="e2",
-            actor_login="alice",
-            created_at="2020-01-01T00:00:00Z",
-            payload={"action": "opened", "pull_request": {"number": 3, "title": "Fix"}},
+            thread=thread,
+            comment_body="",
+            native_id_to_project_name={},
         )
         assert ev.session_key == SessionKey("github/42/change-request/3")
 
-    def test_issue_and_comment_share_session(self) -> None:
-        """IssuesEvent and IssueCommentEvent for the same issue produce the same key."""
+    def test_commit_uses_per_thread_key(self) -> None:
         from thorn.gateway.sources._github import _make_incoming_event
 
-        repo = MagicMock()
-        repo.id = 42
-        repo.full_name = "o/r"
-        repo.clone_url = "https://github.com/o/r.git"
-        repo.default_branch = "main"
-        repo.html_url = "https://github.com/o/r"
-
-        ev_issue = _make_incoming_event(
-            repo=repo,
-            event_type="IssuesEvent",
-            event_id="e1",
-            actor_login="alice",
-            created_at="2020-01-01T00:00:00Z",
-            payload={"action": "opened", "issue": {"number": 5, "title": "Bug"}},
+        thread = _make_notification_thread(
+            thread_id="t999",
+            repo_id=42,
+            subject_type="Commit",
+            subject_url="https://api.github.com/repos/o/r/commits/abc",
         )
-        ev_comment = _make_incoming_event(
-            repo=repo,
-            event_type="IssueCommentEvent",
-            event_id="e2",
-            actor_login="bob",
-            created_at="2020-01-01T01:00:00Z",
-            payload={"comment": {"body": "agreed"}, "issue": {"number": 5}},
-        )
-        assert ev_issue.session_key == ev_comment.session_key
-
-    def test_push_event_uses_per_event_key(self) -> None:
-        from thorn.gateway.sources._github import _make_incoming_event
-
-        repo = MagicMock()
-        repo.id = 42
-        repo.full_name = "o/r"
-        repo.clone_url = "https://github.com/o/r.git"
-        repo.default_branch = "main"
-        repo.html_url = "https://github.com/o/r"
-
         ev = _make_incoming_event(
-            repo=repo,
-            event_type="PushEvent",
-            event_id="e99",
-            actor_login="alice",
-            created_at="2020-01-01T00:00:00Z",
-            payload={"ref": "refs/heads/main", "commits": []},
+            thread=thread,
+            comment_body="",
+            native_id_to_project_name={},
         )
-        assert ev.session_key == SessionKey("github/42/pushevent/e99")
+        assert ev.session_key == SessionKey("github/42/commit/t999")
 
     def test_project_name_in_session_key(self) -> None:
-        """When project_name is provided, the session key uses it."""
         from thorn.gateway.sources._github import _make_incoming_event
 
-        repo = MagicMock()
-        repo.id = 42
-        repo.full_name = "o/r"
-        repo.clone_url = "https://github.com/o/r.git"
-        repo.default_branch = "main"
-        repo.html_url = "https://github.com/o/r"
-
+        thread = _make_notification_thread(repo_id=42)
         ev = _make_incoming_event(
-            repo=repo,
-            event_type="IssuesEvent",
-            event_id="e1",
-            actor_login="alice",
-            created_at="2020-01-01T00:00:00Z",
-            payload={"action": "opened", "issue": {"number": 5, "title": "Bug"}},
-            project_name="my-proj",
+            thread=thread,
+            comment_body="",
+            native_id_to_project_name={"octocat/hello-world": "my-proj"},
         )
-        assert ev.session_key == SessionKey("my-proj/issue/5")
+        assert ev.session_key == SessionKey("my-proj/issue/7")
         assert ev.metadata["project_name"] == "my-proj"
 
     def test_empty_project_name_uses_legacy_key(self) -> None:
-        """When project_name is empty, falls back to repo-id-based key."""
         from thorn.gateway.sources._github import _make_incoming_event
 
-        repo = MagicMock()
-        repo.id = 42
-        repo.full_name = "o/r"
-        repo.clone_url = "https://github.com/o/r.git"
-        repo.default_branch = "main"
-        repo.html_url = "https://github.com/o/r"
-
+        thread = _make_notification_thread(repo_id=42)
         ev = _make_incoming_event(
-            repo=repo,
-            event_type="IssuesEvent",
-            event_id="e1",
-            actor_login="alice",
-            created_at="2020-01-01T00:00:00Z",
-            payload={"action": "opened", "issue": {"number": 5, "title": "Bug"}},
+            thread=thread,
+            comment_body="",
+            native_id_to_project_name={},
         )
-        assert ev.session_key == SessionKey("github/42/issue/5")
+        assert ev.session_key == SessionKey("github/42/issue/7")
 
 
 # ---------------------------------------------------------------------------
@@ -311,142 +218,115 @@ class TestMakeIncomingEvent:
 # ---------------------------------------------------------------------------
 
 
-def _make_mock_github_event(
-    *,
-    eid: str,
-    event_type: str = "IssuesEvent",
-    payload: dict[str, object] | None = None,
-    actor_login: str = "bob",
-) -> MagicMock:
-    ev = MagicMock()
-    ev.id = eid
-    ev.type = event_type
-    ev.payload = payload or {"action": "opened", "issue": {"number": 1, "title": "T"}}
-    actor = MagicMock()
-    actor.login = actor_login
-    ev.actor = actor
-    ev.created_at = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    return ev
-
-
-class TestGitHubNotificationsSourceFetchNewEvents:
-    """Exercise :meth:`GitHubNotificationsSource._fetch_new_events` directly."""
+class TestGitHubNotificationsSourceFetchNewNotifications:
+    """Exercise :meth:`GitHubNotificationsSource._fetch_new_notifications` directly."""
 
     def test_first_fetch_primes_and_returns_empty(self) -> None:
-        with (
-            patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._Github") as mock_gh_cls,
-        ):
-            mock_repo = MagicMock()
-            mock_repo.id = 456
-            mock_repo.full_name = "octocat/hello-world"
-            mock_repo.clone_url = "https://github.com/octocat/hello-world.git"
-            mock_repo.default_branch = "main"
-            mock_repo.html_url = "https://github.com/octocat/hello-world"
-            ev_a = _make_mock_github_event(eid="111")
-            mock_repo.get_events.return_value = [ev_a]
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
 
-            mock_gh = MagicMock()
-            mock_gh.get_repo.return_value = mock_repo
-            mock_gh_cls.return_value = mock_gh
+        config = GitHubNotificationsSourceConfig(token="ghp_test")
+        source = GitHubNotificationsSource(config)
 
-            from thorn.gateway.sources._github import (
-                GitHubNotificationsSource,
-                GitHubNotificationsSourceConfig,
-            )
+        thread = _make_notification_thread(thread_id="111")
 
-            config = GitHubNotificationsSourceConfig(
-                auth=GitHubPatAuth(token="ghp_test"),
-                repository="octocat/hello-world",
-            )
-            source = GitHubNotificationsSource(config)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = [thread]
+        mock_resp.headers = {}
 
-            assert source._fetch_new_events() == []
-            assert source._primed is True
-            assert "111" in source._seen_event_ids
+        with patch.object(source._http, "get", return_value=mock_resp):
+            result = source._fetch_new_notifications()
+
+        assert result == []
+        assert source._primed is True
+        assert "111" in source._seen_thread_ids
 
     def test_subsequent_fetch_returns_only_new_ids(self) -> None:
-        with (
-            patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._Github") as mock_gh_cls,
-        ):
-            mock_repo = MagicMock()
-            mock_repo.id = 456
-            mock_repo.full_name = "octocat/hello-world"
-            mock_repo.clone_url = "https://github.com/octocat/hello-world.git"
-            mock_repo.default_branch = "main"
-            mock_repo.html_url = "https://github.com/octocat/hello-world"
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
 
-            ev_old = _make_mock_github_event(eid="111")
-            ev_new = _make_mock_github_event(eid="222", event_type="IssueCommentEvent")
+        config = GitHubNotificationsSourceConfig(token="ghp_test")
+        source = GitHubNotificationsSource(config)
 
-            mock_repo.get_events.side_effect = [
-                [ev_old],
-                [ev_new, ev_old],
-            ]
+        thread_old = _make_notification_thread(thread_id="111")
+        thread_new = _make_notification_thread(thread_id="222", reason="assign")
 
-            mock_gh = MagicMock()
-            mock_gh.get_repo.return_value = mock_repo
-            mock_gh_cls.return_value = mock_gh
+        call_count = 0
 
-            from thorn.gateway.sources._github import (
-                GitHubNotificationsSource,
-                GitHubNotificationsSourceConfig,
-            )
+        def mock_get(url: str, **kwargs: Any) -> MagicMock:
+            nonlocal call_count
+            if "/issues/comments/" in url:
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.raise_for_status = MagicMock()
+                resp.json.return_value = {"body": "comment text"}
+                return resp
 
-            config = GitHubNotificationsSourceConfig(
-                auth=GitHubPatAuth(token="ghp_test"),
-                repository="octocat/hello-world",
-            )
-            source = GitHubNotificationsSource(config)
+            call_count += 1
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock()
+            resp.headers = {}
+            if call_count == 1:
+                resp.json.return_value = [thread_old]
+            else:
+                resp.json.return_value = [thread_new, thread_old]
+            return resp
 
-            assert source._fetch_new_events() == []
-            second = source._fetch_new_events()
-            assert len(second) == 1
-            assert second[0].metadata["event_id"] == "222"
-            assert second[0].source == "github"
+        with patch.object(source._http, "get", side_effect=mock_get):
+            assert source._fetch_new_notifications() == []
+            second = source._fetch_new_notifications()
+
+        assert len(second) == 1
+        assert second[0].metadata["notification_id"] == "222"
+        assert second[0].source == "github"
 
 
 class TestGitHubNotificationsSourceStart:
     @pytest.mark.asyncio
     async def test_start_invokes_poll_loop(self) -> None:
-        with (
-            patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._Github") as mock_gh_cls,
-        ):
-            mock_repo = MagicMock()
-            mock_repo.id = 1
-            mock_repo.full_name = "o/r"
-            mock_repo.clone_url = "https://github.com/o/r.git"
-            mock_repo.default_branch = "main"
-            mock_repo.html_url = "https://github.com/o/r"
-            mock_repo.get_events.return_value = []
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
 
-            mock_gh = MagicMock()
-            mock_gh.get_repo.return_value = mock_repo
-            mock_gh_cls.return_value = mock_gh
+        config = GitHubNotificationsSourceConfig(
+            token="ghp_test", poll_interval=5,
+        )
+        source = GitHubNotificationsSource(config)
 
-            from thorn.gateway.sources._github import (
-                GitHubNotificationsSource,
-                GitHubNotificationsSourceConfig,
-            )
+        mock_user_resp = MagicMock()
+        mock_user_resp.status_code = 200
+        mock_user_resp.raise_for_status = MagicMock()
+        mock_user_resp.json.return_value = {
+            "login": "bot", "name": "", "html_url": "",
+        }
 
-            config = GitHubNotificationsSourceConfig(
-                auth=GitHubPatAuth(token="ghp_test"),
-                repository="o/r",
-                poll_interval=5,
-            )
-            source = GitHubNotificationsSource(config)
+        mock_notif_resp = MagicMock()
+        mock_notif_resp.status_code = 200
+        mock_notif_resp.raise_for_status = MagicMock()
+        mock_notif_resp.json.return_value = []
+        mock_notif_resp.headers = {}
 
-            async def on_event(_event: IncomingEvent) -> None:
-                pass
+        def mock_get(url: str, **kwargs: Any) -> MagicMock:
+            if url == "/user":
+                return mock_user_resp
+            return mock_notif_resp
 
+        async def on_event(_event: IncomingEvent) -> None:
+            pass
+
+        with patch.object(source._http, "get", side_effect=mock_get):
             task = asyncio.create_task(source.start(on_event))
             await asyncio.sleep(0.05)
             await source.stop()
             await asyncio.wait_for(task, timeout=2.0)
-
-            assert mock_gh.get_repo.called
 
 
 # ---------------------------------------------------------------------------
@@ -454,46 +334,29 @@ class TestGitHubNotificationsSourceStart:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.usefixtures("github_pat_only_env", "clear_github_api_url_env")
 class TestGitHubNotificationsSourceConfig:
     def test_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        with (
-            patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._Github"),
-        ):
-            from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
+        from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
 
-            monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
-            monkeypatch.setenv("GITHUB_URL", "https://gh.corp.example.com")
-            monkeypatch.setenv("THORN_GITHUB_REPOSITORY", "org/repo")
-            monkeypatch.setenv("THORN_GITHUB_APP_SLUG", "my-bot")
-            monkeypatch.setenv("THORN_POLL_INTERVAL", "15")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+        monkeypatch.setenv("GITHUB_API_URL", "https://gh.corp.example.com")
+        monkeypatch.setenv("THORN_POLL_INTERVAL", "15")
 
-            config = GitHubNotificationsSourceConfig.from_env()
-            assert config.auth.kind == "pat"
-            assert config.auth.token == "ghp_secret"
-            assert config.base_url == "https://gh.corp.example.com"
-            assert config.repository == "org/repo"
-            assert config.app_slug == "my-bot"
-            assert config.poll_interval == 15
+        config = GitHubNotificationsSourceConfig.from_env()
+        assert config.token == "ghp_secret"
+        assert config.base_url == "https://gh.corp.example.com"
+        assert config.poll_interval == 15
 
     def test_from_env_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        with (
-            patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._Github"),
-        ):
-            from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
+        from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
 
-            monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
-            monkeypatch.setenv("THORN_GITHUB_REPOSITORY", "org/repo")
-            monkeypatch.delenv("GITHUB_URL", raising=False)
-            monkeypatch.delenv("THORN_GITHUB_APP_SLUG", raising=False)
-            monkeypatch.delenv("THORN_POLL_INTERVAL", raising=False)
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+        monkeypatch.delenv("GITHUB_API_URL", raising=False)
+        monkeypatch.delenv("THORN_POLL_INTERVAL", raising=False)
 
-            config = GitHubNotificationsSourceConfig.from_env()
-            assert config.base_url == "https://api.github.com"
-            assert config.app_slug == ""
-            assert config.poll_interval == 30
+        config = GitHubNotificationsSourceConfig.from_env()
+        assert config.base_url == "https://api.github.com"
+        assert config.poll_interval == 30
 
     def test_from_env_missing_token_raises(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -501,18 +364,7 @@ class TestGitHubNotificationsSourceConfig:
         from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
 
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        monkeypatch.setenv("THORN_GITHUB_REPOSITORY", "org/repo")
         with pytest.raises(ValueError, match="GITHUB_TOKEN"):
-            GitHubNotificationsSourceConfig.from_env()
-
-    def test_from_env_missing_repository_raises(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
-
-        monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
-        monkeypatch.delenv("THORN_GITHUB_REPOSITORY", raising=False)
-        with pytest.raises(ValueError, match="THORN_GITHUB_REPOSITORY"):
             GitHubNotificationsSourceConfig.from_env()
 
 
@@ -538,7 +390,7 @@ class TestGitHubSourceRegistry:
 
 
 # ---------------------------------------------------------------------------
-# instantiate_sources integration
+# instantiate_sources integration (legacy format)
 # ---------------------------------------------------------------------------
 
 
@@ -546,34 +398,26 @@ class TestGitHubInstantiateSources:
     def test_instantiates_github_event_source(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        with (
-            patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._Github"),
-        ):
-            from thorn.gateway._config import (
-                GatewayConfig,
-                ServiceSpec,
-                instantiate_sources,
-            )
-            from thorn.gateway.sources._github import (
-                GitHubNotificationsSource,
-            )
+        from thorn.gateway._config import (
+            GatewayConfig,
+            ServiceSpec,
+            instantiate_sources,
+        )
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+        )
 
-            monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
 
-            config = GatewayConfig(services=[
-                ServiceSpec(
-                    name="test-gh",
-                    type="github-events",
-                    config={
-                        "auth": {
-                            "kind": "pat",
-                            "token": "$GITHUB_TOKEN",
-                        },
-                        "repository": "owner/repo",
-                    },
-                ),
-            ])
-            sources = instantiate_sources(config)
-            assert len(sources) == 1
-            assert isinstance(sources[0], GitHubNotificationsSource)
+        config = GatewayConfig(services=[
+            ServiceSpec(
+                name="test-gh",
+                type="github-events",
+                config={
+                    "token": "$GITHUB_TOKEN",
+                },
+            ),
+        ])
+        sources = instantiate_sources(config)
+        assert len(sources) == 1
+        assert isinstance(sources[0], GitHubNotificationsSource)

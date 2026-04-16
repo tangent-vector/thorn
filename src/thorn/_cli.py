@@ -666,12 +666,6 @@ _FORGE_ENV_DEFAULTS: dict[str, tuple[str, str]] = {
 @click.option("--url-env", default=None, help="Env var holding the forge URL (default: based on --forge-type).")
 @click.option("--git-user-name", default=None, help="Git author/committer name for this agent (default: agent-id).")
 @click.option("--git-user-email", default=None, help="Git author/committer email for this agent (default: <agent-id>@thorn).")
-@click.option(
-    "--github-auth-mode",
-    type=click.Choice(["pat", "app"], case_sensitive=False),
-    default="pat",
-    help="GitHub auth mode: 'pat' (default, uses GITHUB_TOKEN) or 'app' (uses GITHUB_APP_* env vars).",
-)
 @click.option("--workspace", "workspace_path", type=click.Path(file_okay=False), default=".", help="Runtime root directory (default: current dir).")
 @click.pass_context
 def serve_bootstrap(
@@ -687,7 +681,6 @@ def serve_bootstrap(
     url_env: str | None,
     git_user_name: str | None,
     git_user_email: str | None,
-    github_auth_mode: str,
     workspace_path: str,
 ) -> None:
     """Bootstrap a ProjectCoordinator agent in the runtime directory."""
@@ -717,25 +710,17 @@ def serve_bootstrap(
         forge_url_env=url_env,
         git_user_name=git_user_name or "",
         git_user_email=git_user_email or "",
-        github_auth_mode=github_auth_mode,
     )
     console.print(f"[green]Bootstrapped coordinator:[/green] {aid}")
     console.print(f"  Identity: {runtime_root / '.thorn' / 'agents' / f'{aid}.json'}")
     console.print(f"  Gateway config: {runtime_root / '.thorn' / 'gateway.json'}")
     console.print(f"  Workspace: {runtime_root / '.thorn' / 'agents' / str(aid)}")
     if forge_type == "github":
-        if github_auth_mode == "app":
-            console.print(
-                "\nSet GitHub App credentials before running 'thorn serve': "
-                "GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, and "
-                "GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH "
-                f"(optional: {url_env}).",
-            )
-        else:
-            console.print(
-                f"\nSet {token_env} (bot user PAT) before running 'thorn serve'."
-                f"  Optional: {url_env} (defaults to https://api.github.com).",
-            )
+        console.print(
+            f"\nSet {token_env} (bot user PAT with 'notifications' scope) "
+            f"before running 'thorn serve'."
+            f"  Optional: {url_env} (defaults to https://api.github.com).",
+        )
     else:
         console.print(
             "\nEnsure the required environment variables are set (e.g. from a "

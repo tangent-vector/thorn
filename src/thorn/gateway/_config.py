@@ -424,8 +424,9 @@ def infer_event_sources(
     For each agent that has a :class:`ForgeAccountConfig` on a forge
     declared in *config*, an appropriate event source is created:
 
-    - **GitHub**: A per-repository poller for each project fork on
-      this forge, authenticated with the agent's credentials.
+    - **GitHub**: A notifications poller authenticated with the
+      agent's PAT (notifications are user-scoped, no per-repo
+      enumeration needed).
     - **GitLab**: A TODOs poller authenticated with the agent's
       credentials (TODOs are user-scoped, no per-repo enumeration).
 
@@ -467,7 +468,6 @@ def infer_event_sources(
                 forge_spec=forge_spec,
                 account=acct,
                 agent=agent,
-                repositories=info.repositories,
                 native_id_to_project_name=info.native_id_to_project_name,
             )
             if source is not None:
@@ -481,7 +481,6 @@ def _create_event_source_for_account(
     forge_spec: ForgeSpec,
     account: Any,
     agent: Any,
-    repositories: list[str],
     native_id_to_project_name: dict[str, str],
 ) -> EventSource | None:
     """Create a single event source for an agent's account on a forge."""
@@ -495,7 +494,6 @@ def _create_event_source_for_account(
             forge_spec=forge_spec,
             account=account,
             agent_name=str(agent_name),
-            repositories=repositories,
             native_id_to_project_name=native_id_to_project_name,
         )
 
@@ -519,38 +517,23 @@ def _create_github_source(
     forge_spec: ForgeSpec,
     account: Any,
     agent_name: str,
-    repositories: list[str],
     native_id_to_project_name: dict[str, str],
 ) -> EventSource | None:
-    """Create a GitHub repository events source for one (agent, forge) pair.
+    """Create a GitHub notifications source for one (agent, forge) pair.
 
-    Polls each repository in *repositories* using the agent's
-    credentials.  If there are no repositories on this forge, no
-    source is created.
+    The Notifications API is user-scoped (like GitLab TODOs), so no
+    repository list is needed.  Only PAT credentials are supported;
+    GitHub App installation tokens cannot access the Notifications API.
     """
-    if not repositories:
-        log.info(
-            "No projects on forge %r for agent %r; skipping GitHub source.",
-            forge_spec.name, agent_name,
-        )
-        return None
-
-    from thorn.tools._github_connection import GitHubAppAuth, GitHubPatAuth
+    from thorn.tools._github_connection import GitHubPatAuth
 
     creds = account.credentials
-    if isinstance(creds, GitHubPatAuth):
-        auth_block = {"kind": "pat", "token": creds.token}
-    elif isinstance(creds, GitHubAppAuth):
-        auth_block = {
-            "kind": "app",
-            "app_id": creds.app_id,
-            "installation_id": creds.installation_id,
-            "private_key_pem": creds.private_key_pem,
-        }
-    else:
+    if not isinstance(creds, GitHubPatAuth):
         log.warning(
-            "Unsupported credential type %s for GitHub forge %r",
-            type(creds).__name__, forge_spec.name,
+            "GitHub notifications require a PAT; credential type %s "
+            "for forge %r is not supported (agent=%r). "
+            "GitHub App installation tokens cannot access the Notifications API.",
+            type(creds).__name__, forge_spec.name, agent_name,
         )
         return None
 
@@ -560,21 +543,18 @@ def _create_github_source(
     )
 
     base_url = forge_spec.base_url or "https://api.github.com"
-    repo = repositories[0]
-    project_name = native_id_to_project_name.get(repo, "")
     source_name = f"{agent_name}-{forge_spec.name}-events"
 
     cfg = GitHubNotificationsSourceConfig(
+        token=creds.token,
         base_url=base_url,
-        auth=auth_block,  # type: ignore[arg-type]
-        repository=repo,
         poll_interval=forge_spec.poll_interval,
-        project_name=project_name,
+        native_id_to_project_name=native_id_to_project_name,
     )
     source = GitHubNotificationsSource(cfg, service_name=source_name)
     log.info(
-        "Inferred GitHub event source %r (repo=%s, project=%s, agent=%s)",
-        source_name, repo, project_name or "(unknown)", agent_name,
+        "Inferred GitHub notifications source %r (agent=%s)",
+        source_name, agent_name,
     )
     return source
 

@@ -15,6 +15,7 @@ from thorn.core._provider import MockProvider
 from thorn.core._session import Session, _SessionPromptAccessor
 from thorn.gateway._event import EventSource, IncomingEvent
 from thorn.gateway._gateway import Gateway
+from thorn.gateway._routing import NoteableKind
 from thorn.runtime import AgentID, Runtime, SessionKey
 
 
@@ -1733,38 +1734,34 @@ class TestInferEventSources:
             assert "bot-gl-events" in sources[0].name
 
     def test_infers_github_source_from_agent_account(self):
-        with (
-            patch("thorn.gateway.sources._github._HAS_GITHUB", True),
-            patch("thorn.gateway.sources._github._Github"),
-            patch("thorn.tools.github.build_pygithub_auth", return_value=None),
-        ):
-            from thorn.core._account import AgentAccountsConfig, ForgeAccountConfig
-            from thorn.core._agent import Agent
-            from thorn.gateway._config import (
-                ForgeSpec,
-                GatewayConfig,
-                ProjectSpec,
-                infer_event_sources,
-            )
-            from thorn.gateway.sources._github import GitHubNotificationsSource
-            from thorn.tools._github_connection import GitHubPatAuth
+        from thorn.core._account import AgentAccountsConfig, ForgeAccountConfig
+        from thorn.core._agent import Agent
+        from thorn.gateway._config import (
+            ForgeSpec,
+            GatewayConfig,
+            ProjectSpec,
+            infer_event_sources,
+        )
+        from thorn.gateway.sources._github import GitHubNotificationsSource
+        from thorn.tools._github_connection import GitHubPatAuth
 
-            config = GatewayConfig(
-                forges=[ForgeSpec(name="gh", type="github", base_url="https://api.github.com")],
-                projects=[ProjectSpec(name="repo", forge="gh", native_id="owner/repo")],
-            )
-            agent = Agent(
-                name="bot",
-                accounts=AgentAccountsConfig(forge_accounts=[
-                    ForgeAccountConfig(
-                        forge="gh",
-                        credentials=GitHubPatAuth(token="ghp-tok"),
-                    ),
-                ]),
-            )
-            sources = infer_event_sources(config, [agent])
-            assert len(sources) == 1
-            assert isinstance(sources[0], GitHubNotificationsSource)
+        config = GatewayConfig(
+            forges=[ForgeSpec(name="gh", type="github", base_url="https://api.github.com")],
+            projects=[ProjectSpec(name="repo", forge="gh", native_id="owner/repo")],
+        )
+        agent = Agent(
+            name="bot",
+            accounts=AgentAccountsConfig(forge_accounts=[
+                ForgeAccountConfig(
+                    forge="gh",
+                    credentials=GitHubPatAuth(token="ghp-tok"),
+                ),
+            ]),
+        )
+        sources = infer_event_sources(config, [agent])
+        assert len(sources) == 1
+        assert isinstance(sources[0], GitHubNotificationsSource)
+        assert sources[0]._config.native_id_to_project_name == {"owner/repo": "repo"}
 
     def test_no_sources_when_agent_has_no_accounts(self):
         from thorn.core._agent import Agent
@@ -1810,11 +1807,13 @@ class TestInferEventSources:
         sources = infer_event_sources(config, [agent])
         assert sources == []
 
-    def test_github_skipped_when_no_project_repos(self):
-        """GitHub source is not created when no projects are on that forge."""
+    def test_github_created_even_without_project_repos(self):
+        """GitHub notifications source is user-scoped and created even
+        without project repos (unlike the old per-repo events source)."""
         from thorn.core._account import AgentAccountsConfig, ForgeAccountConfig
         from thorn.core._agent import Agent
         from thorn.gateway._config import ForgeSpec, GatewayConfig, infer_event_sources
+        from thorn.gateway.sources._github import GitHubNotificationsSource
         from thorn.tools._github_connection import GitHubPatAuth
 
         config = GatewayConfig(
@@ -1826,6 +1825,34 @@ class TestInferEventSources:
                 ForgeAccountConfig(
                     forge="gh",
                     credentials=GitHubPatAuth(token="ghp-tok"),
+                ),
+            ]),
+        )
+        sources = infer_event_sources(config, [agent])
+        assert len(sources) == 1
+        assert isinstance(sources[0], GitHubNotificationsSource)
+
+    def test_github_skipped_for_app_credentials(self):
+        """GitHub App credentials are rejected since the Notifications
+        API requires a personal access token."""
+        from thorn.core._account import AgentAccountsConfig, ForgeAccountConfig
+        from thorn.core._agent import Agent
+        from thorn.gateway._config import ForgeSpec, GatewayConfig, infer_event_sources
+        from thorn.tools._github_connection import GitHubAppAuth
+
+        config = GatewayConfig(
+            forges=[ForgeSpec(name="gh", type="github", base_url="https://api.github.com")],
+        )
+        agent = Agent(
+            name="bot",
+            accounts=AgentAccountsConfig(forge_accounts=[
+                ForgeAccountConfig(
+                    forge="gh",
+                    credentials=GitHubAppAuth(
+                        app_id="123",
+                        installation_id=456,
+                        private_key_pem="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+                    ),
                 ),
             ]),
         )
@@ -2053,26 +2080,25 @@ class TestBootstrapCoordinator:
         assert acct["credentials"]["kind"] == "pat"
         assert acct["credentials"]["token"] == "$GITHUB_TOKEN"
 
-    def test_github_bootstrap_app_mode(self, tmp_path: Path):
-        """Bootstrap with github_auth_mode='app' produces App auth blocks."""
+    def test_github_bootstrap_always_uses_pat(self, tmp_path: Path):
+        """GitHub bootstrap always uses PAT auth (App auth not supported)."""
         import json
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
             runtime_root=tmp_path,
-            agent_id="gh-app-coord",
+            agent_id="gh-pat-only",
             project_name="my-repo",
             clone_url="https://github.com/owner/repo.git",
             native_project_id="owner/repo",
             forge_type="github",
-            github_auth_mode="app",
         )
 
-        identity = tmp_path / ".thorn" / "agents" / "gh-app-coord.json"
+        identity = tmp_path / ".thorn" / "agents" / "gh-pat-only.json"
         data = json.loads(identity.read_text(encoding="utf-8"))
         acct = data["accounts"]["forge_accounts"][0]
-        assert acct["credentials"]["kind"] == "app"
-        assert acct["credentials"]["app_id"] == "$GITHUB_APP_ID"
+        assert acct["credentials"]["kind"] == "pat"
+        assert acct["credentials"]["token"] == "$GITHUB_TOKEN"
 
     def test_github_bootstrap_without_custom_url(self, tmp_path: Path):
         """When no base_url is given, the forge entry omits base_url."""
@@ -2156,31 +2182,6 @@ class TestBootstrapCoordinator:
         forge = gw_data["forges"][0]
         assert forge["type"] == "github"
 
-    def test_cli_bootstrap_github_app_mode(self, tmp_path: Path):
-        """CLI --github-auth-mode app produces App auth blocks."""
-        from click.testing import CliRunner
-        from thorn._cli import main as cli_main
-
-        runner = CliRunner()
-        result = runner.invoke(cli_main, [
-            "serve", "bootstrap",
-            "--agent-id", "gh-app-cli",
-            "--project-name", "test-repo",
-            "--clone-url", "https://github.com/owner/repo.git",
-            "--forge-type", "github",
-            "--native-project-id", "owner/repo",
-            "--github-auth-mode", "app",
-            "--workspace", str(tmp_path),
-        ])
-        assert result.exit_code == 0, result.output
-        assert "GITHUB_APP_ID" in result.output
-
-        import json
-        identity = tmp_path / ".thorn" / "agents" / "gh-app-cli.json"
-        data = json.loads(identity.read_text(encoding="utf-8"))
-        acct = data["accounts"]["forge_accounts"][0]
-        assert acct["credentials"]["kind"] == "app"
-
     def test_cli_bootstrap_defaults_to_gitlab(self, tmp_path: Path):
         """Without --forge-type, the CLI defaults to gitlab."""
         from click.testing import CliRunner
@@ -2231,6 +2232,348 @@ class TestGatewayReExports:
 
             assert GitLabSourceConfig is not None
             assert GitLabTODOsSource is not None
+
+
+# ---------------------------------------------------------------------------
+# GitHub notifications source
+# ---------------------------------------------------------------------------
+
+
+def _make_notification_thread(
+    *,
+    thread_id: str = "100",
+    repo_id: int = 42,
+    repo_full_name: str = "owner/repo",
+    subject_type: str = "Issue",
+    subject_title: str = "Fix the bug",
+    subject_url: str = "https://api.github.com/repos/owner/repo/issues/7",
+    latest_comment_url: str = "https://api.github.com/repos/owner/repo/issues/comments/999",
+    reason: str = "mention",
+    unread: bool = True,
+    updated_at: str = "2026-04-15T10:00:00Z",
+    clone_url: str = "https://github.com/owner/repo.git",
+    default_branch: str = "main",
+    html_url: str = "https://github.com/owner/repo",
+) -> dict[str, Any]:
+    """Build a notification thread dict matching the GitHub API shape."""
+    return {
+        "id": thread_id,
+        "repository": {
+            "id": repo_id,
+            "full_name": repo_full_name,
+            "clone_url": clone_url,
+            "default_branch": default_branch,
+            "html_url": html_url,
+        },
+        "subject": {
+            "title": subject_title,
+            "url": subject_url,
+            "latest_comment_url": latest_comment_url,
+            "type": subject_type,
+        },
+        "reason": reason,
+        "unread": unread,
+        "updated_at": updated_at,
+        "last_read_at": None,
+        "url": f"https://api.github.com/notifications/threads/{thread_id}",
+        "subscription_url": f"https://api.github.com/notifications/threads/{thread_id}/subscription",
+    }
+
+
+class TestExtractNoteableFromNotification:
+    def test_issue(self):
+        from thorn.gateway.sources._github import _extract_noteable_from_notification
+
+        result = _extract_noteable_from_notification(
+            "Issue", "https://api.github.com/repos/owner/repo/issues/7",
+        )
+        assert result is not None
+        assert result.kind == NoteableKind.ISSUE
+        assert result.number == 7
+
+    def test_pull_request(self):
+        from thorn.gateway.sources._github import _extract_noteable_from_notification
+
+        result = _extract_noteable_from_notification(
+            "PullRequest", "https://api.github.com/repos/owner/repo/pulls/3",
+        )
+        assert result is not None
+        assert result.kind == NoteableKind.CHANGE_REQUEST
+        assert result.number == 3
+
+    def test_commit_returns_none(self):
+        from thorn.gateway.sources._github import _extract_noteable_from_notification
+
+        result = _extract_noteable_from_notification(
+            "Commit", "https://api.github.com/repos/owner/repo/commits/abc",
+        )
+        assert result is None
+
+    def test_bad_url_returns_none(self):
+        from thorn.gateway.sources._github import _extract_noteable_from_notification
+
+        result = _extract_noteable_from_notification("Issue", "")
+        assert result is None
+
+
+class TestFormatNotificationContent:
+    def test_includes_key_fields(self):
+        from thorn.gateway.sources._github import _format_notification_content
+
+        content = _format_notification_content(
+            repo_full_name="owner/repo",
+            repo_id=42,
+            clone_url="https://github.com/owner/repo.git",
+            default_branch="main",
+            html_url="https://github.com/owner/repo",
+            subject_type="Issue",
+            subject_title="Fix the bug",
+            reason="mention",
+            thread_id="100",
+            updated_at="2026-04-15T10:00:00Z",
+            comment_body="Please fix this ASAP",
+        )
+        assert "mention" in content
+        assert "owner/repo" in content
+        assert "Fix the bug" in content
+        assert "100" in content
+        assert "Please fix this ASAP" in content
+        assert "Clone URL:" in content
+        assert "forge_mark_notification_done" in content
+
+    def test_empty_comment(self):
+        from thorn.gateway.sources._github import _format_notification_content
+
+        content = _format_notification_content(
+            repo_full_name="owner/repo",
+            repo_id=42,
+            clone_url="",
+            default_branch="main",
+            html_url="",
+            subject_type="PullRequest",
+            subject_title="My PR",
+            reason="review_requested",
+            thread_id="200",
+            updated_at="2026-04-15T11:00:00Z",
+            comment_body="",
+        )
+        assert "Comment body:" not in content
+        assert "review_requested" in content
+
+
+class TestMakeIncomingEvent:
+    def test_issue_notification(self):
+        from thorn.gateway.sources._github import _make_incoming_event
+
+        thread = _make_notification_thread()
+        event = _make_incoming_event(
+            thread=thread,
+            comment_body="Hello",
+            native_id_to_project_name={"owner/repo": "my-proj"},
+        )
+        assert event.source == "github"
+        assert event.session_key == SessionKey("my-proj/issue/7")
+        assert "Hello" in event.content
+        assert event.metadata["notification_id"] == "100"
+        assert event.metadata["reason"] == "mention"
+        assert event.metadata["repo_full_name"] == "owner/repo"
+        assert event.metadata["project_name"] == "my-proj"
+
+    def test_pull_request_notification(self):
+        from thorn.gateway.sources._github import _make_incoming_event
+
+        thread = _make_notification_thread(
+            subject_type="PullRequest",
+            subject_url="https://api.github.com/repos/owner/repo/pulls/3",
+        )
+        event = _make_incoming_event(
+            thread=thread,
+            comment_body="",
+            native_id_to_project_name={},
+        )
+        assert event.session_key == SessionKey("github/42/change-request/3")
+
+    def test_unknown_subject_type_uses_fallback_key(self):
+        from thorn.gateway.sources._github import _make_incoming_event
+
+        thread = _make_notification_thread(
+            subject_type="Commit",
+            subject_url="https://api.github.com/repos/owner/repo/commits/abc",
+        )
+        event = _make_incoming_event(
+            thread=thread,
+            comment_body="",
+            native_id_to_project_name={},
+        )
+        assert event.session_key == SessionKey("github/42/commit/100")
+
+
+class TestGitHubNotificationsSourceConfig:
+    def test_fields(self):
+        from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
+
+        cfg = GitHubNotificationsSourceConfig(
+            token="ghp-test",
+            base_url="https://api.github.com",
+            poll_interval=15,
+            native_id_to_project_name={"owner/repo": "proj"},
+        )
+        assert cfg.token == "ghp-test"
+        assert cfg.poll_interval == 15
+        assert cfg.native_id_to_project_name == {"owner/repo": "proj"}
+
+    def test_from_env(self, monkeypatch: pytest.MonkeyPatch):
+        from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
+
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp-from-env")
+        monkeypatch.setenv("GITHUB_API_URL", "https://ghe.example.com/api/v3")
+        monkeypatch.setenv("THORN_POLL_INTERVAL", "10")
+
+        cfg = GitHubNotificationsSourceConfig.from_env()
+        assert cfg.token == "ghp-from-env"
+        assert cfg.base_url == "https://ghe.example.com/api/v3"
+        assert cfg.poll_interval == 10
+
+    def test_from_env_requires_token(self, monkeypatch: pytest.MonkeyPatch):
+        from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
+
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        with pytest.raises(ValueError, match="GITHUB_TOKEN"):
+            GitHubNotificationsSourceConfig.from_env()
+
+
+class TestGitHubNotificationsSource:
+    def test_constructor(self):
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        cfg = GitHubNotificationsSourceConfig(token="ghp-test")
+        source = GitHubNotificationsSource(cfg, service_name="test-source")
+        assert source.name == "test-source"
+
+    @pytest.mark.asyncio
+    async def test_start_and_stop(self):
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        cfg = GitHubNotificationsSourceConfig(token="ghp-test", poll_interval=5)
+        source = GitHubNotificationsSource(cfg, service_name="test")
+
+        events_received: list[IncomingEvent] = []
+
+        mock_user_response = MagicMock()
+        mock_user_response.status_code = 200
+        mock_user_response.raise_for_status = MagicMock()
+        mock_user_response.json.return_value = {
+            "login": "bot-user", "name": "Bot", "html_url": "https://github.com/bot-user",
+        }
+
+        mock_notifications_response = MagicMock()
+        mock_notifications_response.status_code = 200
+        mock_notifications_response.raise_for_status = MagicMock()
+        mock_notifications_response.json.return_value = []
+        mock_notifications_response.headers = {}
+
+        def mock_get(url: str, **kwargs: Any) -> Any:
+            if url == "/user":
+                return mock_user_response
+            return mock_notifications_response
+
+        with patch.object(source._http, "get", side_effect=mock_get):
+            async def stop_after_one_poll(event: IncomingEvent) -> None:
+                events_received.append(event)
+
+            task = asyncio.create_task(source.start(stop_after_one_poll))
+            await asyncio.sleep(0.1)
+            await source.stop()
+            await task
+
+        assert events_received == []
+
+    @pytest.mark.asyncio
+    async def test_delivers_new_notifications(self):
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        cfg = GitHubNotificationsSourceConfig(
+            token="ghp-test", poll_interval=5,
+            native_id_to_project_name={"owner/repo": "my-proj"},
+        )
+        source = GitHubNotificationsSource(cfg, service_name="test")
+
+        priming_thread = _make_notification_thread(thread_id="1")
+        new_thread = _make_notification_thread(thread_id="2", reason="assign")
+
+        mock_user_resp = MagicMock()
+        mock_user_resp.status_code = 200
+        mock_user_resp.raise_for_status = MagicMock()
+        mock_user_resp.json.return_value = {"login": "bot", "name": "", "html_url": ""}
+
+        poll_count = 0
+
+        def mock_get(url: str, **kwargs: Any) -> Any:
+            nonlocal poll_count
+            if url == "/user":
+                return mock_user_resp
+            if "/issues/comments/" in url:
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.raise_for_status = MagicMock()
+                resp.json.return_value = {"body": "comment text"}
+                return resp
+
+            poll_count += 1
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock()
+            resp.headers = {}
+            if poll_count == 1:
+                resp.json.return_value = [priming_thread]
+            elif poll_count == 2:
+                resp.json.return_value = [priming_thread, new_thread]
+            else:
+                resp.json.return_value = []
+            return resp
+
+        events_received: list[IncomingEvent] = []
+
+        async def on_event(event: IncomingEvent) -> None:
+            events_received.append(event)
+            await source.stop()
+
+        with patch.object(source._http, "get", side_effect=mock_get):
+            await source.start(on_event)
+
+        assert len(events_received) == 1
+        ev = events_received[0]
+        assert ev.metadata["notification_id"] == "2"
+        assert ev.metadata["reason"] == "assign"
+        assert "comment text" in ev.content
+
+    @pytest.mark.asyncio
+    async def test_304_not_modified_skipped(self):
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        cfg = GitHubNotificationsSourceConfig(token="ghp-test", poll_interval=5)
+        source = GitHubNotificationsSource(cfg, service_name="test")
+        source._primed = True
+
+        resp_304 = MagicMock()
+        resp_304.status_code = 304
+
+        with patch.object(source._http, "get", return_value=resp_304):
+            result = await asyncio.to_thread(source._fetch_new_notifications)
+
+        assert result == []
 
 
 # ---------------------------------------------------------------------------

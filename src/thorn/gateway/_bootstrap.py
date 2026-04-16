@@ -33,6 +33,10 @@ Usage from code::
         forge_type="github",
         forge_base_url="https://api.github.com",
     )
+
+GitHub uses PAT authentication (``$GITHUB_TOKEN``).  GitHub App
+installation tokens are not supported for the event source
+(Notifications API requires user-scoped auth).
 """
 
 from __future__ import annotations
@@ -92,28 +96,6 @@ def _ensure_gateway_config(
     log.info("Wrote gateway config: %s", config_path)
 
 
-def _build_github_auth_block(
-    auth_mode: str,
-    token_env: str,
-) -> dict[str, str]:
-    """Build the ``credentials`` sub-object for a GitHub agent account.
-
-    *auth_mode* is ``"pat"`` (default -- uses ``$<token_env>``) or
-    ``"app"`` (uses ``$GITHUB_APP_*`` env var references).
-    """
-    if auth_mode == "app":
-        return {
-            "kind": "app",
-            "app_id": "$GITHUB_APP_ID",
-            "installation_id": "$GITHUB_APP_INSTALLATION_ID",
-            "private_key_pem": "$GITHUB_APP_PRIVATE_KEY",
-        }
-    return {
-        "kind": "pat",
-        "token": f"${token_env}",
-    }
-
-
 _FORGE_DEFAULTS: dict[str, tuple[str, str]] = {
     "gitlab": ("GITLAB_TOKEN", "GITLAB_URL"),
     "github": ("GITHUB_TOKEN", "GITHUB_API_URL"),
@@ -134,11 +116,11 @@ def bootstrap_coordinator(
     forge_service_name: str = "",
     git_user_name: str = "",
     git_user_email: str = "",
-    github_auth_mode: str = "pat",
     # Legacy parameters (accepted but mapped to new fields)
     project_id: int | None = None,
     forge_url_env: str | None = None,
     gitlab_url_env: str = "",
+    github_auth_mode: str = "pat",
 ) -> AgentID:
     """Create a ProjectCoordinator agent in the given Runtime directory.
 
@@ -158,9 +140,7 @@ def bootstrap_coordinator(
     ``metadata.project`` is also set for backward compatibility with
     code that reads it.
 
-    For GitHub, *github_auth_mode* selects between ``"pat"``
-    (``$GITHUB_TOKEN``, the default) and ``"app"``
-    (``$GITHUB_APP_*``).
+    GitHub always uses PAT authentication (``$GITHUB_TOKEN``).
 
     Returns the ``AgentID`` of the created agent.
     """
@@ -188,9 +168,10 @@ def bootstrap_coordinator(
     # -- Build credentials for the agent account ----------------------------
 
     if forge_type == "github":
-        credentials_block: dict[str, Any] = _build_github_auth_block(
-            github_auth_mode, access_token_env,
-        )
+        credentials_block: dict[str, Any] = {
+            "kind": "pat",
+            "token": f"${access_token_env}",
+        }
     else:
         credentials_block = {
             "kind": "gitlab-pat",

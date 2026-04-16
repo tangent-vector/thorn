@@ -490,15 +490,7 @@ class GitHubForgeClient:
         return self._gh.read_file(native_project_id, file_path, ref)
 
     def mark_notification_done(self, notification_id: str) -> None:
-        # GitHub's Notifications API uses thread IDs unrelated to the
-        # repository-events IDs the gateway polls, and App installation
-        # tokens cannot access the Notifications API at all.  Treating
-        # this as a silent no-op is the correct behavior.
-        log.debug(
-            "mark_notification_done is a no-op for GitHub "
-            "(notification_id=%s)",
-            notification_id,
-        )
+        self._gh.mark_notification_done(notification_id)
 
     def create_issue(
         self, native_project_id: str, title: str, description: str,

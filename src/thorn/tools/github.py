@@ -401,6 +401,21 @@ class GitHubClient:
         )
         response.raise_for_status()
 
+    def mark_notification_done(self, thread_id: str) -> None:
+        """Mark a GitHub notification thread as done.
+
+        "Done" removes the notification from the inbox entirely,
+        equivalent to the "Done" button in the GitHub notifications UI.
+        """
+        response = httpx.delete(
+            f"{self._base_url}/notifications/threads/{thread_id}",
+            headers={
+                "Authorization": f"Bearer {self.bearer_token_for_http()}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        response.raise_for_status()
+
 
 # ---------------------------------------------------------------------------
 # Module-level client accessor
