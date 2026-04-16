@@ -216,6 +216,170 @@ class TestInjectUrlCredentials:
             assert _inject_url_credentials(url) == url
 
 
+class TestInjectUrlCredentialsWithAccounts:
+    """Tests for _inject_url_credentials using account-based credentials."""
+
+    _CTX_PATH = "thorn.core._context.get_context"
+
+    def _make_agent_with_account(
+        self,
+        *,
+        forge_name: str,
+        credentials: object,
+        project_name: str = "my-proj",
+    ) -> object:
+        from thorn.core._account import AgentAccountsConfig, ForgeAccountConfig
+        from thorn.core._agent import Agent
+
+        accounts = AgentAccountsConfig(forge_accounts=[
+            ForgeAccountConfig(
+                forge=forge_name,
+                credentials=credentials,  # type: ignore[arg-type]
+                git_user_name="bot",
+                git_user_email="bot@thorn",
+            ),
+        ])
+        return Agent(
+            metadata={"project": project_name},
+            accounts=accounts,
+        )
+
+    def test_gitlab_uses_account_token(self, tmp_path: Path) -> None:
+        from thorn.core._account import GitLabCredentials
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+        from thorn.runtime import Runtime
+        from thorn.tools.forge import (
+            GitLabForgeService,
+            GitLabForgeServiceConfig,
+            ProjectService,
+            ProjectServiceConfig,
+        )
+
+        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
+        runtime.register_service(
+            GitLabForgeService(
+                GitLabForgeServiceConfig(
+                    url="https://gitlab.example.com", token="old-token",
+                ),
+                service_name="gl-forge",
+            ),
+        )
+        runtime.register_service(
+            ProjectService(
+                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                service_name="my-proj",
+            ),
+        )
+        agent = self._make_agent_with_account(
+            forge_name="gl-forge",
+            credentials=GitLabCredentials(token="account-token"),
+        )
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=runtime,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            result = _inject_url_credentials(
+                "https://gitlab.example.com/group/project.git",
+            )
+        assert "account-token" in result
+        assert "old-token" not in result
+        assert result == (
+            "https://oauth2:account-token@gitlab.example.com/group/project.git"
+        )
+
+    def test_github_uses_account_pat(self, tmp_path: Path) -> None:
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+        from thorn.runtime import Runtime
+        from thorn.tools._github_connection import (
+            GitHubConnectionConfig,
+            GitHubPatAuth,
+        )
+        from thorn.tools.forge import (
+            GitHubForgeService,
+            ProjectService,
+            ProjectServiceConfig,
+        )
+
+        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
+        runtime.register_service(
+            GitHubForgeService(
+                GitHubConnectionConfig(
+                    auth=GitHubPatAuth(token="old-gh-token"),
+                ),
+                service_name="gh-forge",
+            ),
+        )
+        runtime.register_service(
+            ProjectService(
+                ProjectServiceConfig(forge="gh-forge", native_id="o/r"),
+                service_name="my-proj",
+            ),
+        )
+        agent = self._make_agent_with_account(
+            forge_name="gh-forge",
+            credentials=GitHubPatAuth(token="account-gh-token"),
+        )
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=runtime,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            result = _inject_url_credentials(
+                "https://github.com/o/r.git",
+            )
+        assert "account-gh-token" in result
+        assert "old-gh-token" not in result
+        assert result == (
+            "https://x-access-token:account-gh-token@github.com/o/r.git"
+        )
+
+    def test_falls_back_to_legacy_when_no_account(
+        self, tmp_path: Path,
+    ) -> None:
+        """Agent has metadata.project but no accounts -- uses legacy path."""
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+        from thorn.runtime import Runtime
+        from thorn.tools.forge import (
+            GitLabForgeService,
+            GitLabForgeServiceConfig,
+            ProjectService,
+            ProjectServiceConfig,
+        )
+
+        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
+        runtime.register_service(
+            GitLabForgeService(
+                GitLabForgeServiceConfig(
+                    url="https://gitlab.example.com", token="legacy-token",
+                ),
+                service_name="gl-forge",
+            ),
+        )
+        runtime.register_service(
+            ProjectService(
+                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                service_name="my-proj",
+            ),
+        )
+        agent = Agent(metadata={"project": "my-proj"})
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=runtime,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            result = _inject_url_credentials(
+                "https://gitlab.example.com/group/project.git",
+            )
+        assert result == (
+            "https://oauth2:legacy-token@gitlab.example.com/group/project.git"
+        )
+
+
 # ---------------------------------------------------------------------------
 # _run_git helper
 # ---------------------------------------------------------------------------
@@ -333,6 +497,134 @@ class TestGitIdentityEnv:
 
         assert env is not None
         assert "PATH" in env
+
+
+class TestGitIdentityEnvWithAccounts:
+    """Tests for _git_identity_env using account-based identity."""
+
+    _CTX_PATH = "thorn.core._context.get_context"
+
+    def test_prefers_account_identity_over_metadata(
+        self, tmp_path: Path,
+    ) -> None:
+        from thorn.core._account import (
+            AgentAccountsConfig,
+            ForgeAccountConfig,
+            GitLabCredentials,
+        )
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+        from thorn.runtime import Runtime
+        from thorn.tools.forge import (
+            GitLabForgeService,
+            GitLabForgeServiceConfig,
+            ProjectService,
+            ProjectServiceConfig,
+        )
+
+        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
+        runtime.register_service(
+            GitLabForgeService(
+                GitLabForgeServiceConfig(
+                    url="https://gitlab.example.com", token="t",
+                ),
+                service_name="gl-forge",
+            ),
+        )
+        runtime.register_service(
+            ProjectService(
+                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                service_name="my-proj",
+            ),
+        )
+        accounts = AgentAccountsConfig(forge_accounts=[
+            ForgeAccountConfig(
+                forge="gl-forge",
+                credentials=GitLabCredentials(token="t"),
+                git_user_name="account-bot",
+                git_user_email="account-bot@thorn",
+            ),
+        ])
+        agent = Agent(
+            metadata={
+                "project": "my-proj",
+                "git_user_name": "metadata-bot",
+                "git_user_email": "metadata-bot@thorn",
+            },
+            accounts=accounts,
+        )
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=runtime,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            env = _git_identity_env()
+
+        assert env is not None
+        assert env["GIT_AUTHOR_NAME"] == "account-bot"
+        assert env["GIT_AUTHOR_EMAIL"] == "account-bot@thorn"
+
+    def test_falls_back_to_metadata_when_no_account(
+        self, tmp_path: Path,
+    ) -> None:
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        agent = Agent(metadata={
+            "git_user_name": "metadata-bot",
+            "git_user_email": "metadata-bot@thorn",
+        })
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=None,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            env = _git_identity_env()
+
+        assert env is not None
+        assert env["GIT_AUTHOR_NAME"] == "metadata-bot"
+        assert env["GIT_AUTHOR_EMAIL"] == "metadata-bot@thorn"
+
+    def test_account_identity_without_runtime_falls_back(
+        self, tmp_path: Path,
+    ) -> None:
+        """Account is set but no runtime -> can't resolve project -> fallback."""
+        from thorn.core._account import (
+            AgentAccountsConfig,
+            ForgeAccountConfig,
+            GitLabCredentials,
+        )
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+
+        accounts = AgentAccountsConfig(forge_accounts=[
+            ForgeAccountConfig(
+                forge="gl-forge",
+                credentials=GitLabCredentials(token="t"),
+                git_user_name="account-bot",
+                git_user_email="account-bot@thorn",
+            ),
+        ])
+        agent = Agent(
+            metadata={
+                "project": "my-proj",
+                "git_user_name": "metadata-bot",
+                "git_user_email": "metadata-bot@thorn",
+            },
+            accounts=accounts,
+        )
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=None,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            env = _git_identity_env()
+
+        assert env is not None
+        assert env["GIT_AUTHOR_NAME"] == "metadata-bot"
 
 
 class TestGitCommitWithIdentity:

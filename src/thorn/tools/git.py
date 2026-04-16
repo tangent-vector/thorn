@@ -43,10 +43,16 @@ class GitError(Exception):
 def _git_identity_env() -> dict[str, str] | None:
     """Build a subprocess environment with git author/committer identity.
 
-    Reads ``git_user_name`` and ``git_user_email`` from the current
-    agent's metadata.  Returns ``None`` when no identity is available,
-    in which case callers should let the subprocess inherit the ambient
-    environment (which may or may not have git identity configured).
+    Resolution order:
+
+    1. If the agent has a :class:`ForgeAccountConfig` for the project's
+       forge (looked up via ``metadata["project"]``), use the account's
+       ``git_user_name`` / ``git_user_email``.
+    2. Otherwise fall back to ``agent.metadata["git_user_name"]`` /
+       ``["git_user_email"]`` (legacy path).
+
+    Returns ``None`` when no identity is available, in which case
+    callers let the subprocess inherit the ambient environment.
     """
     from thorn.core._context import get_context
 
@@ -59,8 +65,7 @@ def _git_identity_env() -> dict[str, str] | None:
     if agent is None:
         return None
 
-    name = agent.metadata.get("git_user_name")
-    email = agent.metadata.get("git_user_email")
+    name, email = _resolve_git_identity(agent, ctx.runtime)
     if not name and not email:
         return None
 
@@ -72,6 +77,42 @@ def _git_identity_env() -> dict[str, str] | None:
         env["GIT_AUTHOR_EMAIL"] = email
         env["GIT_COMMITTER_EMAIL"] = email
     return env
+
+
+def _resolve_git_identity(
+    agent: object,
+    runtime: object,
+) -> tuple[str, str]:
+    """Return ``(name, email)`` for git commits, preferring account data.
+
+    Tries the agent's :class:`ForgeAccountConfig` for the project's
+    forge first, then falls back to ``agent.metadata`` keys.  Returns
+    ``("", "")`` when nothing is available.
+    """
+    from thorn.core._account import resolve_forge_account
+    from thorn.tools.forge import ForgeHostService, ProjectService
+
+    metadata: dict[str, object] = getattr(agent, "metadata", {})
+
+    if runtime is not None:
+        project_name = metadata.get("project")
+        if isinstance(project_name, str) and project_name:
+            try:
+                project_svc = runtime.get_service(project_name)  # type: ignore[union-attr]
+                if isinstance(project_svc, ProjectService):
+                    forge_svc = runtime.get_service(project_svc.forge_name)  # type: ignore[union-attr]
+                    if isinstance(forge_svc, ForgeHostService):
+                        account = resolve_forge_account(agent, forge_svc.name)  # type: ignore[arg-type]
+                        acct_name = account.git_user_name
+                        acct_email = account.git_user_email
+                        if acct_name or acct_email:
+                            return acct_name, acct_email
+            except KeyError:
+                pass
+
+    name = str(metadata.get("git_user_name") or "")
+    email = str(metadata.get("git_user_email") or "")
+    return name, email
 
 
 async def _run_git(
@@ -115,11 +156,18 @@ async def _run_git(
 def _inject_url_credentials(url: str) -> str:
     """Rewrite a git HTTPS URL to embed credentials from the current agent.
 
-    Uses ``metadata.project`` (project service name) to find the forge
-    service on the ambient :class:`~thorn.runtime.Runtime`, then embeds
-    the current HTTPS password or token.  GitHub uses the
-    ``x-access-token`` username; GitLab uses ``oauth2``.
+    Resolves the project service (via ``metadata["project"]``), finds
+    the forge that hosts it, then looks up the agent's account on that
+    forge to obtain an HTTPS token.
+
+    Falls back to the legacy ``ForgeHostService.git_https_password()``
+    when the agent has no account on the project's forge (old-style
+    configs where credentials live on the forge service itself).
+
+    GitHub forges use the ``x-access-token`` HTTPS username; GitLab
+    forges use ``oauth2``.
     """
+    from thorn.core._account import resolve_forge_account
     from thorn.core._context import get_context
     from thorn.tools.forge import (
         ForgeHostService,
@@ -156,7 +204,12 @@ def _inject_url_credentials(url: str) -> str:
     if not isinstance(forge_svc, ForgeHostService):
         return url
 
-    token = forge_svc.git_https_password()
+    token: str | None = None
+    try:
+        account = resolve_forge_account(agent, forge_svc.name)
+        token = forge_svc.git_https_password_for(account.credentials)
+    except KeyError:
+        token = forge_svc.git_https_password()
 
     if url.startswith("https://"):
         parsed = urlparse(url)

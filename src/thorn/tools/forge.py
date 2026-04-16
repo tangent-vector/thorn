@@ -878,14 +878,51 @@ def get_forge_for_project(
 
 
 def _resolve(project: str) -> tuple[ForgeClient, str]:
-    """Resolve the ForgeClient + native ID from the execution context."""
+    """Resolve an authenticated ForgeClient + native ID for *project*.
+
+    Uses the current agent's :class:`ForgeAccountConfig` to
+    authenticate.  Falls back to the legacy ``ForgeHostService.client``
+    property when the agent has no account on the project's forge
+    (backward compat with old-style configs where credentials live on
+    the forge service itself).
+    """
+    from thorn.core._account import resolve_forge_account
+
     ctx = get_context()
     if ctx.runtime is None:
         raise RuntimeError(
             "No Runtime available in the current ExecutionContext. "
             "Forge tools require a Runtime with registered services."
         )
-    return get_forge_for_project(ctx.runtime, project)
+
+    project_svc: ProjectService = ctx.runtime.get_service(project)
+    if not isinstance(project_svc, ProjectService):
+        raise TypeError(
+            f"Service {project!r} is a "
+            f"{type(project_svc).__name__}, not a ProjectService"
+        )
+
+    forge_svc: ForgeHostService = ctx.runtime.get_service(
+        project_svc.forge_name,
+    )
+    if not isinstance(forge_svc, ForgeHostService):
+        raise TypeError(
+            f"Service {project_svc.forge_name!r} is a "
+            f"{type(forge_svc).__name__}, not a ForgeHostService"
+        )
+
+    agent = ctx.agent
+    if agent is not None:
+        try:
+            account = resolve_forge_account(agent, forge_svc.name)
+            return (
+                forge_svc.authenticated_client(account.credentials),
+                project_svc.native_id,
+            )
+        except KeyError:
+            pass
+
+    return forge_svc.client, project_svc.native_id
 
 
 @tool

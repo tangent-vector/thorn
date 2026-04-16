@@ -835,3 +835,119 @@ class TestForgeToolsIntegration:
                 await forge_read_issue("test-proj", 7)
         finally:
             reset_context(token)
+
+
+class TestResolveWithAccounts:
+    """Test that _resolve uses account-based credentials when available."""
+
+    @pytest.mark.asyncio
+    async def test_resolve_uses_account_credentials(self, tmp_path: Path):
+        """When the agent has an account on the forge, _resolve should use
+        authenticated_client rather than the legacy client property."""
+        from thorn.core._account import (
+            AgentAccountsConfig,
+            ForgeAccountConfig,
+            GitLabCredentials,
+        )
+        from thorn.core._agent import Agent
+        from thorn.tools.forge import forge_read_issue
+
+        mock_account_client = MagicMock()
+        mock_account_client.get_issue.return_value = {
+            "id": 5,
+            "title": "Account Bug",
+            "state": "open",
+            "url": "https://gl.example.com/issues/5",
+            "description": "via account",
+            "labels": [],
+            "assignees": [],
+        }
+
+        mock_legacy_client = MagicMock()
+
+        forge_svc = GitLabForgeService(
+            GitLabForgeServiceConfig(url="https://gl.example.com", token="legacy-t"),
+            service_name="gl",
+        )
+        forge_svc._client = mock_legacy_client
+
+        proj_svc = ProjectService(
+            ProjectServiceConfig(
+                forge="gl", native_id="42", path="org/repo",
+            ),
+            service_name="test-proj",
+        )
+
+        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
+        runtime.register_service(forge_svc)
+        runtime.register_service(proj_svc)
+
+        accounts = AgentAccountsConfig(forge_accounts=[
+            ForgeAccountConfig(
+                forge="gl",
+                credentials=GitLabCredentials(token="account-token"),
+                git_user_name="bot",
+                git_user_email="bot@thorn",
+            ),
+        ])
+        agent = Agent(
+            metadata={"project": "test-proj"},
+            accounts=accounts,
+        )
+
+        with MagicMock() as auth_patch:
+            forge_svc.authenticated_client = MagicMock(  # type: ignore[method-assign]
+                return_value=mock_account_client,
+            )
+
+            async with runtime:
+                runtime.context.agent = agent
+                result = await forge_read_issue("test-proj", 5)
+
+        assert "Account Bug" in result
+        mock_account_client.get_issue.assert_called_once_with("42", 5)
+        mock_legacy_client.get_issue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resolve_falls_back_to_legacy(self, tmp_path: Path):
+        """When the agent has no account on the forge, _resolve should
+        use the legacy client property."""
+        from thorn.core._agent import Agent
+        from thorn.tools.forge import forge_read_issue
+
+        mock_legacy_client = MagicMock()
+        mock_legacy_client.get_issue.return_value = {
+            "id": 5,
+            "title": "Legacy Bug",
+            "state": "open",
+            "url": "https://gl.example.com/issues/5",
+            "description": "via legacy",
+            "labels": [],
+            "assignees": [],
+        }
+
+        forge_svc = GitLabForgeService(
+            GitLabForgeServiceConfig(url="https://gl.example.com", token="t"),
+            service_name="gl",
+        )
+        forge_svc._client = mock_legacy_client
+
+        proj_svc = ProjectService(
+            ProjectServiceConfig(
+                forge="gl", native_id="42", path="org/repo",
+            ),
+            service_name="test-proj",
+        )
+
+        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
+        runtime.register_service(forge_svc)
+        runtime.register_service(proj_svc)
+
+        agent = Agent(metadata={"project": "test-proj"})
+
+        async with runtime:
+            runtime.context.agent = agent
+            result = await forge_read_issue("test-proj", 5)
+
+        assert "Legacy Bug" in result
+        mock_legacy_client.get_issue.assert_called_once_with("42", 5)
