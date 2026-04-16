@@ -20,7 +20,7 @@ from typing import Any
 from pydantic import Field
 
 from thorn.gateway._event import EventSource, IncomingEvent
-from thorn.gateway._routing import route_github_event
+from thorn.gateway._routing import Noteable, NoteableKind, route_github_event
 from thorn.tools._github_connection import GitHubConnectionConfig
 from thorn.tools.github import build_pygithub_auth
 
@@ -136,6 +136,47 @@ def _payload_summary(event_type: str, payload: dict[str, Any]) -> str:
     return raw + ("…" if len(json.dumps(payload, default=str)) > 500 else "")
 
 
+def _extract_noteable(
+    event_type: str,
+    payload: dict[str, Any],
+) -> Noteable | None:
+    """Identify the issue or pull request a GitHub event pertains to.
+
+    Returns ``None`` for events that are not scoped to a noteable
+    (e.g. ``PushEvent``, ``CreateEvent``, ``DeleteEvent``), in which
+    case the routing layer falls back to a per-event session key.
+
+    On GitHub, ``IssueCommentEvent`` fires for comments on both issues
+    and pull requests.  When ``payload["issue"]`` contains a
+    ``pull_request`` key, the comment is on a PR, and we route to the
+    change-request session so it shares history with
+    ``PullRequestEvent`` / ``PullRequestReviewEvent``.
+    """
+    try:
+        if event_type == "IssuesEvent":
+            return Noteable(NoteableKind.ISSUE, payload["issue"]["number"])
+
+        if event_type == "IssueCommentEvent":
+            issue = payload["issue"]
+            if issue.get("pull_request") is not None:
+                return Noteable(NoteableKind.CHANGE_REQUEST, issue["number"])
+            return Noteable(NoteableKind.ISSUE, issue["number"])
+
+        if event_type in (
+            "PullRequestEvent",
+            "PullRequestReviewEvent",
+            "PullRequestReviewCommentEvent",
+        ):
+            return Noteable(
+                NoteableKind.CHANGE_REQUEST,
+                payload["pull_request"]["number"],
+            )
+    except (KeyError, TypeError):
+        pass
+
+    return None
+
+
 def _format_repo_event_content(
     *,
     full_name: str,
@@ -204,6 +245,7 @@ def _make_incoming_event(
 
     session_key = route_github_event(
         repo_id=repo_id,
+        noteable=_extract_noteable(event_type, payload),
         event_type=event_type,
         event_id=event_id,
     )

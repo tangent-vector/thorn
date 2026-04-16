@@ -45,6 +45,107 @@ class TestPayloadSummary:
         assert "no payload" in _payload_summary("X", {}).lower()
 
 
+class TestExtractNoteable:
+    """Test _extract_noteable for each GitHub event type."""
+
+    def test_issues_event(self) -> None:
+        from thorn.gateway._routing import NoteableKind
+        from thorn.gateway.sources._github import _extract_noteable
+
+        n = _extract_noteable("IssuesEvent", {
+            "action": "opened",
+            "issue": {"number": 7, "title": "Bug"},
+        })
+        assert n is not None
+        assert n.kind is NoteableKind.ISSUE
+        assert n.number == 7
+
+    def test_issue_comment_on_issue(self) -> None:
+        from thorn.gateway._routing import NoteableKind
+        from thorn.gateway.sources._github import _extract_noteable
+
+        n = _extract_noteable("IssueCommentEvent", {
+            "comment": {"body": "hello"},
+            "issue": {"number": 3},
+        })
+        assert n is not None
+        assert n.kind is NoteableKind.ISSUE
+        assert n.number == 3
+
+    def test_issue_comment_on_pull_request(self) -> None:
+        from thorn.gateway._routing import NoteableKind
+        from thorn.gateway.sources._github import _extract_noteable
+
+        n = _extract_noteable("IssueCommentEvent", {
+            "comment": {"body": "lgtm"},
+            "issue": {
+                "number": 5,
+                "pull_request": {"url": "https://..."},
+            },
+        })
+        assert n is not None
+        assert n.kind is NoteableKind.CHANGE_REQUEST
+        assert n.number == 5
+
+    def test_pull_request_event(self) -> None:
+        from thorn.gateway._routing import NoteableKind
+        from thorn.gateway.sources._github import _extract_noteable
+
+        n = _extract_noteable("PullRequestEvent", {
+            "action": "opened",
+            "pull_request": {"number": 10, "title": "Fix"},
+        })
+        assert n is not None
+        assert n.kind is NoteableKind.CHANGE_REQUEST
+        assert n.number == 10
+
+    def test_pull_request_review_event(self) -> None:
+        from thorn.gateway._routing import NoteableKind
+        from thorn.gateway.sources._github import _extract_noteable
+
+        n = _extract_noteable("PullRequestReviewEvent", {
+            "review": {"state": "approved"},
+            "pull_request": {"number": 10},
+        })
+        assert n is not None
+        assert n.kind is NoteableKind.CHANGE_REQUEST
+        assert n.number == 10
+
+    def test_pull_request_review_comment_event(self) -> None:
+        from thorn.gateway._routing import NoteableKind
+        from thorn.gateway.sources._github import _extract_noteable
+
+        n = _extract_noteable("PullRequestReviewCommentEvent", {
+            "comment": {"body": "nit"},
+            "pull_request": {"number": 10},
+        })
+        assert n is not None
+        assert n.kind is NoteableKind.CHANGE_REQUEST
+        assert n.number == 10
+
+    def test_push_event_returns_none(self) -> None:
+        from thorn.gateway.sources._github import _extract_noteable
+
+        assert _extract_noteable("PushEvent", {"ref": "refs/heads/main"}) is None
+
+    def test_create_event_returns_none(self) -> None:
+        from thorn.gateway.sources._github import _extract_noteable
+
+        assert _extract_noteable("CreateEvent", {"ref_type": "branch"}) is None
+
+    def test_delete_event_returns_none(self) -> None:
+        from thorn.gateway.sources._github import _extract_noteable
+
+        assert _extract_noteable("DeleteEvent", {"ref_type": "branch"}) is None
+
+    def test_malformed_payload_returns_none(self) -> None:
+        from thorn.gateway.sources._github import _extract_noteable
+
+        assert _extract_noteable("IssuesEvent", {}) is None
+        assert _extract_noteable("IssuesEvent", {"issue": {}}) is None
+        assert _extract_noteable("PullRequestEvent", {}) is None
+
+
 class TestMakeIncomingEvent:
     def test_metadata(self) -> None:
         from thorn.gateway.sources._github import _make_incoming_event
@@ -70,6 +171,95 @@ class TestMakeIncomingEvent:
         assert ev.metadata["repo_id"] == 99
         assert ev.metadata["actor_login"] == "alice"
         assert "GitHub repository activity" in ev.content
+
+    def test_issues_event_routes_to_issue_session(self) -> None:
+        from thorn.gateway.sources._github import _make_incoming_event
+
+        repo = MagicMock()
+        repo.id = 42
+        repo.full_name = "o/r"
+        repo.clone_url = "https://github.com/o/r.git"
+        repo.default_branch = "main"
+        repo.html_url = "https://github.com/o/r"
+
+        ev = _make_incoming_event(
+            repo=repo,
+            event_type="IssuesEvent",
+            event_id="e1",
+            actor_login="alice",
+            created_at="2020-01-01T00:00:00Z",
+            payload={"action": "opened", "issue": {"number": 5, "title": "Bug"}},
+        )
+        assert ev.session_key == SessionKey("github/42/issue/5")
+
+    def test_pull_request_event_routes_to_change_request_session(self) -> None:
+        from thorn.gateway.sources._github import _make_incoming_event
+
+        repo = MagicMock()
+        repo.id = 42
+        repo.full_name = "o/r"
+        repo.clone_url = "https://github.com/o/r.git"
+        repo.default_branch = "main"
+        repo.html_url = "https://github.com/o/r"
+
+        ev = _make_incoming_event(
+            repo=repo,
+            event_type="PullRequestEvent",
+            event_id="e2",
+            actor_login="alice",
+            created_at="2020-01-01T00:00:00Z",
+            payload={"action": "opened", "pull_request": {"number": 3, "title": "Fix"}},
+        )
+        assert ev.session_key == SessionKey("github/42/change-request/3")
+
+    def test_issue_and_comment_share_session(self) -> None:
+        """IssuesEvent and IssueCommentEvent for the same issue produce the same key."""
+        from thorn.gateway.sources._github import _make_incoming_event
+
+        repo = MagicMock()
+        repo.id = 42
+        repo.full_name = "o/r"
+        repo.clone_url = "https://github.com/o/r.git"
+        repo.default_branch = "main"
+        repo.html_url = "https://github.com/o/r"
+
+        ev_issue = _make_incoming_event(
+            repo=repo,
+            event_type="IssuesEvent",
+            event_id="e1",
+            actor_login="alice",
+            created_at="2020-01-01T00:00:00Z",
+            payload={"action": "opened", "issue": {"number": 5, "title": "Bug"}},
+        )
+        ev_comment = _make_incoming_event(
+            repo=repo,
+            event_type="IssueCommentEvent",
+            event_id="e2",
+            actor_login="bob",
+            created_at="2020-01-01T01:00:00Z",
+            payload={"comment": {"body": "agreed"}, "issue": {"number": 5}},
+        )
+        assert ev_issue.session_key == ev_comment.session_key
+
+    def test_push_event_uses_per_event_key(self) -> None:
+        from thorn.gateway.sources._github import _make_incoming_event
+
+        repo = MagicMock()
+        repo.id = 42
+        repo.full_name = "o/r"
+        repo.clone_url = "https://github.com/o/r.git"
+        repo.default_branch = "main"
+        repo.html_url = "https://github.com/o/r"
+
+        ev = _make_incoming_event(
+            repo=repo,
+            event_type="PushEvent",
+            event_id="e99",
+            actor_login="alice",
+            created_at="2020-01-01T00:00:00Z",
+            payload={"ref": "refs/heads/main", "commits": []},
+        )
+        assert ev.session_key == SessionKey("github/42/pushevent/e99")
 
 
 # ---------------------------------------------------------------------------
