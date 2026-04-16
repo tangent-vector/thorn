@@ -273,6 +273,22 @@ class ConsoleEventSink(EventSink):
     _UNICODE_SYMBOLS = ("\u25b6", "\u2713", "\u2717", "\u2500")  # ▶ ✓ ✗ ─
     _ASCII_SYMBOLS = (">", "+", "x", "-")
 
+    # Tool names mapped to the argument key(s) worth showing at NORMAL
+    # verbosity.  Tools not listed here show only their name at NORMAL
+    # (and the full argument dump at VERBOSE, as before).
+    _TOOL_SUMMARY_KEYS: dict[str, list[str]] = {
+        "run_shell": ["command"],
+        "read_file": ["path"],
+        "edit_file": ["path"],
+        "create_file": ["path"],
+        "delete_file": ["path"],
+        "move_file": ["source", "destination"],
+        "write_file": ["path"],
+        "find_files": ["pattern", "path"],
+        "search_files": ["pattern", "path"],
+        "list_directory": ["path"],
+    }
+
     def __init__(self, verbosity: Verbosity = Verbosity.NORMAL) -> None:
         from rich.console import Console
 
@@ -320,16 +336,53 @@ class ConsoleEventSink(EventSink):
             parts.append(f"{key}={s}")
         return " ".join(parts)
 
+    _TOOL_SUMMARY_MAX_LEN: int = 80
+
+    @classmethod
+    def _summarize_tool_args(
+        cls,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> str | None:
+        """Return a short summary string for well-known tools, or ``None``.
+
+        Only extracts the most meaningful argument(s) listed in
+        ``_TOOL_SUMMARY_KEYS``.  Values are shown bare (no key= prefix)
+        when there is a single summary key, or as ``key=value`` pairs
+        when there are multiple.
+        """
+        keys = cls._TOOL_SUMMARY_KEYS.get(name)
+        if not keys:
+            return None
+        values = [arguments.get(k) for k in keys]
+        if not any(v is not None for v in values):
+            return None
+        parts: list[str] = []
+        for key, value in zip(keys, values):
+            if value is None:
+                continue
+            s = value if isinstance(value, str) else json.dumps(value)
+            if len(s) > cls._TOOL_SUMMARY_MAX_LEN:
+                s = s[: cls._TOOL_SUMMARY_MAX_LEN] + "\u2026"
+            if len(keys) > 1:
+                parts.append(f"{key}={s}")
+            else:
+                parts.append(s)
+        return " ".join(parts)
+
     def _scope_label(self, scope: Scope) -> str:
         """Derive a human-readable label for a scope header.
 
         If the scope carries an agent, use ``str(agent)``; otherwise
-        fall back to the raw scope description.
+        fall back to the raw scope description.  When a ``session_key``
+        is present in the scope metadata, it is appended in brackets.
         """
         agent = scope.metadata.get("agent")
-        if agent is not None:
-            return str(agent)
-        return scope.description
+        base = str(agent) if agent is not None else scope.description
+        session_key = scope.metadata.get("session_key")
+        if session_key:
+            return f"{base} [{session_key}]"
+        return base
 
     def _print_rule(self, label: str, scope: Scope, *, suffix: str = "") -> None:
         """Print a horizontal-rule header/footer line for a scope."""
@@ -410,6 +463,10 @@ class ConsoleEventSink(EventSink):
         line = f"{indent}{self._sym_start} {name}"
         if self._verbosity >= Verbosity.VERBOSE and arguments:
             line += f" {self._abbreviate_args(arguments)}"
+        elif arguments:
+            summary = self._summarize_tool_args(name, arguments)
+            if summary:
+                line += f": {summary}"
         self._safe_print(line, highlight=False)
 
     async def on_tool_end(

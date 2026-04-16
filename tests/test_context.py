@@ -8,9 +8,11 @@ from pathlib import Path
 
 from thorn.core._agent import Agent
 from thorn.core._context import (
+    ConsoleEventSink,
     ExecutionContext,
     NullEventSink,
     Scope,
+    Verbosity,
     get_context,
     reset_context,
     resolve_path,
@@ -374,3 +376,110 @@ class TestShellEnv:
             assert env.get("PATH") == os.environ.get("PATH")
         finally:
             reset_context(token)
+
+
+# ---------------------------------------------------------------------------
+# ConsoleEventSink._scope_label
+# ---------------------------------------------------------------------------
+
+class TestConsoleScopeLabel:
+    def _make_sink(self) -> ConsoleEventSink:
+        return ConsoleEventSink(verbosity=Verbosity.NORMAL)
+
+    def test_agent_only(self):
+        agent = Agent(name="reviewer")
+        scope = Scope(description="agent:Agent", metadata={"agent": agent})
+        label = self._make_sink()._scope_label(scope)
+        assert label == "Agent('reviewer')"
+
+    def test_agent_with_session_key(self):
+        agent = Agent(name="reviewer")
+        scope = Scope(
+            description="agent:Agent",
+            metadata={"agent": agent, "session_key": "gitlab/123/issue/42"},
+        )
+        label = self._make_sink()._scope_label(scope)
+        assert label == "Agent('reviewer') [gitlab/123/issue/42]"
+
+    def test_no_agent_falls_back_to_description(self):
+        scope = Scope(description="skill:summarize")
+        label = self._make_sink()._scope_label(scope)
+        assert label == "skill:summarize"
+
+    def test_no_agent_with_session_key(self):
+        scope = Scope(
+            description="skill:summarize",
+            metadata={"session_key": "github/456/change-request/7"},
+        )
+        label = self._make_sink()._scope_label(scope)
+        assert label == "skill:summarize [github/456/change-request/7]"
+
+    def test_empty_session_key_omitted(self):
+        agent = Agent(name="bot")
+        scope = Scope(
+            description="agent:Agent",
+            metadata={"agent": agent, "session_key": ""},
+        )
+        label = self._make_sink()._scope_label(scope)
+        assert label == "Agent('bot')"
+
+    def test_none_session_key_omitted(self):
+        agent = Agent(name="bot")
+        scope = Scope(
+            description="agent:Agent",
+            metadata={"agent": agent, "session_key": None},
+        )
+        label = self._make_sink()._scope_label(scope)
+        assert label == "Agent('bot')"
+
+
+# ---------------------------------------------------------------------------
+# ConsoleEventSink._summarize_tool_args
+# ---------------------------------------------------------------------------
+
+class TestSummarizeToolArgs:
+    def test_known_single_key_tool(self):
+        result = ConsoleEventSink._summarize_tool_args(
+            "run_shell", {"command": "git status", "timeout": 120},
+        )
+        assert result == "git status"
+
+    def test_known_multi_key_tool(self):
+        result = ConsoleEventSink._summarize_tool_args(
+            "move_file", {"source": "a.py", "destination": "b.py"},
+        )
+        assert result == "source=a.py destination=b.py"
+
+    def test_search_files_shows_pattern_and_path(self):
+        result = ConsoleEventSink._summarize_tool_args(
+            "search_files", {"pattern": "TODO", "path": "src/"},
+        )
+        assert result == "pattern=TODO path=src/"
+
+    def test_unknown_tool_returns_none(self):
+        result = ConsoleEventSink._summarize_tool_args(
+            "ask_user", {"question": "hello?"},
+        )
+        assert result is None
+
+    def test_known_tool_missing_keys_returns_none(self):
+        result = ConsoleEventSink._summarize_tool_args(
+            "read_file", {},
+        )
+        assert result is None
+
+    def test_long_value_truncated(self):
+        long_cmd = "x" * 200
+        result = ConsoleEventSink._summarize_tool_args(
+            "run_shell", {"command": long_cmd},
+        )
+        assert result is not None
+        assert len(result) == ConsoleEventSink._TOOL_SUMMARY_MAX_LEN + 1  # +1 for ellipsis
+        assert result.endswith("\u2026")
+
+    def test_partial_keys_present(self):
+        """When only some summary keys have values, the missing ones are skipped."""
+        result = ConsoleEventSink._summarize_tool_args(
+            "find_files", {"pattern": "*.py"},
+        )
+        assert result == "pattern=*.py"
