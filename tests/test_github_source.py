@@ -261,6 +261,50 @@ class TestMakeIncomingEvent:
         )
         assert ev.session_key == SessionKey("github/42/pushevent/e99")
 
+    def test_project_name_in_session_key(self) -> None:
+        """When project_name is provided, the session key uses it."""
+        from thorn.gateway.sources._github import _make_incoming_event
+
+        repo = MagicMock()
+        repo.id = 42
+        repo.full_name = "o/r"
+        repo.clone_url = "https://github.com/o/r.git"
+        repo.default_branch = "main"
+        repo.html_url = "https://github.com/o/r"
+
+        ev = _make_incoming_event(
+            repo=repo,
+            event_type="IssuesEvent",
+            event_id="e1",
+            actor_login="alice",
+            created_at="2020-01-01T00:00:00Z",
+            payload={"action": "opened", "issue": {"number": 5, "title": "Bug"}},
+            project_name="my-proj",
+        )
+        assert ev.session_key == SessionKey("my-proj/issue/5")
+        assert ev.metadata["project_name"] == "my-proj"
+
+    def test_empty_project_name_uses_legacy_key(self) -> None:
+        """When project_name is empty, falls back to repo-id-based key."""
+        from thorn.gateway.sources._github import _make_incoming_event
+
+        repo = MagicMock()
+        repo.id = 42
+        repo.full_name = "o/r"
+        repo.clone_url = "https://github.com/o/r.git"
+        repo.default_branch = "main"
+        repo.html_url = "https://github.com/o/r"
+
+        ev = _make_incoming_event(
+            repo=repo,
+            event_type="IssuesEvent",
+            event_id="e1",
+            actor_login="alice",
+            created_at="2020-01-01T00:00:00Z",
+            payload={"action": "opened", "issue": {"number": 5, "title": "Bug"}},
+        )
+        assert ev.session_key == SessionKey("github/42/issue/5")
+
 
 # ---------------------------------------------------------------------------
 # GitHubNotificationsSource (mocked)

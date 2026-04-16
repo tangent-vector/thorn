@@ -8,6 +8,12 @@ they are derived mechanically from the session key by the gateway (see
 Session keys use ``/`` separators and lowercase, forge-agnostic
 terminology so that they double as a relative directory layout when the
 gateway constructs per-session workspace paths.
+
+When a ``project_name`` is supplied, the session key uses the project
+name as the top-level scope (e.g. ``my-proj/issue/7``), making keys
+stable across forge migrations.  When ``project_name`` is omitted, the
+legacy forge-specific format is used (e.g. ``github/42/issue/7``) for
+backward compatibility with existing sessions.
 """
 
 from __future__ import annotations
@@ -52,28 +58,30 @@ def route_github_event(
     noteable: Noteable | None = None,
     event_type: str,
     event_id: str,
+    project_name: str = "",
 ) -> SessionKey:
     """Derive a session key for a GitHub repository event.
 
-    When *noteable* is provided (issue or pull request), the key is
-    scoped to that noteable so that all events about the same issue or
-    PR share one session::
+    When *project_name* is given the key uses the project name as the
+    top-level scope, dropping the forge-specific prefix::
 
-        github/<repo_id>/issue/<number>
-        github/<repo_id>/change-request/<number>
+        <project_name>/issue/<number>
+        <project_name>/change-request/<number>
+        <project_name>/<event_type>/<event_id>
 
-    When *noteable* is ``None`` (e.g. ``PushEvent``, ``CreateEvent``),
-    the key falls back to a per-event identifier::
-
-        github/<repo_id>/<event_type>/<event_id>
+    When *project_name* is empty (legacy mode), the key preserves the
+    original format with ``github/<repo_id>/…`` for backward
+    compatibility with existing persisted sessions.
     """
+    scope = project_name if project_name else f"github/{repo_id}"
+
     if noteable is not None:
         return SessionKey(
-            f"github/{repo_id}/{noteable.kind.value}/{noteable.number}"
+            f"{scope}/{noteable.kind.value}/{noteable.number}"
         )
 
     safe_type = event_type.lower().replace(" ", "_")
-    return SessionKey(f"github/{repo_id}/{safe_type}/{event_id}")
+    return SessionKey(f"{scope}/{safe_type}/{event_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -84,17 +92,23 @@ def route_gitlab_todo(
     *,
     project_id: int,
     noteable: Noteable,
+    project_name: str = "",
 ) -> SessionKey:
     """Derive a session key for a GitLab TODO.
 
-    GitLab TODOs are always tied to a noteable (issue or merge
-    request), so *noteable* is required::
+    When *project_name* is given the key uses the project name as the
+    top-level scope::
 
-        gitlab/<project_id>/issue/<iid>
-        gitlab/<project_id>/change-request/<iid>
+        <project_name>/issue/<iid>
+        <project_name>/change-request/<iid>
+
+    When *project_name* is empty (legacy mode), the key preserves the
+    original format with ``gitlab/<project_id>/…``.
     """
+    scope = project_name if project_name else f"gitlab/{project_id}"
+
     return SessionKey(
-        f"gitlab/{project_id}/{noteable.kind.value}/{noteable.number}"
+        f"{scope}/{noteable.kind.value}/{noteable.number}"
     )
 
 

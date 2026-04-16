@@ -587,6 +587,34 @@ class TestGitLabTODOsSourceEventFormatting:
         )
         assert _make_session_key(issue_todo) != _make_session_key(mr_todo)
 
+    def test_make_session_key_with_project_name(self):
+        from thorn.gateway.sources._gitlab import _make_session_key
+
+        todo = _make_mock_todo(project_id=456, noteable_type="MergeRequest", noteable_iid=7)
+        key = _make_session_key(todo, project_id_to_name={"456": "lace"})
+        assert key == SessionKey("lace/change-request/7")
+
+    def test_make_event_with_project_name(self):
+        from thorn.gateway.sources._gitlab import _make_event
+
+        todo = _make_mock_todo(
+            todo_id=99, project_id=123, noteable_type="Issue",
+            noteable_iid=42, action_name="mentioned",
+        )
+        event = _make_event(todo, project_id_to_name={"123": "my-proj"})
+        assert event.session_key == SessionKey("my-proj/issue/42")
+        assert event.metadata["project_name"] == "my-proj"
+
+    def test_make_event_unknown_project_falls_back(self):
+        from thorn.gateway.sources._gitlab import _make_event
+
+        todo = _make_mock_todo(
+            todo_id=99, project_id=999, noteable_type="Issue", noteable_iid=1,
+        )
+        event = _make_event(todo, project_id_to_name={"123": "other"})
+        assert event.session_key == SessionKey("gitlab/999/issue/1")
+        assert event.metadata["project_name"] == ""
+
     def test_format_event_content_includes_project_info(self):
         from thorn.gateway.sources._gitlab import _format_event_content
 
@@ -2268,6 +2296,41 @@ class TestRouteGithubEvent:
         )
         assert isinstance(key, SessionKey)
 
+    def test_project_name_based_noteable_key(self):
+        from thorn.gateway._routing import Noteable, NoteableKind, route_github_event
+
+        key = route_github_event(
+            repo_id=42,
+            noteable=Noteable(NoteableKind.ISSUE, 7),
+            event_type="IssuesEvent",
+            event_id="e1",
+            project_name="my-proj",
+        )
+        assert key == SessionKey("my-proj/issue/7")
+
+    def test_project_name_based_non_noteable_key(self):
+        from thorn.gateway._routing import route_github_event
+
+        key = route_github_event(
+            repo_id=42,
+            event_type="PushEvent",
+            event_id="abc123",
+            project_name="my-proj",
+        )
+        assert key == SessionKey("my-proj/pushevent/abc123")
+
+    def test_empty_project_name_falls_back_to_legacy(self):
+        from thorn.gateway._routing import Noteable, NoteableKind, route_github_event
+
+        key = route_github_event(
+            repo_id=42,
+            noteable=Noteable(NoteableKind.ISSUE, 7),
+            event_type="IssuesEvent",
+            event_id="e1",
+            project_name="",
+        )
+        assert key == SessionKey("github/42/issue/7")
+
 
 class TestRouteGitlabTodo:
     def test_issue_key_format(self):
@@ -2309,6 +2372,36 @@ class TestRouteGitlabTodo:
             noteable=Noteable(NoteableKind.ISSUE, 5),
         )
         assert isinstance(key, SessionKey)
+
+    def test_project_name_based_issue_key(self):
+        from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
+
+        key = route_gitlab_todo(
+            project_id=10,
+            noteable=Noteable(NoteableKind.ISSUE, 5),
+            project_name="lace",
+        )
+        assert key == SessionKey("lace/issue/5")
+
+    def test_project_name_based_change_request_key(self):
+        from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
+
+        key = route_gitlab_todo(
+            project_id=10,
+            noteable=Noteable(NoteableKind.CHANGE_REQUEST, 2),
+            project_name="lace",
+        )
+        assert key == SessionKey("lace/change-request/2")
+
+    def test_empty_project_name_falls_back_to_legacy(self):
+        from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
+
+        key = route_gitlab_todo(
+            project_id=10,
+            noteable=Noteable(NoteableKind.ISSUE, 5),
+            project_name="",
+        )
+        assert key == SessionKey("gitlab/10/issue/5")
 
 
 # ---------------------------------------------------------------------------

@@ -68,6 +68,13 @@ class GitLabSourceConfig(BaseModel):
         ge=5,
         description="Seconds between polling cycles",
     )
+    project_id_to_name: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Mapping from stringified GitLab project ID to logical "
+            "project name, used for project-name-based session keys."
+        ),
+    )
 
     @classmethod
     def from_env(cls) -> GitLabSourceConfig:
@@ -161,24 +168,36 @@ def _noteable_from_todo(todo: Any) -> Noteable:
     return Noteable(kind=kind, number=todo.target["iid"])
 
 
-def _make_session_key(todo: Any) -> SessionKey:
+def _make_session_key(
+    todo: Any,
+    project_id_to_name: dict[str, str] | None = None,
+) -> SessionKey:
     """Derive a session key from a TODO.
 
     Thin wrapper for backward compatibility with tests that call this
     directly; delegates to :func:`route_gitlab_todo`.
     """
+    pid = todo.project["id"]
+    proj_name = (project_id_to_name or {}).get(str(pid), "")
     return route_gitlab_todo(
-        project_id=todo.project["id"],
+        project_id=pid,
         noteable=_noteable_from_todo(todo),
+        project_name=proj_name,
     )
 
 
-def _make_event(todo: Any) -> IncomingEvent:
+def _make_event(
+    todo: Any,
+    project_id_to_name: dict[str, str] | None = None,
+) -> IncomingEvent:
     """Convert a GitLab TODO into an ``IncomingEvent``."""
     project = todo.project
+    pid = project["id"]
+    proj_name = (project_id_to_name or {}).get(str(pid), "")
     session_key = route_gitlab_todo(
-        project_id=project["id"],
+        project_id=pid,
         noteable=_noteable_from_todo(todo),
+        project_name=proj_name,
     )
     return IncomingEvent(
         source="gitlab",
@@ -186,7 +205,8 @@ def _make_event(todo: Any) -> IncomingEvent:
         content=_format_event_content(todo),
         metadata={
             "todo_id": todo.id,
-            "project_id": project["id"],
+            "project_id": pid,
+            "project_name": proj_name,
             "noteable_type": todo.target_type,
             "noteable_iid": todo.target["iid"],
             "action_name": todo.action_name,
@@ -278,9 +298,10 @@ class GitLabTODOsSource(EventSource):
                 "Found %d new TODO(s) out of %d pending",
                 len(new_todos), len(todos),
             )
+        id_to_name = self._config.project_id_to_name
         for todo in new_todos:
             self._seen.add(todo.id)
-            event = _make_event(todo)
+            event = _make_event(todo, project_id_to_name=id_to_name)
             await on_event(event)
 
     def _get_pending_todos(self) -> list[Any]:

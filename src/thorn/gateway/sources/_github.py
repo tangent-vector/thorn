@@ -72,6 +72,14 @@ class GitHubNotificationsSourceConfig(GitHubConnectionConfig):
         ge=5,
         description="Seconds between polling cycles",
     )
+    project_name: str = Field(
+        default="",
+        description=(
+            "Logical project name for session-key routing. "
+            "When set, session keys use project-name-based format "
+            "instead of forge-specific repo IDs."
+        ),
+    )
 
     @classmethod
     def from_env(cls) -> GitHubNotificationsSourceConfig:
@@ -223,6 +231,7 @@ def _make_incoming_event(
     actor_login: str,
     created_at: str,
     payload: dict[str, Any],
+    project_name: str = "",
 ) -> IncomingEvent:
     repo_id = repo.id
     full_name = repo.full_name
@@ -248,6 +257,7 @@ def _make_incoming_event(
         noteable=_extract_noteable(event_type, payload),
         event_type=event_type,
         event_id=event_id,
+        project_name=project_name,
     )
 
     return IncomingEvent(
@@ -264,6 +274,7 @@ def _make_incoming_event(
             "clone_url": clone_url,
             "default_branch": default_branch,
             "html_url": html_url,
+            "project_name": project_name,
         },
     )
 
@@ -405,6 +416,7 @@ class GitHubNotificationsSource(EventSource):
                     actor_login=actor_login,
                     created_at=created,
                     payload=payload,
+                    project_name=self._config.project_name,
                 ),
             )
 

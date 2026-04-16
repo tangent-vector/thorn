@@ -405,6 +405,16 @@ def instantiate_new_format(config: GatewayConfig) -> list[Service]:
 # ---------------------------------------------------------------------------
 
 
+class _ForgeProjectInfo:
+    """Per-forge project information used during event source inference."""
+
+    __slots__ = ("repositories", "native_id_to_project_name")
+
+    def __init__(self) -> None:
+        self.repositories: list[str] = []
+        self.native_id_to_project_name: dict[str, str] = {}
+
+
 def infer_event_sources(
     config: GatewayConfig,
     agents: list[Any],
@@ -420,17 +430,21 @@ def infer_event_sources(
       credentials (TODOs are user-scoped, no per-repo enumeration).
 
     The ``poll_interval`` comes from the forge spec in the config.
+    Project names are threaded through to the event sources so that
+    session keys use project-name-based routing.
     """
-    from thorn.core._account import AgentAccountsConfig, ForgeAccountConfig
+    from thorn.core._account import AgentAccountsConfig
 
     forge_specs_by_name: dict[str, ForgeSpec] = {
         f.name: f for f in config.forges
     }
 
-    project_repos_by_forge: dict[str, list[str]] = {}
+    forge_project_info: dict[str, _ForgeProjectInfo] = {}
     for proj in config.projects:
         for fork in proj.resolved_forks():
-            project_repos_by_forge.setdefault(fork.forge, []).append(fork.native_id)
+            info = forge_project_info.setdefault(fork.forge, _ForgeProjectInfo())
+            info.repositories.append(fork.native_id)
+            info.native_id_to_project_name[fork.native_id] = proj.name
 
     sources: list[EventSource] = []
 
@@ -448,11 +462,13 @@ def infer_event_sources(
                 )
                 continue
 
+            info = forge_project_info.get(forge_spec.name, _ForgeProjectInfo())
             source = _create_event_source_for_account(
                 forge_spec=forge_spec,
                 account=acct,
                 agent=agent,
-                repositories=project_repos_by_forge.get(forge_spec.name, []),
+                repositories=info.repositories,
+                native_id_to_project_name=info.native_id_to_project_name,
             )
             if source is not None:
                 sources.append(source)
@@ -466,6 +482,7 @@ def _create_event_source_for_account(
     account: Any,
     agent: Any,
     repositories: list[str],
+    native_id_to_project_name: dict[str, str],
 ) -> EventSource | None:
     """Create a single event source for an agent's account on a forge."""
     from thorn.core._account import ForgeAccountConfig
@@ -479,6 +496,7 @@ def _create_event_source_for_account(
             account=account,
             agent_name=str(agent_name),
             repositories=repositories,
+            native_id_to_project_name=native_id_to_project_name,
         )
 
     if forge_spec.type == "gitlab":
@@ -486,6 +504,7 @@ def _create_event_source_for_account(
             forge_spec=forge_spec,
             account=account,
             agent_name=str(agent_name),
+            native_id_to_project_name=native_id_to_project_name,
         )
 
     log.warning(
@@ -501,6 +520,7 @@ def _create_github_source(
     account: Any,
     agent_name: str,
     repositories: list[str],
+    native_id_to_project_name: dict[str, str],
 ) -> EventSource | None:
     """Create a GitHub repository events source for one (agent, forge) pair.
 
@@ -541,6 +561,7 @@ def _create_github_source(
 
     base_url = forge_spec.base_url or "https://api.github.com"
     repo = repositories[0]
+    project_name = native_id_to_project_name.get(repo, "")
     source_name = f"{agent_name}-{forge_spec.name}-events"
 
     cfg = GitHubNotificationsSourceConfig(
@@ -548,11 +569,12 @@ def _create_github_source(
         auth=auth_block,  # type: ignore[arg-type]
         repository=repo,
         poll_interval=forge_spec.poll_interval,
+        project_name=project_name,
     )
     source = GitHubNotificationsSource(cfg, service_name=source_name)
     log.info(
-        "Inferred GitHub event source %r (repo=%s, agent=%s)",
-        source_name, repo, agent_name,
+        "Inferred GitHub event source %r (repo=%s, project=%s, agent=%s)",
+        source_name, repo, project_name or "(unknown)", agent_name,
     )
     return source
 
@@ -562,10 +584,14 @@ def _create_gitlab_source(
     forge_spec: ForgeSpec,
     account: Any,
     agent_name: str,
+    native_id_to_project_name: dict[str, str],
 ) -> EventSource | None:
     """Create a GitLab TODOs source for one (agent, forge) pair.
 
     GitLab TODOs are user-scoped, so no repository list is needed.
+    The *native_id_to_project_name* mapping (keyed by stringified
+    GitLab project ID) is passed through to the source so that
+    session keys use project-name-based routing.
     """
     from thorn.core._account import GitLabCredentials
 
@@ -584,6 +610,7 @@ def _create_gitlab_source(
         url=forge_spec.base_url,
         token=creds.token,
         poll_interval=forge_spec.poll_interval,
+        project_id_to_name=native_id_to_project_name,
     )
     source = GitLabTODOsSource(cfg, service_name=source_name)
     log.info(
