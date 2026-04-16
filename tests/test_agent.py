@@ -955,3 +955,125 @@ class TestAgencyRootPropagation:
     def test_agency_root_defaults_to_none(self):
         ctx = ExecutionContext(provider=MockProvider())
         assert ctx.agency_root_directory is None
+
+
+# ---------------------------------------------------------------------------
+# Environment summary in system prompts
+# ---------------------------------------------------------------------------
+
+
+class TestEnvironmentPromptInjection:
+    """Verify that _run_session_prompt appends a '## Your environment'
+    fragment listing the working directory and home directory."""
+
+    @pytest.mark.asyncio
+    async def test_both_workspace_and_home_injected(self, tmp_path: Path):
+        ws = tmp_path / "ws"
+        home = tmp_path / "home"
+        ws.mkdir()
+        home.mkdir()
+
+        provider = MockProvider()
+        captured_prompts: list[list[str]] = []
+        original_complete = provider.complete
+
+        async def tracking_complete(
+            system_prompts: list[str],
+            tools: list[dict],
+            messages: list[Any],
+        ):
+            captured_prompts.append(list(system_prompts))
+            async for chunk in original_complete(system_prompts, tools, messages):
+                yield chunk
+
+        provider.complete = tracking_complete  # type: ignore[assignment]
+
+        context = ExecutionContext(provider=provider, workspace_root=ws)
+        token = set_context(context)
+        try:
+            agent = Agent(workspace=ws, home=home)
+            session = Session(agent=agent)
+            await session.prompt("hello")
+
+            assert len(captured_prompts) == 1
+            joined = "\n".join(captured_prompts[0])
+            assert "## Your environment" in joined
+            assert f"Working directory (`.`): {ws}" in joined
+            assert f"Home directory (`~`): {home}" in joined
+        finally:
+            reset_context(token)
+
+    @pytest.mark.asyncio
+    async def test_env_fragment_on_resumed_session(self, tmp_path: Path):
+        """The environment fragment is present on every turn, not just the
+        first (guards against accidentally gating it on empty history)."""
+        ws = tmp_path / "ws"
+        home = tmp_path / "home"
+        ws.mkdir()
+        home.mkdir()
+
+        provider = MockProvider()
+        captured_prompts: list[list[str]] = []
+        original_complete = provider.complete
+
+        async def tracking_complete(
+            system_prompts: list[str],
+            tools: list[dict],
+            messages: list[Any],
+        ):
+            captured_prompts.append(list(system_prompts))
+            async for chunk in original_complete(system_prompts, tools, messages):
+                yield chunk
+
+        provider.complete = tracking_complete  # type: ignore[assignment]
+
+        context = ExecutionContext(provider=provider, workspace_root=ws)
+        token = set_context(context)
+        try:
+            agent = Agent(workspace=ws, home=home)
+            session = Session(agent=agent)
+
+            session._history.append_user_prompt("Earlier message")
+            session._history.append_turn(
+                AssistantMessage(content="Earlier response"), [],
+            )
+
+            await session.prompt("New message after resume")
+
+            assert len(captured_prompts) == 1
+            joined = "\n".join(captured_prompts[0])
+            assert "## Your environment" in joined
+            assert f"Working directory (`.`): {ws}" in joined
+            assert f"Home directory (`~`): {home}" in joined
+        finally:
+            reset_context(token)
+
+    @pytest.mark.asyncio
+    async def test_no_env_fragment_when_nothing_resolved(self):
+        provider = MockProvider()
+        captured_prompts: list[list[str]] = []
+        original_complete = provider.complete
+
+        async def tracking_complete(
+            system_prompts: list[str],
+            tools: list[dict],
+            messages: list[Any],
+        ):
+            captured_prompts.append(list(system_prompts))
+            async for chunk in original_complete(system_prompts, tools, messages):
+                yield chunk
+
+        provider.complete = tracking_complete  # type: ignore[assignment]
+
+        context = ExecutionContext(provider=provider)
+        token = set_context(context)
+        try:
+            agent = Agent()
+            session = Session(agent=agent)
+            await session.prompt("hello")
+
+            assert len(captured_prompts) == 1
+            joined = "\n".join(captured_prompts[0])
+            assert "## Your environment" not in joined
+        finally:
+            reset_context(token)

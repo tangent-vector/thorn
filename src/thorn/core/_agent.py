@@ -482,6 +482,16 @@ async def _run_session_prompt(
                     + journal_content
                 )
 
+    env_lines: list[str] = []
+    if workspace is not None:
+        env_lines.append(f"- Working directory (`.`): {workspace}")
+    if agent_home is not None:
+        env_lines.append(f"- Home directory (`~`): {agent_home}")
+    if env_lines:
+        sys_prompts.append(
+            "## Your environment\n\n" + "\n".join(env_lines)
+        )
+
     await child.event_sink.on_scope_enter(child.scope)
     t0 = time.monotonic()
     token = set_context(child)
