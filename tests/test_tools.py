@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -839,7 +840,7 @@ class TestRunShell:
 
     async def test_output_truncation(self):
         result = await run_shell(
-            f'python -c "print(\'x\' * {MAX_READ_CHARS + 1000})"',
+            f'{sys.executable} -c "print(\'x\' * {MAX_READ_CHARS + 1000})"',
         )
         assert "[output truncated:" in result
 

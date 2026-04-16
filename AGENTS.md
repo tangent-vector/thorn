@@ -1,3 +1,18 @@
+## Development Workflow
+
+This project uses **`uv`** as its package manager. Do not use `pip install`, `python -m pytest`, or other ad-hoc commands.
+
+- **Set up / sync the environment:** `uv sync --all-extras`
+  This creates (or updates) the `.venv/` virtual environment and installs all dependencies, including every optional-dependency group (test, eval, mcp, gitlab, github).
+
+- **Run tests:** `uv run pytest`
+  To run a single test file: `uv run pytest tests/test_foo.py`
+
+- **Run any project command:** `uv run <command>`
+  For example: `uv run thorn ...`
+
+---
+
 - Don't guess or presume. If you aren't exceptionally confident that you understand the situation, the user's intent, etc. then you should ask clarifying questions.
   We are collaborators, and you should leverage the things that the user is good at and the knowledge they have that you may lack.
 

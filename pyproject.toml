@@ -25,12 +25,12 @@ mcp = ["mcp>=1.0"]
 gitlab = ["python-gitlab>=5.0"]
 github = ["PyGithub>=2.0"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/thorn"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 
 [build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
