@@ -559,6 +559,7 @@ def _serve_gateway(
     from thorn.gateway import (
         EventSource,
         Gateway,
+        infer_event_sources,
         instantiate_services,
         load_gateway_config,
     )
@@ -588,14 +589,6 @@ def _serve_gateway(
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
 
-    sources = [s for s in all_services if isinstance(s, EventSource)]
-    if not sources:
-        console.print(
-            "[yellow]Warning:[/yellow] No event sources configured in "
-            f"{thorn_dir / 'gateway.json'}. The gateway will start "
-            "but will not receive any events."
-        )
-
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
         runtime = _build_runtime(
@@ -611,9 +604,25 @@ def _serve_gateway(
     for service in all_services:
         runtime.register_service(service)
 
+    if gateway_config.is_new_format:
+        agents = [
+            runtime.sessions.load_agent(aid)
+            for aid in runtime.sessions.list_agent_ids()
+        ]
+        sources = infer_event_sources(gateway_config, agents)
+    else:
+        sources = [s for s in all_services if isinstance(s, EventSource)]
+
+    if not sources:
+        console.print(
+            "[yellow]Warning:[/yellow] No event sources could be inferred "
+            f"from {thorn_dir / 'gateway.json'} and agent accounts. "
+            "The gateway will start but will not receive any events."
+        )
+
     gateway = Gateway(runtime=runtime, sources=sources)
 
-    service_names = [s.name for s in gateway_config.services]
+    service_names = [s.name for s in all_services]
     console.print(
         f"[bold]thorn serve[/bold]  services: {', '.join(service_names) or '(none)'}"
     )

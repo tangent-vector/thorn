@@ -1,61 +1,45 @@
 """Gateway configuration: loading services from ``.thorn/gateway.json``.
 
-The gateway configuration file declares which services to instantiate
-at startup.  Services include forge connections (``"gitlab"``,
-``"github"``), project definitions (``"project"``), and event sources
-(``"gitlab-events"``, ``"github-events"``).
+The gateway configuration file declares forges and projects.  Forges
+are external platforms that host version-controlled repositories;
+projects are logical software projects with one or more forks hosted
+on those forges.
 
-Each service entry specifies a ``type`` (looked up in the service type
-registry) and a ``config`` dict validated through the service class's
-``Config`` model.
-
-String values in ``config`` that begin with ``$`` are treated as
-environment variable references and expanded at load time, keeping
-secrets out of the config file itself.
-
-Example ``gateway.json``::
+The **new** config format uses top-level ``"forges"`` and
+``"projects"`` arrays::
 
     {
-      "services": [
+      "forges": [
         {
-          "name": "gitlab-master",
-          "type": "gitlab",
-          "config": { "url": "$GITLAB_URL", "token": "$GITLAB_TOKEN" }
-        },
+          "name": "github-com",
+          "type": "github",
+          "base_url": "https://api.github.com",
+          "poll_interval": 30
+        }
+      ],
+      "projects": [
         {
-          "name": "lace",
-          "type": "project",
-          "config": {
-            "forge": "gitlab-master",
-            "native_id": "214768",
-            "path": "lace/lace",
-            "clone_url": "https://gitlab-master.nvidia.com/lace/lace.git",
-            "default_branch": "main"
-          }
-        },
-        {
-          "name": "gitlab-poller",
-          "type": "gitlab-events",
-          "config": { "url": "$GITLAB_URL", "token": "$GITLAB_TOKEN" }
+          "name": "tiny-talk",
+          "forge": "github-com",
+          "native_id": "tangent-vector/tiny-talk",
+          "clone_url": "https://github.com/tangent-vector/tiny-talk.git",
+          "default_branch": "main"
         }
       ]
     }
 
-A ``github`` forge service uses :class:`~thorn.tools._github_connection.GitHubConnectionConfig` — for example a GitHub App installation::
+The **legacy** format uses a flat ``"services"`` array and is still
+accepted for backward compatibility during the transition period.
 
-    {
-      "name": "my-gh",
-      "type": "github",
-      "config": {
-        "base_url": "$GITHUB_API_URL",
-        "auth": {
-          "kind": "app",
-          "app_id": "$GITHUB_APP_ID",
-          "installation_id": "$GITHUB_APP_INSTALLATION_ID",
-          "private_key_pem": "$GITHUB_APP_PRIVATE_KEY"
-        }
-      }
-    }
+Event sources are **no longer configured explicitly**.  They are
+inferred at startup from agent accounts on registered forges (see
+:func:`infer_event_sources`).
+
+String values that begin with ``$`` are treated as environment
+variable references and expanded at load time, keeping secrets out of
+the config file itself.  Per the design convention, only genuinely
+secret values (tokens, private keys) should use ``$ENV_VAR``; all
+other configuration should be literal.
 """
 
 from __future__ import annotations
@@ -66,7 +50,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from thorn.core._service import Service
 from thorn.gateway._event import EventSource
@@ -112,26 +96,83 @@ def expand_env_vars(data: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Configuration models
+# Configuration models -- new format
+# ---------------------------------------------------------------------------
+
+
+class ForgeSpec(BaseModel):
+    """One entry in the ``"forges"`` array of ``gateway.json``."""
+
+    name: str
+    type: str = Field(description="Forge backend: 'github' or 'gitlab'")
+    base_url: str = Field(
+        default="",
+        description="API base URL (literal, not an env var reference)",
+    )
+    poll_interval: int = Field(
+        default=30,
+        ge=5,
+        description="Seconds between event polling cycles",
+    )
+
+
+class ProjectSpec(BaseModel):
+    """One entry in the ``"projects"`` array of ``gateway.json``."""
+
+    name: str
+    forge: str = Field(description="Name of the forge this project is hosted on")
+    native_id: str = Field(
+        default="",
+        description="Forge-native project identifier (owner/repo for GitHub, numeric for GitLab)",
+    )
+    clone_url: str = Field(
+        default="",
+        description="HTTPS clone URL for the repository",
+    )
+    default_branch: str = Field(default="main")
+
+
+# ---------------------------------------------------------------------------
+# Configuration models -- legacy format
 # ---------------------------------------------------------------------------
 
 
 class ServiceSpec(BaseModel):
-    """One entry in the ``"services"`` array of ``gateway.json``."""
+    """One entry in the ``"services"`` array of ``gateway.json`` (legacy)."""
 
     name: str
     type: str
     config: dict[str, Any] = {}
 
 
-class GatewayConfig(BaseModel):
-    """Top-level model for ``.thorn/gateway.json``."""
+# ---------------------------------------------------------------------------
+# Unified config model
+# ---------------------------------------------------------------------------
 
-    services: list[ServiceSpec] = []
+
+class GatewayConfig(BaseModel):
+    """Top-level model for ``.thorn/gateway.json``.
+
+    Supports both the **new** format (``forges`` + ``projects``) and
+    the **legacy** format (flat ``services`` array).  When ``forges``
+    is non-empty, the new format takes precedence.
+    """
+
+    forges: list[ForgeSpec] = []
+    projects: list[ProjectSpec] = []
+
+    services: list[ServiceSpec] = Field(
+        default_factory=list,
+        description="Legacy flat service list (deprecated)",
+    )
+
+    @property
+    def is_new_format(self) -> bool:
+        return bool(self.forges)
 
 
 # ---------------------------------------------------------------------------
-# Service type registry
+# Service type registry (used by legacy instantiation path)
 # ---------------------------------------------------------------------------
 
 _SERVICE_TYPE_REGISTRY: dict[str, Any] = {}
@@ -224,7 +265,260 @@ def _ensure_builtin_types() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Loading and instantiation
+# New-format instantiation
+# ---------------------------------------------------------------------------
+
+
+def instantiate_new_format(config: GatewayConfig) -> list[Service]:
+    """Create :class:`Service` instances from the new-format gateway config.
+
+    Instantiates :class:`ForgeHostService` from ``config.forges`` and
+    :class:`ProjectService` from ``config.projects``.  No event sources
+    are created here — those are inferred separately via
+    :func:`infer_event_sources`.
+    """
+    from thorn.tools._github_connection import GitHubConnectionConfig, GitHubPatAuth
+    from thorn.tools.forge import (
+        GitHubForgeService,
+        GitLabForgeService,
+        GitLabForgeServiceConfig,
+        ProjectService,
+        ProjectServiceConfig,
+    )
+
+    services: list[Service] = []
+
+    for forge_spec in config.forges:
+        if forge_spec.type == "gitlab":
+            cfg = GitLabForgeServiceConfig(url=forge_spec.base_url, token="")
+            svc = GitLabForgeService(cfg, service_name=forge_spec.name)
+        elif forge_spec.type == "github":
+            base_url = forge_spec.base_url or "https://api.github.com"
+            cfg_gh = GitHubConnectionConfig(
+                base_url=base_url,
+                auth=GitHubPatAuth(token=""),
+            )
+            svc = GitHubForgeService(cfg_gh, service_name=forge_spec.name)
+        else:
+            raise ValueError(
+                f"Unknown forge type {forge_spec.type!r} for forge {forge_spec.name!r}. "
+                f"Supported types: 'github', 'gitlab'."
+            )
+        log.info(
+            "Instantiated %s %r (type=%s)",
+            type(svc).__name__, forge_spec.name, forge_spec.type,
+        )
+        services.append(svc)
+
+    for proj_spec in config.projects:
+        proj_cfg = ProjectServiceConfig(
+            forge=proj_spec.forge,
+            native_id=proj_spec.native_id,
+            path=proj_spec.name,
+            clone_url=proj_spec.clone_url,
+            default_branch=proj_spec.default_branch,
+        )
+        proj_svc = ProjectService(proj_cfg, service_name=proj_spec.name)
+        log.info("Instantiated ProjectService %r (forge=%s)", proj_spec.name, proj_spec.forge)
+        services.append(proj_svc)
+
+    return services
+
+
+# ---------------------------------------------------------------------------
+# Event source inference
+# ---------------------------------------------------------------------------
+
+
+def infer_event_sources(
+    config: GatewayConfig,
+    agents: list[Any],
+) -> list[EventSource]:
+    """Create event sources for each (agent, forge) pair.
+
+    For each agent that has a :class:`ForgeAccountConfig` on a forge
+    declared in *config*, an appropriate event source is created:
+
+    - **GitHub**: A per-repository poller for each project fork on
+      this forge, authenticated with the agent's credentials.
+    - **GitLab**: A TODOs poller authenticated with the agent's
+      credentials (TODOs are user-scoped, no per-repo enumeration).
+
+    The ``poll_interval`` comes from the forge spec in the config.
+    """
+    from thorn.core._account import AgentAccountsConfig, ForgeAccountConfig
+
+    forge_specs_by_name: dict[str, ForgeSpec] = {
+        f.name: f for f in config.forges
+    }
+
+    project_repos_by_forge: dict[str, list[str]] = {}
+    for proj in config.projects:
+        project_repos_by_forge.setdefault(proj.forge, []).append(proj.native_id)
+
+    sources: list[EventSource] = []
+
+    for agent in agents:
+        accounts: AgentAccountsConfig | None = getattr(agent, "accounts", None)
+        if accounts is None:
+            continue
+
+        for acct in accounts.forge_accounts:
+            forge_spec = forge_specs_by_name.get(acct.forge)
+            if forge_spec is None:
+                log.warning(
+                    "Agent %r has account on forge %r which is not in gateway config; skipping.",
+                    getattr(agent, "name", "?"), acct.forge,
+                )
+                continue
+
+            source = _create_event_source_for_account(
+                forge_spec=forge_spec,
+                account=acct,
+                agent=agent,
+                repositories=project_repos_by_forge.get(forge_spec.name, []),
+            )
+            if source is not None:
+                sources.append(source)
+
+    return sources
+
+
+def _create_event_source_for_account(
+    *,
+    forge_spec: ForgeSpec,
+    account: Any,
+    agent: Any,
+    repositories: list[str],
+) -> EventSource | None:
+    """Create a single event source for an agent's account on a forge."""
+    from thorn.core._account import ForgeAccountConfig
+
+    assert isinstance(account, ForgeAccountConfig)
+    agent_name = getattr(agent, "name", None) or getattr(agent, "id", "unknown")
+
+    if forge_spec.type == "github":
+        return _create_github_source(
+            forge_spec=forge_spec,
+            account=account,
+            agent_name=str(agent_name),
+            repositories=repositories,
+        )
+
+    if forge_spec.type == "gitlab":
+        return _create_gitlab_source(
+            forge_spec=forge_spec,
+            account=account,
+            agent_name=str(agent_name),
+        )
+
+    log.warning(
+        "No event source strategy for forge type %r (forge=%r, agent=%r)",
+        forge_spec.type, forge_spec.name, agent_name,
+    )
+    return None
+
+
+def _create_github_source(
+    *,
+    forge_spec: ForgeSpec,
+    account: Any,
+    agent_name: str,
+    repositories: list[str],
+) -> EventSource | None:
+    """Create a GitHub repository events source for one (agent, forge) pair.
+
+    Polls each repository in *repositories* using the agent's
+    credentials.  If there are no repositories on this forge, no
+    source is created.
+    """
+    if not repositories:
+        log.info(
+            "No projects on forge %r for agent %r; skipping GitHub source.",
+            forge_spec.name, agent_name,
+        )
+        return None
+
+    from thorn.tools._github_connection import GitHubAppAuth, GitHubPatAuth
+
+    creds = account.credentials
+    if isinstance(creds, GitHubPatAuth):
+        auth_block = {"kind": "pat", "token": creds.token}
+    elif isinstance(creds, GitHubAppAuth):
+        auth_block = {
+            "kind": "app",
+            "app_id": creds.app_id,
+            "installation_id": creds.installation_id,
+            "private_key_pem": creds.private_key_pem,
+        }
+    else:
+        log.warning(
+            "Unsupported credential type %s for GitHub forge %r",
+            type(creds).__name__, forge_spec.name,
+        )
+        return None
+
+    from thorn.gateway.sources._github import (
+        GitHubNotificationsSource,
+        GitHubNotificationsSourceConfig,
+    )
+
+    base_url = forge_spec.base_url or "https://api.github.com"
+    repo = repositories[0]
+    source_name = f"{agent_name}-{forge_spec.name}-events"
+
+    cfg = GitHubNotificationsSourceConfig(
+        base_url=base_url,
+        auth=auth_block,  # type: ignore[arg-type]
+        repository=repo,
+        poll_interval=forge_spec.poll_interval,
+    )
+    source = GitHubNotificationsSource(cfg, service_name=source_name)
+    log.info(
+        "Inferred GitHub event source %r (repo=%s, agent=%s)",
+        source_name, repo, agent_name,
+    )
+    return source
+
+
+def _create_gitlab_source(
+    *,
+    forge_spec: ForgeSpec,
+    account: Any,
+    agent_name: str,
+) -> EventSource | None:
+    """Create a GitLab TODOs source for one (agent, forge) pair.
+
+    GitLab TODOs are user-scoped, so no repository list is needed.
+    """
+    from thorn.core._account import GitLabCredentials
+
+    creds = account.credentials
+    if not isinstance(creds, GitLabCredentials):
+        log.warning(
+            "Unsupported credential type %s for GitLab forge %r",
+            type(creds).__name__, forge_spec.name,
+        )
+        return None
+
+    from thorn.gateway.sources._gitlab import GitLabSourceConfig, GitLabTODOsSource
+
+    source_name = f"{agent_name}-{forge_spec.name}-events"
+    cfg = GitLabSourceConfig(
+        url=forge_spec.base_url,
+        token=creds.token,
+        poll_interval=forge_spec.poll_interval,
+    )
+    source = GitLabTODOsSource(cfg, service_name=source_name)
+    log.info(
+        "Inferred GitLab event source %r (agent=%s)",
+        source_name, agent_name,
+    )
+    return source
+
+
+# ---------------------------------------------------------------------------
+# Legacy instantiation
 # ---------------------------------------------------------------------------
 
 
@@ -246,15 +540,13 @@ def load_gateway_config(thorn_dir: Path) -> GatewayConfig:
 def instantiate_services(config: GatewayConfig) -> list[Service]:
     """Create :class:`Service` instances from a gateway configuration.
 
-    Handles all service types: forge connections (``"gitlab"``,
-    ``"github"``), projects (``"project"``), and event sources
-    (``"gitlab-events"``, ``"github-events"``).
-
-    For backward compatibility, the legacy type keys ``"gitlab"`` and
-    ``"github"`` (without ``-events`` suffix) are also tried against
-    the event source registry when no match is found in the new
-    service type registry.
+    Handles both legacy and new format.  For the new format, delegates
+    to :func:`instantiate_new_format`.  For the legacy format, uses
+    the service type registry.
     """
+    if config.is_new_format:
+        return instantiate_new_format(config)
+
     _ensure_builtin_types()
 
     services: list[Service] = []
@@ -291,10 +583,14 @@ def instantiate_sources(config: GatewayConfig) -> list[EventSource]:
 
 
 __all__ = [
+    "ForgeSpec",
     "GATEWAY_CONFIG_FILENAME",
     "GatewayConfig",
+    "ProjectSpec",
     "ServiceSpec",
     "expand_env_vars",
+    "infer_event_sources",
+    "instantiate_new_format",
     "instantiate_services",
     "instantiate_sources",
     "load_gateway_config",

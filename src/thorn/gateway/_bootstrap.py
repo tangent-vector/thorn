@@ -2,9 +2,12 @@
 
 Creates the agent identity file (``<agent-id>.json``), workspace
 directory, a ``MEMORY.md`` containing project-specific knowledge, and
-a ``gateway.json`` service configuration (forge service, project
-service, and event source).  The result is a Runtime directory ready
-for ``thorn serve``.
+a ``gateway.json`` service configuration (forge definition and project
+definition -- no event sources, as those are inferred at startup).
+
+The agent identity file includes an ``"accounts"`` section with forge
+credentials (using ``$ENV_VAR`` references for secrets) and literal
+git identity fields.
 
 Usage from code::
 
@@ -18,6 +21,7 @@ Usage from code::
         default_branch="main",
         native_project_id="214768",
         forge_type="gitlab",
+        forge_base_url="https://gitlab-master.nvidia.com/api/v4",
     )
 
     bootstrap_coordinator(
@@ -27,7 +31,7 @@ Usage from code::
         clone_url="https://github.com/owner/repo.git",
         native_project_id="owner/repo",
         forge_type="github",
-        forge_url_env="GITHUB_API_URL",
+        forge_base_url="https://api.github.com",
     )
 """
 
@@ -44,39 +48,42 @@ from thorn.runtime._session import AgentID
 log = logging.getLogger(__name__)
 
 
-def _upsert_service(
-    services: list[dict[str, Any]],
+def _upsert_by_name(
+    items: list[dict[str, Any]],
     entry: dict[str, Any],
 ) -> None:
-    """Insert or replace a service entry by name."""
+    """Insert or replace an entry by ``name`` field."""
     name = entry["name"]
-    for i, existing in enumerate(services):
+    for i, existing in enumerate(items):
         if existing.get("name") == name:
-            services[i] = entry
+            items[i] = entry
             return
-    services.append(entry)
+    items.append(entry)
 
 
 def _ensure_gateway_config(
     thorn_dir: Path,
-    entries: list[dict[str, Any]],
+    *,
+    forge_entry: dict[str, Any],
+    project_entry: dict[str, Any],
 ) -> None:
-    """Create or update ``gateway.json`` with multiple service entries.
+    """Create or update ``gateway.json`` with forge and project entries.
 
-    Each entry is upserted by name — existing entries with the same
-    name are replaced, new entries are appended.
+    Uses the new format with top-level ``"forges"`` and ``"projects"``
+    arrays.  Each entry is upserted by name.
     """
     config_path = thorn_dir / GATEWAY_CONFIG_FILENAME
 
     if config_path.is_file():
         data = json.loads(config_path.read_text(encoding="utf-8"))
     else:
-        data = {"services": []}
+        data = {}
 
-    services: list[dict[str, Any]] = data.setdefault("services", [])
+    forges: list[dict[str, Any]] = data.setdefault("forges", [])
+    projects: list[dict[str, Any]] = data.setdefault("projects", [])
 
-    for entry in entries:
-        _upsert_service(services, entry)
+    _upsert_by_name(forges, forge_entry)
+    _upsert_by_name(projects, project_entry)
 
     config_path.write_text(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n",
@@ -89,7 +96,7 @@ def _build_github_auth_block(
     auth_mode: str,
     token_env: str,
 ) -> dict[str, str]:
-    """Build the ``auth`` sub-object for a GitHub service in ``gateway.json``.
+    """Build the ``credentials`` sub-object for a GitHub agent account.
 
     *auth_mode* is ``"pat"`` (default -- uses ``$<token_env>``) or
     ``"app"`` (uses ``$GITHUB_APP_*`` env var references).
@@ -104,41 +111,6 @@ def _build_github_auth_block(
     return {
         "kind": "pat",
         "token": f"${token_env}",
-    }
-
-
-def _build_event_source_entry(
-    *,
-    project_name: str,
-    forge_type: str,
-    access_token_env: str,
-    forge_url_env: str,
-    native_project_id: str,
-    github_auth_mode: str = "pat",
-) -> dict[str, Any]:
-    """Build a ``gateway.json`` event source entry for the given forge type."""
-    source_name = f"{project_name}-events"
-
-    if forge_type == "github":
-        config: dict[str, Any] = {
-            "auth": _build_github_auth_block(github_auth_mode, access_token_env),
-            "repository": native_project_id,
-        }
-        if forge_url_env:
-            config["base_url"] = f"${forge_url_env}"
-        return {
-            "name": source_name,
-            "type": "github-events",
-            "config": config,
-        }
-
-    return {
-        "name": source_name,
-        "type": "gitlab-events",
-        "config": {
-            "url": f"${forge_url_env}",
-            "token": f"${access_token_env}",
-        },
     }
 
 
@@ -158,13 +130,14 @@ def bootstrap_coordinator(
     native_project_id: str = "",
     forge_type: str = "gitlab",
     access_token_env: str | None = None,
-    forge_url_env: str | None = None,
+    forge_base_url: str = "",
     forge_service_name: str = "",
     git_user_name: str = "",
     git_user_email: str = "",
     github_auth_mode: str = "pat",
     # Legacy parameters (accepted but mapped to new fields)
     project_id: int | None = None,
+    forge_url_env: str | None = None,
     gitlab_url_env: str = "",
 ) -> AgentID:
     """Create a ProjectCoordinator agent in the given Runtime directory.
@@ -176,12 +149,14 @@ def bootstrap_coordinator(
     - ``<runtime_root>/.thorn/agents/<agent_id>/MEMORY.md``
     - ``<runtime_root>/.thorn/gateway.json``
 
-    The gateway config includes a forge service, a project service,
-    and an event source so the gateway can start polling immediately.
+    The gateway config includes a forge definition and a project
+    definition.  Event sources are inferred at startup from the
+    agent's account on the forge (no explicit event source entry).
 
-    The agent identity includes ``project`` (for forge credential
-    resolution), ``git_user_name``, and ``git_user_email`` (for git
-    commit authorship) metadata entries.
+    The agent identity includes an ``"accounts"`` section with forge
+    credentials (``$ENV_VAR`` for secrets) and literal git identity.
+    ``metadata.project`` is also set for backward compatibility with
+    code that reads it.
 
     For GitHub, *github_auth_mode* selects between ``"pat"``
     (``$GITHUB_TOKEN``, the default) and ``"app"``
@@ -196,13 +171,11 @@ def bootstrap_coordinator(
     if not forge_service_name:
         forge_service_name = f"{project_name}-forge"
 
-    default_token, default_url = _FORGE_DEFAULTS.get(
+    default_token, _default_url_env = _FORGE_DEFAULTS.get(
         forge_type, ("GITLAB_TOKEN", "GITLAB_URL"),
     )
     if access_token_env is None:
         access_token_env = default_token
-    if forge_url_env is None:
-        forge_url_env = default_url
 
     aid = AgentID(agent_id)
     thorn_dir = runtime_root / ".thorn"
@@ -211,6 +184,18 @@ def bootstrap_coordinator(
 
     resolved_git_name = git_user_name or agent_id
     resolved_git_email = git_user_email or f"{agent_id}@thorn"
+
+    # -- Build credentials for the agent account ----------------------------
+
+    if forge_type == "github":
+        credentials_block: dict[str, Any] = _build_github_auth_block(
+            github_auth_mode, access_token_env,
+        )
+    else:
+        credentials_block = {
+            "kind": "gitlab-pat",
+            "token": f"${access_token_env}",
+        }
 
     # -- Agent identity ------------------------------------------------------
 
@@ -221,8 +206,16 @@ def bootstrap_coordinator(
         "name": agent_id,
         "metadata": {
             "project": project_name,
-            "git_user_name": resolved_git_name,
-            "git_user_email": resolved_git_email,
+        },
+        "accounts": {
+            "forge_accounts": [
+                {
+                    "forge": forge_service_name,
+                    "credentials": credentials_block,
+                    "git_user_name": resolved_git_name,
+                    "git_user_email": resolved_git_email,
+                },
+            ],
         },
     }
 
@@ -256,52 +249,27 @@ def bootstrap_coordinator(
     memory_path.write_text("\n".join(memory_lines) + "\n", encoding="utf-8")
     log.info("Wrote agent memory: %s", memory_path)
 
-    # -- Gateway service configuration ---------------------------------------
+    # -- Gateway configuration (new format) ----------------------------------
 
-    if forge_type == "github":
-        gh_forge_config: dict[str, Any] = {
-            "auth": _build_github_auth_block(github_auth_mode, access_token_env),
-        }
-        if forge_url_env:
-            gh_forge_config["base_url"] = f"${forge_url_env}"
-        forge_entry = {
-            "name": forge_service_name,
-            "type": "github",
-            "config": gh_forge_config,
-        }
-    else:
-        forge_entry = {
-            "name": forge_service_name,
-            "type": "gitlab",
-            "config": {
-                "url": f"${forge_url_env}",
-                "token": f"${access_token_env}",
-            },
-        }
+    forge_entry: dict[str, Any] = {
+        "name": forge_service_name,
+        "type": forge_type,
+    }
+    if forge_base_url:
+        forge_entry["base_url"] = forge_base_url
 
     project_entry: dict[str, Any] = {
         "name": project_name,
-        "type": "project",
-        "config": {
-            "forge": forge_service_name,
-            "native_id": native_project_id,
-            "path": project_name,
-            "clone_url": clone_url,
-            "default_branch": default_branch,
-        },
+        "forge": forge_service_name,
+        "native_id": native_project_id,
+        "clone_url": clone_url,
+        "default_branch": default_branch,
     }
 
-    event_source_entry = _build_event_source_entry(
-        project_name=project_name,
-        forge_type=forge_type,
-        access_token_env=access_token_env,
-        forge_url_env=forge_url_env,
-        native_project_id=native_project_id,
-        github_auth_mode=github_auth_mode,
-    )
-
     _ensure_gateway_config(
-        thorn_dir, [forge_entry, project_entry, event_source_entry],
+        thorn_dir,
+        forge_entry=forge_entry,
+        project_entry=project_entry,
     )
 
     return aid
