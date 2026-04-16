@@ -17,7 +17,6 @@ import contextlib
 import logging
 import signal
 import sys
-from pathlib import Path
 from typing import Any
 
 from thorn.core._agent import Agent
@@ -111,9 +110,19 @@ class Gateway:
     async def _handle_event(self, event: IncomingEvent) -> None:
         """Route a single event to the appropriate agent and session.
 
-        Tools are determined by the agent's class-level ``tools``
-        declaration (via ``Agent._collect_tools``), not passed
-        explicitly by the gateway.
+        The session workspace is derived deterministically from the
+        runtime workspace root, agent ID, and session key::
+
+            <runtime_ws>/<agent_id>/<session_key>/
+
+        Session keys may contain ``/`` (e.g. ``github/42/issue/7``),
+        so ``str(session_key)`` naturally produces nested directories.
+        The directory is pre-created before the session runs so the
+        agent always starts with a valid working directory.
+
+        For already-existing sessions the persisted workspace is
+        retained — ``workspace_root`` is only applied at creation time
+        by :meth:`Runtime.get_or_create_session`.
 
         The agent's lock serializes all event handling for a given
         agent, preventing concurrent mutations to its workspace,
@@ -127,7 +136,14 @@ class Gateway:
 
         async with agent.lock:
             self._runtime.save_agent(agent)
-            ws = Path(event.workspace_root) if event.workspace_root else None
+
+            ws = (
+                self._runtime.workspace_root
+                / str(agent.id)
+                / str(event.session_key)
+            )
+            ws.mkdir(parents=True, exist_ok=True)
+
             session = self._runtime.get_or_create_session(
                 agent, event.session_key, workspace_root=ws,
             )

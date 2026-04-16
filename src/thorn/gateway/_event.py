@@ -28,6 +28,10 @@ class IncomingEvent:
     ``agent_id`` (optional) and ``session_key``.  The ``content`` field
     is the formatted prompt that the agent will receive.
 
+    Workspace paths are never carried on the event — the gateway
+    derives them mechanically from the agent ID and session key (see
+    ``Gateway._handle_event``).
+
     Attributes:
         source: Identifies the originating system (e.g. ``"gitlab"``).
         session_key: Determines which session handles this event,
@@ -36,12 +40,6 @@ class IncomingEvent:
         agent_id: Optional identifier for the agent that should handle
             this event.  When ``None``, the gateway's default routing
             logic applies.
-        workspace_root: Absolute filesystem path to use as the
-            session's workspace when the session is first created.
-            Ignored for events routed to an already-existing session.
-            ``None`` means the session inherits the agent or runtime
-            default.  Stored as ``str`` (not ``Path``) to keep the
-            frozen dataclass JSON-friendly.
         metadata: Source-specific data (project IDs, TODO IDs, etc.)
             for use by tools or diagnostics.
     """
@@ -50,7 +48,6 @@ class IncomingEvent:
     session_key: SessionKey
     content: str
     agent_id: AgentID | None = None
-    workspace_root: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

@@ -2049,69 +2049,25 @@ class TestRouteGitlabTodo:
 
 
 # ---------------------------------------------------------------------------
-# IncomingEvent workspace_root field
-# ---------------------------------------------------------------------------
-
-
-class TestIncomingEventWorkspaceRoot:
-    def test_defaults_to_none(self):
-        event = IncomingEvent(
-            source="test", session_key=SessionKey("k"), content="hi",
-        )
-        assert event.workspace_root is None
-
-    def test_preserves_value(self):
-        event = IncomingEvent(
-            source="test",
-            session_key=SessionKey("k"),
-            content="hi",
-            workspace_root="/tmp/ws",
-        )
-        assert event.workspace_root == "/tmp/ws"
-
-
-# ---------------------------------------------------------------------------
-# Gateway: workspace_root flows through to session creation
+# Gateway: centralized workspace derivation
 # ---------------------------------------------------------------------------
 
 
 class TestGatewayWorkspaceRouting:
+    """Verify that _handle_event derives the session workspace from
+    ``<runtime_ws>/<agent_id>/<session_key>/`` and pre-creates the
+    directory on disk."""
+
     def _make_runtime(self, tmp_path: Path) -> Runtime:
         return Runtime(provider=MockProvider(), workspace_root=tmp_path)
 
     @pytest.mark.asyncio
-    async def test_event_workspace_stored_on_new_session(self, tmp_path: Path):
-        """When an event carries a workspace_root, the newly created
-        session persists that path.
-        """
-        ws = tmp_path / "workspaces" / "repo1"
+    async def test_session_workspace_derived_and_created(self, tmp_path: Path):
+        """The gateway derives the session workspace mechanically and
+        the directory exists on disk after _handle_event."""
         event = IncomingEvent(
             source="test",
-            session_key=SessionKey("ws_key"),
-            content="Hello",
-            workspace_root=str(ws),
-        )
-        source = StubSource([event])
-        runtime = self._make_runtime(tmp_path)
-
-        with patch.object(
-            _SessionPromptAccessor, "__call__", return_value="ok",
-        ):
-            gateway = Gateway(runtime=runtime, sources=[source])
-            await gateway.run()
-
-        agent_ids = runtime.sessions.list_agent_ids()
-        assert agent_ids
-        agent = runtime.sessions.load_agent(agent_ids[0])
-        loaded = runtime.sessions.load_session(agent, SessionKey("ws_key"))
-        assert loaded.workspace_root == ws
-
-    @pytest.mark.asyncio
-    async def test_event_without_workspace_creates_none(self, tmp_path: Path):
-        """Events without workspace_root create sessions with None."""
-        event = IncomingEvent(
-            source="test",
-            session_key=SessionKey("no_ws"),
+            session_key=SessionKey("github/42/issue/7"),
             content="Hello",
         )
         source = StubSource([event])
@@ -2123,31 +2079,62 @@ class TestGatewayWorkspaceRouting:
             gateway = Gateway(runtime=runtime, sources=[source])
             await gateway.run()
 
+        expected_ws = tmp_path / "default" / "github" / "42" / "issue" / "7"
+        assert expected_ws.is_dir()
+
         agent_ids = runtime.sessions.list_agent_ids()
         agent = runtime.sessions.load_agent(agent_ids[0])
-        loaded = runtime.sessions.load_session(agent, SessionKey("no_ws"))
-        assert loaded.workspace_root is None
+        loaded = runtime.sessions.load_session(
+            agent, SessionKey("github/42/issue/7"),
+        )
+        assert loaded.workspace_root == expected_ws
 
     @pytest.mark.asyncio
-    async def test_existing_session_workspace_not_overwritten(self, tmp_path: Path):
-        """A second event with a different workspace_root for the same
-        session key does not change the persisted workspace.
-        """
+    async def test_workspace_uses_agent_id_in_path(self, tmp_path: Path):
+        """When a specific agent handles the event, the workspace path
+        includes that agent's ID."""
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        bootstrap_coordinator(
+            runtime_root=tmp_path,
+            agent_id="my-coord",
+            project_name="proj",
+            clone_url="https://example.com/proj.git",
+        )
         runtime = self._make_runtime(tmp_path)
-        ws_original = tmp_path / "ws" / "original"
-        ws_different = tmp_path / "ws" / "different"
+        event = IncomingEvent(
+            source="test",
+            session_key=SessionKey("gitlab/10/issue/5"),
+            content="Hello",
+        )
+        source = StubSource([event])
+
+        with patch.object(
+            _SessionPromptAccessor, "__call__", return_value="ok",
+        ):
+            gateway = Gateway(runtime=runtime, sources=[source])
+            await gateway.run()
+
+        expected_ws = (
+            tmp_path / "my-coord" / "gitlab" / "10" / "issue" / "5"
+        )
+        assert expected_ws.is_dir()
+
+    @pytest.mark.asyncio
+    async def test_existing_session_workspace_not_overwritten(
+        self, tmp_path: Path,
+    ):
+        """A second event with the same session key does not change
+        the persisted workspace (workspace_root is only applied at
+        session creation time)."""
+        runtime = self._make_runtime(tmp_path)
+        key = SessionKey("github/99/issue/1")
 
         event1 = IncomingEvent(
-            source="test",
-            session_key=SessionKey("stable_ws"),
-            content="First",
-            workspace_root=str(ws_original),
+            source="test", session_key=key, content="First",
         )
         event2 = IncomingEvent(
-            source="test",
-            session_key=SessionKey("stable_ws"),
-            content="Second",
-            workspace_root=str(ws_different),
+            source="test", session_key=key, content="Second",
         )
         source = StubSource([event1, event2])
 
@@ -2159,5 +2146,35 @@ class TestGatewayWorkspaceRouting:
 
         agent_ids = runtime.sessions.list_agent_ids()
         agent = runtime.sessions.load_agent(agent_ids[0])
-        loaded = runtime.sessions.load_session(agent, SessionKey("stable_ws"))
-        assert loaded.workspace_root == ws_original
+        loaded = runtime.sessions.load_session(agent, key)
+
+        expected_ws = tmp_path / "default" / "github" / "99" / "issue" / "1"
+        assert loaded.workspace_root == expected_ws
+
+    @pytest.mark.asyncio
+    async def test_flat_session_key_workspace(self, tmp_path: Path):
+        """A simple (non-slashed) session key produces a single-level
+        directory under the agent ID."""
+        event = IncomingEvent(
+            source="test",
+            session_key=SessionKey("simple_key"),
+            content="Hello",
+        )
+        source = StubSource([event])
+        runtime = self._make_runtime(tmp_path)
+
+        with patch.object(
+            _SessionPromptAccessor, "__call__", return_value="ok",
+        ):
+            gateway = Gateway(runtime=runtime, sources=[source])
+            await gateway.run()
+
+        expected_ws = tmp_path / "default" / "simple_key"
+        assert expected_ws.is_dir()
+
+        agent_ids = runtime.sessions.list_agent_ids()
+        agent = runtime.sessions.load_agent(agent_ids[0])
+        loaded = runtime.sessions.load_session(
+            agent, SessionKey("simple_key"),
+        )
+        assert loaded.workspace_root == expected_ws
