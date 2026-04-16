@@ -1601,6 +1601,76 @@ class TestInstantiateNewFormat:
         legacy = GatewayConfig(services=[])
         assert legacy.is_new_format is False
 
+    def test_project_spec_resolved_forks_from_explicit(self):
+        from thorn.gateway._config import ForkSpec, ProjectSpec
+
+        proj = ProjectSpec(
+            name="p",
+            forks=[
+                ForkSpec(forge="gh", native_id="a/repo", name="upstream"),
+                ForkSpec(forge="gh", native_id="b/repo", name="origin"),
+            ],
+        )
+        forks = proj.resolved_forks()
+        assert len(forks) == 2
+        assert forks[0].native_id == "a/repo"
+        assert forks[1].native_id == "b/repo"
+
+    def test_project_spec_resolved_forks_from_legacy(self):
+        from thorn.gateway._config import ProjectSpec
+
+        proj = ProjectSpec(
+            name="p", forge="gh", native_id="owner/repo",
+            clone_url="https://github.com/owner/repo.git",
+        )
+        forks = proj.resolved_forks()
+        assert len(forks) == 1
+        assert forks[0].forge == "gh"
+        assert forks[0].native_id == "owner/repo"
+        assert forks[0].name == "upstream"
+        assert forks[0].clone_url == "https://github.com/owner/repo.git"
+
+    def test_project_spec_primary_forge(self):
+        from thorn.gateway._config import ForkSpec, ProjectSpec
+
+        proj = ProjectSpec(
+            name="p",
+            forks=[
+                ForkSpec(forge="gh-pub", native_id="a/repo", name="upstream"),
+                ForkSpec(forge="gh-ent", native_id="b/repo", name="origin"),
+            ],
+        )
+        assert proj.primary_forge == "gh-pub"
+
+    def test_project_with_forks_creates_correct_project_service(self):
+        from thorn.gateway._config import (
+            ForgeSpec,
+            ForkSpec,
+            GatewayConfig,
+            ProjectSpec,
+            instantiate_new_format,
+        )
+        from thorn.tools.forge import ProjectService
+
+        config = GatewayConfig(
+            forges=[ForgeSpec(name="gh", type="github", base_url="https://api.github.com")],
+            projects=[ProjectSpec(
+                name="my-proj",
+                forks=[
+                    ForkSpec(forge="gh", native_id="owner/upstream", name="upstream",
+                             clone_url="https://github.com/owner/upstream.git"),
+                    ForkSpec(forge="gh", native_id="bot/fork", name="origin",
+                             clone_url="https://github.com/bot/fork.git"),
+                ],
+                default_branch="main",
+            )],
+        )
+        services = instantiate_new_format(config)
+        proj_svc = [s for s in services if isinstance(s, ProjectService)][0]
+        assert len(proj_svc.forks) == 2
+        assert proj_svc.forge_name == "gh"
+        assert proj_svc.native_id == "owner/upstream"
+
 
 class TestInferEventSources:
     def test_infers_gitlab_source_from_agent_account(self):
@@ -1788,9 +1858,11 @@ class TestBootstrapCoordinator:
 
         proj = gw_data["projects"][0]
         assert proj["name"] == "my-project"
-        assert proj["native_id"] == "42"
-        assert proj["clone_url"] == "https://gitlab.example.com/group/my-project.git"
         assert proj["default_branch"] == "develop"
+        fork = proj["forks"][0]
+        assert fork["native_id"] == "42"
+        assert fork["clone_url"] == "https://gitlab.example.com/group/my-project.git"
+        assert fork["name"] == "upstream"
 
     def test_bootstrap_appends_to_existing_gateway_config(self, tmp_path: Path):
         import json
@@ -1836,7 +1908,7 @@ class TestBootstrapCoordinator:
         gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
         assert len(gw_data["forges"]) == 1
         assert len(gw_data["projects"]) == 1
-        assert gw_data["projects"][0]["clone_url"] == "https://example.com/proj-v2.git"
+        assert gw_data["projects"][0]["forks"][0]["clone_url"] == "https://example.com/proj-v2.git"
 
     def test_bootstrap_custom_token_env(self, tmp_path: Path):
         """Custom access_token_env is written into agent credentials."""
@@ -1915,7 +1987,7 @@ class TestBootstrapCoordinator:
         gateway_config = tmp_path / ".thorn" / "gateway.json"
         gw_data = json.loads(gateway_config.read_text(encoding="utf-8"))
         proj = gw_data["projects"][0]
-        assert proj["native_id"] == "999"
+        assert proj["forks"][0]["native_id"] == "999"
 
     def test_github_bootstrap_pat_default(self, tmp_path: Path):
         """Bootstrap with forge_type='github' defaults to PAT auth."""
@@ -1940,8 +2012,9 @@ class TestBootstrapCoordinator:
         assert forge["base_url"] == "https://api.github.com"
 
         proj = gw_data["projects"][0]
-        assert proj["native_id"] == "owner/repo"
-        assert proj["forge"] == "my-repo-forge"
+        fork = proj["forks"][0]
+        assert fork["native_id"] == "owner/repo"
+        assert fork["forge"] == "my-repo-forge"
 
         identity = tmp_path / ".thorn" / "agents" / "gh-coord.json"
         data = json.loads(identity.read_text(encoding="utf-8"))

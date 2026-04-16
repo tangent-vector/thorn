@@ -8,6 +8,7 @@ TODOs, future webhook endpoints, etc.) into Thorn agents.
 from thorn.gateway._agents import ProjectCoordinator
 from thorn.gateway._config import (
     ForgeSpec,
+    ForkSpec,
     GatewayConfig,
     ProjectSpec,
     ServiceSpec,
@@ -24,6 +25,7 @@ from thorn.gateway._gateway import Gateway
 __all__ = [
     "EventSource",
     "ForgeSpec",
+    "ForkSpec",
     "Gateway",
     "GatewayConfig",
     "IncomingEvent",

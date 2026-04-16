@@ -18,6 +18,7 @@ from thorn.tools._github_connection import GitHubConnectionConfig, GitHubPatAuth
 from thorn.tools.forge import (
     FORGE_TOOLS,
     CommentTargetKind,
+    ForkConfig,
     GitHubForgeClient,
     GitHubForgeService,
     GitLabForgeClient,
@@ -426,6 +427,39 @@ class TestGitLabForgeService:
         svc = GitLabForgeService(config, service_name="my-gitlab")
         assert svc.name == "my-gitlab"
 
+    def test_clone_url_for_returns_empty(self):
+        """GitLab native IDs are numeric, so clone URLs can't be derived."""
+        config = GitLabForgeServiceConfig(url="https://gl.example.com", token="t")
+        svc = GitLabForgeService(config, service_name="gl")
+        assert svc.clone_url_for("214768") == ""
+
+
+class TestGitHubForgeServiceCloneUrl:
+    def test_derives_clone_url_from_api_url(self):
+        cfg = GitHubConnectionConfig(
+            base_url="https://api.github.com",
+            auth=GitHubPatAuth(token="tok"),
+        )
+        svc = GitHubForgeService(cfg, service_name="gh")
+        assert svc.clone_url_for("owner/repo") == "https://github.com/owner/repo.git"
+
+    def test_github_enterprise_url(self):
+        cfg = GitHubConnectionConfig(
+            base_url="https://api.github.example.com",
+            auth=GitHubPatAuth(token="tok"),
+        )
+        svc = GitHubForgeService(cfg, service_name="ghe")
+        assert svc.clone_url_for("org/proj") == "https://github.example.com/org/proj.git"
+
+    def test_non_api_prefixed_url(self):
+        """When base_url doesn't have an 'api.' prefix, use the host as-is."""
+        cfg = GitHubConnectionConfig(
+            base_url="https://github.example.com/api/v3",
+            auth=GitHubPatAuth(token="tok"),
+        )
+        svc = GitHubForgeService(cfg, service_name="gh")
+        assert svc.clone_url_for("o/r") == "https://github.example.com/o/r.git"
+
 
 # ---------------------------------------------------------------------------
 # ProjectService
@@ -433,7 +467,8 @@ class TestGitLabForgeService:
 
 
 class TestProjectService:
-    def test_properties(self):
+    def test_legacy_properties(self):
+        """Legacy single-fork config still works via compatibility shims."""
         config = ProjectServiceConfig(
             forge="gl",
             native_id="214768",
@@ -448,6 +483,59 @@ class TestProjectService:
         assert svc.path == "lace/lace"
         assert svc.clone_url == "https://gl.example.com/lace/lace.git"
         assert svc.default_branch == "main"
+
+        forks = svc.forks
+        assert len(forks) == 1
+        assert forks[0].forge == "gl"
+        assert forks[0].native_id == "214768"
+        assert forks[0].name == "upstream"
+
+    def test_fork_based_properties(self):
+        """New fork-based config provides correct primary fork accessors."""
+        config = ProjectServiceConfig(
+            forks=[
+                ForkConfig(
+                    forge="gh", native_id="owner/upstream",
+                    name="upstream", clone_url="https://github.com/owner/upstream.git",
+                ),
+                ForkConfig(
+                    forge="gh", native_id="bot/fork",
+                    name="origin", clone_url="https://github.com/bot/fork.git",
+                ),
+            ],
+            default_branch="main",
+        )
+        svc = ProjectService(config, service_name="my-proj")
+        assert svc.forge_name == "gh"
+        assert svc.native_id == "owner/upstream"
+        assert svc.clone_url == "https://github.com/owner/upstream.git"
+        assert len(svc.forks) == 2
+
+    def test_get_fork_by_name(self):
+        config = ProjectServiceConfig(
+            forks=[
+                ForkConfig(forge="gh", native_id="a/repo", name="upstream"),
+                ForkConfig(forge="gh", native_id="b/repo", name="origin"),
+            ],
+        )
+        svc = ProjectService(config, service_name="p")
+        assert svc.get_fork("origin").native_id == "b/repo"
+        assert svc.get_fork("upstream").native_id == "a/repo"
+        assert svc.get_fork().native_id == "a/repo"
+
+    def test_get_fork_missing_raises(self):
+        config = ProjectServiceConfig(
+            forks=[ForkConfig(forge="gh", native_id="a/repo", name="upstream")],
+        )
+        svc = ProjectService(config, service_name="p")
+        with pytest.raises(KeyError, match="no-such-fork"):
+            svc.get_fork("no-such-fork")
+
+    def test_get_fork_no_forks_raises(self):
+        config = ProjectServiceConfig()
+        svc = ProjectService(config, service_name="p")
+        with pytest.raises(KeyError, match="no forks"):
+            svc.get_fork()
 
     def test_get_forge_client_resolves_via_runtime(self, tmp_path: Path):
         mock_forge_client = MagicMock()

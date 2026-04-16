@@ -260,10 +260,15 @@ def bootstrap_coordinator(
 
     project_entry: dict[str, Any] = {
         "name": project_name,
-        "forge": forge_service_name,
-        "native_id": native_project_id,
-        "clone_url": clone_url,
         "default_branch": default_branch,
+        "forks": [
+            {
+                "forge": forge_service_name,
+                "native_id": native_project_id,
+                "name": "upstream",
+                "clone_url": clone_url,
+            },
+        ],
     }
 
     _ensure_gateway_config(

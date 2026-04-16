@@ -116,20 +116,77 @@ class ForgeSpec(BaseModel):
     )
 
 
-class ProjectSpec(BaseModel):
-    """One entry in the ``"projects"`` array of ``gateway.json``."""
+class ForkSpec(BaseModel):
+    """A single fork of a project, hosted on a forge.
 
-    name: str
-    forge: str = Field(description="Name of the forge this project is hosted on")
+    Each fork identifies a forge-specific repository.  The ``name``
+    becomes the git remote name when the project is cloned locally.
+    """
+
+    forge: str = Field(description="Name of the forge hosting this fork")
     native_id: str = Field(
+        description="Forge-native identifier (owner/repo for GitHub, numeric for GitLab)",
+    )
+    name: str = Field(
         default="",
-        description="Forge-native project identifier (owner/repo for GitHub, numeric for GitLab)",
+        description="Local name for this fork / git remote name (e.g. 'upstream', 'origin')",
     )
     clone_url: str = Field(
         default="",
-        description="HTTPS clone URL for the repository",
+        description="HTTPS clone URL override (derived from forge when empty)",
     )
+
+
+class ProjectSpec(BaseModel):
+    """One entry in the ``"projects"`` array of ``gateway.json``.
+
+    A project has one or more forks.  When ``forks`` is non-empty,
+    the first fork is the canonical upstream.  When ``forks`` is
+    empty, the legacy single-fork fields (``forge``, ``native_id``,
+    ``clone_url``) are used to construct a single implicit fork.
+    """
+
+    name: str
     default_branch: str = Field(default="main")
+
+    forks: list[ForkSpec] = Field(
+        default_factory=list,
+        description="Explicit list of forks (new format)",
+    )
+
+    forge: str = Field(
+        default="",
+        description="(Legacy) Name of the forge this project is hosted on",
+    )
+    native_id: str = Field(
+        default="",
+        description="(Legacy) Forge-native identifier",
+    )
+    clone_url: str = Field(
+        default="",
+        description="(Legacy) HTTPS clone URL for the repository",
+    )
+
+    def resolved_forks(self) -> list[ForkSpec]:
+        """Return the effective fork list, synthesizing from legacy fields if needed."""
+        if self.forks:
+            return list(self.forks)
+        if self.forge and self.native_id:
+            return [ForkSpec(
+                forge=self.forge,
+                native_id=self.native_id,
+                name="upstream",
+                clone_url=self.clone_url,
+            )]
+        return []
+
+    @property
+    def primary_forge(self) -> str:
+        """Name of the forge hosting the primary (first) fork."""
+        forks = self.resolved_forks()
+        if forks:
+            return forks[0].forge
+        return self.forge
 
 
 # ---------------------------------------------------------------------------
@@ -311,15 +368,33 @@ def instantiate_new_format(config: GatewayConfig) -> list[Service]:
         services.append(svc)
 
     for proj_spec in config.projects:
-        proj_cfg = ProjectServiceConfig(
-            forge=proj_spec.forge,
-            native_id=proj_spec.native_id,
-            path=proj_spec.name,
-            clone_url=proj_spec.clone_url,
-            default_branch=proj_spec.default_branch,
-        )
+        resolved = proj_spec.resolved_forks()
+        if resolved:
+            from thorn.tools.forge import ForkConfig as _ForkConfig
+
+            fork_configs = [
+                _ForkConfig(
+                    forge=f.forge,
+                    native_id=f.native_id,
+                    name=f.name or ("upstream" if i == 0 else f"fork-{i}"),
+                    clone_url=f.clone_url,
+                )
+                for i, f in enumerate(resolved)
+            ]
+            proj_cfg = ProjectServiceConfig(
+                forks=fork_configs,
+                default_branch=proj_spec.default_branch,
+            )
+        else:
+            proj_cfg = ProjectServiceConfig(
+                forge=proj_spec.forge,
+                native_id=proj_spec.native_id,
+                path=proj_spec.name,
+                clone_url=proj_spec.clone_url,
+                default_branch=proj_spec.default_branch,
+            )
         proj_svc = ProjectService(proj_cfg, service_name=proj_spec.name)
-        log.info("Instantiated ProjectService %r (forge=%s)", proj_spec.name, proj_spec.forge)
+        log.info("Instantiated ProjectService %r (forge=%s)", proj_spec.name, proj_spec.primary_forge)
         services.append(proj_svc)
 
     return services
@@ -354,7 +429,8 @@ def infer_event_sources(
 
     project_repos_by_forge: dict[str, list[str]] = {}
     for proj in config.projects:
-        project_repos_by_forge.setdefault(proj.forge, []).append(proj.native_id)
+        for fork in proj.resolved_forks():
+            project_repos_by_forge.setdefault(fork.forge, []).append(fork.native_id)
 
     sources: list[EventSource] = []
 
@@ -583,6 +659,7 @@ def instantiate_sources(config: GatewayConfig) -> list[EventSource]:
 
 
 __all__ = [
+    "ForkSpec",
     "ForgeSpec",
     "GATEWAY_CONFIG_FILENAME",
     "GatewayConfig",

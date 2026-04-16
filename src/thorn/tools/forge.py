@@ -631,6 +631,14 @@ class ForgeHostService(Service, ABC):
         (typically a PAT token string or an installation access token).
         """
 
+    @abstractmethod
+    def clone_url_for(self, native_id: str) -> str:
+        """Derive the HTTPS clone URL for a project on this forge.
+
+        Each forge backend knows how to construct a clone URL from
+        its base URL and the forge-native project identifier.
+        """
+
 
 class GitLabForgeService(ForgeHostService):
     """Connection to a GitLab instance."""
@@ -688,6 +696,21 @@ class GitLabForgeService(ForgeHostService):
         credentials: ForgeCredentials,
     ) -> str:
         return self._extract_gitlab_token(credentials)
+
+    def clone_url_for(self, native_id: str) -> str:
+        """Derive an HTTPS clone URL from the GitLab instance URL.
+
+        For GitLab the native_id is a numeric project ID, so we
+        can't derive a path-based URL.  Instead, we use the
+        ``/api/v4/projects/:id`` style URL to construct a clone
+        target -- but that doesn't work for git.  The practical
+        approach is that callers should provide an explicit
+        ``clone_url`` for GitLab forks, or the project info can
+        be fetched from the API to get ``http_url_to_repo``.
+
+        As a fallback, returns an empty string.
+        """
+        return ""
 
 
 class GitHubForgeService(ForgeHostService):
@@ -758,44 +781,123 @@ class GitHubForgeService(ForgeHostService):
         gh_client = GitHubClient(conn)
         return gh_client.bearer_token_for_http()
 
+    def clone_url_for(self, native_id: str) -> str:
+        """Derive an HTTPS clone URL for a GitHub repository.
+
+        For GitHub, ``native_id`` is ``owner/repo``, and the clone
+        URL is ``https://<host>/<owner>/<repo>.git``.  The host is
+        derived from the API base URL.
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self._config.base_url)
+        host = parsed.hostname or "github.com"
+        if host.startswith("api."):
+            host = host[4:]
+        return f"https://{host}/{native_id}.git"
+
 
 # ---------------------------------------------------------------------------
 # ProjectService
 # ---------------------------------------------------------------------------
 
 
-class ProjectServiceConfig(BaseModel):
-    """Configuration for a project service."""
+class ForkConfig(BaseModel):
+    """A single fork of a project hosted on a forge.
 
-    forge: str = Field(
-        description="Name of the forge service this project belongs to",
-    )
+    Each fork identifies a forge-specific repository.  The ``name``
+    becomes the git remote name when the project is cloned locally
+    (conventionally ``"upstream"`` for the first fork).
+    """
+
+    forge: str = Field(description="Name of the forge service hosting this fork")
     native_id: str = Field(
         description=(
             "Forge-native project identifier "
             "(numeric string for GitLab, owner/repo for GitHub)"
         ),
     )
-    path: str = Field(
+    name: str = Field(
         default="",
-        description="Human-readable project path (e.g. 'lace/lace')",
+        description="Local remote name for this fork (e.g. 'upstream', 'origin')",
     )
     clone_url: str = Field(
         default="",
-        description="HTTPS clone URL for the repository",
+        description="HTTPS clone URL override (derived from forge when empty)",
+    )
+
+
+class ProjectServiceConfig(BaseModel):
+    """Configuration for a project service.
+
+    A project has one or more forks.  When ``forks`` is non-empty,
+    per-fork fields are used.  When ``forks`` is empty, the legacy
+    single-fork fields (``forge``, ``native_id``, ``clone_url``,
+    ``path``) are used to construct an implicit single-fork config.
+    """
+
+    forks: list[ForkConfig] = Field(
+        default_factory=list,
+        description="List of forks (new format)",
     )
     default_branch: str = Field(
         default="main",
         description="Default branch name",
     )
 
+    forge: str = Field(
+        default="",
+        description="(Legacy) Name of the forge service this project belongs to",
+    )
+    native_id: str = Field(
+        default="",
+        description="(Legacy) Forge-native project identifier",
+    )
+    path: str = Field(
+        default="",
+        description="(Legacy) Human-readable project path",
+    )
+    clone_url: str = Field(
+        default="",
+        description="(Legacy) HTTPS clone URL for the repository",
+    )
+
+    def resolved_forks(self) -> list[ForkConfig]:
+        """Return the effective fork list, synthesizing from legacy fields when needed."""
+        if self.forks:
+            return list(self.forks)
+        if self.forge and self.native_id:
+            return [ForkConfig(
+                forge=self.forge,
+                native_id=self.native_id,
+                name="upstream",
+                clone_url=self.clone_url,
+            )]
+        return []
+
+    @property
+    def primary_forge_name(self) -> str:
+        """Name of the forge hosting the primary (first) fork."""
+        forks = self.resolved_forks()
+        if forks:
+            return forks[0].forge
+        return self.forge
+
+    @property
+    def primary_native_id(self) -> str:
+        """Native identifier of the primary (first) fork."""
+        forks = self.resolved_forks()
+        if forks:
+            return forks[0].native_id
+        return self.native_id
+
 
 class ProjectService(Service):
-    """A named project within a forge.
+    """A named project within a forge (possibly with multiple forks).
 
-    Carries the project's native identifier, clone URL, and default
-    branch.  Resolves its ``ForgeClient`` by looking up its forge
-    service on the ``Runtime``.
+    Carries the project's fork list, default branch, and convenience
+    accessors for the primary fork.  Resolves its ``ForgeClient`` by
+    looking up the forge service on the ``Runtime``.
     """
 
     Config: ClassVar[type[BaseModel]] = ProjectServiceConfig
@@ -814,13 +916,19 @@ class ProjectService(Service):
         return self._service_name
 
     @property
+    def forks(self) -> list[ForkConfig]:
+        """The effective fork list for this project."""
+        return self._config.resolved_forks()
+
+    @property
     def forge_name(self) -> str:
-        """Name of the forge service this project belongs to."""
-        return self._config.forge
+        """Name of the forge hosting the primary fork."""
+        return self._config.primary_forge_name
 
     @property
     def native_id(self) -> str:
-        return self._config.native_id
+        """Native identifier of the primary fork."""
+        return self._config.primary_native_id
 
     @property
     def path(self) -> str:
@@ -828,17 +936,42 @@ class ProjectService(Service):
 
     @property
     def clone_url(self) -> str:
+        """Clone URL of the primary fork."""
+        forks = self.forks
+        if forks:
+            return forks[0].clone_url
         return self._config.clone_url
 
     @property
     def default_branch(self) -> str:
         return self._config.default_branch
 
+    def get_fork(self, fork_name: str = "") -> ForkConfig:
+        """Look up a fork by name, defaulting to the first fork.
+
+        Raises :class:`KeyError` when the named fork doesn't exist.
+        """
+        forks = self.forks
+        if not forks:
+            raise KeyError(
+                f"Project {self.name!r} has no forks configured"
+            )
+        if not fork_name:
+            return forks[0]
+        for fork in forks:
+            if fork.name == fork_name:
+                return fork
+        raise KeyError(
+            f"No fork named {fork_name!r} in project {self.name!r}. "
+            f"Available: {[f.name for f in forks]}"
+        )
+
     def get_forge_client(self, runtime: Any) -> tuple[ForgeClient, str]:
         """Resolve this project's ``ForgeClient`` via the Runtime.
 
-        Returns ``(client, native_id)`` so callers can make API calls
-        using the forge-native project identifier.
+        Returns ``(client, native_id)`` for the primary fork so
+        callers can make API calls using the forge-native project
+        identifier.
         """
         forge_service: ForgeHostService = runtime.get_service(self.forge_name)
         if not isinstance(forge_service, ForgeHostService):
@@ -1279,6 +1412,7 @@ __all__ = [
     "CommentTargetKind",
     "FORGE_TOOLS",
     "ForgeClient",
+    "ForkConfig",
     "ForgeHostService",
     "GitHubForgeService",
     "GitLabForgeService",
