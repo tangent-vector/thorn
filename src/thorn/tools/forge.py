@@ -28,10 +28,15 @@ from typing import Any, ClassVar, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
+from thorn.core._account import ForgeCredentials, GitLabCredentials
 from thorn.core._context import get_context
 from thorn.core._func import tool
 from thorn.core._service import Service
-from thorn.tools._github_connection import GitHubConnectionConfig
+from thorn.tools._github_connection import (
+    GitHubAppAuth,
+    GitHubConnectionConfig,
+    GitHubPatAuth,
+)
 
 log = logging.getLogger(__name__)
 
@@ -569,16 +574,62 @@ class GitLabForgeServiceConfig(BaseModel):
 
 
 class ForgeHostService(Service, ABC):
-    """API client plus credentials for HTTPS git against this forge host."""
+    """API client plus credentials for HTTPS git against this forge host.
+
+    Concrete subclasses implement two families of methods:
+
+    **Legacy (credentials baked into the service config):**
+    ``client`` property and ``git_https_password()`` — used by
+    existing code that reads credentials from the forge service
+    config.  These will be removed once all consumers migrate to
+    the account-based methods below.
+
+    **Account-based (credentials passed in):**
+    ``authenticated_client(credentials)`` and
+    ``git_https_password_for(credentials)`` — the target API.
+    Consumers resolve the agent's :class:`ForgeAccountConfig` for
+    this forge, then pass its credentials here.
+    """
 
     @property
     @abstractmethod
     def client(self) -> ForgeClient:
-        """Forge-neutral client for issues, MRs/PRs, etc."""
+        """Forge-neutral client for issues, MRs/PRs, etc.
+
+        .. deprecated::
+            Use :meth:`authenticated_client` with explicit credentials.
+        """
 
     @abstractmethod
     def git_https_password(self) -> str:
-        """Password (or token) for embedding in HTTPS git URLs."""
+        """Password (or token) for embedding in HTTPS git URLs.
+
+        .. deprecated::
+            Use :meth:`git_https_password_for` with explicit credentials.
+        """
+
+    @abstractmethod
+    def authenticated_client(
+        self,
+        credentials: ForgeCredentials,
+    ) -> ForgeClient:
+        """Build a forge client authenticated with the given credentials.
+
+        Unlike the ``client`` property, this does not rely on
+        credentials stored in the service config — they come from the
+        agent's :class:`ForgeAccountConfig` instead.
+        """
+
+    @abstractmethod
+    def git_https_password_for(
+        self,
+        credentials: ForgeCredentials,
+    ) -> str:
+        """Return the HTTPS password/token for git operations.
+
+        The credential material is extracted from *credentials*
+        (typically a PAT token string or an installation access token).
+        """
 
 
 class GitLabForgeService(ForgeHostService):
@@ -596,6 +647,11 @@ class GitLabForgeService(ForgeHostService):
         return self._service_name
 
     @property
+    def url(self) -> str:
+        """GitLab instance API base URL."""
+        return self._config.url
+
+    @property
     def client(self) -> ForgeClient:
         if self._client is None:
             from thorn.tools.gitlab import GitLabClient, GitLabConfig
@@ -608,6 +664,30 @@ class GitLabForgeService(ForgeHostService):
 
     def git_https_password(self) -> str:
         return self._config.token
+
+    def _extract_gitlab_token(self, credentials: ForgeCredentials) -> str:
+        if not isinstance(credentials, GitLabCredentials):
+            raise TypeError(
+                f"GitLabForgeService requires GitLabCredentials, "
+                f"got {type(credentials).__name__}"
+            )
+        return credentials.token
+
+    def authenticated_client(
+        self,
+        credentials: ForgeCredentials,
+    ) -> ForgeClient:
+        from thorn.tools.gitlab import GitLabClient, GitLabConfig
+
+        token = self._extract_gitlab_token(credentials)
+        gl_config = GitLabConfig(url=self._config.url, token=token)
+        return GitLabForgeClient(GitLabClient(gl_config))
+
+    def git_https_password_for(
+        self,
+        credentials: ForgeCredentials,
+    ) -> str:
+        return self._extract_gitlab_token(credentials)
 
 
 class GitHubForgeService(ForgeHostService):
@@ -626,6 +706,11 @@ class GitHubForgeService(ForgeHostService):
         return self._service_name
 
     @property
+    def base_url(self) -> str:
+        """GitHub REST API base URL."""
+        return self._config.base_url
+
+    @property
     def client(self) -> ForgeClient:
         if self._forge_client is None:
             from thorn.tools.github import GitHubClient
@@ -638,6 +723,40 @@ class GitHubForgeService(ForgeHostService):
         _ = self.client
         assert self._github_client is not None
         return self._github_client.bearer_token_for_http()
+
+    def _build_connection_config(
+        self,
+        credentials: ForgeCredentials,
+    ) -> GitHubConnectionConfig:
+        if not isinstance(credentials, (GitHubPatAuth, GitHubAppAuth)):
+            raise TypeError(
+                f"GitHubForgeService requires GitHubPatAuth or "
+                f"GitHubAppAuth, got {type(credentials).__name__}"
+            )
+        return GitHubConnectionConfig(
+            base_url=self._config.base_url,
+            auth=credentials,
+        )
+
+    def authenticated_client(
+        self,
+        credentials: ForgeCredentials,
+    ) -> ForgeClient:
+        from thorn.tools.github import GitHubClient
+
+        conn = self._build_connection_config(credentials)
+        gh_client = GitHubClient(conn)
+        return GitHubForgeClient(gh_client)
+
+    def git_https_password_for(
+        self,
+        credentials: ForgeCredentials,
+    ) -> str:
+        from thorn.tools.github import GitHubClient
+
+        conn = self._build_connection_config(credentials)
+        gh_client = GitHubClient(conn)
+        return gh_client.bearer_token_for_http()
 
 
 # ---------------------------------------------------------------------------
