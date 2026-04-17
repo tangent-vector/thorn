@@ -9,9 +9,9 @@ import pytest
 
 from thorn.core._discovery import (
     discover_tools,
+    find_agents_thorn_dirs,
     find_thorn_dirs,
     load_agent_memory,
-    load_module_tools,
     load_workspace_instructions,
 )
 from thorn.core._func import tool
@@ -58,7 +58,7 @@ class TestToolDecorator:
 
 
 # ---------------------------------------------------------------------------
-# find_thorn_dirs
+# find_thorn_dirs (agency state)
 # ---------------------------------------------------------------------------
 
 class TestFindThornDirs:
@@ -94,7 +94,6 @@ class TestFindThornDirs:
         deep = tmp_path / "a" / "b"
         deep.mkdir(parents=True)
         result = find_thorn_dirs(start=deep)
-        # May include ~/.thorn if it exists, but no dirs from tmp_path
         for d in result:
             assert not str(d).startswith(str(tmp_path))
 
@@ -103,6 +102,61 @@ class TestFindThornDirs:
         result = find_thorn_dirs(start=tmp_path)
         for d in result:
             assert not str(d).startswith(str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# find_agents_thorn_dirs (project tool definitions)
+# ---------------------------------------------------------------------------
+
+class TestFindAgentsThornDirs:
+    def test_finds_agents_thorn_dir(self, tmp_path: Path):
+        agents_thorn = tmp_path / ".agents" / "thorn"
+        agents_thorn.mkdir(parents=True)
+        (agents_thorn / "tools.py").write_text("x = 1\n")
+
+        result = find_agents_thorn_dirs(start=tmp_path)
+        assert agents_thorn in result
+
+    def test_ignores_empty_thorn_dir(self, tmp_path: Path):
+        agents_thorn = tmp_path / ".agents" / "thorn"
+        agents_thorn.mkdir(parents=True)
+
+        result = find_agents_thorn_dirs(start=tmp_path)
+        assert agents_thorn not in result
+
+    def test_finds_in_ancestor(self, tmp_path: Path):
+        agents_thorn = tmp_path / ".agents" / "thorn"
+        agents_thorn.mkdir(parents=True)
+        (agents_thorn / "tools.py").write_text("x = 1\n")
+        child = tmp_path / "a" / "b" / "c"
+        child.mkdir(parents=True)
+
+        result = find_agents_thorn_dirs(start=child)
+        assert agents_thorn in result
+
+    def test_deepest_first_ordering(self, tmp_path: Path):
+        parent_agents = tmp_path / ".agents" / "thorn"
+        parent_agents.mkdir(parents=True)
+        (parent_agents / "a.py").write_text("x = 1\n")
+
+        child = tmp_path / "project"
+        child.mkdir()
+        child_agents = child / ".agents" / "thorn"
+        child_agents.mkdir(parents=True)
+        (child_agents / "b.py").write_text("x = 2\n")
+
+        result = find_agents_thorn_dirs(start=child)
+        parent_idx = result.index(parent_agents)
+        child_idx = result.index(child_agents)
+        assert child_idx < parent_idx
+
+    def test_ignores_non_directory(self, tmp_path: Path):
+        agents_dir = tmp_path / ".agents"
+        agents_dir.mkdir()
+        (agents_dir / "thorn").write_text("not a directory")
+
+        result = find_agents_thorn_dirs(start=tmp_path)
+        assert len(result) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -152,92 +206,14 @@ class TestLoadAgentMemory:
 
 
 # ---------------------------------------------------------------------------
-# load_module_tools
-# ---------------------------------------------------------------------------
-
-class TestLoadModuleTools:
-    def test_loads_tool_decorated_function(self, tmp_path: Path):
-        py = tmp_path / "my_tools.py"
-        py.write_text(textwrap.dedent("""\
-            from thorn import tool
-
-            @tool
-            def greet(name: str) -> str:
-                \"\"\"Say hi.\"\"\"
-                return f"hello {name}"
-        """))
-        result = load_module_tools(py)
-        assert len(result) == 1
-        assert result[0].__name__ == "greet"
-        assert result[0]("world") == "hello world"
-
-    def test_loads_skill_decorated_function(self, tmp_path: Path):
-        py = tmp_path / "my_skills.py"
-        py.write_text(textwrap.dedent("""\
-            from thorn import skill
-
-            @skill
-            async def summarize(text: str) -> str:
-                \"\"\"Summarize: {text}\"\"\"
-        """))
-        result = load_module_tools(py)
-        assert len(result) == 1
-        assert result[0].__name__ == "summarize"
-        assert getattr(result[0], "_thorn_skill", False) is True
-
-    def test_ignores_undecorated_functions(self, tmp_path: Path):
-        py = tmp_path / "mixed.py"
-        py.write_text(textwrap.dedent("""\
-            from thorn import tool
-
-            def helper():
-                return 42
-
-            @tool
-            def exposed(x: int) -> int:
-                \"\"\"Do something.\"\"\"
-                return helper() + x
-        """))
-        result = load_module_tools(py)
-        assert len(result) == 1
-        assert result[0].__name__ == "exposed"
-
-    def test_ignores_private_functions(self, tmp_path: Path):
-        py = tmp_path / "private.py"
-        py.write_text(textwrap.dedent("""\
-            from thorn import tool
-
-            @tool
-            def _internal(x: int) -> int:
-                \"\"\"Internal.\"\"\"
-                return x
-        """))
-        result = load_module_tools(py)
-        assert len(result) == 0
-
-    def test_syntax_error_returns_empty(self, tmp_path: Path):
-        py = tmp_path / "broken.py"
-        py.write_text("def oops(\n")
-        result = load_module_tools(py)
-        assert result == []
-
-    def test_import_error_returns_empty(self, tmp_path: Path):
-        py = tmp_path / "bad_import.py"
-        py.write_text("import nonexistent_module_xyzzy_12345\n")
-        result = load_module_tools(py)
-        assert result == []
-
-
-# ---------------------------------------------------------------------------
-# discover_tools (integration)
+# discover_tools (integration, from .agents/thorn/)
 # ---------------------------------------------------------------------------
 
 class TestDiscoverTools:
-    def test_discovers_from_thorn_dir(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
-        py = thorn_dir / "tools.py"
-        py.write_text(textwrap.dedent("""\
+    def test_discovers_from_agents_thorn_dir(self, tmp_path: Path):
+        tool_dir = tmp_path / ".agents" / "thorn"
+        tool_dir.mkdir(parents=True)
+        (tool_dir / "tools.py").write_text(textwrap.dedent("""\
             from thorn import tool
 
             @tool
@@ -251,14 +227,14 @@ class TestDiscoverTools:
         assert "ping" in names
 
     def test_deduplicates_by_name(self, tmp_path: Path):
-        parent_thorn = tmp_path / ".thorn"
-        parent_thorn.mkdir()
+        parent_tools = tmp_path / ".agents" / "thorn"
+        parent_tools.mkdir(parents=True)
         child = tmp_path / "sub"
         child.mkdir()
-        child_thorn = child / ".thorn"
-        child_thorn.mkdir()
+        child_tools = child / ".agents" / "thorn"
+        child_tools.mkdir(parents=True)
 
-        for d in [parent_thorn, child_thorn]:
+        for d in [parent_tools, child_tools]:
             (d / "tools.py").write_text(textwrap.dedent("""\
                 from thorn import tool
 
@@ -273,10 +249,10 @@ class TestDiscoverTools:
         assert len(ping_fns) == 1
 
     def test_multiple_files(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
+        tool_dir = tmp_path / ".agents" / "thorn"
+        tool_dir.mkdir(parents=True)
 
-        (thorn_dir / "a.py").write_text(textwrap.dedent("""\
+        (tool_dir / "a.py").write_text(textwrap.dedent("""\
             from thorn import tool
 
             @tool
@@ -284,7 +260,7 @@ class TestDiscoverTools:
                 \"\"\"Alpha.\"\"\"
                 return "a"
         """))
-        (thorn_dir / "b.py").write_text(textwrap.dedent("""\
+        (tool_dir / "b.py").write_text(textwrap.dedent("""\
             from thorn import tool
 
             @tool
@@ -299,10 +275,10 @@ class TestDiscoverTools:
         assert "beta" in names
 
     def test_skips_broken_files_gracefully(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
+        tool_dir = tmp_path / ".agents" / "thorn"
+        tool_dir.mkdir(parents=True)
 
-        (thorn_dir / "good.py").write_text(textwrap.dedent("""\
+        (tool_dir / "good.py").write_text(textwrap.dedent("""\
             from thorn import tool
 
             @tool
@@ -310,26 +286,25 @@ class TestDiscoverTools:
                 \"\"\"Works.\"\"\"
                 return "yes"
         """))
-        (thorn_dir / "broken.py").write_text("this is not valid python {{{{")
+        (tool_dir / "broken.py").write_text("this is not valid python {{{{")
 
         result = discover_tools(start=tmp_path)
         names = [fn.__name__ for fn in result]
         assert "works" in names
 
-    def test_empty_thorn_dir(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
+    def test_empty_agents_thorn_dir_yields_nothing(self, tmp_path: Path):
+        tool_dir = tmp_path / ".agents" / "thorn"
+        tool_dir.mkdir(parents=True)
         result = discover_tools(start=tmp_path)
-        # Only things from ~/.thorn might show up, nothing from tmp_path
         for fn in result:
             source = getattr(fn, "__module__", "")
             assert "thorn_user" not in source or tmp_path.name not in source
 
     def test_sibling_relative_imports(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
+        tool_dir = tmp_path / ".agents" / "thorn"
+        tool_dir.mkdir(parents=True)
 
-        (thorn_dir / "helpers.py").write_text(textwrap.dedent("""\
+        (tool_dir / "helpers.py").write_text(textwrap.dedent("""\
             from thorn import tool
 
             @tool
@@ -337,7 +312,7 @@ class TestDiscoverTools:
                 \"\"\"Add two numbers.\"\"\"
                 return a + b
         """))
-        (thorn_dir / "main_tools.py").write_text(textwrap.dedent("""\
+        (tool_dir / "main_tools.py").write_text(textwrap.dedent("""\
             from thorn import tool
             from .helpers import helper_add
 
@@ -353,51 +328,19 @@ class TestDiscoverTools:
         assert "add_and_double" in by_name
         assert by_name["add_and_double"](3, 4) == 14
 
-
-# ---------------------------------------------------------------------------
-# thorn init (CLI command)
-# ---------------------------------------------------------------------------
-
-from click.testing import CliRunner
-from thorn._cli import main as cli_main
-
-
-class TestThornInit:
-    def test_creates_files_in_cwd(self, tmp_path: Path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        runner = CliRunner()
-        result = runner.invoke(cli_main, ["init"], catch_exceptions=False)
-        assert result.exit_code == 0
-
+    def test_does_not_discover_from_dot_thorn(self, tmp_path: Path):
+        """Tool discovery no longer scans .thorn/ directories."""
         thorn_dir = tmp_path / ".thorn"
-        assert thorn_dir.is_dir()
-        tools_py = thorn_dir / "tools.py"
-        assert tools_py.is_file()
-        content = tools_py.read_text(encoding="utf-8")
-        assert "from thorn import tool" in content
+        thorn_dir.mkdir()
+        (thorn_dir / "tools.py").write_text(textwrap.dedent("""\
+            from thorn import tool
 
-    def test_refuses_if_already_exists(self, tmp_path: Path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / ".thorn").mkdir()
-        runner = CliRunner()
-        result = runner.invoke(cli_main, ["init"], catch_exceptions=False)
-        assert result.exit_code != 0
+            @tool
+            def old_tool() -> str:
+                \"\"\"Should not be found.\"\"\"
+                return "nope"
+        """))
 
-    def test_with_mcp_creates_mcp_json(self, tmp_path: Path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        runner = CliRunner()
-        result = runner.invoke(cli_main, ["init", "--with-mcp"], catch_exceptions=False)
-        assert result.exit_code == 0
-
-        mcp_json = tmp_path / ".thorn" / "mcp.json"
-        assert mcp_json.is_file()
-        import json
-        data = json.loads(mcp_json.read_text(encoding="utf-8"))
-        assert "mcpServers" in data
-
-    def test_without_mcp_no_mcp_json(self, tmp_path: Path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        runner = CliRunner()
-        result = runner.invoke(cli_main, ["init"], catch_exceptions=False)
-        assert result.exit_code == 0
-        assert not (tmp_path / ".thorn" / "mcp.json").exists()
+        result = discover_tools(start=tmp_path)
+        names = [fn.__name__ for fn in result]
+        assert "old_tool" not in names

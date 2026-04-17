@@ -1,14 +1,15 @@
-""".thorn/ directory discovery.
+"""Workspace discovery: agent instructions, memory, and tool loading.
 
-Walks from CWD up to the filesystem root (and checks the user home
-directory) looking for ``.thorn/`` directories.  Python files inside
-those directories are imported, and any functions decorated with
-``@tool`` or ``@skill`` are collected for use as agent tools.
+Locates ``.thorn/`` directories (used for agency state such as agent
+identities, session history, and journals) and ``.agents/thorn/``
+directories (used for project-level Python tool definitions).
 
-Each ``.thorn/`` directory is registered as a synthetic Python package
-so that files within it can use relative imports to reference siblings::
+Python files in an ``.agents/thorn/`` directory are imported, and any
+functions decorated with ``@tool`` or ``@skill`` are collected for use
+as agent tools.  Each such directory is registered as a synthetic Python
+package so that files within it can use relative imports::
 
-    # In .thorn/dev_tools.py
+    # In .agents/thorn/dev_tools.py
     from .build_tools import build, run_calc
 """
 
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# .thorn/ directory location
+# .thorn/ directory location (agency state)
 # ---------------------------------------------------------------------------
 
 def find_thorn_dirs(start: Path | None = None) -> list[Path]:
@@ -35,6 +36,9 @@ def find_thorn_dirs(start: Path | None = None) -> list[Path]:
     Returns directories ordered deepest-first (most specific first).
     The user home directory (``~/.thorn``) is appended last, if it
     exists and wasn't already found during the walk.
+
+    These directories are used for **agency state** (agent identities,
+    session history, journals, memory) -- not for tool definitions.
     """
     if start is None:
         start = Path.cwd()
@@ -60,6 +64,46 @@ def find_thorn_dirs(start: Path | None = None) -> list[Path]:
 
     return found
 
+
+# ---------------------------------------------------------------------------
+# .agents/thorn/ directory location (project-level tool definitions)
+# ---------------------------------------------------------------------------
+
+def find_agents_thorn_dirs(start: Path | None = None) -> list[Path]:
+    """Locate ``.agents/thorn/`` directories by walking up from *start*.
+
+    Returns directories ordered deepest-first (most specific first).
+    Only directories that actually contain at least one ``.py`` file
+    are returned.  A bare ``.agents/thorn.py`` file (without a sibling
+    directory) is treated as if it were a single-file directory.
+    """
+    if start is None:
+        start = Path.cwd()
+    start = start.resolve()
+
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    current = start
+    while True:
+        agents_dir = current / ".agents"
+        if agents_dir.is_dir():
+            thorn_pkg = agents_dir / "thorn"
+            if thorn_pkg.is_dir() and thorn_pkg.resolve() not in seen:
+                if any(thorn_pkg.glob("*.py")):
+                    found.append(thorn_pkg)
+                    seen.add(thorn_pkg.resolve())
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Workspace instructions and agent memory
+# ---------------------------------------------------------------------------
 
 def load_workspace_instructions(workspace_root: Path) -> str | None:
     """Read ``AGENTS.md`` from *workspace_root*, if it exists.
@@ -99,42 +143,42 @@ def load_agent_memory(workspace: Path) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Synthetic package management for .thorn/ directories
+# Synthetic package management for tool directories
 # ---------------------------------------------------------------------------
 
-def _package_name_for_dir(thorn_dir: Path) -> str:
-    """Generate a stable synthetic package name for a ``.thorn/`` directory."""
-    dir_hash = hashlib.sha256(str(thorn_dir.resolve()).encode()).hexdigest()[:12]
+def _package_name_for_dir(tool_dir: Path) -> str:
+    """Generate a stable synthetic package name for a tool directory."""
+    dir_hash = hashlib.sha256(str(tool_dir.resolve()).encode()).hexdigest()[:12]
     return f"_thorn_user_.d{dir_hash}"
 
 
-def _ensure_package(thorn_dir: Path) -> str:
-    """Register *thorn_dir* as a synthetic Python package in ``sys.modules``.
+def _ensure_package(tool_dir: Path) -> str:
+    """Register *tool_dir* as a synthetic Python package in ``sys.modules``.
 
     Returns the package name.  Repeated calls for the same directory
     are idempotent.  The package's ``__path__`` is set so that Python's
     standard ``PathFinder`` can resolve relative imports between sibling
     ``.py`` files in the directory.
     """
-    thorn_dir = thorn_dir.resolve()
-    pkg_name = _package_name_for_dir(thorn_dir)
+    tool_dir = tool_dir.resolve()
+    pkg_name = _package_name_for_dir(tool_dir)
     if pkg_name not in sys.modules:
         pkg = types.ModuleType(pkg_name)
-        pkg.__path__ = [str(thorn_dir)]
+        pkg.__path__ = [str(tool_dir)]
         pkg.__package__ = pkg_name
         sys.modules[pkg_name] = pkg
     return pkg_name
 
 
-def _load_thorn_module(thorn_dir: Path, py_file: Path) -> types.ModuleType | None:
-    """Load a ``.py`` file as a submodule of the synthetic package for *thorn_dir*.
+def _load_module(tool_dir: Path, py_file: Path) -> types.ModuleType | None:
+    """Load a ``.py`` file as a submodule of the synthetic package for *tool_dir*.
 
     The module is kept in ``sys.modules`` so that sibling files can
     import it via relative imports (``from .sibling import thing``).
 
     Returns the loaded module, or ``None`` on failure.
     """
-    pkg_name = _ensure_package(thorn_dir)
+    pkg_name = _ensure_package(tool_dir)
     module_name = f"{pkg_name}.{py_file.stem}"
 
     if module_name in sys.modules:
@@ -175,37 +219,24 @@ def _scan_tools(module: types.ModuleType) -> list[Callable[..., Any]]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def load_module_tools(path: Path) -> list[Callable[..., Any]]:
-    """Import a ``.py`` file and return functions marked with ``@tool`` or ``@skill``.
-
-    The file is loaded as a submodule of a synthetic package for its
-    parent directory, enabling relative imports between sibling files.
-
-    Import errors (syntax errors, missing dependencies, etc.) are logged
-    as warnings rather than propagated — a broken file in ``.thorn/``
-    should not prevent the rest of discovery from working.
-    """
-    module = _load_thorn_module(path.parent, path)
-    if module is None:
-        return []
-    return _scan_tools(module)
-
-
 def discover_tools(start: Path | None = None) -> list[Callable[..., Any]]:
-    """Find all ``@tool`` and ``@skill`` functions in ``.thorn/`` directories.
+    """Find all ``@tool`` and ``@skill`` functions in ``.agents/thorn/`` directories.
 
-    Each ``.thorn/`` directory is registered as a synthetic package and
-    all ``.py`` files within it are loaded before scanning for tools.
-    This ensures sibling imports resolve correctly even when loading
-    order would otherwise matter.
+    Each ``.agents/thorn/`` directory is registered as a synthetic
+    package and all ``.py`` files within it are loaded before scanning
+    for tools.  This ensures sibling imports resolve correctly even when
+    loading order would otherwise matter.
+
+    Tools are deduplicated by function name (first occurrence wins,
+    deepest directory first).
     """
     result: list[Callable[..., Any]] = []
     seen_names: set[str] = set()
 
-    for thorn_dir in find_thorn_dirs(start):
+    for tool_dir in find_agents_thorn_dirs(start):
         modules: list[types.ModuleType] = []
-        for py_file in sorted(thorn_dir.glob("*.py")):
-            module = _load_thorn_module(thorn_dir, py_file)
+        for py_file in sorted(tool_dir.glob("*.py")):
+            module = _load_module(tool_dir, py_file)
             if module is not None:
                 modules.append(module)
 

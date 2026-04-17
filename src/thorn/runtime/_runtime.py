@@ -37,6 +37,7 @@ from thorn.core._context import (
 from thorn.core._provider import LLMProvider
 from thorn.core._session import Session
 from thorn.core._service import Service
+from thorn.runtime._paths import AgencyPaths
 from thorn.runtime._session import AgentID, SessionKey
 from thorn.runtime._store import SessionStore
 
@@ -76,6 +77,7 @@ class Runtime:
         session_store: SessionStore | None = None,
         validation_tracker: ValidationTracker | None = None,
         status_providers: list[StatusProvider] | None = None,
+        paths: AgencyPaths | None = None,
     ) -> None:
         self.provider = provider
         self.event_sink: EventSink = event_sink or NullEventSink()
@@ -88,9 +90,15 @@ class Runtime:
         if validation_tracker is not None:
             self.status_providers.append(validation_tracker)
 
+        if paths is None:
+            paths = AgencyPaths(
+                home_root=workspace_root / ".thorn",
+                workspace_root=workspace_root,
+            )
+        self.paths = paths
+
         if session_store is None:
-            agents_root = workspace_root / ".thorn" / "agents"
-            session_store = SessionStore(agents_root)
+            session_store = SessionStore(paths.agents_root)
         self.sessions = session_store
 
         self._services: dict[str, Service] = {}
@@ -216,15 +224,15 @@ class Runtime:
 
         When *id* is ``None``, a UUID-based ID is generated.
         When *name* is ``None``, the ID is used as the display name.
-        When *workspace* is ``None``, a directory under the runtime's
-        agents root is used (same as ``home``).
+        When *workspace* is ``None``, the agent's home directory (derived
+        from ``AgencyPaths``) is used.
         """
         if id is None:
             id = AgentID(str(uuid.uuid4()))
         elif not isinstance(id, AgentID):
             id = AgentID(id)
 
-        home = self.sessions.root / str(id)
+        home = self.paths.agent_home(id)
         if workspace is None:
             workspace = home
 

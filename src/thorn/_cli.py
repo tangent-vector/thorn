@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 from contextlib import AsyncExitStack
@@ -19,16 +20,46 @@ from thorn.core._context import (
     ExecutionContext,
     Verbosity,
 )
-from thorn.core._agent import Agent
-from thorn.core._discovery import discover_tools, find_thorn_dirs
+from thorn.core._discovery import discover_tools
 from thorn.core._func import _prepare_tools, prompt
 from thorn.core._loop import run_agent_loop, _WrappedTool
 from thorn.core._provider import load_provider_from_env
-from thorn.core._tools import ALL_BUILTIN_TOOLS
+from thorn.core._tools import ALL_BUILTIN_TOOLS, FILE_WRITING, run_shell
+from thorn.tools.git import GIT_TOOLS
+
+CLI_DEFAULT_TOOLS: list[object] = [
+    FILE_WRITING,
+    run_shell,
+    GIT_TOOLS,
+]
+"""Default tool set for ``thorn run`` / ``thorn chat`` CLI commands.
+
+Includes file operations (read + write), shell access, and git tools.
+The ``ask_user`` tool is added separately depending on interactivity.
+"""
 from thorn.core.errors import SkillError, ThornError
-from thorn.runtime import Runtime
+from thorn.runtime import AgentID, Runtime, SessionKey
 
 console = Console()
+
+CLI_AGENT_ID = AgentID("local")
+"""Well-known agent ID for the CLI local coding agent."""
+
+CLI_SESSION_KEY = SessionKey("default")
+"""Default session key for CLI mode (single-session per workspace)."""
+
+
+def _ensure_cli_agent(runtime: Runtime) -> "Agent":
+    """Get or create the CLI local agent, persisting identity to disk.
+
+    Returns the agent instance.  On first use, creates the agent
+    directory and identity file under ``.thorn/``.
+    """
+    from thorn.core._agent import Agent
+
+    agent = runtime.get_or_create_agent(CLI_AGENT_ID, name="local")
+    runtime.save_agent(agent)
+    return agent
 
 
 async def _rich_ask_user(question: str) -> str:
@@ -65,6 +96,7 @@ def _build_runtime(
     workspace: str | None = None,
     *,
     interactive: bool = True,
+    paths: "AgencyPaths | None" = None,
 ) -> Runtime:
     """Create a ``Runtime`` from environment variables.
 
@@ -74,12 +106,16 @@ def _build_runtime(
 
     *workspace* overrides the workspace root.  When ``None``, the
     heuristic in :func:`thorn.infer_workspace_root` is used.
+
+    *paths*, when provided, sets the agency directory layout explicitly.
+    When ``None``, CLI-mode paths are derived from the workspace root.
     """
     from pathlib import Path
 
     from thorn import infer_workspace_root
     from thorn.core._discovery import load_workspace_instructions
     from thorn.core._file_access import load_global_ignores
+    from thorn.runtime._paths import AgencyPaths
 
     provider = load_provider_from_env()
     console_sink: EventSink = ConsoleEventSink(verbosity=verbosity)
@@ -94,6 +130,9 @@ def _build_runtime(
 
     ws_root = Path(workspace).resolve() if workspace else infer_workspace_root()
 
+    if paths is None:
+        paths = AgencyPaths.for_cli(ws_root)
+
     return Runtime(
         provider=provider,
         event_sink=sink,
@@ -101,6 +140,7 @@ def _build_runtime(
         workspace_instructions=load_workspace_instructions(ws_root),
         global_ignores=load_global_ignores(ws_root),
         ask_user_handler=_rich_ask_user if interactive else None,
+        paths=paths,
     )
 
 
@@ -110,18 +150,25 @@ async def _collect_all_tools(
     no_tools: bool,
     no_discover: bool,
     no_mcp: bool,
+    interactive: bool = True,
 ) -> list[_WrappedTool]:
     """Assemble tools from all sources: builtins, discovery, and MCP servers.
+
+    Tool discovery scans ``.agents/thorn/`` directories for ``@tool`` /
+    ``@skill`` Python functions.  MCP configs are loaded from
+    ``.agents/mcp.json`` (future) or ``.thorn/mcp.json`` (legacy).
 
     MCP sessions are registered on *exit_stack* so they stay alive for
     the duration of the caller's async block.
     """
+    from thorn.core._tools import ask_user
+
     raw: list[Any] = []
 
     if not no_tools:
-        raw.extend(ALL_BUILTIN_TOOLS)
-
-    thorn_dirs = find_thorn_dirs() if (not no_discover or not no_mcp) else []
+        raw.extend(CLI_DEFAULT_TOOLS)
+        if interactive:
+            raw.append(ask_user)
 
     if not no_discover:
         discovered = discover_tools()
@@ -137,9 +184,18 @@ async def _collect_all_tools(
 
     if not no_mcp:
         try:
-            from thorn.core._mcp import MCPToolSource, load_mcp_configs
+            from thorn.core._mcp import MCPToolSource
+            from thorn.core._workspace_config import load_workspace_config
 
-            configs = load_mcp_configs(thorn_dirs)
+            ws_config = load_workspace_config(Path.cwd())
+            configs = list(ws_config.mcp_configs)
+
+            if not configs:
+                from thorn.core._discovery import find_thorn_dirs
+                from thorn.core._mcp import load_mcp_configs
+
+                configs = load_mcp_configs(find_thorn_dirs())
+
             if configs:
                 mcp_source: MCPToolSource = await exit_stack.enter_async_context(
                     MCPToolSource(configs)
@@ -161,18 +217,6 @@ async def _collect_all_tools(
     return tools
 
 
-def _collect_concierge_prompts() -> list[str]:
-    """Return system prompts from any registered ``Concierge`` Agent subclass.
-
-    Called after tool discovery so that ``.thorn/`` modules have had a
-    chance to define and register their ``Concierge`` class.
-    """
-    concierge_cls = Agent._registry.get("Concierge")
-    if concierge_cls is None:
-        return []
-    return concierge_cls._collect_system_prompts()
-
-
 # ---------------------------------------------------------------------------
 # CLI group
 # ---------------------------------------------------------------------------
@@ -185,64 +229,6 @@ def main() -> None:
         load_dotenv(find_dotenv(usecwd=True))
     except ImportError:
         pass
-
-
-# ---------------------------------------------------------------------------
-# thorn init
-# ---------------------------------------------------------------------------
-
-_STARTER_TOOLS = '''\
-"""Project-specific tools for thorn.
-
-Functions decorated with @tool or @skill are automatically discovered
-by `thorn run`, `thorn chat`, and `thorn serve`.
-"""
-
-from thorn import tool
-
-# @tool
-# async def build_project() -> str:
-#     """Build the project and return a summary of the results."""
-#     ...
-'''
-
-_STARTER_MCP_JSON = '{\n    "mcpServers": {}\n}\n'
-
-
-@main.command()
-@click.option(
-    "--with-mcp",
-    is_flag=True,
-    default=False,
-    help="Also create a stub mcp.json for MCP server configuration.",
-)
-def init(with_mcp: bool) -> None:
-    """Create a .thorn/ directory with starter files in the current directory."""
-    from pathlib import Path
-
-    thorn_dir = Path.cwd() / ".thorn"
-
-    if thorn_dir.exists():
-        console.print(
-            f"[yellow].thorn/ already exists at {thorn_dir}[/yellow]"
-        )
-        sys.exit(1)
-
-    thorn_dir.mkdir()
-
-    tools_path = thorn_dir / "tools.py"
-    tools_path.write_text(_STARTER_TOOLS, encoding="utf-8")
-    console.print(f"  Created {tools_path}")
-
-    if with_mcp:
-        mcp_path = thorn_dir / "mcp.json"
-        mcp_path.write_text(_STARTER_MCP_JSON, encoding="utf-8")
-        console.print(f"  Created {mcp_path}")
-
-    console.print(
-        "\n[green]Initialized .thorn/ directory.[/green] "
-        "Edit tools.py to define your project's tools."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +277,7 @@ def _write_result_file(
     "--no-discover",
     is_flag=True,
     default=False,
-    help="Skip .thorn/ directory discovery.",
+    help="Skip .agents/thorn/ tool discovery.",
 )
 @click.option(
     "--no-mcp",
@@ -324,6 +310,7 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
     async def _run() -> str:
         async with runtime:
             ctx_holder.append(runtime.context)
+            _ensure_cli_agent(runtime)
             async with AsyncExitStack() as stack:
                 tools = await _collect_all_tools(
                     stack,
@@ -336,7 +323,6 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
                     "Complete the task and report results concisely. "
                     "Do not offer follow-up actions or ask questions.",
                 ]
-                sys_prompts.extend(_collect_concierge_prompts())
                 return await run_agent_loop(
                     context=runtime.context,
                     user_prompt=prompt_text,
@@ -393,7 +379,7 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
     "--no-discover",
     is_flag=True,
     default=False,
-    help="Skip .thorn/ directory discovery.",
+    help="Skip .agents/thorn/ tool discovery.",
 )
 @click.option(
     "--no-mcp",
@@ -416,82 +402,123 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
             trace_file.close()
         sys.exit(1)
 
-    messages: list = []
-
     console.print("[bold]thorn[/bold] interactive chat  (Ctrl+C to exit)\n")
 
     async def _chat() -> None:
+        from thorn.core._history import TurnNode, ToolCallNode, UserPromptNode
         from thorn.core._messages import UserMessage, AssistantMessage, ToolResultMessage
-        from thorn.core._loop import _request_completion, _execute_tool_calls, _RESULT_SENTINEL
+        from thorn.core._loop import _execute_tool_calls
         from thorn.core._provider import TextChunk, ToolCallChunk, FinishChunk
+        from thorn.runtime._lock import SessionLockError, session_lock
 
         async with runtime:
-            ctx = runtime.context
-            ctx.system_prompts.append(
-                "You are in an interactive chat session with a human user. "
-                "You may ask clarifying questions and suggest next steps."
-            )
-            async with AsyncExitStack() as stack:
-                tools = await _collect_all_tools(
-                    stack,
-                    no_tools=no_tools,
-                    no_discover=no_discover,
-                    no_mcp=no_mcp,
+            agent = _ensure_cli_agent(runtime)
+
+            session_key = CLI_SESSION_KEY
+            session_dir = runtime.sessions._session_dir(agent.id, session_key)
+
+            try:
+                lock_ctx = session_lock(session_dir)
+                lock_ctx.__enter__()
+            except SessionLockError:
+                console.print(
+                    "[yellow]Session is in use by another process; "
+                    "starting a fresh session.[/yellow]\n"
                 )
-                ctx.system_prompts.extend(_collect_concierge_prompts())
-                tool_schemas = [t.schema for t in tools]
-                tool_dispatch = {
-                    t.schema.get("function", {}).get("name", ""): t
-                    for t in tools
-                }
+                session_key = SessionKey(f"default-{os.getpid()}")
+                session_dir = runtime.sessions._session_dir(agent.id, session_key)
+                lock_ctx = session_lock(session_dir)
+                lock_ctx.__enter__()
 
-                while True:
-                    try:
-                        user_input = console.input("[green]you>[/green] ")
-                    except EOFError:
-                        break
-                    if not user_input.strip():
-                        continue
+            try:
+                session = runtime.get_or_create_session(
+                    agent, session_key,
+                    workspace_root=runtime.workspace_root,
+                )
+                history = session._history
 
-                    messages.append(UserMessage(content=user_input))
+                if history.nodes:
+                    console.print(
+                        f"[dim]Resuming session with {len(history.nodes)} history entries.[/dim]\n"
+                    )
 
-                    for _ in range(50):
-                        text_parts: list[str] = []
-                        tool_call_chunks: list = []
-                        finish_reason = "stop"
+                ctx = runtime.context
+                ctx.system_prompts.append(
+                    "You are in an interactive chat session with a human user. "
+                    "You may ask clarifying questions and suggest next steps."
+                )
+                async with AsyncExitStack() as stack:
+                    tools = await _collect_all_tools(
+                        stack,
+                        no_tools=no_tools,
+                        no_discover=no_discover,
+                        no_mcp=no_mcp,
+                    )
+                    tool_schemas = [t.schema for t in tools]
+                    tool_dispatch = {
+                        t.schema.get("function", {}).get("name", ""): t
+                        for t in tools
+                    }
 
-                        response = ctx.provider.complete(
-                            ctx.system_prompts, tool_schemas, messages,
-                        )
-                        async for chunk in response:
-                            await ctx.event_sink.on_response_chunk(chunk, scope=ctx.scope)
-                            match chunk:
-                                case TextChunk():
-                                    text_parts.append(chunk.text)
-                                case ToolCallChunk():
-                                    tool_call_chunks.append(chunk)
-                                case FinishChunk():
-                                    finish_reason = chunk.reason
-
-                        text = "".join(text_parts)
-                        tool_calls = [tc.to_tool_call() for tc in tool_call_chunks]
-
-                        assistant_msg = AssistantMessage(content=text, tool_calls=tool_calls)
-                        messages.append(assistant_msg)
-
-                        if not tool_calls:
+                    while True:
+                        try:
+                            user_input = console.input("[green]you>[/green] ")
+                        except EOFError:
                             break
+                        if not user_input.strip():
+                            continue
 
-                        result_msgs, _ = await _execute_tool_calls(
-                            tool_calls=tool_calls,
-                            tool_dispatch=tool_dispatch,
-                            context=ctx,
-                            result_type=None,
-                        )
-                        for rm in result_msgs:
-                            messages.append(rm)
+                        user_msg = UserMessage(content=user_input)
+                        history.append(UserPromptNode(user_msg))
+                        messages = history.render()
 
-                    console.print()
+                        for _ in range(50):
+                            text_parts: list[str] = []
+                            tool_call_chunks: list = []
+                            finish_reason = "stop"
+
+                            response = ctx.provider.complete(
+                                ctx.system_prompts, tool_schemas, messages,
+                            )
+                            async for chunk in response:
+                                await ctx.event_sink.on_response_chunk(chunk, scope=ctx.scope)
+                                match chunk:
+                                    case TextChunk():
+                                        text_parts.append(chunk.text)
+                                    case ToolCallChunk():
+                                        tool_call_chunks.append(chunk)
+                                    case FinishChunk():
+                                        finish_reason = chunk.reason
+
+                            text = "".join(text_parts)
+                            tool_calls = [tc.to_tool_call() for tc in tool_call_chunks]
+
+                            tc_nodes: list[ToolCallNode] = []
+                            if tool_calls:
+                                result_msgs, _ = await _execute_tool_calls(
+                                    tool_calls=tool_calls,
+                                    tool_dispatch=tool_dispatch,
+                                    context=ctx,
+                                    result_type=None,
+                                )
+                                for tc, rm in zip(tool_calls, result_msgs):
+                                    tc_nodes.append(ToolCallNode(tool_call=tc, result=rm))
+
+                            turn = TurnNode(
+                                assistant_content=text,
+                                tool_call_nodes=tc_nodes,
+                            )
+                            history.append(turn)
+
+                            if not tool_calls:
+                                break
+
+                            messages = history.render()
+
+                        runtime.save_session(session)
+                        console.print()
+            finally:
+                lock_ctx.__exit__(None, None, None)
 
     try:
         asyncio.run(_chat())
@@ -574,6 +601,8 @@ def _serve_gateway(
         handlers=[RichHandler(rich_tracebacks=True)],
     )
 
+    from thorn.runtime._paths import AgencyPaths
+
     ws_root = Path(workspace_path).resolve() if workspace_path else infer_workspace_root()
     thorn_dir = ws_root / ".thorn"
 
@@ -589,11 +618,16 @@ def _serve_gateway(
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
 
+    paths = AgencyPaths.for_gateway(
+        agency_dir=thorn_dir,
+        workspace_dir=ws_root,
+    )
+
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
         runtime = _build_runtime(
             verbosity, trace_file=trace_file, workspace=workspace_path,
-            interactive=False,
+            interactive=False, paths=paths,
         )
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -748,7 +782,7 @@ def serve_bootstrap(
     "--no-discover",
     is_flag=True,
     default=False,
-    help="Skip .thorn/ directory discovery.",
+    help="Skip .agents/thorn/ tool discovery.",
 )
 @click.option("--name", default="thorn", help="Server name reported to MCP clients.")
 def serve_mcp(

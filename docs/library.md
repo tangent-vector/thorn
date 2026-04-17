@@ -171,18 +171,16 @@ Do the following development task:
 The CLI
 -------
 
-The `thorn` command-line tool can also be used to run ad-hoc prompts and chat sessions.
-
 ### Basic Usage
 
 Use `thorn run "..."` to execute a single prompt, or `thorn chat` to start an interactive CLI chat session.
 
 ### Providing Tools and Skills
 
-When you run `thorn`, it automatically searches for any `.thorn/` directories in the current working directory (or its ancestors), as well as any `.thorn/` directory in your user home directory.
-Any `.py` files in a `.thorn/` directory are automatically loaded, and any `@tool` or `@skill` functions defined in them will be available to the top-level Thorn agent.
+When you run `thorn`, it automatically searches for `.agents/thorn/` directories in the current working directory (or its ancestors).
+Any `.py` files in a `.agents/thorn/` directory are automatically loaded, and any `@tool` or `@skill` functions defined in them will be available to the Thorn agent.
 
-As an example, if you have defined a file `.thorn/dev_tools.py` in your repository, and it contains:
+As an example, if you have defined a file `.agents/thorn/dev_tools.py` in your repository, and it contains:
 
 ```python
 @tool
@@ -208,9 +206,9 @@ $ thorn run "build and test the project, and summarize any failures"
 You can define project-specific tools using Thorn and serve them to your preferred agent via MCP:
 
 ```console
-$ thorn serve --transport streamable-http
+$ thorn serve mcp --transport streamable-http
 ```
 
-This means you can define a `build_project` tool in your `.thorn/` directory once, and immediately use it from Cursor, Claude Code, or any other MCP client -- without any of those tools needing to know how your project's build system works.
+This means you can define a `build_project` tool in your `.agents/thorn/` directory once, and immediately use it from Cursor, Claude Code, or any other MCP client -- without any of those tools needing to know how your project's build system works.
 
 The `--transport` option selects between `streamable-http` or `stdio`, depending on what your MCP client supports.

@@ -22,13 +22,6 @@ client/dist/
 .DS_Store
 Thumbs.db
 
-# Example projects
-examples/calc/build_test/
-examples/calc/trials*/
-examples/calc/**/*.cpp
-examples/calc/**/*.h
-!examples/calc/.thorn/
-!examples/calc/template/**/*
-
-evaluation/trials/
+# Thorn agent state (CLI mode)
+.thorn/
 .cursor/plans/
