@@ -48,6 +48,11 @@ from thorn.runtime._notification_queue import (
     NotificationQueue,
 )
 from thorn.runtime._paths import AgencyPaths, safe_dirname, unsafe_dirname
+from thorn.runtime._prompt_format import (
+    build_inbox_prompt,
+    inbox_prompt_dispatcher,
+    summarize_notification_content,
+)
 from thorn.runtime._queue import DurableQueue
 from thorn.runtime._runtime import Runtime
 from thorn.runtime._scheduler import (
@@ -98,8 +103,10 @@ __all__ = [
     "SessionStore",
     "SweepReport",
     "apply_handling_transition",
+    "build_inbox_prompt",
     "deserialize_history",
     "dispatch_step_two",
+    "inbox_prompt_dispatcher",
     "list_inbox_items",
     "read_inbox_item",
     "rebuild_in_flight_index",
@@ -107,6 +114,7 @@ __all__ = [
     "safe_dirname",
     "serialize_history",
     "session_lock",
+    "summarize_notification_content",
     "unsafe_dirname",
     "update_inbox_item",
 ]
