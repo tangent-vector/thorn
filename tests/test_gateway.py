@@ -450,7 +450,7 @@ class TestGateway:
                 apply_handling_transition(
                     inbox,
                     pending[0].id,
-                    new_status=NotificationStatus.HANDLED,
+                    NotificationStatus.HANDLED,
                     address_book=runtime.address_book,
                 )
             return "ok"
@@ -528,6 +528,524 @@ class TestGateway:
         assert total < delay * 1.8, (
             f"Two different agents took {total:.2f}s — expected parallel "
             f"execution (~{delay}s, not ~{delay * 2}s)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gateway integration with the inbox / scheduler model
+#
+# These tests exercise the post-refactor invariants: lazy-but-durable
+# session creation, per-session serialization via the scheduler, the
+# N-strikes progress guarantee, RSVP delivery to a registered service
+# queue, and crash recovery via the startup sweep.  They are written as
+# black-box tests against the ``Gateway`` public surface wherever
+# possible and reach into ``thorn.runtime`` internals only to seed or
+# observe on-disk state.
+# ---------------------------------------------------------------------------
+
+
+class TestGatewayInboxIntegration:
+    # Integration tests under this class drive the real ``Gateway``
+    # lifecycle (``gateway.run()`` + shutdown).  They override the
+    # default shutdown grace period so the tests don't pay the full
+    # 30-second production budget on every teardown.  The override is
+    # applied via :meth:`_make_gateway` below.
+    _TEST_SHUTDOWN_TIMEOUT = 1.0
+
+    def _make_runtime(self, tmp_path: Path) -> Runtime:
+        return Runtime(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+        )
+
+    def _make_gateway(
+        self,
+        runtime: Runtime,
+        sources: list[EventSource],
+        *,
+        prompt_dispatcher: Any = None,
+        agent_concurrency: int = 3,
+        shutdown_timeout: float | None = None,
+    ) -> Gateway:
+        return Gateway(
+            runtime=runtime,
+            sources=sources,
+            tools=[],
+            agent_concurrency=agent_concurrency,
+            prompt_dispatcher=prompt_dispatcher,
+            shutdown_timeout=(
+                shutdown_timeout
+                if shutdown_timeout is not None
+                else self._TEST_SHUTDOWN_TIMEOUT
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_session_events_serialized(self, tmp_path: Path):
+        """Two events for the same session should be processed serially.
+
+        Each session has exactly one driver inside its agent's scheduler,
+        so overlapping prompts for the same ``(agent_id, session_key)``
+        pair cannot run concurrently -- even if the agent concurrency
+        cap would otherwise allow multiple prompts in flight.
+        """
+        from thorn.runtime._address import SessionAddress
+        from thorn.runtime._dispatch import apply_handling_transition
+        from thorn.runtime._inbox import SessionInbox
+        from thorn.runtime._notification import NotificationStatus
+
+        agent_id = AgentID("serial-session-agent")
+        key = SessionKey("shared-session")
+        delay = 0.1
+
+        events = [
+            IncomingEvent(
+                source="test",
+                session_key=key,
+                content=f"message {i}",
+                agent_id=agent_id,
+            )
+            for i in range(2)
+        ]
+        source = StubSource(events)
+        runtime = self._make_runtime(tmp_path)
+        gateway = self._make_gateway(runtime, [source])
+
+        active = 0
+        max_active = 0
+        lock = asyncio.Lock()
+
+        async def slow_prompt(self_accessor, text, **kwargs):
+            nonlocal active, max_active
+            session = self_accessor._session
+            address = SessionAddress(session.agent.id, session.key)
+            inbox = runtime.address_book.get(address)
+            assert isinstance(inbox, SessionInbox)
+            async with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(delay)
+            finally:
+                async with lock:
+                    active -= 1
+            pending = inbox.prompt_pending()
+            if pending:
+                apply_handling_transition(
+                    inbox,
+                    pending[0].id,
+                    NotificationStatus.HANDLED,
+                    address_book=runtime.address_book,
+                )
+            return "ok"
+
+        with patch.object(
+            _SessionPromptAccessor, "__call__", slow_prompt,
+        ):
+            await gateway.run()
+
+        assert max_active == 1, (
+            f"Per-session serialization violated: observed {max_active} "
+            f"concurrent prompts for a single session"
+        )
+
+    @pytest.mark.asyncio
+    async def test_startup_sweep_reverts_in_progress(self, tmp_path: Path):
+        """An ``in_progress`` notification left from a prior run is
+        reverted to ``pending`` by the startup sweep, and then processed
+        alongside any newly-arriving events that wake the session driver.
+
+        The sweep itself does not kick idle sessions -- that's by design
+        (sessions that never receive another event stay dormant until
+        one arrives).  This test exercises the common case: a source
+        delivers a fresh event shortly after restart, and the driver
+        processes the fresh event together with the sweep-resurrected
+        one in a single round.
+        """
+        from thorn.runtime._address import SessionAddress
+        from thorn.runtime._dispatch import apply_handling_transition
+        from thorn.runtime._inbox import SessionInbox
+        from thorn.runtime._notification import (
+            NotificationSpec,
+            NotificationStatus,
+        )
+
+        agent_id = AgentID("resume-agent")
+        key = SessionKey("resume-key")
+
+        # Pre-seed the on-disk inbox with an ``in_progress`` item.
+        runtime_seed = self._make_runtime(tmp_path)
+        async with runtime_seed:
+            agent = runtime_seed.get_or_create_agent(agent_id)
+            runtime_seed.save_agent(agent)
+            ws = runtime_seed.paths.session_workspace(agent_id, key)
+            ws.mkdir(parents=True, exist_ok=True)
+            session = runtime_seed.get_or_create_session(
+                agent, key, workspace_root=ws,
+            )
+            runtime_seed.save_session(session)
+            inbox_dir_seed = runtime_seed.paths.session_inbox_dir(
+                agent_id, key,
+            )
+            seed_inbox = SessionInbox(
+                inbox_dir_seed, SessionAddress(agent_id, key),
+            )
+            spec = NotificationSpec(
+                source="test",
+                content="pre-existing work",
+                target=SessionAddress(agent_id, key),
+            )
+            notification = seed_inbox.post(spec)
+            seed_inbox.update_status(
+                notification.id, NotificationStatus.IN_PROGRESS,
+            )
+
+        # Start a fresh runtime / gateway pointed at the same tmp_path,
+        # along with a new incoming event that will wake the driver.
+        wake_event = IncomingEvent(
+            source="test",
+            session_key=key,
+            content="wake up",
+            agent_id=agent_id,
+        )
+        source = StubSource([wake_event])
+        runtime = self._make_runtime(tmp_path)
+
+        handled_ids: list[str] = []
+
+        async def dispatcher(session_obj, inbox_obj):
+            for item in list(inbox_obj.prompt_pending()):
+                handled_ids.append(item.id)
+                apply_handling_transition(
+                    inbox_obj,
+                    item.id,
+                    NotificationStatus.HANDLED,
+                    address_book=runtime.address_book,
+                )
+
+        gateway = self._make_gateway(
+            runtime, [source], prompt_dispatcher=dispatcher,
+        )
+        await gateway.run()
+
+        # The sweep reverted the old item to pending; the new event
+        # also landed as pending; both were handled by the dispatcher.
+        assert notification.id in handled_ids, (
+            f"Expected sweep-resurrected {notification.id!r} to be "
+            f"handled; got {handled_ids}"
+        )
+        assert len(handled_ids) == 2, (
+            f"Expected both resurrected + fresh items handled; got "
+            f"{handled_ids}"
+        )
+        inbox_dir = runtime.paths.session_inbox_dir(agent_id, key)
+        remaining = [p.name for p in inbox_dir.glob("*.json")]
+        assert remaining == [], (
+            f"Inbox should be empty after handling, found {remaining}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_startup_sweep_dispatches_stuck_handled(
+        self, tmp_path: Path,
+    ):
+        """A ``handled`` notification without an RSVP that survived a
+        mid-step-2 crash is cleaned up (deleted) by the startup sweep.
+        """
+        from thorn.runtime._address import SessionAddress
+        from thorn.runtime._inbox import SessionInbox
+        from thorn.runtime._notification import (
+            NotificationSpec,
+            NotificationStatus,
+        )
+
+        agent_id = AgentID("stuck-handled-agent")
+        key = SessionKey("stuck-session")
+
+        runtime_seed = self._make_runtime(tmp_path)
+        async with runtime_seed:
+            agent = runtime_seed.get_or_create_agent(agent_id)
+            runtime_seed.save_agent(agent)
+            ws = runtime_seed.paths.session_workspace(agent_id, key)
+            ws.mkdir(parents=True, exist_ok=True)
+            session = runtime_seed.get_or_create_session(
+                agent, key, workspace_root=ws,
+            )
+            runtime_seed.save_session(session)
+            inbox_dir = runtime_seed.paths.session_inbox_dir(agent_id, key)
+            inbox = SessionInbox(inbox_dir, SessionAddress(agent_id, key))
+            spec = NotificationSpec(
+                source="test",
+                content="completed but not cleaned up",
+                target=SessionAddress(agent_id, key),
+            )
+            notification = inbox.post(spec)
+            inbox.update_status(
+                notification.id, NotificationStatus.HANDLED,
+            )
+
+        runtime = self._make_runtime(tmp_path)
+        gateway = self._make_gateway(runtime, [StubSource([])])
+        await gateway.run()
+
+        # Step 2 for a handled, no-RSVP item is an in-place delete; the
+        # inbox should now be empty.
+        inbox_dir = runtime.paths.session_inbox_dir(agent_id, key)
+        remaining = [p.name for p in inbox_dir.glob("*.json")]
+        assert remaining == [], (
+            f"Sweep should have deleted the stuck handled item; "
+            f"found {remaining}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rsvp_delivered_to_service_queue(self, tmp_path: Path):
+        """When an inbox item carries an ``rsvp_to`` service address and
+        the agent marks it handled, the dispatch step moves the file to
+        the target service's notification queue.
+
+        Real sources will populate ``rsvp_to`` on the
+        :class:`NotificationSpec` they post; today's gateway does not
+        yet build specs that way from :class:`IncomingEvent` (see the
+        pending ``source-refactors`` plan item).  This test pre-seeds
+        a spec with an RSVP on disk and then triggers the driver with
+        an ordinary event to keep the end-to-end scheduler / dispatch
+        path in scope.
+        """
+        from thorn.runtime._address import ServiceAddress, SessionAddress
+        from thorn.runtime._dispatch import apply_handling_transition
+        from thorn.runtime._inbox import SessionInbox
+        from thorn.runtime._notification import (
+            NotificationSpec,
+            NotificationStatus,
+        )
+        from thorn.runtime._notification_queue import NotificationQueue
+
+        agent_id = AgentID("rsvp-agent")
+        key = SessionKey("rsvp-session")
+        service_name = "test-service"
+        service_addr = ServiceAddress(service_name)
+
+        # Seed the on-disk inbox with a notification that RSVPs to the
+        # service queue, using a throwaway runtime.
+        seed_runtime = self._make_runtime(tmp_path)
+        async with seed_runtime:
+            agent = seed_runtime.get_or_create_agent(agent_id)
+            seed_runtime.save_agent(agent)
+            ws = seed_runtime.paths.session_workspace(agent_id, key)
+            ws.mkdir(parents=True, exist_ok=True)
+            session = seed_runtime.get_or_create_session(
+                agent, key, workspace_root=ws,
+            )
+            seed_runtime.save_session(session)
+            seed_inbox_dir = seed_runtime.paths.session_inbox_dir(
+                agent_id, key,
+            )
+            rsvp_spec = NotificationSpec(
+                source="test",
+                content="please rsvp",
+                target=SessionAddress(agent_id, key),
+                rsvp_to=service_addr,
+            )
+            rsvp_notification = SessionInbox(
+                seed_inbox_dir, SessionAddress(agent_id, key),
+            ).post(rsvp_spec)
+
+        runtime = self._make_runtime(tmp_path)
+        service_queue_dir = runtime.paths.service_queue_dir(service_name)
+        service_queue_dir.mkdir(parents=True, exist_ok=True)
+
+        # A fresh event so the driver has something to drive on.
+        wake_event = IncomingEvent(
+            source="test",
+            session_key=key,
+            content="wake",
+            agent_id=agent_id,
+        )
+        source = StubSource([wake_event])
+
+        async def handling_dispatcher(session_obj, inbox_obj):
+            # Register the service queue on the runtime's address
+            # book the first time we run.  This mirrors what a real
+            # service startup path would do (e.g. registering a
+            # GitLab service's RSVP queue at gateway boot).
+            if service_addr not in runtime.address_book:
+                runtime.address_book.register(
+                    service_addr,
+                    NotificationQueue(service_queue_dir, service_addr),
+                )
+            for item in list(inbox_obj.prompt_pending()):
+                apply_handling_transition(
+                    inbox_obj,
+                    item.id,
+                    NotificationStatus.HANDLED,
+                    address_book=runtime.address_book,
+                )
+
+        gateway = self._make_gateway(
+            runtime, [source], prompt_dispatcher=handling_dispatcher,
+        )
+        await gateway.run()
+
+        # After handling, the RSVP'd item should have been moved out
+        # of the session inbox and into the service queue.
+        inbox_dir = runtime.paths.session_inbox_dir(agent_id, key)
+        assert list(inbox_dir.glob("*.json")) == [], (
+            f"Session inbox should be empty after RSVP + handled; "
+            f"found {[p.name for p in inbox_dir.glob('*.json')]}"
+        )
+
+        service_items = list(service_queue_dir.glob("*.json"))
+        assert len(service_items) == 1, (
+            f"Expected 1 notification in service queue, found "
+            f"{[p.name for p in service_items]}"
+        )
+        # And it should be the RSVP'd one (not the wake event).
+        assert service_items[0].stem == rsvp_notification.id
+
+    @pytest.mark.asyncio
+    async def test_n_strikes_evicts_oldest_item(self, tmp_path: Path):
+        """If the dispatcher makes no progress for ``progress_strikes``
+        consecutive rounds, the default progress evictor errors the
+        oldest inbox item so the session can move on.
+
+        This test keeps the event source alive (a :class:`SlowSource`)
+        so the gateway does not start shutting down before the driver
+        has had a chance to exhaust its strike budget.  A polling await
+        loop watches the session's ``errored/`` directory on disk as
+        the externally-visible signal of eviction.
+        """
+        agent_id = AgentID("stalling-agent")
+        key = SessionKey("stuck-key")
+
+        event = IncomingEvent(
+            source="test",
+            session_key=key,
+            content="never handled",
+            agent_id=agent_id,
+        )
+        source = SlowSource()
+        runtime = self._make_runtime(tmp_path)
+
+        rounds = 0
+
+        async def no_progress_dispatcher(session_obj, inbox_obj):
+            nonlocal rounds
+            rounds += 1
+            # Yield the event loop between rounds so the driver does
+            # not hog it and so shutdown (when it eventually runs) has
+            # a chance to be observed.
+            await asyncio.sleep(0)
+
+        gateway = self._make_gateway(
+            runtime,
+            [source],
+            prompt_dispatcher=no_progress_dispatcher,
+            shutdown_timeout=0.5,
+        )
+
+        gateway_task = asyncio.create_task(gateway.run())
+        try:
+            # Wait for the gateway to enter its run loop, then post
+            # the event directly via _handle_event (bypassing the
+            # source so we control timing).
+            while not gateway._started:  # type: ignore[attr-defined]
+                await asyncio.sleep(0.01)
+            await gateway._handle_event(event)
+
+            errored_dir = runtime.paths.session_inbox_errored_dir(
+                agent_id, key,
+            )
+
+            # Poll for eviction to land on disk.  Budget is generous
+            # relative to the ~zero work per round and the 3-strike
+            # threshold, but bounded so a genuine bug is caught.
+            deadline = asyncio.get_event_loop().time() + 2.0
+            while asyncio.get_event_loop().time() < deadline:
+                if errored_dir.is_dir() and list(errored_dir.glob("*.json")):
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            await gateway.shutdown()
+            await gateway_task
+
+        assert rounds >= 3, f"Dispatcher was only invoked {rounds} times"
+
+        errored_items = list(errored_dir.glob("*.json"))
+        assert len(errored_items) == 1, (
+            f"Expected oldest item evicted to errored/; found "
+            f"{[p.name for p in errored_items]}"
+        )
+
+        inbox_dir = runtime.paths.session_inbox_dir(agent_id, key)
+        assert [p for p in inbox_dir.glob("*.json")] == []
+
+    @pytest.mark.asyncio
+    async def test_agent_concurrency_cap_serializes_sessions(
+        self, tmp_path: Path,
+    ):
+        """With ``agent_concurrency=1``, two different sessions of the
+        same agent must run sequentially even though they have distinct
+        drivers.  This verifies that the per-agent semaphore does what
+        it claims.
+        """
+        from thorn.runtime._address import SessionAddress
+        from thorn.runtime._dispatch import apply_handling_transition
+        from thorn.runtime._inbox import SessionInbox
+        from thorn.runtime._notification import NotificationStatus
+
+        agent_id = AgentID("cap-agent")
+        delay = 0.1
+
+        events = [
+            IncomingEvent(
+                source="test",
+                session_key=SessionKey(f"k{i}"),
+                content=f"msg {i}",
+                agent_id=agent_id,
+            )
+            for i in range(2)
+        ]
+        source = StubSource(events)
+        runtime = self._make_runtime(tmp_path)
+
+        active = 0
+        max_active = 0
+        lock = asyncio.Lock()
+
+        async def serialized_prompt(self_accessor, text, **kwargs):
+            nonlocal active, max_active
+            session = self_accessor._session
+            address = SessionAddress(session.agent.id, session.key)
+            inbox = runtime.address_book.get(address)
+            assert isinstance(inbox, SessionInbox)
+            async with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(delay)
+            finally:
+                async with lock:
+                    active -= 1
+            pending = inbox.prompt_pending()
+            if pending:
+                apply_handling_transition(
+                    inbox,
+                    pending[0].id,
+                    NotificationStatus.HANDLED,
+                    address_book=runtime.address_book,
+                )
+            return "ok"
+
+        gateway = self._make_gateway(
+            runtime, [source], agent_concurrency=1,
+        )
+        with patch.object(
+            _SessionPromptAccessor, "__call__", serialized_prompt,
+        ):
+            await gateway.run()
+
+        assert max_active == 1, (
+            f"agent_concurrency=1 violated: observed {max_active} "
+            f"concurrent prompts under a single agent"
         )
 
 

@@ -132,6 +132,56 @@ A rule that matches on more keys is more specific than one that matches on fewer
 A rule that matches on a specific value for a key is more specific than one that does a wildcard match.
 If no single most-specific rule matches, then an error is logged (the situation represents a configuration problem).
 
+### Memory
+
+The memory of an agent is stored as ordinary files in the agent's home directory.
+The agent is given flexibility to read and write those files as it sees fit, but it is also informed of conventions that it should follow and that the runtime system will strive to support and reinforce.
+
+#### `MEMORY.md`
+
+The top-level `MEMORY.md` file in an agent's home diretory is meant to serve as a high-level overview of how the rest of the memory is organized.
+The `MEMORY.md` file is authored and maintained by the agent, for its own benefit.
+The runtime system treats this file specially, injecting it in as part of the system prompt for the agent.
+
+#### `AGENTS.md`
+
+While a session may also derive `AGENTS.md` and related information (e.g., a `.agents/skills/` directory) from the session's workspace path, an `AGENTS.md` file in the agent's home directory will also be treated as system-prompt guidance for the agent.
+
+Under this convention, an agent in Thorn is allowed to write to its own behavioral instructions.
+This is by design, to allow conversations with user's to guide the agent in shaping its own behavior.
+
+#### Session-Aligned Memory Scopes
+
+While not something directly enforced or required by the runtime, conventions and policies will encourage agents to record important information at paths in their memory that correspond to the shape of session keys.
+E.g., if a session key like `peers/tess/dms/telegram` is used for Telegram direct messages between the agent and the peer/user `tess`, then the following paths under the agent's home directory are reasonable places to put notes:
+
+- `peers/tess/`: information pertaining to the agent's understanding of the user `tess` and what it likes/expects/etc.
+- `peers/tess/dms`: information pertaining to DM conversations that have been had with `tess`
+- `peers/`: overview information pertaining to all of the agent's peers, perhaps noting groups or organizations that are relevant
+
+The runtime system will not only encourage agents (via their system prompt) to write down important information to paths following such shapes.
+In addition, if extends the policy of automatically loading any `MEMORY.md` and/or `AGENTS.md` files from the agent's home directory to also apply to subdirectories derived from a session's key.
+For example, in a session with key `peers/tess/dms/telegram`, if there was a file `peers/tess/MEMORY.md` under the agent's home directory, it would automatically be part of the system prompt for that session.
+
+### Memory Keys
+
+A **memory key** is a collection of information akin to that used when routing events to sessions:
+
+- A set of string tags
+- A dictionary of key-value pairs (string-to-string)
+
+Similar to the routing rules, the static configuration of an agent includes a set of rules for mapping a session key to a memory key (almost the inverse of the event-to-session-key mapping operation).
+For example:
+
+- A session key of the form `peers/{p}/dms/{s}` might map to a memory key with tag `direct_message` and key-value pairs `peer={p}` and `service={s}`
+
+- A session key of the form `projects/{p}/issues/{f}-{i}` might map to a memory key with key-value pairs `project={p}`, `fork={f}`, `issue={i}`, and `service={f.forge}`
+
+We can define additional paths that even if not used as session keys can be turned into memory keys when referring to filesystem paths in the agent's home directory.
+E.g., if there is a session `projects/foo/issues/gitlab-123`, then a directory `~/projects/foo/forks/gitlab/` in the agent's home directory would also be relevant, even if it isn't a strict prefix match on the session key.
+
+(This is all basically trying to add semantic meaning to the directory hierarchy under the agent's home directory, in a way that we can do the mapping deterministically.. which is maybe not even worth it in practice...)
+
 ### Journaling
 
 Every agent has access to temporal memory in the form of a **journal**.
@@ -141,4 +191,8 @@ While an agent's journal is stored as ordinary files, and can be manipulated as 
 Each journal entry is tagged with both a timestamp, and also the session key of the session that posted the entry.
 
 When prompting an LLM, the system prompt generated for a session will include recent journal entries for the agent, prioritizing entries that are from the same or related sessions.
-(TODO: the exact definition of what "related" means here)
+"Related" here can be identified by translating the session key of the session A being process and the session key B of a session that wrote a journal entry, translating both of those session keys over to memory keys, and then comparing the similarity of the memory keys (how many tags or key/value pairs do they have in common vs. how many differ).
+
+CLI Sessions
+------------
+
