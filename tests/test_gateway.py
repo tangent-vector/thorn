@@ -203,7 +203,13 @@ class TestGateway:
 
     @pytest.mark.asyncio
     async def test_error_in_session_prompt_does_not_crash(self, tmp_path: Path):
-        """If session.prompt() fails, the gateway logs and continues."""
+        """If session.prompt() fails, the gateway logs and continues.
+
+        Under the inbox/scheduler model, the session and its inbox are
+        created proactively when the event arrives, so the session is
+        persisted even though the prompt dispatcher fails.  The point of
+        the test is that no exception escapes from ``gateway.run()``.
+        """
         event = IncomingEvent(
             source="test",
             session_key=SessionKey("err_key"),
@@ -219,7 +225,7 @@ class TestGateway:
         ):
             await gateway.run()
 
-        assert not runtime.sessions.session_exists(AgentID("default"), "err_key")
+        assert runtime.sessions.session_exists(AgentID("default"), "err_key")
 
     @pytest.mark.asyncio
     async def test_resolve_agent_uses_persisted_coordinator(
@@ -395,55 +401,78 @@ class TestGateway:
 
 
     @pytest.mark.asyncio
-    async def test_same_agent_events_serialized(self, tmp_path: Path):
-        """Two events for the same agent should execute sequentially
-        (the per-agent lock serializes them)."""
+    async def test_same_agent_different_sessions_parallel(self, tmp_path: Path):
+        """Two events for different sessions of the same agent should
+        execute concurrently (governed by the per-agent scheduler's
+        concurrency cap, default 3).  Only events on the *same session*
+        are serialized, which happens naturally because each session has
+        a single driver.
+        """
         timestamps: list[tuple[str, float]] = []
         delay = 0.1
 
+        agent_id = AgentID("multi-session-agent")
+
+        event_a = IncomingEvent(
+            source="test",
+            session_key=SessionKey("k1"),
+            content="first",
+            agent_id=agent_id,
+        )
+        event_b = IncomingEvent(
+            source="test",
+            session_key=SessionKey("k2"),
+            content="second",
+            agent_id=agent_id,
+        )
+        source = StubSource([event_a, event_b])
+
         runtime = self._make_runtime(tmp_path)
-        gateway = Gateway(runtime=runtime, sources=[])
+        gateway = Gateway(runtime=runtime, sources=[source], tools=[])
 
-        agent_id = AgentID("serial-agent")
+        from thorn.runtime._address import SessionAddress
+        from thorn.runtime._dispatch import apply_handling_transition
+        from thorn.runtime._notification import NotificationStatus
+        from thorn.runtime._inbox import SessionInbox
 
-        async with runtime:
-            agent = runtime.get_or_create_agent(agent_id)
-            runtime.save_agent(agent)
-
-            original_prompt = _SessionPromptAccessor.__call__
-
-            async def slow_prompt(self_accessor, text, **kwargs):
-                timestamps.append(("enter", asyncio.get_event_loop().time()))
-                await asyncio.sleep(delay)
-                timestamps.append(("exit", asyncio.get_event_loop().time()))
-                return "ok"
-
-            event_a = IncomingEvent(
-                source="test",
-                session_key=SessionKey("k1"),
-                content="first",
-                agent_id=agent_id,
-            )
-            event_b = IncomingEvent(
-                source="test",
-                session_key=SessionKey("k2"),
-                content="second",
-                agent_id=agent_id,
-            )
-
-            with patch.object(
-                _SessionPromptAccessor, "__call__", slow_prompt,
-            ):
-                await asyncio.gather(
-                    gateway._handle_event(event_a),
-                    gateway._handle_event(event_b),
+        async def slow_prompt(self_accessor, text, **kwargs):
+            # Mark the oldest inbox item handled so the driver makes
+            # progress and exits after a single round per session.
+            session = self_accessor._session
+            address = SessionAddress(session.agent.id, session.key)
+            inbox = runtime.address_book.get(address)
+            assert isinstance(inbox, SessionInbox)
+            pending = inbox.prompt_pending()
+            timestamps.append(("enter", asyncio.get_event_loop().time()))
+            await asyncio.sleep(delay)
+            timestamps.append(("exit", asyncio.get_event_loop().time()))
+            if pending:
+                apply_handling_transition(
+                    inbox,
+                    pending[0].id,
+                    new_status=NotificationStatus.HANDLED,
+                    address_book=runtime.address_book,
                 )
+            return "ok"
 
-        assert len(timestamps) == 4
-        first_exit = timestamps[1][1]
-        second_enter = timestamps[2][1]
-        assert second_enter >= first_exit, (
-            "Second event started before first finished — lock not working"
+        with patch.object(
+            _SessionPromptAccessor, "__call__", slow_prompt,
+        ):
+            t0 = asyncio.get_event_loop().time()
+            await gateway.run()
+            total = asyncio.get_event_loop().time() - t0
+
+        # Both sessions should have run their prompt exactly once.
+        assert len(timestamps) == 4, (
+            f"Expected 4 timestamps (enter/exit × 2 sessions), got "
+            f"{len(timestamps)}"
+        )
+        # With two concurrent sessions under a single agent scheduler
+        # (concurrency cap >= 2), total wall time should be closer to
+        # ``delay`` than to ``2 * delay``.
+        assert total < delay * 1.8, (
+            f"Two sessions of the same agent took {total:.2f}s — expected "
+            f"concurrent execution (~{delay}s, not ~{delay * 2}s)"
         )
 
     @pytest.mark.asyncio

@@ -132,7 +132,7 @@ A rule that matches on more keys is more specific than one that matches on fewer
 A rule that matches on a specific value for a key is more specific than one that does a wildcard match.
 If no single most-specific rule matches, then an error is logged (the situation represents a configuration problem).
 
-### Journalling
+### Journaling
 
 Every agent has access to temporal memory in the form of a **journal**.
 The journal for an agent is stored in its home directory as files for the form `journal/YYY/MM/DD.md`.
