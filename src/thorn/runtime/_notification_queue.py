@@ -53,11 +53,14 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from thorn.runtime._address import Address
 from thorn.runtime._notification import Notification, NotificationStatus
 from thorn.runtime._queue import DurableQueue
+
+if TYPE_CHECKING:
+    from thorn.runtime._in_flight_index import InFlightIndex
 
 
 log = logging.getLogger(__name__)
@@ -139,8 +142,14 @@ class NotificationQueue(DurableQueue):
     :meth:`drain` explicitly.
     """
 
-    def __init__(self, root_dir: Path, address: Address) -> None:
-        super().__init__(root_dir)
+    def __init__(
+        self,
+        root_dir: Path,
+        address: Address,
+        *,
+        in_flight_index: "InFlightIndex | None" = None,
+    ) -> None:
+        super().__init__(root_dir, in_flight_index=in_flight_index)
         self._address = address
         self._fresh_handler: NotificationHandler | None = None
         self._rsvp_handler: NotificationHandler | None = None

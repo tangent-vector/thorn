@@ -22,6 +22,7 @@ from thorn.runtime._address import (
     SessionAddress,
 )
 from thorn.runtime._inbox import SessionInbox
+from thorn.runtime._in_flight_index import InFlightIndex, rebuild_in_flight_index
 from thorn.runtime._lock import SessionLockError, session_lock
 from thorn.runtime._notification import (
     Notification,
@@ -35,7 +36,7 @@ from thorn.runtime._notification_queue import (
     NotificationHandler,
     NotificationQueue,
 )
-from thorn.runtime._paths import AgencyPaths
+from thorn.runtime._paths import AgencyPaths, safe_dirname, unsafe_dirname
 from thorn.runtime._queue import DurableQueue
 from thorn.runtime._runtime import Runtime
 from thorn.runtime._session import AgentID, SessionKey
@@ -56,6 +57,7 @@ __all__ = [
     "DrainOutcome",
     "DrainResult",
     "DurableQueue",
+    "InFlightIndex",
     "JsonSessionSerializer",
     "Notification",
     "NotificationHandler",
@@ -71,6 +73,9 @@ __all__ = [
     "SessionSerializer",
     "SessionStore",
     "deserialize_history",
+    "rebuild_in_flight_index",
+    "safe_dirname",
     "serialize_history",
     "session_lock",
+    "unsafe_dirname",
 ]

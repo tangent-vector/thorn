@@ -10,32 +10,31 @@ and their sessions, using a hierarchical layout:
                 <session-key>/
                     session.json        -- session timestamps, metadata
                     history.json        -- conversation history
+                    inbox/              -- session's durable inbox
             ...                         -- agent's personal memory, etc.
 
-Directory and file names are URL-encoded via :func:`_safe_dirname` so
-that arbitrary identifiers map to valid filesystem paths.
+Directory and file names are URL-encoded via
+:func:`~thorn.runtime._paths.safe_dirname` so that arbitrary
+identifiers map to valid filesystem paths.
 """
 
 from __future__ import annotations
 
 import shutil
-import urllib.parse
 from pathlib import Path
 
 from thorn.core._agent import Agent
 from thorn.core._session import Session
+from thorn.runtime._paths import safe_dirname, unsafe_dirname
 from thorn.runtime._serializer import JsonSessionSerializer, SessionSerializer
 from thorn.runtime._session import AgentID, SessionKey
 
 
-def _safe_dirname(key: str) -> str:
-    """Encode an identifier into a filesystem-safe directory/file name."""
-    return urllib.parse.quote(str(key), safe="_-.")
-
-
-def _unsafe_dirname(dirname: str) -> str:
-    """Recover the original identifier from an encoded name."""
-    return urllib.parse.unquote(dirname)
+# Backward-compatible aliases for code that imported the previously-private
+# helpers from this module.  New callers should import from
+# ``thorn.runtime._paths`` directly.
+_safe_dirname = safe_dirname
+_unsafe_dirname = unsafe_dirname
 
 
 class SessionStore:

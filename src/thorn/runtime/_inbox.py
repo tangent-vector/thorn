@@ -26,10 +26,14 @@ belong in which slice of the lifecycle" question.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from thorn.runtime._address import SessionAddress
 from thorn.runtime._notification import Notification, NotificationStatus
 from thorn.runtime._queue import DurableQueue
+
+if TYPE_CHECKING:
+    from thorn.runtime._in_flight_index import InFlightIndex
 
 
 class SessionInbox(DurableQueue):
@@ -38,10 +42,20 @@ class SessionInbox(DurableQueue):
     Attached to a :class:`SessionAddress` so the rest of the runtime
     can identify which session a given queue belongs to without
     round-tripping through the address book.
+
+    An optional :class:`~thorn.runtime.InFlightIndex` is forwarded to
+    the base :class:`DurableQueue`; see its docstring for the
+    semantics and crash-ordering guarantees.
     """
 
-    def __init__(self, root_dir: Path, address: SessionAddress) -> None:
-        super().__init__(root_dir)
+    def __init__(
+        self,
+        root_dir: Path,
+        address: SessionAddress,
+        *,
+        in_flight_index: "InFlightIndex | None" = None,
+    ) -> None:
+        super().__init__(root_dir, in_flight_index=in_flight_index)
         self._address = address
 
     @property

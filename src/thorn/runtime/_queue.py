@@ -45,13 +45,16 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from thorn.runtime._notification import (
     Notification,
     NotificationSpec,
     NotificationStatus,
 )
+
+if TYPE_CHECKING:
+    from thorn.runtime._in_flight_index import InFlightIndex
 
 
 _LIVE_SUFFIX = ".json"
@@ -67,12 +70,30 @@ class DurableQueue:
 
     The class is intentionally small: it knows how to post, list, get,
     mutate, move, and delete.  Anything semantically richer (the
-    two-step handling dance, the in-flight index, the RSVP flow) is
-    built on top using these five operations.
+    two-step handling dance, the RSVP flow, source-level dedup policy)
+    is built on top using these operations.
+
+    An optional :class:`~thorn.runtime.InFlightIndex` can be supplied
+    at construction time.  When present, every :meth:`post` adds the
+    notification's ``external_key`` to the index, and every
+    :meth:`delete` removes it.  Status mutations and moves do not
+    touch the index: the item is still "in flight" from a source's
+    perspective, just in a different location or state.  Ordering is
+    carefully chosen to be crash-safe: posts write the file first
+    then update the index, and deletes unlink the file first then
+    update the index, so that at no point can the index claim a key
+    is in flight when no file exists, or claim a key is absent while
+    a file for it still exists and could get duplicated.
     """
 
-    def __init__(self, root_dir: Path) -> None:
+    def __init__(
+        self,
+        root_dir: Path,
+        *,
+        in_flight_index: "InFlightIndex | None" = None,
+    ) -> None:
         self._root = Path(root_dir)
+        self._in_flight_index = in_flight_index
 
     @property
     def root_dir(self) -> Path:
@@ -92,9 +113,17 @@ class DurableQueue:
         Atomicity: writes the full JSON body to a ``.tmp-<ulid>.json``
         sidecar, then renames it into place.  A crash before the
         rename leaves no live file; the sidecar is orphaned.
+
+        If an :class:`~thorn.runtime.InFlightIndex` was supplied to
+        this queue and *spec* carries an ``external_key``, the key is
+        added to the index after the file has landed on disk.  A
+        crash between rename and index update is harmless: the next
+        rebuild repopulates the index from the filesystem.
         """
         notification = Notification.from_spec(spec)
         self._write_atomic(notification)
+        if self._in_flight_index is not None and notification.external_key is not None:
+            self._in_flight_index.add(notification.external_key)
         return notification
 
     # ------------------------------------------------------------------
@@ -206,11 +235,31 @@ class DurableQueue:
         Raises ``KeyError`` if no such notification is present.  A
         crash has nothing to corrupt here: either the ``unlink`` ran
         or it didn't.
+
+        If an :class:`~thorn.runtime.InFlightIndex` was supplied to
+        this queue, the deleted notification's ``external_key`` (if
+        any) is removed from the index *after* the unlink completes.
+        The order matters for crash safety: unlinking first means a
+        crash between the two steps leaves a stale key in the
+        in-memory index, which is harmless -- the next rebuild
+        recovers.  The reverse order could let a source re-post while
+        the old file still exists, producing a genuine duplicate.
         """
         path = self._path_for(notification_id)
         if not path.exists():
             raise KeyError(notification_id)
+        # Load the key BEFORE unlinking, because after the unlink we
+        # have no way to recover it.  Tolerate files that can't be
+        # parsed -- the unlink still needs to happen.
+        external_key: str | None = None
+        if self._in_flight_index is not None:
+            try:
+                external_key = self._load(path).external_key
+            except (OSError, ValueError, KeyError):
+                external_key = None
         path.unlink()
+        if self._in_flight_index is not None and external_key is not None:
+            self._in_flight_index.remove(external_key)
 
     # ------------------------------------------------------------------
     # Maintenance
