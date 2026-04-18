@@ -15,8 +15,20 @@ This package sits between ``thorn.core`` (agent primitives) and
   implementation planned).
 """
 
+from thorn.runtime._address import (
+    Address,
+    AddressBook,
+    ServiceAddress,
+    SessionAddress,
+)
 from thorn.runtime._lock import SessionLockError, session_lock
+from thorn.runtime._notification import (
+    Notification,
+    NotificationSpec,
+    NotificationStatus,
+)
 from thorn.runtime._paths import AgencyPaths
+from thorn.runtime._queue import DurableQueue
 from thorn.runtime._runtime import Runtime
 from thorn.runtime._session import AgentID, SessionKey
 from thorn.runtime._store import SessionStore
@@ -28,14 +40,22 @@ from thorn.runtime._serializer import (
 )
 
 __all__ = [
+    "Address",
+    "AddressBook",
     "AgencyPaths",
     "AgentID",
+    "DurableQueue",
+    "JsonSessionSerializer",
+    "Notification",
+    "NotificationSpec",
+    "NotificationStatus",
     "Runtime",
+    "ServiceAddress",
+    "SessionAddress",
     "SessionKey",
     "SessionLockError",
-    "SessionStore",
     "SessionSerializer",
-    "JsonSessionSerializer",
+    "SessionStore",
     "deserialize_history",
     "serialize_history",
     "session_lock",
