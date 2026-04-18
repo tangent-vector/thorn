@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +52,38 @@ from thorn.runtime._session import AgentID, SessionKey
 
 _SESSION_FILE = "session.json"
 _HISTORY_FILE = "history.json"
+
+# Prefix used for sidecar temp files during atomic writes.  Matches
+# the convention used by :class:`DurableQueue` so that both systems
+# surface their in-flight writes in recognisably named files.
+_ATOMIC_TEMP_PREFIX = ".tmp-"
+
+
+def _atomic_write_text(path: Path, payload: str) -> None:
+    """Write *payload* to *path* atomically.
+
+    Uses the write-to-sidecar + :func:`os.replace` pattern: the
+    target is first written in full to ``<dir>/.tmp-<name>``, then
+    replaced into place.  Guarantees:
+
+    - A crash (or task cancellation) before the ``os.replace`` call
+      leaves the previous contents of *path* intact.  The partial
+      sidecar is orphaned but recoverable by operator cleanup or a
+      future sweep; importantly, any reader seeing *path* sees either
+      the old full value or the new full value, never a truncation.
+    - A crash during the ``os.replace`` call is not possible on POSIX
+      or Windows: the rename is atomic.
+
+    Used for both session/history files and agent-identity files so
+    that graceful-shutdown scenarios (cancel mid-save) cannot leave
+    the store in a torn state.  The sidecar is placed in the same
+    directory as *path* so that the rename is guaranteed to be on
+    the same filesystem.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.parent / f"{_ATOMIC_TEMP_PREFIX}{path.name}"
+    temp_path.write_text(payload, encoding="utf-8")
+    os.replace(temp_path, path)
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +388,14 @@ class JsonSessionSerializer:
     """
 
     def save_agent(self, agent: Agent, path: Path) -> None:
+        """Persist agent identity atomically.
+
+        Writes the agent JSON via :func:`_atomic_write_text` so a
+        mid-write crash or cancellation leaves any previous
+        identity file intact.  Callers can therefore rely on the
+        post-crash state always being a complete, loadable agent
+        record (either the previous one or the new one, never
+        torn)."""
         agent_data: dict[str, Any] = {
             "id": str(agent.id) if agent.id is not None else None,
             "agent_class": type(agent).__name__,
@@ -364,10 +405,9 @@ class JsonSessionSerializer:
         accounts_data = _serialize_accounts(agent)
         if accounts_data is not None:
             agent_data["accounts"] = accounts_data
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+        _atomic_write_text(
+            path,
             json.dumps(agent_data, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
         )
 
     def load_agent(self, path: Path) -> Agent:
@@ -395,6 +435,21 @@ class JsonSessionSerializer:
         )
 
     def save_session(self, session: Session, directory: Path) -> None:
+        """Persist session metadata and history atomically.
+
+        Each of ``session.json`` and ``history.json`` is written
+        via :func:`_atomic_write_text`, so a crash or cancellation
+        mid-save leaves both files at their previous contents (or
+        both at the new contents, if the save completed).  The two
+        files are not collectively atomic -- a crash between the
+        two replaces could leave ``session.json`` updated but
+        ``history.json`` still on the previous version -- which is
+        acceptable because neither file's contents depend on the
+        other's value for correctness (``session.json`` carries
+        timestamps; ``history.json`` carries the conversation
+        tree).  The guarantee we need for graceful shutdown is
+        that each file is internally well-formed, and that holds.
+        """
         directory.mkdir(parents=True, exist_ok=True)
 
         session_data: dict[str, Any] = {
@@ -405,17 +460,15 @@ class JsonSessionSerializer:
         }
         if session.workspace_root is not None:
             session_data["workspace_root"] = str(session.workspace_root)
-        session_path = directory / _SESSION_FILE
-        session_path.write_text(
+        _atomic_write_text(
+            directory / _SESSION_FILE,
             json.dumps(session_data, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
         )
 
         history_data = serialize_history(session._history)
-        history_path = directory / _HISTORY_FILE
-        history_path.write_text(
+        _atomic_write_text(
+            directory / _HISTORY_FILE,
             json.dumps(history_data, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
         )
 
     def load_session(self, directory: Path, agent: Agent) -> Session:

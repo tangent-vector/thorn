@@ -96,4 +96,49 @@ For each peer, the agency includes information on their account names/numbers on
 
 When a running agency detects a potentially-interesting **event** coming from a service (e.g., by polling for notifications on GitHub or GitLab), it will route that event to the correct session inbox for handling.
 
-Most events will clearly indicate the right
+#### Routing to Agents
+
+Most events will clearly indicate the right agent to handle them.
+For example, if an event shows a direct message was received for a Discord account, then the correct agent to handle it is the one associated with that account (if any).
+When events aren't clearly directed to a single agent, the given service will have to use other criteria to determin which agent(s) should be notified.
+
+#### Routing to Sessions
+
+Once the runtime has determined that a given agent should potentially be notified of an event, it must decide which session on the agent should receive the notificatin in its inbox.
+
+In order to guide routing, we think of each event as producing a combination of:
+
+- A set of string tags defining simple attributes of the event's context (e.g., `direct_message` for events that relate to a direct-messaging channel/conversation).
+
+- A set of key-value pairs (string to string) defining properties of the events context (e.g., mapping the key `peer` to the name of a known peer, or from the key `service` to the name of a service)
+
+As part of the static configuration of an agent, there are **routing rules** that determine where an event should go.
+Each routing rule defines:
+
+- A set of tags to look for. The rule matches events that have all the tags, and otherwise doesn't match.
+
+- A set of keys to look for, and either a corresponding value to look for or a wildcard `*`.
+  The rule matches on events that have the key, if it has an identical value, or if the rule had a wildcard (`*`) value.
+
+- A template for a session key to use, if this rule matches and is chosen.
+  For example, a template might take the form `peers/{peer}/dms/{service}` for a rule that required the `direct_message` tag, and matched both the keys `peer` and `service` with wildcards.
+
+  The `{}`-enclosed names in the session-key template must be keys that the rule matched with a wildcard.
+  Not every key that was matched must be present in the session key template.
+
+The runtime matches an event against the declared rules and then picks the *most specific* rule that matched.
+A rule that matches on more tags is more specific than one that matches on a subset of those tags.
+A rule that matches on more keys is more specific than one that matches on fewer keys.
+A rule that matches on a specific value for a key is more specific than one that does a wildcard match.
+If no single most-specific rule matches, then an error is logged (the situation represents a configuration problem).
+
+### Journalling
+
+Every agent has access to temporal memory in the form of a **journal**.
+The journal for an agent is stored in its home directory as files for the form `journal/YYY/MM/DD.md`.
+
+While an agent's journal is stored as ordinary files, and can be manipulated as such, agents will typically write journal entries with a dedicated tool, which automatically appends a timestamped entry to the current day's journal.
+Each journal entry is tagged with both a timestamp, and also the session key of the session that posted the entry.
+
+When prompting an LLM, the system prompt generated for a session will include recent journal entries for the agent, prioritizing entries that are from the same or related sessions.
+(TODO: the exact definition of what "related" means here)

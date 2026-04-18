@@ -1276,6 +1276,164 @@ class TestJsonSessionSerializerSession:
 
 
 # ---------------------------------------------------------------------------
+# JsonSessionSerializer -- atomic-write crash safety
+# ---------------------------------------------------------------------------
+
+
+class TestJsonSessionSerializerAtomicWrites:
+    """Cancel-mid-save / crash-mid-save must leave on-disk state intact.
+
+    The graceful-shutdown work item requires that each persisted
+    file is written atomically: a reader that sees the file always
+    sees either its old contents or its new contents, never a torn
+    partial write.  These tests simulate the failure modes that
+    matter in practice:
+
+    - a permission / OSError raised during the final ``os.replace``
+      (stand-in for any interrupt that prevents the rename from
+      completing);
+    - repeated saves after a failure, to verify the store can
+      recover without operator intervention.
+
+    The sidecar temp files used by the atomic writer are allowed
+    to be left behind after a failure; we assert they do not
+    contaminate the live files.
+    """
+
+    def test_agent_save_failure_preserves_old_contents(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        serializer = JsonSessionSerializer()
+        path = tmp_path / "agent.json"
+
+        # Seed a known-good record.
+        initial = Agent(
+            id=AgentID("a1"), name="initial", metadata={"v": 1},
+        )
+        serializer.save_agent(initial, path)
+        original_bytes = path.read_bytes()
+
+        # Patch os.replace in the serializer module to simulate a
+        # crash between writing the sidecar and renaming it into
+        # place.  The live file must remain unchanged.
+        import thorn.runtime._serializer as serializer_mod
+
+        def boom(src: str | Path, dst: str | Path) -> None:
+            raise OSError("simulated rename failure")
+
+        monkeypatch.setattr(serializer_mod.os, "replace", boom)
+
+        updated = Agent(
+            id=AgentID("a1"), name="updated", metadata={"v": 2},
+        )
+        with pytest.raises(OSError):
+            serializer.save_agent(updated, path)
+
+        # Live file untouched.
+        assert path.read_bytes() == original_bytes
+        # Loading still yields the initial record.
+        loaded = serializer.load_agent(path)
+        assert loaded.name == "initial"
+
+    def test_agent_save_after_failure_recovers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        serializer = JsonSessionSerializer()
+        path = tmp_path / "agent.json"
+
+        initial = Agent(id=AgentID("a1"), name="initial")
+        serializer.save_agent(initial, path)
+
+        import thorn.runtime._serializer as serializer_mod
+
+        call_count = {"n": 0}
+        real_replace = serializer_mod.os.replace
+
+        def flaky_replace(src: str | Path, dst: str | Path) -> None:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise OSError("first-time failure")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(serializer_mod.os, "replace", flaky_replace)
+
+        next_attempt = Agent(id=AgentID("a1"), name="second")
+        with pytest.raises(OSError):
+            serializer.save_agent(next_attempt, path)
+
+        # Second call succeeds; the live file now reflects the new
+        # state and the stale sidecar is gone (because the
+        # successful replace consumed it).
+        third = Agent(id=AgentID("a1"), name="third")
+        serializer.save_agent(third, path)
+
+        loaded = serializer.load_agent(path)
+        assert loaded.name == "third"
+        assert not any(
+            p.name.startswith(".tmp-")
+            for p in path.parent.iterdir()
+        )
+
+    def test_session_save_failure_preserves_history(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # history.json must survive a failed save of either file.
+        # We stash a known history.json, then force the rename of
+        # history.json to fail on the next save; the live file must
+        # remain at its original contents.
+        serializer = JsonSessionSerializer()
+        directory = tmp_path / "session"
+        agent = Agent(id=AgentID("a1"), name="bot")
+
+        session = Session(agent=agent, key=SessionKey("s1"))
+        session._history.append_user_prompt("hello world")
+        serializer.save_session(session, directory)
+
+        history_path = directory / "history.json"
+        original_history_bytes = history_path.read_bytes()
+
+        # Patch os.replace so any call with history.json as dst
+        # raises; session.json replace is allowed through.
+        import thorn.runtime._serializer as serializer_mod
+        real_replace = serializer_mod.os.replace
+
+        def selective_replace(src: str | Path, dst: str | Path) -> None:
+            if str(dst).endswith("history.json"):
+                raise OSError("history rename failed")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(serializer_mod.os, "replace", selective_replace)
+
+        # Mutate in-memory state and try to save.
+        session._history.append_user_prompt("second turn")
+        with pytest.raises(OSError):
+            serializer.save_session(session, directory)
+
+        # history.json is still the old value -- the in-memory
+        # mutation never reached disk.
+        assert history_path.read_bytes() == original_history_bytes
+
+    def test_atomic_writer_leaves_no_tmp_on_success(
+        self, tmp_path: Path,
+    ) -> None:
+        # Happy path: a successful save leaves no sidecar files
+        # behind.  Critical for operators so they can trust that a
+        # lingering .tmp-* file indicates an earlier failure.
+        serializer = JsonSessionSerializer()
+        directory = tmp_path / "session"
+        agent = Agent(id=AgentID("a1"), name="bot")
+
+        session = Session(agent=agent, key=SessionKey("s1"))
+        serializer.save_session(session, directory)
+
+        sidecars = [
+            p for p in directory.iterdir()
+            if p.name.startswith(".tmp-")
+        ]
+        assert sidecars == []
+
+
+# ---------------------------------------------------------------------------
 # SessionStore -- agent identity operations
 # ---------------------------------------------------------------------------
 

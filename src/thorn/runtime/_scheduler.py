@@ -53,11 +53,18 @@ What the scheduler does NOT do
   scheduler only reads ``prompt_pending()`` to decide whether a
   round is needed; it never mutates notification state itself.
 
-- **Progress guarantees.**  A session whose dispatcher spins without
-  the agent making progress (no items transitioning out of pending/
-  in_progress) will loop indefinitely here.  The N-strikes guard is
-  a distinct work item that layers on top of the scheduler by
-  watching transitions between rounds.
+- **Progress guarantees (optional).**  By default the scheduler
+  enforces an N-strikes forward-progress policy: after
+  :data:`DEFAULT_PROGRESS_STRIKES` consecutive rounds in which no
+  inbox item transitioned out of pending/in_progress, the scheduler
+  invokes an injected :data:`ProgressEvictor` to evict the oldest
+  item.  The default evictor is :func:`default_progress_evictor`,
+  which marks the oldest item ``errored`` via the dispatch machinery
+  (so any RSVP recipient is notified).  Tests and alternative
+  integrations can pass ``progress_evictor=None`` to disable the
+  guard, matching the previous behaviour of looping forever on a
+  non-making-progress session.  ``progress_strikes`` controls the
+  threshold; a value of 0 disables the guard as well.
 
 - **Persistence.**  Agent identity and session history persistence
   are orthogonal.  An optional :data:`SessionSaver` callback is
@@ -98,11 +105,14 @@ import contextlib
 import logging
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from thorn.runtime._dispatch import DispatchError, apply_handling_transition
 from thorn.runtime._inbox import SessionInbox
+from thorn.runtime._notification import NotificationStatus
 
 if TYPE_CHECKING:
     from thorn.core._agent import Agent
     from thorn.core._session import Session
+    from thorn.runtime._address import AddressBook
     from thorn.runtime._session import SessionKey
 
 
@@ -138,6 +148,20 @@ successful :data:`PromptDispatcher` return; not called if the
 dispatcher raised.  Exceptions are logged; the scheduler continues.
 """
 
+ProgressEvictor = Callable[[SessionInbox], Awaitable[None]]
+"""Callable invoked when a session stalls for :data:`DEFAULT_PROGRESS_STRIKES`
+consecutive rounds.
+
+The evictor is responsible for unblocking the session by removing at
+least one item from ``prompt_pending()``; the canonical
+implementation is :func:`default_progress_evictor`, which marks the
+oldest item ``errored`` via the dispatch machinery so any RSVP
+recipient is notified.
+
+Exceptions raised by the evictor are logged by the scheduler and
+the strike counter is left untouched, so the next round retries.
+"""
+
 
 DEFAULT_AGENT_CONCURRENCY = 3
 """Default agent-level concurrency cap.
@@ -146,6 +170,20 @@ Matches the plan's recommended baseline.  Gateway-level
 configuration and per-agent overrides are plumbed in by the
 ``Runtime`` / ``Gateway`` layers; this scheduler module just picks
 the value up from its constructor.
+"""
+
+DEFAULT_PROGRESS_STRIKES = 3
+"""Default N-strikes threshold for the forward-progress guarantee.
+
+A session that completes this many rounds in a row without any inbox
+item transitioning out of pending/in_progress has its oldest item
+evicted (marked ``errored``).  The counter resets as soon as progress
+is observed or an eviction succeeds.
+
+A value of 0 (or a ``None`` evictor) disables the guarantee; the
+scheduler will then loop indefinitely on stuck sessions, which is
+sometimes useful for tests and for integrations that want to supply
+their own progress policy out of band.
 """
 
 
@@ -176,15 +214,24 @@ class AgentScheduler:
         prompt_dispatcher: PromptDispatcher,
         concurrency: int = DEFAULT_AGENT_CONCURRENCY,
         save_session: SessionSaver | None = None,
+        progress_strikes: int = DEFAULT_PROGRESS_STRIKES,
+        progress_evictor: ProgressEvictor | None = None,
     ) -> None:
         if concurrency < 1:
             raise ValueError(
                 f"AgentScheduler concurrency must be >= 1, got {concurrency!r}"
             )
+        if progress_strikes < 0:
+            raise ValueError(
+                "AgentScheduler progress_strikes must be >= 0, got "
+                f"{progress_strikes!r}"
+            )
         self._agent = agent
         self._dispatcher = prompt_dispatcher
         self._save_session = save_session
         self._concurrency = concurrency
+        self._progress_strikes = progress_strikes
+        self._progress_evictor = progress_evictor
         self._semaphore = asyncio.Semaphore(concurrency)
         self._drivers: dict["SessionKey", _SessionDriver] = {}
         self._drivers_lock = asyncio.Lock()
@@ -249,6 +296,8 @@ class AgentScheduler:
                     semaphore=self._semaphore,
                     dispatcher=self._dispatcher,
                     save_session=self._save_session,
+                    progress_strikes=self._progress_strikes,
+                    progress_evictor=self._progress_evictor,
                 )
                 self._drivers[session.key] = driver
                 driver.start()
@@ -339,6 +388,7 @@ class _SessionDriver:
 
     __slots__ = (
         "_session", "_inbox", "_semaphore", "_dispatcher", "_save_session",
+        "_progress_strikes", "_progress_evictor", "_stall_count",
         "_wake", "_task", "_stop",
     )
 
@@ -350,12 +400,17 @@ class _SessionDriver:
         semaphore: asyncio.Semaphore,
         dispatcher: PromptDispatcher,
         save_session: SessionSaver | None,
+        progress_strikes: int,
+        progress_evictor: ProgressEvictor | None,
     ) -> None:
         self._session = session
         self._inbox = inbox
         self._semaphore = semaphore
         self._dispatcher = dispatcher
         self._save_session = save_session
+        self._progress_strikes = progress_strikes
+        self._progress_evictor = progress_evictor
+        self._stall_count = 0
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._stop = False
@@ -434,8 +489,28 @@ class _SessionDriver:
             )
 
     async def _run_one_round(self) -> None:
-        """Invoke the dispatcher once under the agent-level cap."""
+        """Invoke the dispatcher once under the agent-level cap.
+
+        After the dispatcher returns (or raises a non-cancellation
+        exception), updates the forward-progress strike counter
+        based on whether any item transitioned out of prompt-pending
+        view during the round.  When the counter reaches the
+        configured threshold and an evictor is installed, the
+        evictor is invoked to unblock the session.
+
+        Progress is defined as *at least one item* from the set of
+        pre-round prompt-pending IDs being absent from the post-round
+        set.  Additions to the inbox during the round do not count as
+        progress -- only closures do -- because the guarantee is
+        specifically about the session's ability to clear the items
+        it was already shown.  A dispatcher that raises is treated as
+        making no progress.
+        """
         async with self._semaphore:
+            before_ids = frozenset(
+                item.id for item in self._inbox.prompt_pending()
+            )
+            dispatcher_raised = False
             try:
                 await self._dispatcher(self._session, self._inbox)
             except asyncio.CancelledError:
@@ -448,9 +523,20 @@ class _SessionDriver:
                     "leaving inbox state untouched and looping",
                     self._session.agent.id, self._session.key,
                 )
-                return
+                dispatcher_raised = True
 
-        if self._save_session is None:
+            after_ids = frozenset(
+                item.id for item in self._inbox.prompt_pending()
+            )
+            closed_out = before_ids - after_ids
+            if closed_out:
+                self._stall_count = 0
+            else:
+                self._stall_count += 1
+
+            await self._maybe_evict_for_progress()
+
+        if dispatcher_raised or self._save_session is None:
             return
         try:
             await self._save_session(self._session)
@@ -463,10 +549,123 @@ class _SessionDriver:
                 self._session.agent.id, self._session.key,
             )
 
+    async def _maybe_evict_for_progress(self) -> None:
+        """Invoke the installed evictor if the strike threshold has been hit.
+
+        No-ops when the guarantee is disabled (threshold of 0 or no
+        installed evictor) or the counter is below the threshold.
+        If the evictor raises, the error is logged and the strike
+        counter is intentionally left in its elevated state so the
+        next round retries eviction; if the evictor returns
+        normally, the counter resets to give the session a fresh
+        attempt on its remaining items.
+        """
+        if self._progress_evictor is None:
+            return
+        if self._progress_strikes <= 0:
+            return
+        if self._stall_count < self._progress_strikes:
+            return
+        log.warning(
+            "Progress guarantee: session agent=%r key=%r has stalled for %d "
+            "rounds; invoking evictor",
+            self._session.agent.id, self._session.key, self._stall_count,
+        )
+        try:
+            await self._progress_evictor(self._inbox)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "Progress evictor raised for agent=%r session=%r; "
+                "strike counter left at %d and will retry next round",
+                self._session.agent.id, self._session.key, self._stall_count,
+            )
+            return
+        self._stall_count = 0
+
+
+# ---------------------------------------------------------------------------
+# Default evictor
+# ---------------------------------------------------------------------------
+
+_EVICTION_REASON = (
+    "Evicted by progress guarantee: this session did not close out any "
+    "inbox items across multiple prompt rounds."
+)
+"""Canned ``error_reason`` attached to evicted notifications.
+
+Kept as a module-level constant rather than f-stringed with the
+strike count because the count is a scheduler-level policy knob, not
+information intrinsic to this item's failure.  Operators diagnosing
+a stuck session should look at logs for the exact count."""
+
+
+def default_progress_evictor(
+    address_book: "AddressBook",
+) -> ProgressEvictor:
+    """Build a :data:`ProgressEvictor` that errors the oldest inbox item.
+
+    The returned callable, when invoked with a :class:`SessionInbox`,
+    marks the inbox's oldest remaining pending/in_progress item as
+    ``errored`` via :func:`apply_handling_transition`.  That routes
+    the item through the normal handling-dispatch machinery, so:
+
+    - items with an RSVP target are forwarded to that target with
+      the canned eviction reason as ``error_reason``;
+    - items without an RSVP are moved to the inbox's ``errored/``
+      directory for operator inspection.
+
+    When the inbox is unexpectedly empty (e.g. a concurrent handler
+    drained it between the scheduler's check and the evictor's
+    invocation), the evictor returns without action.
+
+    A :class:`DispatchError` from step 2 of dispatch is swallowed
+    (with a warning): step 1 has already persisted the errored
+    status, so the item is gone from ``prompt_pending()`` and the
+    stall is resolved; the startup sweep will reconcile the
+    abandoned step 2 on the next runtime entry.
+    """
+
+    async def _evict(inbox: SessionInbox) -> None:
+        pending = inbox.prompt_pending()
+        if not pending:
+            log.debug(
+                "default_progress_evictor: inbox %r is empty; nothing to evict",
+                inbox.address,
+            )
+            return
+        oldest = pending[0]
+        log.warning(
+            "default_progress_evictor: marking oldest item %s on inbox %r "
+            "as errored to restore forward progress",
+            oldest.id, inbox.address,
+        )
+        try:
+            apply_handling_transition(
+                inbox,
+                oldest.id,
+                NotificationStatus.ERRORED,
+                address_book=address_book,
+                error_reason=_EVICTION_REASON,
+            )
+        except DispatchError as exc:
+            log.warning(
+                "default_progress_evictor: step-2 dispatch failed for "
+                "evicted item %s: %s; status has been recorded and the "
+                "next startup sweep will reconcile",
+                oldest.id, exc,
+            )
+
+    return _evict
+
 
 __all__ = [
     "AgentScheduler",
     "DEFAULT_AGENT_CONCURRENCY",
+    "DEFAULT_PROGRESS_STRIKES",
     "PromptDispatcher",
+    "ProgressEvictor",
     "SessionSaver",
+    "default_progress_evictor",
 ]

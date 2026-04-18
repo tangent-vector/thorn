@@ -57,9 +57,12 @@ from thorn.runtime._queue import DurableQueue
 from thorn.runtime._runtime import Runtime
 from thorn.runtime._scheduler import (
     DEFAULT_AGENT_CONCURRENCY,
+    DEFAULT_PROGRESS_STRIKES,
     AgentScheduler,
     PromptDispatcher,
+    ProgressEvictor,
     SessionSaver,
+    default_progress_evictor,
 )
 from thorn.runtime._session import AgentID, SessionKey
 from thorn.runtime._store import SessionStore
@@ -79,6 +82,7 @@ __all__ = [
     "AgentScheduler",
     "ArrivalKind",
     "DEFAULT_AGENT_CONCURRENCY",
+    "DEFAULT_PROGRESS_STRIKES",
     "DispatchError",
     "DrainOutcome",
     "DrainResult",
@@ -91,6 +95,7 @@ __all__ = [
     "NotificationQueue",
     "NotificationSpec",
     "NotificationStatus",
+    "ProgressEvictor",
     "PromptDispatcher",
     "Runtime",
     "ServiceAddress",
@@ -104,6 +109,7 @@ __all__ = [
     "SweepReport",
     "apply_handling_transition",
     "build_inbox_prompt",
+    "default_progress_evictor",
     "deserialize_history",
     "dispatch_step_two",
     "inbox_prompt_dispatcher",

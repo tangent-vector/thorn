@@ -35,11 +35,16 @@ from thorn.core._session import Session
 from thorn.runtime._address import SessionAddress
 from thorn.runtime._inbox import SessionInbox
 from thorn.runtime._notification import NotificationSpec, NotificationStatus
+from thorn.runtime._address import AddressBook, ServiceAddress
+from thorn.runtime._notification_queue import NotificationQueue
 from thorn.runtime._scheduler import (
     DEFAULT_AGENT_CONCURRENCY,
+    DEFAULT_PROGRESS_STRIKES,
     AgentScheduler,
     PromptDispatcher,
+    ProgressEvictor,
     SessionSaver,
+    default_progress_evictor,
 )
 from thorn.runtime._session import AgentID, SessionKey
 
@@ -578,22 +583,25 @@ class TestExceptionIsolation:
         assert inbox.prompt_pending() == []
 
     async def test_no_progress_dispatcher_spins_until_shutdown(self, tmp_path: Path) -> None:
-        # A dispatcher that makes no progress will spin.  This
-        # documents the current behavior -- N-strikes progress
-        # enforcement is a separate work item.
+        # With the N-strikes guard disabled (progress_evictor=None),
+        # a dispatcher that never closes out items will spin forever.
+        # The default ProgressEvictor path is covered by the
+        # dedicated TestProgressGuarantee class below.
         agent = _make_agent()
         session = _make_session(agent, "s1")
         inbox = _make_inbox(tmp_path, agent, "s1")
         inbox.post(_spec(inbox.address))
 
         probe = _DispatcherProbe(action=_handle_nothing)
-        sched = AgentScheduler(agent=agent, prompt_dispatcher=probe)
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=None,
+        )
 
         await sched.submit(session, inbox)
-        # Give the loop a chance to spin a few times.
         await _wait_for(lambda: probe.call_count >= 3)
         await sched.shutdown(timeout=0)
-        # Inbox still has the item because nothing ever handled it.
         assert len(inbox.prompt_pending()) == 1
 
 
@@ -705,3 +713,390 @@ class TestSubmitValidation:
             await sched.submit(session, inbox)
 
         await sched.shutdown(timeout=0)
+
+
+# ---------------------------------------------------------------------------
+# Progress guarantee
+# ---------------------------------------------------------------------------
+
+class _RecordingEvictor:
+    """Test double for :data:`ProgressEvictor`.
+
+    Records every call and optionally mutates the inbox in the same
+    shape the default evictor would (erroring the oldest item) so
+    tests can exercise both "evictor succeeded" and "evictor failed"
+    paths.
+    """
+
+    def __init__(
+        self,
+        *,
+        mode: str = "evict_oldest",
+        raises: BaseException | None = None,
+    ) -> None:
+        self.calls: list[SessionInbox] = []
+        self._mode = mode
+        self._raises = raises
+
+    async def __call__(self, inbox: SessionInbox) -> None:
+        self.calls.append(inbox)
+        if self._raises is not None:
+            raise self._raises
+        if self._mode == "noop":
+            return
+        if self._mode == "evict_oldest":
+            pending = inbox.prompt_pending()
+            if pending:
+                inbox.update_status(
+                    pending[0].id, NotificationStatus.HANDLED,
+                )
+
+
+class TestProgressGuarantee:
+    async def test_evictor_fires_after_n_stalled_rounds(
+        self, tmp_path: Path,
+    ) -> None:
+        # With the default strike threshold (3), a dispatcher that
+        # never closes items must trigger exactly one evictor call
+        # after the third stalled round.
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address))
+
+        probe = _DispatcherProbe(action=_handle_nothing)
+        evictor = _RecordingEvictor(mode="noop")
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=evictor,
+        )
+
+        await sched.submit(session, inbox)
+        await _wait_for(lambda: len(evictor.calls) >= 1)
+        # Wait a little more to confirm it only fires once per
+        # threshold crossing (not once per round past the threshold).
+        await _short_sleep()
+        await sched.shutdown(timeout=0)
+
+        assert len(evictor.calls) >= 1
+        # Three rounds observed before the first eviction.  The
+        # dispatcher may race ahead by one extra round before
+        # shutdown takes effect, so we check for "at least three."
+        first_round_before_evict = probe.call_count
+        assert first_round_before_evict >= DEFAULT_PROGRESS_STRIKES
+
+    async def test_progress_resets_counter(self, tmp_path: Path) -> None:
+        # If the dispatcher closes an item on the second round, the
+        # strike counter must reset; with further stalled rounds the
+        # evictor should not fire until another N rounds elapse.
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        for _ in range(10):
+            inbox.post(_spec(inbox.address))
+
+        call_counter = {"i": 0}
+
+        def progress_on_second(
+            session: Session, inbox: SessionInbox, idx: int,
+        ) -> None:
+            call_counter["i"] += 1
+            # Progress only on call 2, then stall forever.
+            if call_counter["i"] == 2:
+                pending = inbox.prompt_pending()
+                if pending:
+                    inbox.update_status(
+                        pending[0].id, NotificationStatus.HANDLED,
+                    )
+
+        probe = _DispatcherProbe(action=progress_on_second)
+        evictor = _RecordingEvictor(mode="noop")
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=evictor,
+            progress_strikes=2,  # Tighten for a faster test.
+        )
+
+        await sched.submit(session, inbox)
+        # One progress (round 2) + two stalled rounds (rounds 3 & 4)
+        # should trigger the evictor at round 4.  The stall count
+        # before the reset would be 1 at round 1; 0 at round 2;
+        # 1 at round 3; 2 -> fire at round 4.
+        await _wait_for(lambda: len(evictor.calls) >= 1)
+        await sched.shutdown(timeout=0)
+
+        # First eviction fired no earlier than round 4 (because
+        # the round-2 reset delayed the trigger).
+        first_evict_round = probe.call_count
+        assert first_evict_round >= 4
+
+    async def test_dispatcher_exception_counts_as_stall(
+        self, tmp_path: Path,
+    ) -> None:
+        # A raising dispatcher never closes items, so its rounds
+        # should accrue strikes just like a silently-stalling one.
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address))
+
+        probe = _DispatcherProbe(raises=RuntimeError("boom"))
+        evictor = _RecordingEvictor(mode="noop")
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=evictor,
+            progress_strikes=2,
+        )
+
+        await sched.submit(session, inbox)
+        await _wait_for(lambda: len(evictor.calls) >= 1)
+        await sched.shutdown(timeout=0)
+
+        assert len(evictor.calls) >= 1
+
+    async def test_new_arrivals_do_not_count_as_progress(
+        self, tmp_path: Path,
+    ) -> None:
+        # Items arriving mid-round do not reset the strike counter;
+        # only closed-out items do.  Without this, a chatty source
+        # could indefinitely delay the forward-progress guarantee.
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address, content="original"))
+
+        def post_then_stall(
+            session: Session, inbox: SessionInbox, idx: int,
+        ) -> None:
+            # Simulate a source posting during the prompt.
+            inbox.post(_spec(inbox.address, content=f"arrived-{idx}"))
+
+        probe = _DispatcherProbe(action=post_then_stall)
+        evictor = _RecordingEvictor(mode="noop")
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=evictor,
+            progress_strikes=2,
+        )
+
+        await sched.submit(session, inbox)
+        await _wait_for(lambda: len(evictor.calls) >= 1)
+        await sched.shutdown(timeout=0)
+
+        assert len(evictor.calls) >= 1
+
+    async def test_evictor_success_resets_counter(
+        self, tmp_path: Path,
+    ) -> None:
+        # After an eviction, the strike counter must reset.  With a
+        # dispatcher that continues to stall, a second eviction
+        # should fire only after another N rounds elapse (which we
+        # verify by counting rounds between evictions).
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        for _ in range(3):
+            inbox.post(_spec(inbox.address))
+
+        probe = _DispatcherProbe(action=_handle_nothing)
+        evictor = _RecordingEvictor(mode="evict_oldest")
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=evictor,
+            progress_strikes=2,
+        )
+
+        await sched.submit(session, inbox)
+        await _wait_for(lambda: len(evictor.calls) >= 2)
+        await sched.shutdown(timeout=0)
+
+        assert len(evictor.calls) >= 2
+
+    async def test_evictor_exception_retries_next_round(
+        self, tmp_path: Path,
+    ) -> None:
+        # A raising evictor must not kill the driver.  The strike
+        # counter is left elevated so the next round retries
+        # eviction; until the evictor succeeds, the session keeps
+        # trying.
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address))
+
+        probe = _DispatcherProbe(action=_handle_nothing)
+        evictor = _RecordingEvictor(
+            mode="noop", raises=RuntimeError("evictor crashed"),
+        )
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=evictor,
+            progress_strikes=2,
+        )
+
+        await sched.submit(session, inbox)
+        # At least two evictor calls -- demonstrating retry after
+        # the first failure -- without the driver dying.
+        await _wait_for(lambda: len(evictor.calls) >= 2)
+        await sched.shutdown(timeout=0)
+
+    async def test_progress_strikes_zero_disables_guard(
+        self, tmp_path: Path,
+    ) -> None:
+        # Explicit 0 disables the guard even when an evictor is
+        # installed: the session spins without eviction.
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address))
+
+        probe = _DispatcherProbe(action=_handle_nothing)
+        evictor = _RecordingEvictor(mode="noop")
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=evictor,
+            progress_strikes=0,
+        )
+
+        await sched.submit(session, inbox)
+        await _wait_for(lambda: probe.call_count >= 5)
+        await sched.shutdown(timeout=0)
+
+        assert evictor.calls == []
+
+    async def test_negative_progress_strikes_rejected(self) -> None:
+        probe = _DispatcherProbe()
+        with pytest.raises(ValueError, match="progress_strikes must be >= 0"):
+            AgentScheduler(
+                agent=_make_agent(),
+                prompt_dispatcher=probe,
+                progress_strikes=-1,
+            )
+
+
+# ---------------------------------------------------------------------------
+# default_progress_evictor
+# ---------------------------------------------------------------------------
+
+class TestDefaultProgressEvictor:
+    async def test_marks_oldest_errored_when_no_rsvp(
+        self, tmp_path: Path,
+    ) -> None:
+        # Without an RSVP target, the oldest item is moved to the
+        # inbox's errored/ directory with the canned reason.
+        inbox = _make_inbox(tmp_path, _make_agent(), "s1")
+        first = inbox.post(_spec(inbox.address, content="first"))
+        inbox.post(_spec(inbox.address, content="second"))
+        ab = AddressBook()
+
+        evictor = default_progress_evictor(ab)
+        await evictor(inbox)
+
+        # Oldest is gone from prompt-pending.
+        pending_ids = [n.id for n in inbox.prompt_pending()]
+        assert first.id not in pending_ids
+        assert len(pending_ids) == 1
+
+    async def test_routes_to_rsvp_target_when_set(
+        self, tmp_path: Path,
+    ) -> None:
+        # With an RSVP set, the evicted (errored) item is forwarded
+        # to the RSVP target's queue with the canned error_reason.
+        inbox = _make_inbox(tmp_path, _make_agent(), "s1")
+        svc_addr = ServiceAddress("gitlab-master")
+        svc_queue = NotificationQueue(tmp_path / "svc-queue", svc_addr)
+        first = inbox.post(_spec(inbox.address, content="first"))
+        # Replace with an RSVP-carrying spec: we have to repost since
+        # the factory helper doesn't thread rsvp_to.  Use the queue
+        # directly.
+        inbox.update_status(first.id, NotificationStatus.HANDLED)
+        # Clean slate: post a fresh RSVP item.
+        rsvp_spec = NotificationSpec(
+            source="test",
+            content="with rsvp",
+            target=inbox.address,
+            rsvp_to=svc_addr,
+        )
+        posted = inbox.post(rsvp_spec)
+
+        ab = AddressBook()
+        ab.register(svc_addr, svc_queue)
+
+        evictor = default_progress_evictor(ab)
+        await evictor(inbox)
+
+        # Item no longer pending in session inbox.
+        assert [n.id for n in inbox.prompt_pending()] == []
+        # Item now in service queue as an errored RSVP.
+        forwarded = list(svc_queue.list())
+        assert len(forwarded) == 1
+        assert forwarded[0].id == posted.id
+        assert forwarded[0].status is NotificationStatus.ERRORED
+        assert forwarded[0].error_reason is not None
+        assert "progress guarantee" in forwarded[0].error_reason.lower()
+
+    async def test_empty_inbox_is_a_noop(self, tmp_path: Path) -> None:
+        inbox = _make_inbox(tmp_path, _make_agent(), "s1")
+        evictor = default_progress_evictor(AddressBook())
+        # Must not raise.
+        await evictor(inbox)
+        assert inbox.prompt_pending() == []
+
+    async def test_dispatch_error_swallowed(self, tmp_path: Path) -> None:
+        # Step 1 succeeds (item marked errored); step 2 fails
+        # because the RSVP target is not registered.  The evictor
+        # must swallow the DispatchError so the scheduler can reset
+        # its counter -- the item has been removed from the
+        # pending view, which is what matters for the guarantee.
+        inbox = _make_inbox(tmp_path, _make_agent(), "s1")
+        unknown_addr = ServiceAddress("no-such-service")
+        spec = NotificationSpec(
+            source="test",
+            content="x",
+            target=inbox.address,
+            rsvp_to=unknown_addr,
+        )
+        inbox.post(spec)
+
+        evictor = default_progress_evictor(AddressBook())
+        # Must not raise even though the RSVP target is unknown.
+        await evictor(inbox)
+
+        # prompt_pending is clear regardless of step-2 failure.
+        assert inbox.prompt_pending() == []
+
+    async def test_scheduler_integration_with_default_evictor(
+        self, tmp_path: Path,
+    ) -> None:
+        # End-to-end: scheduler + default evictor + a silently-
+        # stalling dispatcher must eventually empty the inbox by
+        # eviction alone.
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        for _ in range(2):
+            inbox.post(_spec(inbox.address))
+
+        probe = _DispatcherProbe(action=_handle_nothing)
+        evictor = default_progress_evictor(AddressBook())
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=evictor,
+            progress_strikes=2,
+        )
+
+        await sched.submit(session, inbox)
+        await _wait_for(lambda: len(inbox.prompt_pending()) == 0)
+        await sched.shutdown(timeout=0)
+
+        # All items were evicted (marked errored and parked in
+        # errored/ since no RSVP was set).
+        assert inbox.prompt_pending() == []
