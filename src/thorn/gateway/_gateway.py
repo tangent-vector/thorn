@@ -150,7 +150,7 @@ class Gateway:
 
         async with self._runtime:
             self._install_signal_handlers()
-            self._startup()
+            await self._startup()
 
             for source in self._sources:
                 task = asyncio.create_task(
@@ -178,7 +178,7 @@ class Gateway:
     # Startup
     # ------------------------------------------------------------------
 
-    def _startup(self) -> None:
+    async def _startup(self) -> None:
         """One-time startup: sweep, in-flight index rebuild, agent load.
 
         Order matters:
@@ -189,9 +189,13 @@ class Gateway:
         2. Run the sweep, which mutates the filesystem (and the
            rebuilt index) to restore invariants.
         3. Pre-load every persisted agent and stand up its scheduler.
-           Sessions themselves stay on disk until their first event
-           arrives; we create the :class:`SessionInbox` (and its
-           address-book entry) lazily in :meth:`_handle_event`.
+        4. Activate every session whose inbox still has
+           ``prompt_pending`` work, so drivers resume without having
+           to wait for a fresh incoming event.  The session
+           activation pass is what closes the "sweep leaves items on
+           disk but no driver runs" loop: if an inbox has anything in
+           ``{pending, in_progress}``, the session goes on the
+           scheduler's work list immediately.
         """
         if self._started:
             return
@@ -213,7 +217,6 @@ class Gateway:
         if (
             report.session_handled_dispatched
             or report.session_errored_dispatched
-            or report.session_in_progress_reverted
             or report.session_confirmed_cleaned
             or report.service_in_progress_reverted
             or report.service_confirmed_cleaned
@@ -227,7 +230,79 @@ class Gateway:
             agent = self._runtime.get_or_create_agent(agent_id)
             self._ensure_scheduler_for_agent(agent)
 
+        activated = await self._activate_sessions_with_work()
+        if activated:
+            log.info(
+                "Startup activation: submitted %d session(s) with pending work",
+                activated,
+            )
+
         self._started = True
+
+    async def _activate_sessions_with_work(self) -> int:
+        """Submit every session with ``prompt_pending`` work to its scheduler.
+
+        Walks every session inbox on disk via
+        :meth:`AgencyPaths.iter_session_inbox_locations`.  For each
+        inbox whose ``prompt_pending`` view is non-empty, loads the
+        session, registers the canonical
+        :class:`~thorn.runtime.SessionInbox` in the address book, and
+        submits ``(session, inbox)`` to the agent's scheduler so the
+        driver picks up where it left off.
+
+        Returns the number of sessions activated.
+
+        Inboxes holding only ``handled`` / ``errored`` items (which
+        the sweep could not dispatch because the RSVP target was
+        unresolved) are skipped: a driver wake-up would not help them
+        move forward.  Empty inbox directories are also skipped.
+        """
+        activated = 0
+        for agent_id, session_key, inbox_dir in (
+            self._runtime.paths.iter_session_inbox_locations()
+        ):
+            address = SessionAddress(agent_id, session_key)
+            # Cheap probe: a fresh SessionInbox does no I/O until we
+            # call ``prompt_pending``.  The instance is discarded if
+            # we skip; if we don't, ``_ensure_inbox`` constructs the
+            # canonical one that goes into the address book and is
+            # shared with the driver.
+            probe = SessionInbox(
+                inbox_dir,
+                address,
+                in_flight_index=self._runtime.in_flight_index,
+            )
+            if not probe.prompt_pending():
+                continue
+
+            if not self._runtime.sessions.agent_exists(agent_id):
+                # A session directory without a persisted agent file
+                # is an inconsistency the sweep can't repair.  Log
+                # and skip rather than silently fabricating an agent.
+                log.warning(
+                    "Skipping activation of session %s: agent %s is not "
+                    "persisted", address, agent_id,
+                )
+                continue
+
+            agent = self._runtime.get_or_create_agent(agent_id)
+            scheduler = self._ensure_scheduler_for_agent(agent)
+
+            ws = self._runtime.paths.session_workspace(agent_id, session_key)
+            ws.mkdir(parents=True, exist_ok=True)
+            session = self._runtime.get_or_create_session(
+                agent, session_key, workspace_root=ws,
+            )
+            _, inbox = self._ensure_inbox(agent, session_key)
+
+            # ``scheduler.submit`` returns promptly: it registers the
+            # driver (spawning its task) and kicks it if needed, but
+            # does not await the prompt round itself.  Submitting
+            # sequentially is fine for any realistic number of
+            # sessions-with-work, and keeps startup deterministic.
+            await scheduler.submit(session, inbox)
+            activated += 1
+        return activated
 
     # ------------------------------------------------------------------
     # Agent / scheduler / inbox lifecycle

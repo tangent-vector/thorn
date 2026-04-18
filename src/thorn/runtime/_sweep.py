@@ -11,9 +11,16 @@ Session inboxes:
 - **Temp sidecars (``.tmp-*.json``)** -- deleted.  These are partial
   writes from a crash during ``DurableQueue._write_atomic``; no live
   state depends on them.
-- **``status == in_progress``** -- reverted to ``pending``.  The
-  previous process was running a prompt that touched this item; on
-  restart we retry it from scratch.
+- **``status == in_progress``** -- left alone.  On the session-inbox
+  side, ``prompt_pending`` already treats ``pending`` and
+  ``in_progress`` identically, so reverting would have no effect on
+  scheduling.  The alternative -- presenting the agent with a fresh
+  item on restart that it never saw in-progress -- would be just as
+  confusing as the status surviving the crash (and arguably more so,
+  since the notification's ``notes`` field may contain context the
+  prior agent incarnation left for itself).  We deliberately let the
+  on-disk status stand and rely on the session activation pass in
+  :meth:`Gateway._startup` to ensure the driver still runs.
 - **``status == handled`` or ``status == errored``** -- step 2
   re-driven.  The previous process landed step 1 (status update)
   but crashed before step 2 (move or delete).  The sweep calls
@@ -100,9 +107,6 @@ class SweepReport:
 
     temp_files_removed: int = 0
     """``.tmp-*.json`` sidecars cleaned up across all queues."""
-
-    session_in_progress_reverted: int = 0
-    """``in_progress`` session-inbox items reverted to ``pending``."""
 
     session_handled_dispatched: int = 0
     """``handled`` session-inbox items whose step 2 the sweep ran."""
@@ -197,12 +201,9 @@ def _sweep_session_inboxes(
             status = notification.status
 
             if status is NotificationStatus.IN_PROGRESS:
-                # Previous process was prompting on this item; reset
-                # so the next prompt sees it as a fresh pending item.
-                inbox.update_status(
-                    notification.id, NotificationStatus.PENDING,
-                )
-                report.session_in_progress_reverted += 1
+                # Deliberately left as-is; see module docstring.  The
+                # session activation pass in Gateway._startup is
+                # responsible for making sure the driver runs.
                 continue
 
             if status in (

@@ -89,18 +89,26 @@ def _make_service_queue(
 # ---------------------------------------------------------------------------
 
 class TestSessionInboxSweep:
-    def test_in_progress_is_reverted_to_pending(self, tmp_path: Path) -> None:
+    def test_in_progress_is_left_untouched(self, tmp_path: Path) -> None:
+        """The sweep intentionally leaves ``in_progress`` items alone.
+
+        ``SessionInbox.prompt_pending`` treats ``pending`` and
+        ``in_progress`` identically, so nothing in the scheduling
+        machinery depends on a revert.  The gateway's session
+        activation pass (not the sweep) is what re-wakes the driver.
+        Keeping the status means we also preserve any ``notes`` the
+        prior agent incarnation wrote for its future self.
+        """
         paths = _paths(tmp_path)
         book = AddressBook()
         inbox = _make_session_inbox(paths, "coord", "proj/1")
         posted = inbox.post(_spec(target=inbox.address))
         inbox.update_status(posted.id, NotificationStatus.IN_PROGRESS)
 
-        report = run_startup_sweep(paths, book)
+        run_startup_sweep(paths, book)
 
-        assert report.session_in_progress_reverted == 1
         surviving = inbox.get(posted.id)
-        assert surviving.status is NotificationStatus.PENDING
+        assert surviving.status is NotificationStatus.IN_PROGRESS
 
     def test_stuck_handled_no_rsvp_is_deleted(self, tmp_path: Path) -> None:
         paths = _paths(tmp_path)
@@ -218,7 +226,6 @@ class TestSessionInboxSweep:
         report = run_startup_sweep(paths, book)
 
         # A pending item triggers no sweep action.
-        assert report.session_in_progress_reverted == 0
         assert report.session_handled_dispatched == 0
         surviving = inbox.get(posted.id)
         assert surviving.status is NotificationStatus.PENDING
@@ -313,5 +320,4 @@ def test_second_sweep_is_noop(tmp_path: Path) -> None:
 
     second = run_startup_sweep(paths, book)
     assert second.session_handled_dispatched == 0
-    assert second.session_in_progress_reverted == 0
     assert second.dispatch_skipped_unresolved == []

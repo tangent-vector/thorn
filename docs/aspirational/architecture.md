@@ -208,4 +208,4 @@ When the CLI app exits, the session is always prompted to perform housekeeping a
 
 When `thorn` CLI sessions connect to the default local agency, they check for a singleton daemon process serving that agency and start it if necessary. All currently-active CLI sessions connect to the same daemon process. The daemon will automatically shut down when no CLI connections have been made for a certain duration (around 1 minute). For scheduled actions (e.g., "dreaming" to better organize memory, etc.), a cron job is used to wake the local agency so it can process any time-based updates it needs on a semi-regular basis.
 
-If the `--server <URL>` option is passed to `thorn run` or `thorn chat`
+If the `--server <URL>` option is passed to `thorn run` or `thorn chat` they will not connect to the default local agency, and will instead connect to the agency running on the identified server.

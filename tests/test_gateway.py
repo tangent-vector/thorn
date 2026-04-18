@@ -650,17 +650,18 @@ class TestGatewayInboxIntegration:
         )
 
     @pytest.mark.asyncio
-    async def test_startup_sweep_reverts_in_progress(self, tmp_path: Path):
-        """An ``in_progress`` notification left from a prior run is
-        reverted to ``pending`` by the startup sweep, and then processed
-        alongside any newly-arriving events that wake the session driver.
+    async def test_startup_activates_session_with_pending_work(
+        self, tmp_path: Path,
+    ):
+        """A session left with unprocessed inbox items is activated at
+        startup without needing a fresh incoming event.
 
-        The sweep itself does not kick idle sessions -- that's by design
-        (sessions that never receive another event stay dormant until
-        one arrives).  This test exercises the common case: a source
-        delivers a fresh event shortly after restart, and the driver
-        processes the fresh event together with the sweep-resurrected
-        one in a single round.
+        This is the contract the activation pass enforces: if an
+        inbox has anything in ``{pending, in_progress}`` on restart,
+        the gateway submits it to its scheduler during ``_startup``
+        so the driver drains it.  Previously this test relied on a
+        fresh event to wake the driver; we now verify the stronger
+        property that activation happens even with an empty source.
         """
         from thorn.runtime._address import SessionAddress
         from thorn.runtime._dispatch import apply_handling_transition
@@ -673,7 +674,9 @@ class TestGatewayInboxIntegration:
         agent_id = AgentID("resume-agent")
         key = SessionKey("resume-key")
 
-        # Pre-seed the on-disk inbox with an ``in_progress`` item.
+        # Pre-seed the on-disk inbox with an ``in_progress`` item
+        # (simulating a prior-process crash mid-prompt) and a
+        # ``pending`` item (a queued event that never got picked up).
         runtime_seed = self._make_runtime(tmp_path)
         async with runtime_seed:
             agent = runtime_seed.get_or_create_agent(agent_id)
@@ -690,25 +693,23 @@ class TestGatewayInboxIntegration:
             seed_inbox = SessionInbox(
                 inbox_dir_seed, SessionAddress(agent_id, key),
             )
-            spec = NotificationSpec(
+            in_progress_n = seed_inbox.post(NotificationSpec(
                 source="test",
-                content="pre-existing work",
+                content="mid-prompt work",
                 target=SessionAddress(agent_id, key),
-            )
-            notification = seed_inbox.post(spec)
+            ))
             seed_inbox.update_status(
-                notification.id, NotificationStatus.IN_PROGRESS,
+                in_progress_n.id, NotificationStatus.IN_PROGRESS,
             )
+            pending_n = seed_inbox.post(NotificationSpec(
+                source="test",
+                content="queued work",
+                target=SessionAddress(agent_id, key),
+            ))
 
-        # Start a fresh runtime / gateway pointed at the same tmp_path,
-        # along with a new incoming event that will wake the driver.
-        wake_event = IncomingEvent(
-            source="test",
-            session_key=key,
-            content="wake up",
-            agent_id=agent_id,
-        )
-        source = StubSource([wake_event])
+        # No incoming events on this run -- the activation pass is
+        # what must drive the driver.
+        source = StubSource([])
         runtime = self._make_runtime(tmp_path)
 
         handled_ids: list[str] = []
@@ -728,15 +729,11 @@ class TestGatewayInboxIntegration:
         )
         await gateway.run()
 
-        # The sweep reverted the old item to pending; the new event
-        # also landed as pending; both were handled by the dispatcher.
-        assert notification.id in handled_ids, (
-            f"Expected sweep-resurrected {notification.id!r} to be "
-            f"handled; got {handled_ids}"
-        )
-        assert len(handled_ids) == 2, (
-            f"Expected both resurrected + fresh items handled; got "
-            f"{handled_ids}"
+        # Both items were handled by the activation-woken driver,
+        # and the ``in_progress`` item retained its status until the
+        # driver touched it (the sweep no longer reverts to pending).
+        assert set(handled_ids) == {in_progress_n.id, pending_n.id}, (
+            f"Expected both seeded items handled; got {handled_ids}"
         )
         inbox_dir = runtime.paths.session_inbox_dir(agent_id, key)
         remaining = [p.name for p in inbox_dir.glob("*.json")]
@@ -1072,7 +1069,7 @@ class TestGatewayInboxIntegration:
 
         async with runtime:
             gateway = self._make_gateway(runtime, [])
-            gateway._startup()
+            await gateway._startup()
             # Pretend an earlier post already placed this key in the
             # index.  A real agency would reach this state either via
             # the rebuild-from-disk or via a prior successful post.
@@ -1107,7 +1104,7 @@ class TestGatewayInboxIntegration:
 
         async with runtime:
             gateway = self._make_gateway(runtime, [])
-            gateway._startup()
+            await gateway._startup()
             assert "gitlab:example:todo:99" not in runtime.in_flight_index
 
             event = IncomingEvent(
