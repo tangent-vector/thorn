@@ -39,6 +39,12 @@ from thorn.runtime._notification_queue import (
 from thorn.runtime._paths import AgencyPaths, safe_dirname, unsafe_dirname
 from thorn.runtime._queue import DurableQueue
 from thorn.runtime._runtime import Runtime
+from thorn.runtime._scheduler import (
+    DEFAULT_AGENT_CONCURRENCY,
+    AgentScheduler,
+    PromptDispatcher,
+    SessionSaver,
+)
 from thorn.runtime._session import AgentID, SessionKey
 from thorn.runtime._store import SessionStore
 from thorn.runtime._serializer import (
@@ -53,7 +59,9 @@ __all__ = [
     "AddressBook",
     "AgencyPaths",
     "AgentID",
+    "AgentScheduler",
     "ArrivalKind",
+    "DEFAULT_AGENT_CONCURRENCY",
     "DrainOutcome",
     "DrainResult",
     "DurableQueue",
@@ -64,12 +72,14 @@ __all__ = [
     "NotificationQueue",
     "NotificationSpec",
     "NotificationStatus",
+    "PromptDispatcher",
     "Runtime",
     "ServiceAddress",
     "SessionAddress",
     "SessionInbox",
     "SessionKey",
     "SessionLockError",
+    "SessionSaver",
     "SessionSerializer",
     "SessionStore",
     "deserialize_history",
