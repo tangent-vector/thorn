@@ -37,6 +37,8 @@ from thorn.core._context import (
 from thorn.core._provider import LLMProvider
 from thorn.core._session import Session
 from thorn.core._service import Service
+from thorn.runtime._address import AddressBook
+from thorn.runtime._in_flight_index import InFlightIndex
 from thorn.runtime._paths import AgencyPaths
 from thorn.runtime._session import AgentID, SessionKey
 from thorn.runtime._store import SessionStore
@@ -78,6 +80,8 @@ class Runtime:
         validation_tracker: ValidationTracker | None = None,
         status_providers: list[StatusProvider] | None = None,
         paths: AgencyPaths | None = None,
+        address_book: AddressBook | None = None,
+        in_flight_index: InFlightIndex | None = None,
     ) -> None:
         self.provider = provider
         self.event_sink: EventSink = event_sink or NullEventSink()
@@ -100,6 +104,16 @@ class Runtime:
         if session_store is None:
             session_store = SessionStore(paths.agents_root)
         self.sessions = session_store
+
+        # Address book and in-flight index are both always present so
+        # that consumers (dispatchers, tools, sweep) can assume they
+        # exist without null-checking.  Callers that run a sweep at
+        # startup may replace ``in_flight_index`` with one rebuilt
+        # from the filesystem; we keep fields mutable on purpose.
+        self.address_book: AddressBook = address_book or AddressBook()
+        self.in_flight_index: InFlightIndex = (
+            in_flight_index or InFlightIndex()
+        )
 
         self._services: dict[str, Service] = {}
 

@@ -44,16 +44,56 @@ The memory and sessions of an agent together define its durable state, and these
 If `helper` is an agent and the agency root is `.../.thorn`, then the state of the agent would be persisted as the directory `.../.thorn/agents/helper/`.
 Under the agent's directory there are its *home* directory (`.../.thorn/agents/helper/home/`) and a directory for its sessions (`.../.thorn/agents/helper/sessions/`).
 
+The static state of an agent (the ports of itself it shouldn't be allowed to modify freely) are stored under the agent directory as a simple configuration file (`.../.thorn/agents/helper/agent.json`).
+
 The workspace of an agent is more like the desk or computer of a human: a place for in-progress work that, while important, is not as vital to save as the agent's own memory.
 The runtime system for an agency should strive not to throw away an agent's workspace, but at the same time agents are expected to be able to recover from loss of workspace data in much the same way a human would: if something you're working on is truly important, it should be backed up, in source control, etc.
 
 ### Sessions
 
 A **session** is single logical "thread" of conversation and/or action that an agent is engaged in.
-All of the sessions for a given agent share the same memory, but each session has a distinct sequence of user/assistant/system messages that are used when requesting completions from an LLM.
+All of the sessions for a given agent share the same memory, but each session has a distinct sequence of messages that are used when requesting completions from an LLM.
 
-Each session also has a logical **inbox** of notifications
+Each session also has a logical **inbox** of **notifications**.
+Notifications can represent incoming events from chat services, other agents, etc.
+A session is active/runnable when it has unhandled notifications in its inbox; the system will schedule runnable sessions, prompting an LLM to read and handle the remaining notifications.
 
-### Agencies
+#### Session Keys
 
-An **agency** represents
+Every session of an agent has a unique **session key**.
+
+When a notification is to be sent to an agent, an appropriate session key is determined and then the notification is placed in the session of that agent corresponding to the key (potentially creating such a session if it did not already exist).
+
+At the simplest, session keys are just strings, but in practice they use a path-like notation that ends up being reflected in how sessiosn are actually stored.
+For example for a session with a key like `a/b/c` on an agent `helper`, the state of the session would be stored at `.thorn/agents/helper/sessions/a/b/c/`.
+
+#### Session Workspaces
+
+Each session has a workspace within the overall workspace of the containing agent, with a relative path based on the session key.
+For example, if the workspace of agent `helper` is at `/workspace/helper/` then the workspace for a session with key `a/b/c` would be `/workspace/helper/a/b/c/`.
+
+Note that all sessions of an agent share the same home directory (that of the agent), but distinct sessions always have distinct session workspaces.
+
+The workspace of a session is effectively just the "current working directory" for the purpose of paths used in tool calls made for that session.
+Tool calls made by the session may still access/modify files outside of its specific workspace, unless other measures are taken to prevent such operations.
+
+### Services
+
+A **service** represents an messaging platform, server, etc. that is external to the agency.
+An example of a service would be Telegram or a GitLab server.
+An agent can have an **account** (including the relevant **credentials**) on one or more services.
+
+An agency is explicitly configured with a list of services it should be aware of, and the static configuration of an agent includes its accounts/credentials on the various services it can receive events from, send messages/requests to, etc.
+
+### Peers
+
+A **peer** is a logical individual (typically a person, but not always) that agents in a given agency might have reason to communicate or interact with.
+
+The configuration of an agency includes a list of known peers.
+For each peer, the agency includes information on their account names/numbers on various services, allowing the agency and the agents in it to identify when two accounts (potentially on different services) represent the same individual.
+
+### Routing of Events
+
+When a running agency detects a potentially-interesting **event** coming from a service (e.g., by polling for notifications on GitHub or GitLab), it will route that event to the correct session inbox for handling.
+
+Most events will clearly indicate the right

@@ -21,7 +21,18 @@ from thorn.runtime._address import (
     ServiceAddress,
     SessionAddress,
 )
+from thorn.runtime._dispatch import (
+    DispatchError,
+    apply_handling_transition,
+    dispatch_step_two,
+)
 from thorn.runtime._inbox import SessionInbox
+from thorn.runtime._inbox_tools import (
+    INBOX_TOOLS,
+    list_inbox_items,
+    read_inbox_item,
+    update_inbox_item,
+)
 from thorn.runtime._in_flight_index import InFlightIndex, rebuild_in_flight_index
 from thorn.runtime._lock import SessionLockError, session_lock
 from thorn.runtime._notification import (
@@ -47,6 +58,7 @@ from thorn.runtime._scheduler import (
 )
 from thorn.runtime._session import AgentID, SessionKey
 from thorn.runtime._store import SessionStore
+from thorn.runtime._sweep import SweepReport, run_startup_sweep
 from thorn.runtime._serializer import (
     JsonSessionSerializer,
     SessionSerializer,
@@ -62,9 +74,11 @@ __all__ = [
     "AgentScheduler",
     "ArrivalKind",
     "DEFAULT_AGENT_CONCURRENCY",
+    "DispatchError",
     "DrainOutcome",
     "DrainResult",
     "DurableQueue",
+    "INBOX_TOOLS",
     "InFlightIndex",
     "JsonSessionSerializer",
     "Notification",
@@ -82,10 +96,17 @@ __all__ = [
     "SessionSaver",
     "SessionSerializer",
     "SessionStore",
+    "SweepReport",
+    "apply_handling_transition",
     "deserialize_history",
+    "dispatch_step_two",
+    "list_inbox_items",
+    "read_inbox_item",
     "rebuild_in_flight_index",
+    "run_startup_sweep",
     "safe_dirname",
     "serialize_history",
     "session_lock",
     "unsafe_dirname",
+    "update_inbox_item",
 ]

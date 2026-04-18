@@ -17,6 +17,11 @@ from thorn.core._context import (
 )
 from thorn.core._func import skill
 from thorn.core._journal import JOURNAL_TOOLS
+from thorn.runtime._inbox_tools import INBOX_TOOLS
+
+# Framework-default tools appended to every agent, in the order
+# ``Agent._collect_tools`` adds them.
+_DEFAULT_TOOLS = list(JOURNAL_TOOLS) + list(INBOX_TOOLS)
 from thorn.core._messages import AssistantMessage
 from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
 from thorn.core._session import Session
@@ -66,7 +71,7 @@ class TestMROCollection:
         class Child(Base):
             tools = [tool_b]
 
-        assert Child._collect_tools() == [tool_a, tool_b] + JOURNAL_TOOLS
+        assert Child._collect_tools() == [tool_a, tool_b] + _DEFAULT_TOOLS
 
     def test_child_without_own_prompts_inherits_parent(self):
         """A subclass that doesn't declare system_prompts in its own __dict__
@@ -90,7 +95,7 @@ class TestMROCollection:
         class Child(Base):
             pass
 
-        assert Child._collect_tools() == [tool_a] + JOURNAL_TOOLS
+        assert Child._collect_tools() == [tool_a] + _DEFAULT_TOOLS
 
     def test_diamond_no_double_counting(self):
         """In diamond inheritance, each class's prompts appear exactly once,
@@ -126,7 +131,7 @@ class TestMROCollection:
             tools = [shared]
 
         collected = Child._collect_tools()
-        mro_tools = collected[: -len(JOURNAL_TOOLS)]
+        mro_tools = collected[: -len(_DEFAULT_TOOLS)]
         assert len(mro_tools) == 1
         assert mro_tools[0] is shared
 
@@ -151,7 +156,7 @@ class TestMROCollection:
             tools = [helper_v2]
 
         collected = Child._collect_tools()
-        mro_tools = collected[: -len(JOURNAL_TOOLS)]
+        mro_tools = collected[: -len(_DEFAULT_TOOLS)]
         assert len(mro_tools) == 1
         assert mro_tools[0] is helper
 
@@ -169,7 +174,7 @@ class TestMROCollection:
             tools = [[tool_a, tool_b], tool_c]
 
         collected = Base._collect_tools()
-        assert collected == [tool_a, tool_b, tool_c] + JOURNAL_TOOLS
+        assert collected == [tool_a, tool_b, tool_c] + _DEFAULT_TOOLS
 
     def test_nested_toolset_dedup_across_mro(self):
         """A toolset constant included in both parent and child is
@@ -193,7 +198,7 @@ class TestMROCollection:
             tools = [TOOLSET, tool_c]
 
         collected = Child._collect_tools()
-        assert collected == [tool_a, tool_b, tool_c] + JOURNAL_TOOLS
+        assert collected == [tool_a, tool_b, tool_c] + _DEFAULT_TOOLS
 
     def test_single_inheritance_validation_rules(self):
         class Base(Agent):
@@ -242,7 +247,7 @@ class TestMROCollection:
 
     def test_bare_agent_has_empty_collections(self):
         assert Agent._collect_system_prompts() == []
-        assert Agent._collect_tools() == list(JOURNAL_TOOLS)
+        assert Agent._collect_tools() == list(_DEFAULT_TOOLS)
         assert Agent._collect_validation_rules() == []
 
 

@@ -227,6 +227,55 @@ class AgencyPaths:
             if queue_dir.is_dir():
                 yield queue_dir
 
+    def iter_session_inbox_locations(
+        self,
+    ) -> Iterator[tuple[AgentID, SessionKey, Path]]:
+        """Yield ``(agent_id, session_key, inbox_dir)`` for every inbox on disk.
+
+        Decodes the directory names via :func:`unsafe_dirname` so the
+        returned identifiers are the original application-level values
+        (with ``/`` and other special characters restored).  Useful for
+        sweep and address-aware enumeration paths that need more than
+        just the raw directory.
+        """
+        agents_root = self.agents_root
+        if not agents_root.exists():
+            return
+        for agent_dir in agents_root.iterdir():
+            if not agent_dir.is_dir():
+                continue
+            sessions_dir = agent_dir / "sessions"
+            if not sessions_dir.is_dir():
+                continue
+            agent_id = AgentID(unsafe_dirname(agent_dir.name))
+            for session_dir in sessions_dir.iterdir():
+                if not session_dir.is_dir():
+                    continue
+                inbox_dir = session_dir / "inbox"
+                if not inbox_dir.is_dir():
+                    continue
+                session_key = SessionKey(unsafe_dirname(session_dir.name))
+                yield (agent_id, session_key, inbox_dir)
+
+    def iter_service_queue_locations(self) -> Iterator[tuple[str, Path]]:
+        """Yield ``(service_name, queue_dir)`` for every service queue on disk.
+
+        Mirrors :meth:`iter_session_inbox_locations` for service
+        queues.  The service name is decoded from its directory via
+        :func:`unsafe_dirname`.
+        """
+        services_root = self.services_root
+        if not services_root.exists():
+            return
+        for service_dir in services_root.iterdir():
+            if not service_dir.is_dir():
+                continue
+            queue_dir = service_dir / "queue"
+            if not queue_dir.is_dir():
+                continue
+            service_name = unsafe_dirname(service_dir.name)
+            yield (service_name, queue_dir)
+
     @classmethod
     def for_cli(cls, cwd: Path) -> AgencyPaths:
         """Construct paths for CLI mode (``thorn run`` / ``thorn chat``).

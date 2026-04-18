@@ -219,11 +219,13 @@ class Agent:
         Nested iterables (e.g. toolset constants like ``FILE_READING``)
         are flattened before deduplication.
 
-        Journal tools (``write_journal``, ``read_journal``) are always
-        appended unless a tool with the same name was already declared
-        in the MRO, so every agent gets journaling capability by default.
-        A subclass that needs to shadow a journal tool can declare its
-        own function with the same ``__name__``.
+        Journal tools (``write_journal``, ``read_journal``) and inbox
+        tools (``list_inbox_items``, ``read_inbox_item``,
+        ``update_inbox_item``) are always appended unless a tool with
+        the same name was already declared in the MRO, so every agent
+        gets journaling and inbox capability by default.  A subclass
+        that needs to shadow one of these can declare its own
+        function with the same ``__name__``.
         """
         from thorn.core._func import _flatten_tools
 
@@ -239,6 +241,13 @@ class Agent:
 
         from thorn.core._journal import JOURNAL_TOOLS
         for tool_item in _flatten_tools(JOURNAL_TOOLS):
+            tool_name = getattr(tool_item, "__name__", str(tool_item))
+            if tool_name not in seen_names:
+                collected.append(tool_item)
+                seen_names.add(tool_name)
+
+        from thorn.runtime._inbox_tools import INBOX_TOOLS
+        for tool_item in _flatten_tools(INBOX_TOOLS):
             tool_name = getattr(tool_item, "__name__", str(tool_item))
             if tool_name not in seen_names:
                 collected.append(tool_item)
