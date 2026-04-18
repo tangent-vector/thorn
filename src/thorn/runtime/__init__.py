@@ -21,11 +21,19 @@ from thorn.runtime._address import (
     ServiceAddress,
     SessionAddress,
 )
+from thorn.runtime._inbox import SessionInbox
 from thorn.runtime._lock import SessionLockError, session_lock
 from thorn.runtime._notification import (
     Notification,
     NotificationSpec,
     NotificationStatus,
+)
+from thorn.runtime._notification_queue import (
+    ArrivalKind,
+    DrainOutcome,
+    DrainResult,
+    NotificationHandler,
+    NotificationQueue,
 )
 from thorn.runtime._paths import AgencyPaths
 from thorn.runtime._queue import DurableQueue
@@ -44,14 +52,20 @@ __all__ = [
     "AddressBook",
     "AgencyPaths",
     "AgentID",
+    "ArrivalKind",
+    "DrainOutcome",
+    "DrainResult",
     "DurableQueue",
     "JsonSessionSerializer",
     "Notification",
+    "NotificationHandler",
+    "NotificationQueue",
     "NotificationSpec",
     "NotificationStatus",
     "Runtime",
     "ServiceAddress",
     "SessionAddress",
+    "SessionInbox",
     "SessionKey",
     "SessionLockError",
     "SessionSerializer",
