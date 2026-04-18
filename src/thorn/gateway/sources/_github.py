@@ -157,11 +157,24 @@ def _format_notification_content(
         lines.append(comment_body)
         lines.append("")
 
-    lines.extend([
-        "Respond to the notification as appropriate, then mark the "
-        "notification as done using forge_mark_notification_done.",
-    ])
+    lines.append(
+        "Respond to the notification as appropriate.  The GitHub "
+        "notification thread has already been marked read on your "
+        "behalf.",
+    )
     return "\n".join(lines)
+
+
+def _make_external_key(base_url: str, thread_id: str) -> str:
+    """Build the source-namespaced ``external_key`` for a GitHub thread.
+
+    GitHub thread IDs are unique within an instance; the API base URL
+    is included so that a single agency polling multiple GitHub
+    instances (e.g. github.com plus a GitHub Enterprise server) does
+    not collide.  See :mod:`thorn.runtime._in_flight_index` for the
+    wider contract.
+    """
+    return f"github:{base_url}:thread:{thread_id}"
 
 
 def _make_incoming_event(
@@ -169,6 +182,7 @@ def _make_incoming_event(
     thread: dict[str, Any],
     comment_body: str,
     native_id_to_project_name: dict[str, str],
+    base_url: str = "",
 ) -> IncomingEvent:
     """Convert a GitHub notification thread dict into an :class:`IncomingEvent`."""
     repo = thread["repository"]
@@ -229,6 +243,7 @@ def _make_incoming_event(
             "project_name": project_name,
             "updated_at": updated_at,
         },
+        external_key=_make_external_key(base_url, thread_id),
     )
 
 
@@ -325,7 +340,29 @@ class GitHubNotificationsSource(EventSource):
         if new_events:
             log.info("Found %d new notification(s)", len(new_events))
         for ev in new_events:
-            await on_event(ev)
+            try:
+                await on_event(ev)
+            except Exception:
+                # One bad event shouldn't poison the whole poll; skip
+                # mark-as-read so the thread resurfaces on the next
+                # poll and we get another shot at posting it.
+                log.exception(
+                    "Failed to post event for GitHub thread %s",
+                    ev.metadata.get("notification_id", "?"),
+                )
+                continue
+
+            # Mark the thread read so GitHub doesn't resurface the
+            # same notification on every poll.  Runs regardless of
+            # whether the gateway actually posted or deduplicated the
+            # event -- the in-flight copy will be handled on its own
+            # schedule, and we want the *platform* to stop resurfacing
+            # the entity either way.
+            thread_id = ev.metadata.get("notification_id")
+            if thread_id:
+                await asyncio.to_thread(
+                    self._mark_thread_read, str(thread_id),
+                )
 
     def _fetch_new_notifications(self) -> list[IncomingEvent]:
         """Return new notifications since last poll."""
@@ -373,12 +410,34 @@ class GitHubNotificationsSource(EventSource):
                     thread=thread,
                     comment_body=comment_body,
                     native_id_to_project_name=self._config.native_id_to_project_name,
+                    base_url=self._config.base_url,
                 ),
             )
 
         # Process oldest-first so prompts follow chronological order.
         incoming.sort(key=lambda e: e.metadata.get("updated_at", ""))
         return incoming
+
+    def _mark_thread_read(self, thread_id: str) -> None:
+        """Mark a notification thread as read on GitHub.
+
+        Best-effort: a failed PATCH is logged and swallowed.  The
+        ``_seen_thread_ids`` cache prevents a re-emit within this
+        process; on restart the source re-primes from GitHub's own
+        unread state, so a missed mark-read simply means the thread
+        is dropped by the prime (since by then it will have been
+        read or otherwise aged out of the notifications feed) or
+        picked up again as a "new" thread and deduplicated by the
+        gateway's :class:`InFlightIndex` if still in flight.
+        """
+        try:
+            resp = self._http.patch(f"/notifications/threads/{thread_id}")
+            resp.raise_for_status()
+        except Exception:
+            log.exception(
+                "Failed to mark GitHub notification thread %s as read",
+                thread_id,
+            )
 
     def _fetch_latest_comment(self, thread: dict[str, Any]) -> str:
         """Fetch the body of the latest comment on the notification thread.

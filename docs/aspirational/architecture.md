@@ -196,3 +196,16 @@ When prompting an LLM, the system prompt generated for a session will include re
 CLI Sessions
 ------------
 
+The `thorn chat` and `thorn run` tools by default create sessions that run inside the default agent of the local agency for the current user (that is, whatever is in `~<username>/.thorn/`).
+
+The `--agent <name>` option can be used to identify the specific agent to open a session with (not necessarily the default).
+The `--model <name>` option can be used to specify a specific LLM model to use for the session; otherwise the model to use will be chosen based on the agent's configuration.
+
+Each invocation of `thorn chat` or `thorn run` creates a fresh session by default, with a key that depends on the current working directory when the command was run, along with a unique ID.
+When the CLI app exits, the session is always prompted to perform housekeeping and migrate all relevant information out to the journal or durable memory, since there is no guarantee that the session will ever be revisited.
+
+(slash commands could be added to `thorn chat` to allow a user to re-connect to old sessions, or to explicitly ask that the current session be saved)
+
+When `thorn` CLI sessions connect to the default local agency, they check for a singleton daemon process serving that agency and start it if necessary. All currently-active CLI sessions connect to the same daemon process. The daemon will automatically shut down when no CLI connections have been made for a certain duration (around 1 minute). For scheduled actions (e.g., "dreaming" to better organize memory, etc.), a cron job is used to wake the local agency so it can process any time-based updates it needs on a semi-regular basis.
+
+If the `--server <URL>` option is passed to `thorn run` or `thorn chat`

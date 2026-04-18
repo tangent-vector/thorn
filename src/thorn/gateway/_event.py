@@ -42,6 +42,16 @@ class IncomingEvent:
             logic applies.
         metadata: Source-specific data (project IDs, TODO IDs, etc.)
             for use by tools or diagnostics.
+        external_key: Optional source-namespaced stable identifier for
+            the external entity this event represents (e.g.
+            ``"gitlab:https://gitlab.example.com:todo:42"``).  When
+            set, the gateway uses the runtime's
+            :class:`~thorn.runtime.InFlightIndex` to silently drop the
+            event if another notification for the same key is still in
+            flight somewhere in the agency.  This is the primary
+            mechanism by which sources avoid re-posting the same
+            external event across polls (including after a restart,
+            thanks to the index's filesystem-backed rebuild).
     """
 
     source: str
@@ -49,6 +59,7 @@ class IncomingEvent:
     content: str
     agent_id: AgentID | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    external_key: str | None = None
 
 
 class EventSource(Service):

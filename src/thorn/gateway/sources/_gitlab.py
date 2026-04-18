@@ -145,10 +145,10 @@ def _format_event_content(todo: Any) -> str:
         lines.append(body)
         lines.append("")
 
-    lines.extend([
-        "Respond to the notification as appropriate, then mark the "
-        "notification as done using forge_mark_notification_done.",
-    ])
+    lines.append(
+        "Respond to the notification as appropriate.  The GitLab TODO "
+        "has already been marked done on your behalf.",
+    )
     return "\n".join(lines)
 
 
@@ -186,9 +186,25 @@ def _make_session_key(
     )
 
 
+def _make_external_key(gitlab_url: str, todo_id: int) -> str:
+    """Build the source-namespaced ``external_key`` for a GitLab TODO.
+
+    The key is globally unique across GitLab instances: a TODO ID is
+    only unique within its instance, so we include the URL to avoid
+    cross-instance collisions when a single agency polls multiple
+    GitLabs.  The URL is included verbatim (no normalization) because
+    the config is the source of truth for what "this GitLab" means;
+    if the same GitLab is configured with two textually different
+    URLs, that is the operator's responsibility to deduplicate.
+    """
+    return f"gitlab:{gitlab_url}:todo:{todo_id}"
+
+
 def _make_event(
     todo: Any,
     project_id_to_name: dict[str, str] | None = None,
+    *,
+    gitlab_url: str = "",
 ) -> IncomingEvent:
     """Convert a GitLab TODO into an ``IncomingEvent``."""
     project = todo.project
@@ -214,6 +230,7 @@ def _make_event(
             "default_branch": project.get("default_branch", "main"),
             "web_url": project.get("web_url", ""),
         },
+        external_key=_make_external_key(gitlab_url, todo.id),
     )
 
 
@@ -301,8 +318,39 @@ class GitLabTODOsSource(EventSource):
         id_to_name = self._config.project_id_to_name
         for todo in new_todos:
             self._seen.add(todo.id)
-            event = _make_event(todo, project_id_to_name=id_to_name)
-            await on_event(event)
+            event = _make_event(
+                todo,
+                project_id_to_name=id_to_name,
+                gitlab_url=self._config.url,
+            )
+            try:
+                await on_event(event)
+            except Exception:
+                # Intentionally swallow per-TODO errors so one bad
+                # TODO doesn't poison the whole poll cycle.  Skip
+                # mark-done: without a confirmed post we want the
+                # TODO to reappear on the next poll so we can retry.
+                log.exception(
+                    "Failed to post event for GitLab TODO %s", todo.id,
+                )
+                continue
+
+            # Proactively mark the TODO as done on GitLab's side once
+            # it has been safely handed off to the gateway.  This
+            # happens regardless of whether the gateway deduplicated
+            # the post: the point is to keep GitLab from surfacing
+            # the same TODO on every poll.  If an earlier copy is
+            # already in flight (dedup path) the agent will still
+            # handle it; if mark_as_done itself fails we just log and
+            # move on -- the `_seen` cache prevents a re-emit within
+            # this process, and a restart will retry via the normal
+            # pending-TODOs path.
+            try:
+                await asyncio.to_thread(todo.mark_as_done)
+            except Exception:
+                log.exception(
+                    "Failed to mark GitLab TODO %s as done", todo.id,
+                )
 
     def _get_pending_todos(self) -> list[Any]:
         return list(self._gl.todos.list(state="pending", iterator=True))

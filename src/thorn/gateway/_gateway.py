@@ -381,11 +381,33 @@ class Gateway:
         the first prompt has not yet run (or has crashed).  This is
         a semantic shift from the pre-inbox gateway, where
         persistence was gated on a successful prompt.
+
+        Source-level deduplication: if the event carries an
+        ``external_key`` that is already recorded in the runtime's
+        :class:`InFlightIndex`, the event is silently dropped and no
+        session state is touched.  This is the gateway-side half of
+        the contract described in :mod:`thorn.runtime._in_flight_index`
+        -- sources set stable, namespaced keys on events they emit and
+        the gateway enforces at-most-one-in-flight-per-key across the
+        whole agency.  Sources may (and typically do) call back to
+        their external platform regardless of dedup (for example, the
+        GitLab source marks a TODO as done after every post, so that
+        the *platform* also stops resurfacing the underlying entity).
         """
         log.info(
             "Handling event from %s (session=%s)",
             event.source, event.session_key,
         )
+
+        if event.external_key is not None:
+            if event.external_key in self._runtime.in_flight_index:
+                log.info(
+                    "Dropping duplicate event from %s "
+                    "(external_key=%s already in flight)",
+                    event.source, event.external_key,
+                )
+                return
+
         agent = self._resolve_agent(event)
 
         # Persist identity on first sight so the resolved agent is
@@ -417,6 +439,7 @@ class Gateway:
             content=event.content,
             target=address,
             metadata=dict(event.metadata),
+            external_key=event.external_key,
         )
         notification = inbox.post(spec)
         log.info(

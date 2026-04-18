@@ -1048,6 +1048,82 @@ class TestGatewayInboxIntegration:
             f"concurrent prompts under a single agent"
         )
 
+    @pytest.mark.asyncio
+    async def test_event_with_in_flight_external_key_is_dropped(
+        self, tmp_path: Path,
+    ):
+        """A fresh event whose ``external_key`` is already recorded in
+        the runtime's :class:`InFlightIndex` must be silently dropped
+        by the gateway -- no inbox post, no session persistence, no
+        scheduler submit.
+
+        This is the contract sources rely on to avoid re-delivering
+        the same external entity across polls (and across restarts,
+        via the startup rebuild of the index).  We drive the gateway
+        startup explicitly rather than through :meth:`Gateway.run`
+        because the behaviour we care about is entirely on the
+        receiving-side ``_handle_event`` path.
+        """
+        from thorn.runtime._address import SessionAddress
+
+        agent_id = AgentID("dedup-agent")
+        key = SessionKey("dedup-session")
+        runtime = self._make_runtime(tmp_path)
+
+        async with runtime:
+            gateway = self._make_gateway(runtime, [])
+            gateway._startup()
+            # Pretend an earlier post already placed this key in the
+            # index.  A real agency would reach this state either via
+            # the rebuild-from-disk or via a prior successful post.
+            runtime.in_flight_index.add("gitlab:example:todo:42")
+
+            duplicate = IncomingEvent(
+                source="test",
+                session_key=key,
+                content="should be dropped",
+                agent_id=agent_id,
+                external_key="gitlab:example:todo:42",
+            )
+            await gateway._handle_event(duplicate)
+
+            # No agent was persisted, no session created, no inbox
+            # registered -- the gateway short-circuited before any
+            # of that work.
+            assert not runtime.sessions.agent_exists(agent_id)
+            assert not runtime.sessions.session_exists(agent_id, key)
+            assert SessionAddress(agent_id, key) not in gateway._inboxes
+
+    @pytest.mark.asyncio
+    async def test_event_with_fresh_external_key_is_posted(
+        self, tmp_path: Path,
+    ):
+        """An event whose ``external_key`` is not in flight must post
+        normally and register the key in the index, so a subsequent
+        identical event would be deduplicated."""
+        agent_id = AgentID("fresh-key-agent")
+        key = SessionKey("fresh-key-session")
+        runtime = self._make_runtime(tmp_path)
+
+        async with runtime:
+            gateway = self._make_gateway(runtime, [])
+            gateway._startup()
+            assert "gitlab:example:todo:99" not in runtime.in_flight_index
+
+            event = IncomingEvent(
+                source="test",
+                session_key=key,
+                content="fresh",
+                agent_id=agent_id,
+                external_key="gitlab:example:todo:99",
+            )
+            await gateway._handle_event(event)
+
+            assert runtime.sessions.session_exists(agent_id, key)
+            assert "gitlab:example:todo:99" in runtime.in_flight_index
+
+            await gateway.shutdown()
+
 
 # ---------------------------------------------------------------------------
 # GitLabTODOsSource (mocked)
@@ -1105,7 +1181,7 @@ class TestGitLabTODOsSourceEventFormatting:
         assert "mentioned" in event.content
         assert "Issue #42" in event.content
         assert "Please help" in event.content
-        assert "forge_mark_notification_done" in event.content
+        assert "forge_mark_notification_done" not in event.content
         assert event.metadata["todo_id"] == 99
         assert event.metadata["project_id"] == 123
         assert event.metadata["clone_url"] == "https://gitlab.example.com/org/repo.git"
@@ -1168,10 +1244,28 @@ class TestGitLabTODOsSourceEventFormatting:
 
         todo = _make_mock_todo()
         content = _format_event_content(todo)
-        assert "forge_mark_notification_done" in content
+        assert "forge_mark_notification_done" not in content
+        assert "marked done on your behalf" in content
         assert "Clone URL:" in content
         assert "Default branch:" in content
         assert "Project URL:" in content
+
+    def test_make_event_sets_namespaced_external_key(self):
+        from thorn.gateway.sources._gitlab import _make_event
+
+        todo = _make_mock_todo(
+            todo_id=99, project_id=123, noteable_type="Issue",
+            noteable_iid=42, action_name="mentioned",
+        )
+        event = _make_event(
+            todo, gitlab_url="https://gitlab.example.com",
+        )
+        # Key must be source-namespaced and unique per TODO so the
+        # InFlightIndex can dedupe across polls and restarts without
+        # cross-source collisions.
+        assert event.external_key == (
+            "gitlab:https://gitlab.example.com:todo:99"
+        )
 
 
 class TestGitLabTODOsSourcePolling:
@@ -1263,6 +1357,74 @@ class TestGitLabTODOsSourcePolling:
             assert len(events) == 2
             assert events[0].session_key == events[1].session_key
             assert events[0].metadata["todo_id"] != events[1].metadata["todo_id"]
+
+    @pytest.mark.asyncio
+    async def test_marks_todo_as_done_after_post(self):
+        """GitLab source should mark each TODO as done on GitLab's side
+        as soon as it has safely posted the event.  This keeps the
+        pending-TODO list bounded even when sessions take their time
+        handling notifications."""
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib") as mock_gl_mod,
+        ):
+            mock_gl_instance = MagicMock()
+            mock_gl_mod.Gitlab.return_value = mock_gl_instance
+
+            todo = _make_mock_todo(todo_id=77)
+            mock_gl_instance.todos.list.return_value = [todo]
+
+            from thorn.gateway.sources._gitlab import (
+                GitLabSourceConfig,
+                GitLabTODOsSource,
+            )
+
+            config = GitLabSourceConfig(
+                url="https://gitlab.example.com",
+                token="test-token",
+                poll_interval=5,
+            )
+            source = GitLabTODOsSource(config)
+
+            async def on_event(_event: IncomingEvent) -> None:
+                pass
+
+            await source._poll_once(on_event)
+
+            todo.mark_as_done.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_post_failure_skips_mark_done(self):
+        """If the gateway raises, we must not mark the TODO done --
+        otherwise the TODO would be lost on both sides."""
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib") as mock_gl_mod,
+        ):
+            mock_gl_instance = MagicMock()
+            mock_gl_mod.Gitlab.return_value = mock_gl_instance
+
+            todo = _make_mock_todo(todo_id=78)
+            mock_gl_instance.todos.list.return_value = [todo]
+
+            from thorn.gateway.sources._gitlab import (
+                GitLabSourceConfig,
+                GitLabTODOsSource,
+            )
+
+            config = GitLabSourceConfig(
+                url="https://gitlab.example.com",
+                token="test-token",
+                poll_interval=5,
+            )
+            source = GitLabTODOsSource(config)
+
+            async def on_event(_event: IncomingEvent) -> None:
+                raise RuntimeError("boom")
+
+            await source._poll_once(on_event)
+
+            todo.mark_as_done.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_deduplicates_todos(self):
@@ -1730,7 +1892,7 @@ class TestEndToEndWiring:
 
         assert "Clone URL:" in content
         assert "Default branch:" in content
-        assert "forge_mark_notification_done" in content
+        assert "marked done on your behalf" in content
 
 
 # ---------------------------------------------------------------------------
@@ -2886,7 +3048,7 @@ class TestFormatNotificationContent:
         assert "100" in content
         assert "Please fix this ASAP" in content
         assert "Clone URL:" in content
-        assert "forge_mark_notification_done" in content
+        assert "marked read on your behalf" in content
 
     def test_empty_comment(self):
         from thorn.gateway.sources._github import _format_notification_content

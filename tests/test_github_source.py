@@ -139,6 +139,7 @@ class TestMakeIncomingEvent:
             thread=thread,
             comment_body="Please fix this",
             native_id_to_project_name={},
+            base_url="https://api.github.com",
         )
         assert ev.source == "github"
         assert ev.metadata["notification_id"] == "100"
@@ -146,6 +147,18 @@ class TestMakeIncomingEvent:
         assert ev.metadata["repo_id"] == 456
         assert ev.metadata["repo_full_name"] == "octocat/hello-world"
         assert "Please fix this" in ev.content
+        # Source-namespaced external_key keyed on the API base URL
+        # and the notification thread id -- this is what the
+        # InFlightIndex consults for cross-poll and cross-restart
+        # deduplication.
+        assert ev.external_key == (
+            "github:https://api.github.com:thread:100"
+        )
+        # The content no longer instructs the agent to close out the
+        # notification itself: the source marks the thread read on
+        # GitHub at post time.
+        assert "forge_mark_notification_done" not in ev.content
+        assert "marked read on your behalf" in ev.content
 
     def test_issue_routes_to_issue_session(self) -> None:
         from thorn.gateway.sources._github import _make_incoming_event
@@ -286,6 +299,105 @@ class TestGitHubNotificationsSourceFetchNewNotifications:
         assert len(second) == 1
         assert second[0].metadata["notification_id"] == "222"
         assert second[0].source == "github"
+
+
+class TestGitHubNotificationsSourcePollOnce:
+    """Exercise the mark-read-at-post behaviour of ``_poll_once``."""
+
+    @pytest.mark.asyncio
+    async def test_marks_thread_read_after_post(self) -> None:
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        config = GitHubNotificationsSourceConfig(token="ghp_test")
+        source = GitHubNotificationsSource(config)
+        source._primed = True
+
+        thread = _make_notification_thread(thread_id="300")
+
+        list_resp = MagicMock()
+        list_resp.status_code = 200
+        list_resp.raise_for_status = MagicMock()
+        list_resp.json.return_value = [thread]
+        list_resp.headers = {}
+
+        comment_resp = MagicMock()
+        comment_resp.status_code = 200
+        comment_resp.raise_for_status = MagicMock()
+        comment_resp.json.return_value = {"body": "comment"}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 205
+        patch_resp.raise_for_status = MagicMock()
+
+        def mock_get(url: str, **kwargs: Any) -> MagicMock:
+            if "/issues/comments/" in url:
+                return comment_resp
+            return list_resp
+
+        patch_calls: list[str] = []
+
+        def mock_patch(url: str, **kwargs: Any) -> MagicMock:
+            patch_calls.append(url)
+            return patch_resp
+
+        async def on_event(_event: IncomingEvent) -> None:
+            pass
+
+        with (
+            patch.object(source._http, "get", side_effect=mock_get),
+            patch.object(source._http, "patch", side_effect=mock_patch),
+        ):
+            await source._poll_once(on_event)
+
+        assert patch_calls == ["/notifications/threads/300"]
+
+    @pytest.mark.asyncio
+    async def test_post_failure_skips_mark_read(self) -> None:
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        config = GitHubNotificationsSourceConfig(token="ghp_test")
+        source = GitHubNotificationsSource(config)
+        source._primed = True
+
+        thread = _make_notification_thread(thread_id="301")
+
+        list_resp = MagicMock()
+        list_resp.status_code = 200
+        list_resp.raise_for_status = MagicMock()
+        list_resp.json.return_value = [thread]
+        list_resp.headers = {}
+
+        comment_resp = MagicMock()
+        comment_resp.status_code = 200
+        comment_resp.raise_for_status = MagicMock()
+        comment_resp.json.return_value = {"body": "comment"}
+
+        def mock_get(url: str, **kwargs: Any) -> MagicMock:
+            if "/issues/comments/" in url:
+                return comment_resp
+            return list_resp
+
+        patch_calls: list[str] = []
+
+        async def on_event(_event: IncomingEvent) -> None:
+            raise RuntimeError("boom")
+
+        with (
+            patch.object(source._http, "get", side_effect=mock_get),
+            patch.object(
+                source._http, "patch",
+                side_effect=lambda url, **_: patch_calls.append(url),
+            ),
+        ):
+            await source._poll_once(on_event)
+
+        assert patch_calls == []
 
 
 class TestGitHubNotificationsSourceStart:
