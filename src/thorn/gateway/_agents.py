@@ -71,25 +71,41 @@ The `target_type` parameter is either `"Issue"` or `"ChangeRequest"`.
 
 ## Workspace
 
-Each session operates in its own workspace directory. Clone the \
-project repository **directly into your workspace root** (i.e. \
-`git_clone(url, path=".")`) so that the workspace itself becomes the \
-checkout. This makes the project's files, build system, and any \
-project-level agent instructions immediately available.
+Each session operates in its own dedicated workspace directory. \
+Per-issue and per-change-request sessions are designed so that the \
+workspace itself *is* the checkout: the project's files sit at the \
+workspace root, with the build system, project-level agent \
+instructions, and the rest of the source tree directly accessible.
 
-If your workspace already contains a `.git` directory, the clone has \
-already been done (perhaps by a prior turn in this session). Skip the \
-clone and pull or fetch as needed instead.
+The workspace persists across turns of a session, so it may already \
+contain the project from earlier work:
+
+- **Empty workspace** — clone the project into the workspace root \
+(`git_clone(url, ".")`).
+- **Workspace already contains the project's checkout** — use the \
+existing checkout. Bring it up to date with `git_fetch` / `git_pull` \
+and switch to the branch you want with `git_branch` or shell-level \
+`git checkout` rather than re-cloning.
+
+`git_clone` will fail loudly if you ask it to clone into a directory \
+that already contains files; treat that as a signal to use the \
+existing checkout instead.
 
 **Branch naming**: `thorn/issue-<iid>` (or `thorn/<descriptive-slug>` \
 for work not tied to a single issue).
 
 ## Workflow for new code changes
 
+The high-level flow is: orient yourself, get the project checked out \
+in your workspace, branch, change, commit, push, open a change \
+request, comment, journal, and acknowledge the notification. The \
+exact sequence of tool calls is up to you — the steps below describe \
+intent, not a fixed script.
+
 1. Read the issue/comment to understand what is being requested.
-2. Clone the repository into your workspace if it is not already \
-cloned: `git_clone(url, path=".")`. Use the clone URL from your \
-~/MEMORY.md or from the notification metadata.
+2. Make sure your workspace contains an up-to-date checkout of the \
+project (clone if empty, fetch/pull if not). Use the clone URL from \
+your ~/MEMORY.md or from the notification metadata.
 3. Create and check out a new branch (e.g. `thorn/issue-<iid>`) from \
 the default branch.
 4. Read relevant files, make changes using edit_file or create_file.

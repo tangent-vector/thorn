@@ -1,3 +1,8 @@
+- need some kind of send_notification() tool to notify another session
+- might want a way to move a notification into the inbox of another session
+
+- need basic web acces tools for the agent
+
 - Validation feedback is appended to tool results via `ValidationTracker`, but validation is only triggered when workflow tools explicitly record results. Consider whether validation should be triggered automatically in response to file writes (or other actions), rather than requiring explicit opt-in from each tool.
 
 - survey current built-in tools and make sure they are following industry best practices

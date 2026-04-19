@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -11,8 +12,8 @@ import pytest
 from thorn.tools.git import (
     GIT_TOOLS,
     GitError,
+    _git_auth_env_for_current_agent,
     _git_identity_env,
-    _inject_url_credentials,
     _run_git,
     git_add,
     git_branch,
@@ -73,19 +74,27 @@ def bare_repo(tmp_path: Path, git_repo: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Credential injection
+# Credential injection (per-call env vars, no URL embedding)
 # ---------------------------------------------------------------------------
 
 
-class TestInjectUrlCredentials:
+def _expected_basic_header(username: str, token: str) -> str:
+    """Build the AUTHORIZATION header value our code is expected to produce."""
+    encoded = base64.b64encode(f"{username}:{token}".encode()).decode()
+    return f"AUTHORIZATION: basic {encoded}"
+
+
+class TestGitAuthEnv:
+    """Tests for `_git_auth_env_for_current_agent` -- the per-call HTTPS
+    credential injection mechanism that replaces URL-embedded tokens."""
+
     _CTX_PATH = "thorn.core._context.get_context"
 
-    def test_no_context_returns_url_unchanged(self) -> None:
-        url = "https://gitlab.example.com/group/project.git"
+    def test_no_context_returns_empty(self) -> None:
         with patch(self._CTX_PATH, side_effect=RuntimeError):
-            assert _inject_url_credentials(url) == url
+            assert _git_auth_env_for_current_agent() == {}
 
-    def test_no_agent_returns_url_unchanged(self, tmp_path: Path) -> None:
+    def test_no_agent_returns_empty(self, tmp_path: Path) -> None:
         from thorn.core._context import ExecutionContext
         from thorn.core._provider import MockProvider
 
@@ -94,10 +103,9 @@ class TestInjectUrlCredentials:
             workspace_root=tmp_path,
         )
         with patch(self._CTX_PATH, return_value=ctx):
-            url = "https://gitlab.example.com/group/project.git"
-            assert _inject_url_credentials(url) == url
+            assert _git_auth_env_for_current_agent() == {}
 
-    def test_no_project_metadata_returns_url_unchanged(self, tmp_path: Path) -> None:
+    def test_no_project_metadata_returns_empty(self, tmp_path: Path) -> None:
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
         from thorn.core._provider import MockProvider
@@ -108,18 +116,35 @@ class TestInjectUrlCredentials:
             workspace_root=tmp_path,
         )
         with patch(self._CTX_PATH, return_value=ctx):
-            url = "https://gitlab.example.com/group/project.git"
-            assert _inject_url_credentials(url) == url
+            assert _git_auth_env_for_current_agent() == {}
 
-    def test_gitlab_rewrites_https_url_via_forge(
-        self, tmp_path: Path,
-    ) -> None:
+    def test_unknown_project_service_returns_empty(self, tmp_path: Path) -> None:
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
-        from thorn.tools.forge import GitLabForgeService, GitLabForgeServiceConfig
-        from thorn.tools.forge import ProjectService, ProjectServiceConfig
+
+        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
+        agent = Agent(metadata={"project": "no-such-proj"})
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=runtime,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            assert _git_auth_env_for_current_agent() == {}
+
+    def test_gitlab_legacy_token(self, tmp_path: Path) -> None:
+        """No agent account on the forge -> falls back to forge-config token."""
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+        from thorn.runtime import Runtime
+        from thorn.tools.forge import (
+            GitLabForgeService,
+            GitLabForgeServiceConfig,
+            ProjectService,
+            ProjectServiceConfig,
+        )
 
         runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
         runtime.register_service(
@@ -142,22 +167,36 @@ class TestInjectUrlCredentials:
             workspace_root=tmp_path,
         )
         with patch(self._CTX_PATH, return_value=ctx):
-            result = _inject_url_credentials(
-                "https://gitlab.example.com/group/project.git",
-            )
-        assert result == (
-            "https://oauth2:glpat-abc123@gitlab.example.com/group/project.git"
+            env = _git_auth_env_for_current_agent()
+
+        assert env["GIT_CONFIG_COUNT"] == "1"
+        assert env["GIT_CONFIG_KEY_0"] == (
+            "http.https://gitlab.example.com/.extraheader"
+        )
+        assert env["GIT_CONFIG_VALUE_0"] == _expected_basic_header(
+            "oauth2", "glpat-abc123",
+        )
+        assert "glpat-abc123" not in env["GIT_CONFIG_KEY_0"], (
+            "URL prefix should not contain the token"
         )
 
-    def test_github_uses_x_access_token(
+    def test_github_legacy_token_strips_api_subdomain(
         self, tmp_path: Path,
     ) -> None:
+        """github.com's API host is api.github.com but git URLs use github.com."""
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
-        from thorn.tools._github_connection import GitHubConnectionConfig, GitHubPatAuth
-        from thorn.tools.forge import GitHubForgeService, ProjectService, ProjectServiceConfig
+        from thorn.tools._github_connection import (
+            GitHubConnectionConfig,
+            GitHubPatAuth,
+        )
+        from thorn.tools.forge import (
+            GitHubForgeService,
+            ProjectService,
+            ProjectServiceConfig,
+        )
 
         runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
         runtime.register_service(
@@ -178,18 +217,86 @@ class TestInjectUrlCredentials:
             workspace_root=tmp_path,
         )
         with patch(self._CTX_PATH, return_value=ctx):
-            result = _inject_url_credentials(
-                "https://github.com/o/r.git",
-            )
-        assert result == "https://x-access-token:ghp_testtok@github.com/o/r.git"
+            env = _git_auth_env_for_current_agent()
 
-    def test_non_https_url_unchanged(self, tmp_path: Path) -> None:
+        assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+        assert env["GIT_CONFIG_VALUE_0"] == _expected_basic_header(
+            "x-access-token", "ghp_testtok",
+        )
+
+    def test_gitlab_account_token_takes_precedence(self, tmp_path: Path) -> None:
+        from thorn.core._account import (
+            AgentAccountsConfig,
+            ForgeAccountConfig,
+            GitLabCredentials,
+        )
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
-        from thorn.tools.forge import GitLabForgeService, GitLabForgeServiceConfig
-        from thorn.tools.forge import ProjectService, ProjectServiceConfig
+        from thorn.tools.forge import (
+            GitLabForgeService,
+            GitLabForgeServiceConfig,
+            ProjectService,
+            ProjectServiceConfig,
+        )
+
+        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
+        runtime.register_service(
+            GitLabForgeService(
+                GitLabForgeServiceConfig(
+                    url="https://gitlab.example.com", token="forge-config-token",
+                ),
+                service_name="gl-forge",
+            ),
+        )
+        runtime.register_service(
+            ProjectService(
+                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                service_name="my-proj",
+            ),
+        )
+        accounts = AgentAccountsConfig(forge_accounts=[
+            ForgeAccountConfig(
+                forge="gl-forge",
+                credentials=GitLabCredentials(token="account-token"),
+                git_user_name="bot",
+                git_user_email="bot@thorn",
+            ),
+        ])
+        agent = Agent(metadata={"project": "my-proj"}, accounts=accounts)
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=runtime,
+            workspace_root=tmp_path,
+        )
+        with patch(self._CTX_PATH, return_value=ctx):
+            env = _git_auth_env_for_current_agent()
+
+        assert env["GIT_CONFIG_VALUE_0"] == _expected_basic_header(
+            "oauth2", "account-token",
+        )
+        assert "forge-config-token" not in env["GIT_CONFIG_VALUE_0"]
+
+
+class TestRunGitAuthInjection:
+    """Black-box tests that `_run_git(..., auth=True)` actually merges the
+    auth env vars into the subprocess environment."""
+
+    _CTX_PATH = "thorn.core._context.get_context"
+
+    async def test_auth_false_does_not_set_git_config_vars(
+        self, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+        from thorn.runtime import Runtime
+        from thorn.tools.forge import (
+            GitLabForgeService,
+            GitLabForgeServiceConfig,
+            ProjectService,
+            ProjectServiceConfig,
+        )
 
         runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
         runtime.register_service(
@@ -211,135 +318,32 @@ class TestInjectUrlCredentials:
             provider=MockProvider(), agent=agent, runtime=runtime,
             workspace_root=tmp_path,
         )
-        with patch(self._CTX_PATH, return_value=ctx):
-            url = "git@gitlab.example.com:group/project.git"
-            assert _inject_url_credentials(url) == url
 
+        captured: dict[str, str | None] = {}
 
-class TestInjectUrlCredentialsWithAccounts:
-    """Tests for _inject_url_credentials using account-based credentials."""
-
-    _CTX_PATH = "thorn.core._context.get_context"
-
-    def _make_agent_with_account(
-        self,
-        *,
-        forge_name: str,
-        credentials: object,
-        project_name: str = "my-proj",
-    ) -> object:
-        from thorn.core._account import AgentAccountsConfig, ForgeAccountConfig
-        from thorn.core._agent import Agent
-
-        accounts = AgentAccountsConfig(forge_accounts=[
-            ForgeAccountConfig(
-                forge=forge_name,
-                credentials=credentials,  # type: ignore[arg-type]
-                git_user_name="bot",
-                git_user_email="bot@thorn",
-            ),
-        ])
-        return Agent(
-            metadata={"project": project_name},
-            accounts=accounts,
-        )
-
-    def test_gitlab_uses_account_token(self, tmp_path: Path) -> None:
-        from thorn.core._account import GitLabCredentials
-        from thorn.core._context import ExecutionContext
-        from thorn.core._provider import MockProvider
-        from thorn.runtime import Runtime
-        from thorn.tools.forge import (
-            GitLabForgeService,
-            GitLabForgeServiceConfig,
-            ProjectService,
-            ProjectServiceConfig,
-        )
-
-        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
-        runtime.register_service(
-            GitLabForgeService(
-                GitLabForgeServiceConfig(
-                    url="https://gitlab.example.com", token="old-token",
-                ),
-                service_name="gl-forge",
-            ),
-        )
-        runtime.register_service(
-            ProjectService(
-                ProjectServiceConfig(forge="gl-forge", native_id="1"),
-                service_name="my-proj",
-            ),
-        )
-        agent = self._make_agent_with_account(
-            forge_name="gl-forge",
-            credentials=GitLabCredentials(token="account-token"),
-        )
-        ctx = ExecutionContext(
-            provider=MockProvider(), agent=agent, runtime=runtime,
-            workspace_root=tmp_path,
-        )
-        with patch(self._CTX_PATH, return_value=ctx):
-            result = _inject_url_credentials(
-                "https://gitlab.example.com/group/project.git",
+        async def fake_subprocess_exec(*args, env=None, **kwargs):
+            captured["GIT_CONFIG_COUNT"] = (
+                env.get("GIT_CONFIG_COUNT") if env else None
             )
-        assert "account-token" in result
-        assert "old-token" not in result
-        assert result == (
-            "https://oauth2:account-token@gitlab.example.com/group/project.git"
-        )
 
-    def test_github_uses_account_pat(self, tmp_path: Path) -> None:
-        from thorn.core._context import ExecutionContext
-        from thorn.core._provider import MockProvider
-        from thorn.runtime import Runtime
-        from thorn.tools._github_connection import (
-            GitHubConnectionConfig,
-            GitHubPatAuth,
-        )
-        from thorn.tools.forge import (
-            GitHubForgeService,
-            ProjectService,
-            ProjectServiceConfig,
-        )
+            class _Proc:
+                returncode = 0
 
-        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
-        runtime.register_service(
-            GitHubForgeService(
-                GitHubConnectionConfig(
-                    auth=GitHubPatAuth(token="old-gh-token"),
-                ),
-                service_name="gh-forge",
-            ),
-        )
-        runtime.register_service(
-            ProjectService(
-                ProjectServiceConfig(forge="gh-forge", native_id="o/r"),
-                service_name="my-proj",
-            ),
-        )
-        agent = self._make_agent_with_account(
-            forge_name="gh-forge",
-            credentials=GitHubPatAuth(token="account-gh-token"),
-        )
-        ctx = ExecutionContext(
-            provider=MockProvider(), agent=agent, runtime=runtime,
-            workspace_root=tmp_path,
-        )
-        with patch(self._CTX_PATH, return_value=ctx):
-            result = _inject_url_credentials(
-                "https://github.com/o/r.git",
-            )
-        assert "account-gh-token" in result
-        assert "old-gh-token" not in result
-        assert result == (
-            "https://x-access-token:account-gh-token@github.com/o/r.git"
-        )
+                async def communicate(self):
+                    return (b"", b"")
 
-    def test_falls_back_to_legacy_when_no_account(
-        self, tmp_path: Path,
+            return _Proc()
+
+        with patch(self._CTX_PATH, return_value=ctx), patch(
+            "asyncio.create_subprocess_exec", side_effect=fake_subprocess_exec,
+        ):
+            await _run_git("status", cwd=str(git_repo), auth=False)
+
+        assert captured["GIT_CONFIG_COUNT"] is None
+
+    async def test_auth_true_merges_git_config_vars(
+        self, git_repo: Path, tmp_path: Path,
     ) -> None:
-        """Agent has metadata.project but no accounts -- uses legacy path."""
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
         from thorn.core._provider import MockProvider
@@ -355,7 +359,7 @@ class TestInjectUrlCredentialsWithAccounts:
         runtime.register_service(
             GitLabForgeService(
                 GitLabForgeServiceConfig(
-                    url="https://gitlab.example.com", token="legacy-token",
+                    url="https://gitlab.example.com", token="abc",
                 ),
                 service_name="gl-forge",
             ),
@@ -371,12 +375,110 @@ class TestInjectUrlCredentialsWithAccounts:
             provider=MockProvider(), agent=agent, runtime=runtime,
             workspace_root=tmp_path,
         )
-        with patch(self._CTX_PATH, return_value=ctx):
-            result = _inject_url_credentials(
-                "https://gitlab.example.com/group/project.git",
-            )
-        assert result == (
-            "https://oauth2:legacy-token@gitlab.example.com/group/project.git"
+
+        captured: dict[str, str | None] = {}
+
+        async def fake_subprocess_exec(*args, env=None, **kwargs):
+            assert env is not None
+            captured["GIT_CONFIG_COUNT"] = env.get("GIT_CONFIG_COUNT")
+            captured["GIT_CONFIG_KEY_0"] = env.get("GIT_CONFIG_KEY_0")
+            captured["GIT_CONFIG_VALUE_0"] = env.get("GIT_CONFIG_VALUE_0")
+
+            class _Proc:
+                returncode = 0
+
+                async def communicate(self):
+                    return (b"", b"")
+
+            return _Proc()
+
+        with patch(self._CTX_PATH, return_value=ctx), patch(
+            "asyncio.create_subprocess_exec", side_effect=fake_subprocess_exec,
+        ):
+            await _run_git("status", cwd=str(git_repo), auth=True)
+
+        assert captured["GIT_CONFIG_COUNT"] == "1"
+        assert captured["GIT_CONFIG_KEY_0"] == (
+            "http.https://gitlab.example.com/.extraheader"
+        )
+        assert captured["GIT_CONFIG_VALUE_0"] == _expected_basic_header(
+            "oauth2", "abc",
+        )
+
+    async def test_auth_true_appends_to_existing_git_config(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If the parent process already exports GIT_CONFIG_*, our entries
+        are appended after the existing ones rather than overwriting them."""
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext
+        from thorn.core._provider import MockProvider
+        from thorn.runtime import Runtime
+        from thorn.tools.forge import (
+            GitLabForgeService,
+            GitLabForgeServiceConfig,
+            ProjectService,
+            ProjectServiceConfig,
+        )
+
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.email")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "site@policy.example")
+
+        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
+        runtime.register_service(
+            GitLabForgeService(
+                GitLabForgeServiceConfig(
+                    url="https://gitlab.example.com", token="t",
+                ),
+                service_name="gl-forge",
+            ),
+        )
+        runtime.register_service(
+            ProjectService(
+                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                service_name="my-proj",
+            ),
+        )
+        agent = Agent(metadata={
+            "project": "my-proj",
+            "git_user_name": "bot",
+            "git_user_email": "bot@thorn",
+        })
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=runtime,
+            workspace_root=tmp_path,
+        )
+
+        captured: dict[str, str | None] = {}
+
+        async def fake_subprocess_exec(*args, env=None, **kwargs):
+            assert env is not None
+            for k in (
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+                "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1",
+            ):
+                captured[k] = env.get(k)
+
+            class _Proc:
+                returncode = 0
+
+                async def communicate(self):
+                    return (b"", b"")
+
+            return _Proc()
+
+        with patch(self._CTX_PATH, return_value=ctx), patch(
+            "asyncio.create_subprocess_exec", side_effect=fake_subprocess_exec,
+        ):
+            await _run_git("status", cwd=str(git_repo), auth=True)
+
+        assert captured["GIT_CONFIG_COUNT"] == "2"
+        assert captured["GIT_CONFIG_KEY_0"] == "user.email"
+        assert captured["GIT_CONFIG_VALUE_0"] == "site@policy.example"
+        assert captured["GIT_CONFIG_KEY_1"] == (
+            "http.https://gitlab.example.com/.extraheader"
         )
 
 
@@ -811,17 +913,77 @@ class TestGitLog:
 
 
 class TestGitClone:
-    async def test_clone_bare(self, git_repo: Path, tmp_path: Path) -> None:
+    async def test_clone_into_new_directory(
+        self, git_repo: Path, tmp_path: Path,
+    ) -> None:
         dest = str(tmp_path / "clone.git")
         result = await git_clone(str(git_repo), dest)
         assert "Cloned" in result
         assert os.path.isdir(dest)
 
-    async def test_fetch_existing(self, git_repo: Path, tmp_path: Path) -> None:
+    async def test_re_clone_into_existing_directory_fails(
+        self, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        """Re-cloning into the same destination must fail loudly rather than
+        silently swap to a `git fetch` (which would leave the working tree
+        stale and was the source of confusing 'git fetch --all' errors)."""
         dest = str(tmp_path / "clone.git")
         await git_clone(str(git_repo), dest)
-        result = await git_clone(str(git_repo), dest)
-        assert "Fetched" in result
+        with pytest.raises(GitError) as exc_info:
+            await git_clone(str(git_repo), dest)
+        assert "already exists" in exc_info.value.output
+
+    async def test_clone_does_not_embed_token_in_remote_url(
+        self, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        """Regression guard: even when an agent context is active and would
+        provide a token, the resulting clone's remote.origin.url must be the
+        plain URL we passed -- credentials are injected per-call via env
+        vars, not baked into .git/config."""
+        from thorn.core._agent import Agent
+        from thorn.core._context import ExecutionContext, reset_context, set_context
+        from thorn.core._provider import MockProvider
+        from thorn.runtime import Runtime
+        from thorn.tools.forge import (
+            GitLabForgeService,
+            GitLabForgeServiceConfig,
+            ProjectService,
+            ProjectServiceConfig,
+        )
+
+        runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
+        runtime.register_service(
+            GitLabForgeService(
+                GitLabForgeServiceConfig(
+                    url="https://gitlab.example.com",
+                    token="should-not-appear-in-config",
+                ),
+                service_name="gl-forge",
+            ),
+        )
+        runtime.register_service(
+            ProjectService(
+                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                service_name="my-proj",
+            ),
+        )
+        agent = Agent(metadata={"project": "my-proj"})
+        ctx = ExecutionContext(
+            provider=MockProvider(), agent=agent, runtime=runtime,
+            workspace_root=tmp_path,
+        )
+        token_handle = set_context(ctx)
+        try:
+            dest = str(tmp_path / "clone.git")
+            await git_clone(str(git_repo), dest)
+        finally:
+            reset_context(token_handle)
+
+        config = (Path(dest) / ".git" / "config").read_text()
+        assert "should-not-appear-in-config" not in config, (
+            "Token leaked into .git/config -- per-call credential injection "
+            "regressed to URL embedding"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import subprocess
 from pathlib import Path
 
@@ -10,6 +9,7 @@ import pytest
 
 from thorn.core._context import ExecutionContext, reset_context, set_context
 from thorn.core._provider import MockProvider
+from thorn.tools.git import GitError
 
 
 def _init_upstream(path: Path) -> str:
@@ -85,25 +85,54 @@ class TestGitClone:
         assert not (clone_dir / "README.md").exists(), "bare clone should not have checked-out files"
         assert "Cloned" in result
 
-    async def test_fetch_when_directory_exists(
+    async def test_re_clone_into_existing_directory_fails(
         self, upstream: str, workspace: Path, ctx_with_workspace: ExecutionContext,
     ) -> None:
+        """git_clone never silently swaps to fetch -- a second clone into
+        the same path must fail with git's native 'already exists' error."""
         from thorn.tools.git import git_clone
 
         await git_clone(upstream, "repo")
-        result = await git_clone(upstream, "repo")
+        with pytest.raises(GitError) as exc_info:
+            await git_clone(upstream, "repo")
+        assert "already exists" in exc_info.value.output
 
-        assert "Fetched" in result
-
-    async def test_bare_fetch_when_directory_exists(
+    async def test_re_clone_bare_into_existing_directory_fails(
         self, upstream: str, workspace: Path, ctx_with_workspace: ExecutionContext,
     ) -> None:
         from thorn.tools.git import git_clone
 
         await git_clone(upstream, "repo.git", bare=True)
-        result = await git_clone(upstream, "repo.git", bare=True)
+        with pytest.raises(GitError) as exc_info:
+            await git_clone(upstream, "repo.git", bare=True)
+        assert "already exists" in exc_info.value.output
 
-        assert "Fetched" in result
+    async def test_clone_into_dot_with_empty_workspace(
+        self, upstream: str, workspace: Path, ctx_with_workspace: ExecutionContext,
+    ) -> None:
+        """The recommended `git_clone(url, ".")` pattern works on a fresh
+        (empty) session workspace."""
+        from thorn.tools.git import git_clone
+
+        result = await git_clone(upstream, ".")
+
+        assert "Cloned" in result
+        assert (workspace / ".git").is_dir()
+        assert (workspace / "README.md").is_file()
+
+    async def test_clone_into_dot_when_workspace_non_empty_fails(
+        self, upstream: str, workspace: Path, ctx_with_workspace: ExecutionContext,
+    ) -> None:
+        """If the session workspace already contains files (e.g. a prior
+        clone), `git_clone(url, ".")` must fail loudly so the agent knows
+        to use the existing checkout instead of re-cloning."""
+        from thorn.tools.git import git_clone
+
+        (workspace / "marker.txt").write_text("not empty\n")
+
+        with pytest.raises(GitError) as exc_info:
+            await git_clone(upstream, ".")
+        assert "already exists" in exc_info.value.output
 
     async def test_default_bare_is_false(
         self, upstream: str, workspace: Path, ctx_with_workspace: ExecutionContext,

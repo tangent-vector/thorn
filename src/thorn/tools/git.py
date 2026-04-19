@@ -18,11 +18,12 @@ Adapted from ``thorn-bot/src/thorn_bot/_git.py``.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 from thorn.core._func import tool
 
@@ -119,6 +120,7 @@ async def _run_git(
     *args: str,
     cwd: str | None = None,
     check: bool = True,
+    auth: bool = False,
 ) -> tuple[int, str]:
     """Run a git command asynchronously, returning (returncode, combined output).
 
@@ -127,16 +129,33 @@ async def _run_git(
     ``GIT_COMMITTER_*`` environment variables so commits succeed even
     when the system git config has no identity set.
 
+    When *auth* is True, additional ``GIT_CONFIG_*`` env vars are
+    injected so that any HTTPS request git makes to the agent's
+    project's forge carries an ``Authorization`` header derived from
+    the agent's per-account credentials.  This avoids ever embedding
+    tokens in URLs (which would otherwise leak into ``.git/config``)
+    and is intended for git tools that perform network operations
+    (clone, push, fetch, pull).
+
     Raises ``GitError`` when *check* is True and the process exits non-zero.
     """
     cmd = ["git", *args]
-    log.debug("Running: %s (cwd=%s)", " ".join(cmd), cwd)
+    log.debug("Running: %s (cwd=%s, auth=%s)", " ".join(cmd), cwd, auth)
+
+    env = _git_identity_env()
+    if auth:
+        auth_env = _git_auth_env_for_current_agent()
+        if auth_env:
+            if env is None:
+                env = os.environ.copy()
+            _merge_git_config_env(env, auth_env)
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=cwd,
-        env=_git_identity_env(),
+        env=env,
     )
     raw_stdout, _ = await proc.communicate()
     output = raw_stdout.decode(errors="replace") if raw_stdout else ""
@@ -153,56 +172,76 @@ async def _run_git(
 # ---------------------------------------------------------------------------
 
 
-def _inject_url_credentials(url: str) -> str:
-    """Rewrite a git HTTPS URL to embed credentials from the current agent.
+def _git_auth_env_for_current_agent() -> dict[str, str]:
+    """Build subprocess env vars that authenticate git over HTTPS.
 
-    Resolves the project service (via ``metadata["project"]``), finds
-    the forge that hosts it, then looks up the agent's account on that
-    forge to obtain an HTTPS token.
+    Returns a mapping like::
 
-    Falls back to the legacy ``ForgeHostService.git_https_password()``
-    when the agent has no account on the project's forge (old-style
-    configs where credentials live on the forge service itself).
+        {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.https://gitlab.example.com/.extraheader",
+            "GIT_CONFIG_VALUE_0": "AUTHORIZATION: basic <base64(user:token)>",
+        }
 
-    GitHub forges use the ``x-access-token`` HTTPS username; GitLab
-    forges use ``oauth2``.
+    When merged into a git subprocess's environment, modern git (>=
+    2.31) reads these as ad-hoc ``-c key=value`` overrides.  The
+    ``http.<URL>.extraheader`` form scopes the injected
+    ``Authorization`` header to URLs that share the given prefix, so
+    this never leaks into requests git makes to unrelated hosts (e.g.
+    submodules from another forge).
+
+    Resolves credentials the same way the old URL-embedding path did:
+
+    1. From the agent's :class:`ForgeAccountConfig` for the project's
+       forge (looked up via ``metadata["project"]``), preferred.
+    2. Falling back to the legacy
+       :meth:`ForgeHostService.git_https_password` when the agent has
+       no account on that forge.
+
+    Returns ``{}`` when there is no active agent context, no project
+    metadata, no resolvable forge service, no credential, or the
+    forge service is of an unexpected type.  Callers should treat
+    that as "let git fall through to whatever ambient credential
+    helper the OS provides," which is the right behavior for both
+    local development and unauthenticated public-repo clones.
     """
     from thorn.core._account import resolve_forge_account
     from thorn.core._context import get_context
     from thorn.tools.forge import (
         ForgeHostService,
         GitHubForgeService,
+        GitLabForgeService,
         ProjectService,
     )
 
     try:
         ctx = get_context()
     except RuntimeError:
-        return url
+        return {}
 
     agent = ctx.agent
     if agent is None or ctx.runtime is None:
-        return url
+        return {}
 
     project_name = agent.metadata.get("project")
     if not project_name:
-        return url
+        return {}
 
     try:
         project_svc = ctx.runtime.get_service(project_name)
     except KeyError:
-        return url
+        return {}
 
     if not isinstance(project_svc, ProjectService):
-        return url
+        return {}
 
     try:
         forge_svc = ctx.runtime.get_service(project_svc.forge_name)
     except KeyError:
-        return url
+        return {}
 
     if not isinstance(forge_svc, ForgeHostService):
-        return url
+        return {}
 
     token: str | None = None
     try:
@@ -211,17 +250,83 @@ def _inject_url_credentials(url: str) -> str:
     except KeyError:
         token = forge_svc.git_https_password()
 
-    if url.startswith("https://"):
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
-        port_suffix = f":{parsed.port}" if parsed.port else ""
-        user = "x-access-token" if isinstance(forge_svc, GitHubForgeService) else "oauth2"
-        rewritten = parsed._replace(
-            netloc=f"{user}:{token}@{host}{port_suffix}",
-        )
-        return urlunparse(rewritten)
+    if not token:
+        return {}
 
-    return url
+    if isinstance(forge_svc, GitHubForgeService):
+        username = "x-access-token"
+        url_prefix = _github_git_url_prefix(forge_svc.base_url)
+    elif isinstance(forge_svc, GitLabForgeService):
+        username = "oauth2"
+        url_prefix = _https_origin_prefix(forge_svc.url)
+    else:
+        return {}
+
+    if not url_prefix:
+        return {}
+
+    basic = base64.b64encode(f"{username}:{token}".encode()).decode()
+    config_key = f"http.{url_prefix}.extraheader"
+    config_value = f"AUTHORIZATION: basic {basic}"
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": config_key,
+        "GIT_CONFIG_VALUE_0": config_value,
+    }
+
+
+def _github_git_url_prefix(api_base_url: str) -> str:
+    """Derive the public ``https://<host>/`` prefix for a GitHub forge.
+
+    GitHub.com's API lives at ``api.github.com`` while git URLs use
+    ``github.com``; GitHub Enterprise generally uses the same host
+    for both (with an ``/api/v3`` path suffix).  Mirrors the host
+    derivation in :meth:`GitHubForgeService.clone_url_for`.
+    """
+    parsed = urlparse(api_base_url)
+    host = parsed.hostname or "github.com"
+    if host.startswith("api."):
+        host = host[len("api."):]
+    port_suffix = f":{parsed.port}" if parsed.port else ""
+    return f"https://{host}{port_suffix}/"
+
+
+def _https_origin_prefix(url: str) -> str:
+    """Return ``https://<host>[:port]/`` for *url*, or ``""`` on parse failure."""
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return ""
+    port_suffix = f":{parsed.port}" if parsed.port else ""
+    return f"https://{host}{port_suffix}/"
+
+
+def _merge_git_config_env(
+    env: dict[str, str],
+    auth_env: dict[str, str],
+) -> None:
+    """Merge auth_env's ``GIT_CONFIG_*`` entries into env.
+
+    If env already carries a ``GIT_CONFIG_COUNT``-style block (e.g.
+    inherited from the parent process), the new entries are appended
+    after the existing ones rather than overwriting them, so a
+    site-wide policy in ``GIT_CONFIG_*`` is preserved alongside our
+    per-call auth header.
+    """
+    new_count = int(auth_env.get("GIT_CONFIG_COUNT", "0"))
+    if new_count <= 0:
+        return
+
+    try:
+        existing_count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        existing_count = 0
+
+    for i in range(new_count):
+        slot = existing_count + i
+        env[f"GIT_CONFIG_KEY_{slot}"] = auth_env[f"GIT_CONFIG_KEY_{i}"]
+        env[f"GIT_CONFIG_VALUE_{slot}"] = auth_env[f"GIT_CONFIG_VALUE_{i}"]
+    env["GIT_CONFIG_COUNT"] = str(existing_count + new_count)
 
 
 # ---------------------------------------------------------------------------
@@ -284,30 +389,42 @@ async def git_clone(
     local_path: str,
     bare: bool = False,
 ) -> str:
-    """Clone a git repository, or fetch updates if it already exists.
+    """Clone a git repository into *local_path*.
+
+    Always invokes ``git clone`` -- this tool deliberately does
+    *not* fall back to ``git fetch`` when *local_path* already
+    exists, since "fetch" and "clone" have very different semantics
+    (fetch leaves the working tree untouched) and conflating them
+    silently makes for surprising agent behavior.
 
     By default, performs a normal clone that produces a working tree
-    (checked-out files you can edit directly).  Pass ``bare=True`` for
-    a bare clone suitable for managing multiple worktrees.
+    (checked-out files you can edit directly).  Pass ``bare=True``
+    for a bare clone suitable for managing multiple worktrees.
 
-    Credentials are injected transparently from the agent's metadata
-    when available.
+    If *local_path* already exists and is non-empty, ``git clone``
+    will fail with ``destination path '...' already exists and is
+    not an empty directory.``  In that case, treat the existing
+    checkout as the source of truth: use ``git_fetch`` / ``git_pull``
+    / ``git_branch`` etc. to bring it up to date rather than calling
+    ``git_clone`` again.
+
+    Credentials for HTTPS URLs are injected per-call via subprocess
+    environment variables (a scoped ``http.<URL>.extraheader``
+    config), so tokens never land in ``.git/config``'s
+    ``remote.origin.url``.  This means the resulting clone has no
+    embedded credentials and won't go stale when the agent's token
+    is rotated.
 
     Returns a confirmation message with the local path.
     """
     resolved = _resolve_tool_path(local_path)
-    authenticated_url = _inject_url_credentials(remote_url)
-
-    if os.path.isdir(resolved):
-        _, output = await _run_git("fetch", "--all", cwd=resolved)
-        return f"Fetched updates in {local_path}\n{output}".strip()
 
     clone_args = ["clone"]
     if bare:
         clone_args.append("--bare")
-    clone_args.extend([authenticated_url, resolved])
+    clone_args.extend([remote_url, resolved])
 
-    _, output = await _run_git(*clone_args)
+    _, output = await _run_git(*clone_args, auth=True)
     return f"Cloned {remote_url} -> {local_path}\n{output}".strip()
 
 
@@ -389,12 +506,15 @@ async def git_push(
 ) -> str:
     """Push a branch to a remote repository.
 
-    Pushes the specified *branch_name* to *remote* (default ``origin``).
-    Authentication is handled transparently via the forge service
-    registered for the agent's project (see ``_inject_url_credentials``).
+    Pushes the specified *branch_name* to *remote* (default
+    ``origin``).  Credentials for HTTPS remotes belonging to the
+    agent's project are injected per-call via subprocess environment
+    variables (see :func:`_git_auth_env_for_current_agent`).
     """
     resolved = _resolve_tool_path(repo_path)
-    _, output = await _run_git("push", remote, branch_name, cwd=resolved)
+    _, output = await _run_git(
+        "push", remote, branch_name, cwd=resolved, auth=True,
+    )
     return f"Pushed {branch_name} to {remote}\n{output}".strip()
 
 
@@ -443,9 +563,11 @@ async def git_fetch(
 
     Retrieves new commits, branches, and tags from *remote* (default
     ``origin``).  Works in both bare repositories and worktrees.
+    Credentials for the agent's project's forge are injected per-call
+    (see :func:`_git_auth_env_for_current_agent`).
     """
     resolved = _resolve_tool_path(repo_path)
-    _, output = await _run_git("fetch", remote, cwd=resolved)
+    _, output = await _run_git("fetch", remote, cwd=resolved, auth=True)
     return f"Fetched from {remote}\n{output}".strip()
 
 
@@ -460,13 +582,15 @@ async def git_pull(
     Runs ``git pull <remote> [<branch>]``.  When *branch* is not
     specified, pulls the tracking branch.  Typically used inside a
     worktree to incorporate upstream changes (e.g. reviewer-pushed
-    fixup commits or base-branch updates).
+    fixup commits or base-branch updates).  Credentials for the
+    agent's project's forge are injected per-call (see
+    :func:`_git_auth_env_for_current_agent`).
     """
     resolved = _resolve_tool_path(repo_path)
     args = ["pull", remote]
     if branch is not None:
         args.append(branch)
-    _, output = await _run_git(*args, cwd=resolved)
+    _, output = await _run_git(*args, cwd=resolved, auth=True)
     return f"Pulled from {remote}\n{output}".strip()
 
 
