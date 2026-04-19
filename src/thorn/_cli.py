@@ -758,42 +758,26 @@ def _serve_gateway(
             trace_file.close()
 
 
-_FORGE_TOKEN_ENV_DEFAULTS: dict[str, str] = {
-    "gitlab": "GITLAB_TOKEN",
-    "github": "GITHUB_TOKEN",
-}
-
-_GITHUB_DEFAULT_BASE_URL = "https://api.github.com"
-
-
 @serve.command("bootstrap")
 @click.option("--agent-id", required=True, help="Unique identifier for the coordinator agent.")
 @click.option("--project-name", required=True, help="Human-readable project name.")
-@click.option("--clone-url", required=True, help="HTTPS clone URL for the project.")
-@click.option("--default-branch", default="main", help="Default branch name (default: main).")
 @click.option(
-    "--forge-type",
-    type=click.Choice(["gitlab", "github"], case_sensitive=False),
-    default="gitlab",
-    help="Forge type (default: gitlab).",
-)
-@click.option(
-    "--native-project-id",
-    default=None,
-    help="Forge-native project identifier (numeric ID for GitLab, owner/repo for GitHub).",
+    "--project-url",
+    required=True,
+    help=(
+        "Human-facing project URL on its forge "
+        "(e.g. https://github.com/owner/repo or "
+        "https://gitlab.com/group/project).  The forge type, name, "
+        "API URL, and the per-fork native ID and clone URL are all "
+        "derived from this URL."
+    ),
 )
 @click.option(
     "--token-env",
     default=None,
-    help="Env var holding the access token (default: based on --forge-type).",
-)
-@click.option(
-    "--forge-base-url",
-    default=None,
     help=(
-        "Forge API base URL written literally into gateway.json "
-        "(required for --forge-type=gitlab; defaults to "
-        "https://api.github.com for --forge-type=github)."
+        "Env var holding the access token "
+        "(default: GITHUB_TOKEN for github.com, GITLAB_TOKEN otherwise)."
     ),
 )
 @click.option("--git-user-name", default=None, help="Git author/committer name for this agent (default: agent-id).")
@@ -824,12 +808,8 @@ def serve_bootstrap(
     ctx: click.Context,
     agent_id: str,
     project_name: str,
-    clone_url: str,
-    default_branch: str,
-    forge_type: str,
-    native_project_id: str | None,
+    project_url: str,
     token_env: str | None,
-    forge_base_url: str | None,
     git_user_name: str | None,
     git_user_email: str | None,
     agency_home_path: str,
@@ -839,45 +819,35 @@ def serve_bootstrap(
     from pathlib import Path
     from thorn.gateway._bootstrap import bootstrap_coordinator
 
-    if token_env is None:
-        token_env = _FORGE_TOKEN_ENV_DEFAULTS[forge_type]
-
-    if forge_base_url is None:
-        if forge_type == "github":
-            forge_base_url = _GITHUB_DEFAULT_BASE_URL
-        else:
-            console.print(
-                "[red]Error:[/red] --forge-base-url is required for "
-                "--forge-type=gitlab (e.g. https://gitlab.example.com/api/v4)."
-            )
-            sys.exit(1)
-
     agency_home = Path(agency_home_path).expanduser().resolve()
     agency_workspace = Path(agency_workspace_path).expanduser().resolve()
-    aid = bootstrap_coordinator(
-        agency_home=agency_home,
-        agency_workspace=agency_workspace,
-        agent_id=agent_id,
-        project_name=project_name,
-        clone_url=clone_url,
-        default_branch=default_branch,
-        native_project_id=native_project_id or "",
-        forge_type=forge_type,
-        access_token_env=token_env,
-        forge_base_url=forge_base_url,
-        git_user_name=git_user_name or "",
-        git_user_email=git_user_email or "",
-    )
+    try:
+        aid = bootstrap_coordinator(
+            agency_home=agency_home,
+            agency_workspace=agency_workspace,
+            agent_id=agent_id,
+            project_name=project_name,
+            project_url=project_url,
+            access_token_env=token_env,
+            git_user_name=git_user_name or "",
+            git_user_email=git_user_email or "",
+        )
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+
     gateway_config_path = agency_home / "gateway.json"
     console.print(f"[green]Bootstrapped coordinator:[/green] {aid}")
     console.print(f"  Identity: {agency_home / 'agents' / f'{aid}.json'}")
     console.print(f"  Agent home: {agency_home / 'agents' / str(aid)}")
     console.print(f"  Gateway config: {gateway_config_path}")
     console.print(f"  Agent workspace: {agency_workspace / str(aid)}")
+    if token_env is None:
+        token_env = (
+            "GITHUB_TOKEN" if "github.com" in project_url else "GITLAB_TOKEN"
+        )
     console.print(
-        f"\nSet ${token_env} before running 'thorn serve'. "
-        f"The forge base URL ({forge_base_url}) is recorded literally in "
-        f"{gateway_config_path} under forges[].base_url; edit it there if it changes."
+        f"\nSet ${token_env} before running 'thorn serve'."
     )
 
 

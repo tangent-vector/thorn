@@ -154,6 +154,41 @@ class TestGitLabForgeClient:
         assert result["name"] == "Org / Repo"
         assert result["clone_url"] == "https://gl.example.com/org/repo.git"
 
+    def test_path_native_id_forwarded_verbatim(self):
+        """A path-style native id (``group/project``) is passed through
+        unchanged.  ``python-gitlab`` accepts both numeric IDs and
+        URL-encoded ``namespace/path`` strings; the new gateway config
+        derives the latter from the fork URL so we no longer have to
+        force operators to write the numeric form."""
+        client, mock_gl = self._make_client()
+        mock_gl.get_issue.return_value = {
+            "iid": 7,
+            "title": "Fix bug",
+            "state": "opened",
+            "web_url": "https://gl.example.com/group/project/issues/7",
+            "description": "",
+            "labels": [],
+            "assignees": [],
+        }
+        client.get_issue("group/project", 7)
+        mock_gl.get_issue.assert_called_once_with("group/project", 7)
+
+    def test_subgroup_native_id_forwarded_verbatim(self):
+        """Subgroup paths (``group/sub/project``) are also passed
+        through verbatim; python-gitlab handles URL-encoding."""
+        client, mock_gl = self._make_client()
+        mock_gl.get_project_info.return_value = {
+            "name_with_namespace": "Group / Sub / Project",
+            "path_with_namespace": "group/sub/project",
+            "http_url_to_repo": "https://gl.example.com/group/sub/project.git",
+            "ssh_url_to_repo": "",
+            "default_branch": "main",
+            "web_url": "",
+            "description": "",
+        }
+        client.get_project_info("group/sub/project")
+        mock_gl.get_project_info.assert_called_once_with("group/sub/project")
+
     def test_read_file(self):
         client, mock_gl = self._make_client()
         mock_gl.read_file.return_value = {
@@ -466,28 +501,33 @@ class TestGitHubForgeServiceCloneUrl:
 
 
 class TestProjectService:
-    def test_legacy_properties(self):
-        """Legacy single-fork config still works via compatibility shims."""
+    def test_single_fork_properties(self):
+        """A single-fork project exposes the primary fork via top-level accessors."""
         config = ProjectServiceConfig(
-            forge="gl",
-            native_id="214768",
-            path="lace/lace",
-            clone_url="https://gl.example.com/lace/lace.git",
+            forks=[
+                ForkConfig(
+                    forge="gl",
+                    native_id="lace/lace",
+                    name="origin",
+                    clone_url="https://gl.example.com/lace/lace.git",
+                ),
+            ],
             default_branch="main",
         )
         svc = ProjectService(config, service_name="lace")
         assert svc.name == "lace"
         assert svc.forge_name == "gl"
-        assert svc.native_id == "214768"
-        assert svc.path == "lace/lace"
+        assert svc.native_id == "lace/lace"
         assert svc.clone_url == "https://gl.example.com/lace/lace.git"
+        # ``default_branch`` is the *configured* override; resolution
+        # of the live value is via ``resolve_default_branch``.
         assert svc.default_branch == "main"
 
         forks = svc.forks
         assert len(forks) == 1
         assert forks[0].forge == "gl"
-        assert forks[0].native_id == "214768"
-        assert forks[0].name == "upstream"
+        assert forks[0].native_id == "lace/lace"
+        assert forks[0].name == "origin"
 
     def test_fork_based_properties(self):
         """New fork-based config provides correct primary fork accessors."""
@@ -536,6 +576,122 @@ class TestProjectService:
         with pytest.raises(KeyError, match="no forks"):
             svc.get_fork()
 
+    def test_resolve_default_branch_uses_per_fork_override(
+        self, tmp_path: Path,
+    ):
+        """A per-fork override wins over project- and forge-level values."""
+        mock_forge_client = MagicMock()
+        forge_config = GitLabForgeServiceConfig(
+            url="https://gl.example.com", token="t",
+        )
+        forge_svc = GitLabForgeService(forge_config, service_name="gl")
+        forge_svc._client = mock_forge_client
+
+        proj_config = ProjectServiceConfig(
+            forks=[ForkConfig(
+                forge="gl", native_id="org/repo",
+                default_branch="develop",
+            )],
+            default_branch="main",
+        )
+        proj_svc = ProjectService(proj_config, service_name="proj")
+
+        runtime = Runtime(
+            provider=MockProvider(), workspace_root=tmp_path,
+        )
+        runtime.register_service(forge_svc)
+        runtime.register_service(proj_svc)
+
+        # Per-fork override returned without consulting the forge.
+        assert proj_svc.resolve_default_branch(runtime) == "develop"
+        mock_forge_client.get_project_info.assert_not_called()
+
+    def test_resolve_default_branch_uses_project_override(
+        self, tmp_path: Path,
+    ):
+        mock_forge_client = MagicMock()
+        forge_config = GitLabForgeServiceConfig(
+            url="https://gl.example.com", token="t",
+        )
+        forge_svc = GitLabForgeService(forge_config, service_name="gl")
+        forge_svc._client = mock_forge_client
+
+        proj_config = ProjectServiceConfig(
+            forks=[ForkConfig(forge="gl", native_id="org/repo")],
+            default_branch="trunk",
+        )
+        proj_svc = ProjectService(proj_config, service_name="proj")
+
+        runtime = Runtime(
+            provider=MockProvider(), workspace_root=tmp_path,
+        )
+        runtime.register_service(forge_svc)
+        runtime.register_service(proj_svc)
+
+        assert proj_svc.resolve_default_branch(runtime) == "trunk"
+        mock_forge_client.get_project_info.assert_not_called()
+
+    def test_resolve_default_branch_falls_back_to_forge_lookup(
+        self, tmp_path: Path,
+    ):
+        """When no override is set, resolve via the forge API.  The
+        result should be cached for subsequent calls."""
+        mock_forge_client = MagicMock()
+        mock_forge_client.get_project_info.return_value = {
+            "default_branch": "develop",
+        }
+        forge_config = GitLabForgeServiceConfig(
+            url="https://gl.example.com", token="t",
+        )
+        forge_svc = GitLabForgeService(forge_config, service_name="gl")
+        forge_svc._client = mock_forge_client
+
+        proj_config = ProjectServiceConfig(
+            forks=[ForkConfig(forge="gl", native_id="org/repo")],
+        )
+        proj_svc = ProjectService(proj_config, service_name="proj")
+
+        runtime = Runtime(
+            provider=MockProvider(), workspace_root=tmp_path,
+        )
+        runtime.register_service(forge_svc)
+        runtime.register_service(proj_svc)
+
+        assert proj_svc.resolve_default_branch(runtime) == "develop"
+        mock_forge_client.get_project_info.assert_called_once_with("org/repo")
+
+        # Second call hits the cache, not the forge.
+        mock_forge_client.get_project_info.reset_mock()
+        assert proj_svc.resolve_default_branch(runtime) == "develop"
+        mock_forge_client.get_project_info.assert_not_called()
+
+    def test_resolve_default_branch_defaults_to_main_when_forge_returns_empty(
+        self, tmp_path: Path,
+    ):
+        """If the forge can't tell us, fall back to ``"main"`` rather
+        than returning an empty string that callers would treat as
+        "not configured"."""
+        mock_forge_client = MagicMock()
+        mock_forge_client.get_project_info.return_value = {"default_branch": ""}
+        forge_config = GitLabForgeServiceConfig(
+            url="https://gl.example.com", token="t",
+        )
+        forge_svc = GitLabForgeService(forge_config, service_name="gl")
+        forge_svc._client = mock_forge_client
+
+        proj_config = ProjectServiceConfig(
+            forks=[ForkConfig(forge="gl", native_id="org/repo")],
+        )
+        proj_svc = ProjectService(proj_config, service_name="proj")
+
+        runtime = Runtime(
+            provider=MockProvider(), workspace_root=tmp_path,
+        )
+        runtime.register_service(forge_svc)
+        runtime.register_service(proj_svc)
+
+        assert proj_svc.resolve_default_branch(runtime) == "main"
+
     def test_get_forge_client_resolves_via_runtime(self, tmp_path: Path):
         mock_forge_client = MagicMock()
         forge_config = GitLabForgeServiceConfig(
@@ -547,7 +703,7 @@ class TestProjectService:
         forge_svc._client = mock_forge_client
 
         proj_config = ProjectServiceConfig(
-            forge="gl", native_id="42", path="org/repo",
+            forks=[ForkConfig(forge="gl", native_id="org/repo")],
         )
         proj_svc = ProjectService(proj_config, service_name="my-proj")
 
@@ -559,7 +715,7 @@ class TestProjectService:
 
         client, native_id = proj_svc.get_forge_client(runtime)
         assert client is mock_forge_client
-        assert native_id == "42"
+        assert native_id == "org/repo"
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +735,7 @@ class TestGetForgeForProject:
         forge_svc._client = mock_forge_client
 
         proj_config = ProjectServiceConfig(
-            forge="gl", native_id="99",
+            forks=[ForkConfig(forge="gl", native_id="99")],
         )
         proj_svc = ProjectService(proj_config, service_name="test-proj")
 
@@ -638,7 +794,9 @@ class TestRuntimeGetForgeForProject:
         forge_svc._forge_client = mock_client
 
         proj_svc = ProjectService(
-            ProjectServiceConfig(forge="gh", native_id="org/repo"),
+            ProjectServiceConfig(forks=[
+                ForkConfig(forge="gh", native_id="org/repo"),
+            ]),
             service_name="my-proj",
         )
 
@@ -701,9 +859,9 @@ class TestForgeToolsIntegration:
         forge_svc._client = mock_forge_client
 
         proj_svc = ProjectService(
-            ProjectServiceConfig(
-                forge="gl", native_id="42", path="org/repo",
-            ),
+            ProjectServiceConfig(forks=[
+                ForkConfig(forge="gl", native_id="42"),
+            ]),
             service_name="test-proj",
         )
 
@@ -959,9 +1117,9 @@ class TestResolveWithAccounts:
         forge_svc._client = mock_legacy_client
 
         proj_svc = ProjectService(
-            ProjectServiceConfig(
-                forge="gl", native_id="42", path="org/repo",
-            ),
+            ProjectServiceConfig(forks=[
+                ForkConfig(forge="gl", native_id="42"),
+            ]),
             service_name="test-proj",
         )
 
@@ -969,9 +1127,9 @@ class TestResolveWithAccounts:
         runtime.register_service(forge_svc)
         runtime.register_service(proj_svc)
 
-        accounts = AgentAccountsConfig(forge_accounts=[
+        accounts = AgentAccountsConfig(accounts=[
             ForgeAccountConfig(
-                forge="gl",
+                service="gl",
                 credentials=GitLabCredentials(token="account-token"),
                 git_user_name="bot",
                 git_user_email="bot@thorn",
@@ -1020,9 +1178,9 @@ class TestResolveWithAccounts:
         forge_svc._client = mock_legacy_client
 
         proj_svc = ProjectService(
-            ProjectServiceConfig(
-                forge="gl", native_id="42", path="org/repo",
-            ),
+            ProjectServiceConfig(forks=[
+                ForkConfig(forge="gl", native_id="42"),
+            ]),
             service_name="test-proj",
         )
 

@@ -72,6 +72,16 @@ class Agent:
         home: Path | None = None,
         **kwargs: Any,
     ) -> None:
+        # ``id`` is the persistent identifier (used as the path stem
+        # for the agent's identity file and per-agent
+        # subdirectories) and ``name`` is the human-facing label.
+        # The two are distinct in code so that an in-memory agent
+        # constructed without an ``id`` cannot be accidentally
+        # persisted; callers that want a one-off agent for tests
+        # can therefore pass ``name="x"`` without obtaining a
+        # spurious ``AgentID``.  In persisted JSON only ``name`` is
+        # written -- the ``id`` is the file's path stem -- but at
+        # construction time the two parameters remain independent.
         self.name: str | None = name
         self.metadata: dict[str, Any] = metadata if metadata is not None else {}
         self.id: AgentID | None = id

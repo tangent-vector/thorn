@@ -135,8 +135,20 @@ class GitLabForgeClient:
         self._gl = gl_client
 
     @staticmethod
-    def _pid(native_project_id: str) -> int:
-        return int(native_project_id)
+    def _pid(native_project_id: str) -> int | str:
+        """Coerce a config-supplied native ID into the form python-gitlab expects.
+
+        ``python-gitlab``'s ``projects.get(...)`` accepts either a
+        numeric ID or a URL-encoded ``namespace/project/path`` string.
+        Configurations historically required the numeric form; the new
+        gateway config shape derives the path-based form from the
+        fork's URL, so pass either through unchanged (numeric digits
+        get parsed as ``int`` for parity with the legacy behaviour;
+        anything else is forwarded verbatim).
+        """
+        if native_project_id.isdigit():
+            return int(native_project_id)
+        return native_project_id
 
     @staticmethod
     def _target_type(target_type: str) -> str:
@@ -690,19 +702,27 @@ class GitLabForgeService(ForgeHostService):
         return self._extract_gitlab_token(credentials)
 
     def clone_url_for(self, native_id: str) -> str:
-        """Derive an HTTPS clone URL from the GitLab instance URL.
+        """Derive an HTTPS clone URL for a GitLab project.
 
-        For GitLab the native_id is a numeric project ID, so we
-        can't derive a path-based URL.  Instead, we use the
-        ``/api/v4/projects/:id`` style URL to construct a clone
-        target -- but that doesn't work for git.  The practical
-        approach is that callers should provide an explicit
-        ``clone_url`` for GitLab forks, or the project info can
-        be fetched from the API to get ``http_url_to_repo``.
+        With the path-based ``native_id`` shape used by the new
+        gateway config (e.g. ``"group/subgroup/project"``), the clone
+        URL is just the GitLab instance URL with that path appended
+        and a ``.git`` suffix.
 
-        As a fallback, returns an empty string.
+        Returns an empty string when the native_id is purely numeric
+        (legacy callers): we don't have enough information to
+        reconstruct the path without a forge API call.
         """
-        return ""
+        if not native_id or native_id.isdigit():
+            return ""
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self._config.url)
+        host = parsed.hostname or ""
+        scheme = parsed.scheme or "https"
+        if not host:
+            return ""
+        return f"{scheme}://{host}/{native_id}.git"
 
 
 class GitHubForgeService(ForgeHostService):
@@ -797,99 +817,83 @@ class GitHubForgeService(ForgeHostService):
 class ForkConfig(BaseModel):
     """A single fork of a project hosted on a forge.
 
-    Each fork identifies a forge-specific repository.  The ``name``
-    becomes the git remote name when the project is cloned locally
-    (conventionally ``"upstream"`` for the first fork).
+    Built by :func:`thorn.gateway._config.instantiate_services` from a
+    :class:`thorn.gateway._config.ForkSpec` -- ``native_id`` and
+    ``clone_url`` are derived from the user-facing ``url`` so that
+    consumers of ``ForkConfig`` have all the forge-specific identifiers
+    they need without re-parsing.
+
+    The ``name`` becomes the git remote name when the project is
+    cloned locally (defaults are picked at config-resolution time:
+    ``"origin"`` for single-fork projects, the forge name otherwise).
     """
 
     forge: str = Field(description="Name of the forge service hosting this fork")
     native_id: str = Field(
         description=(
             "Forge-native project identifier "
-            "(numeric string for GitLab, owner/repo for GitHub)"
+            "(``namespace/path`` for GitLab, ``owner/repo`` for GitHub)"
         ),
     )
     name: str = Field(
         default="",
-        description="Local remote name for this fork (e.g. 'upstream', 'origin')",
+        description="Local remote name for this fork (e.g. 'origin')",
     )
     clone_url: str = Field(
         default="",
-        description="HTTPS clone URL override (derived from forge when empty)",
+        description="HTTPS clone URL for this fork",
+    )
+    default_branch: str = Field(
+        default="",
+        description=(
+            "Per-fork override for the default branch.  When empty, "
+            "the project-level default is used; when that is also "
+            "empty, the value is fetched from the forge API on first "
+            "access (see :meth:`ProjectService.resolve_default_branch`)."
+        ),
     )
 
 
 class ProjectServiceConfig(BaseModel):
     """Configuration for a project service.
 
-    A project has one or more forks.  When ``forks`` is non-empty,
-    per-fork fields are used.  When ``forks`` is empty, the legacy
-    single-fork fields (``forge``, ``native_id``, ``clone_url``,
-    ``path``) are used to construct an implicit single-fork config.
+    A project has one or more forks.  ``default_branch`` is an
+    optional project-level override; when omitted, the value is
+    resolved lazily by querying the forge API for the primary fork
+    (see :meth:`ProjectService.resolve_default_branch`).
     """
 
     forks: list[ForkConfig] = Field(
         default_factory=list,
-        description="List of forks (new format)",
+        description=(
+            "List of forks of this project.  Defaults to an empty "
+            "list so that a ``ProjectServiceConfig`` can be constructed "
+            "incrementally; methods that need at least one fork (e.g. "
+            ":meth:`ProjectService.get_fork`, "
+            ":attr:`ProjectService.forge_name`) raise a clear "
+            "``KeyError`` / ``ValueError`` when the list is still empty."
+        ),
     )
     default_branch: str = Field(
-        default="main",
-        description="Default branch name",
-    )
-
-    forge: str = Field(
         default="",
-        description="(Legacy) Name of the forge service this project belongs to",
+        description=(
+            "Project-level default branch override.  When empty, "
+            "the value is looked up from the forge for the primary "
+            "fork on first access and cached for the process lifetime."
+        ),
     )
-    native_id: str = Field(
-        default="",
-        description="(Legacy) Forge-native project identifier",
-    )
-    path: str = Field(
-        default="",
-        description="(Legacy) Human-readable project path",
-    )
-    clone_url: str = Field(
-        default="",
-        description="(Legacy) HTTPS clone URL for the repository",
-    )
-
-    def resolved_forks(self) -> list[ForkConfig]:
-        """Return the effective fork list, synthesizing from legacy fields when needed."""
-        if self.forks:
-            return list(self.forks)
-        if self.forge and self.native_id:
-            return [ForkConfig(
-                forge=self.forge,
-                native_id=self.native_id,
-                name="upstream",
-                clone_url=self.clone_url,
-            )]
-        return []
-
-    @property
-    def primary_forge_name(self) -> str:
-        """Name of the forge hosting the primary (first) fork."""
-        forks = self.resolved_forks()
-        if forks:
-            return forks[0].forge
-        return self.forge
-
-    @property
-    def primary_native_id(self) -> str:
-        """Native identifier of the primary (first) fork."""
-        forks = self.resolved_forks()
-        if forks:
-            return forks[0].native_id
-        return self.native_id
 
 
 class ProjectService(Service):
     """A named project within a forge (possibly with multiple forks).
 
-    Carries the project's fork list, default branch, and convenience
-    accessors for the primary fork.  Resolves its ``ForgeClient`` by
-    looking up the forge service on the ``Runtime``.
+    Carries the project's fork list and convenience accessors for
+    the primary fork.  Resolves its ``ForgeClient`` by looking up the
+    forge service on the ``Runtime``.
+
+    The default branch for any given fork is resolved by
+    :meth:`resolve_default_branch`, which consults a cascade of
+    overrides before falling back to a forge API lookup.
     """
 
     Config: ClassVar[type[BaseModel]] = ProjectServiceConfig
@@ -902,6 +906,12 @@ class ProjectService(Service):
     ) -> None:
         self._config = config
         self._service_name = service_name
+        # Per-fork default-branch cache (filled by
+        # ``resolve_default_branch`` on first lookup).  Keys are fork
+        # names.  The cache is process-scoped because the default
+        # branch on a forge changes infrequently and a stale value
+        # is acceptable until the gateway restarts.
+        self._default_branch_cache: dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -910,33 +920,86 @@ class ProjectService(Service):
     @property
     def forks(self) -> list[ForkConfig]:
         """The effective fork list for this project."""
-        return self._config.resolved_forks()
+        return list(self._config.forks)
 
     @property
     def forge_name(self) -> str:
         """Name of the forge hosting the primary fork."""
-        return self._config.primary_forge_name
+        forks = self.forks
+        if not forks:
+            raise ValueError(
+                f"Project {self.name!r} has no forks configured"
+            )
+        return forks[0].forge
 
     @property
     def native_id(self) -> str:
         """Native identifier of the primary fork."""
-        return self._config.primary_native_id
-
-    @property
-    def path(self) -> str:
-        return self._config.path
+        forks = self.forks
+        if not forks:
+            raise ValueError(
+                f"Project {self.name!r} has no forks configured"
+            )
+        return forks[0].native_id
 
     @property
     def clone_url(self) -> str:
         """Clone URL of the primary fork."""
         forks = self.forks
-        if forks:
-            return forks[0].clone_url
-        return self._config.clone_url
+        if not forks:
+            return ""
+        return forks[0].clone_url
 
     @property
     def default_branch(self) -> str:
+        """Project-level default branch override (may be empty).
+
+        This returns only the *configured* override; it does **not**
+        trigger a forge API lookup.  Consumers that need a definitive
+        value should call :meth:`resolve_default_branch`, which
+        cascades through overrides and falls back to a live lookup.
+        """
         return self._config.default_branch
+
+    def resolve_default_branch(
+        self,
+        runtime: Any,
+        fork_name: str = "",
+    ) -> str:
+        """Resolve the default branch for *fork_name*, looking it up if needed.
+
+        Resolution cascade:
+
+        1. Per-fork override on :attr:`ForkConfig.default_branch`.
+        2. Project-level override on :attr:`default_branch`.
+        3. Process-cached previous lookup.
+        4. Live ``get_project_info`` call against the fork's forge.
+
+        The result of step 4 is cached per fork for subsequent calls.
+        Raises :class:`KeyError` for an unknown fork name.
+        """
+        fork = self.get_fork(fork_name)
+
+        if fork.default_branch:
+            return fork.default_branch
+        if self._config.default_branch:
+            return self._config.default_branch
+
+        cache_key = fork.name
+        cached = self._default_branch_cache.get(cache_key)
+        if cached:
+            return cached
+
+        forge_svc = runtime.get_service(fork.forge)
+        if not isinstance(forge_svc, ForgeHostService):
+            raise TypeError(
+                f"Service {fork.forge!r} is a "
+                f"{type(forge_svc).__name__}, not a ForgeHostService"
+            )
+        info = forge_svc.client.get_project_info(fork.native_id)
+        resolved = info.get("default_branch") or "main"
+        self._default_branch_cache[cache_key] = resolved
+        return resolved
 
     def get_fork(self, fork_name: str = "") -> ForkConfig:
         """Look up a fork by name, defaulting to the first fork.

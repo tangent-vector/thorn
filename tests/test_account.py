@@ -46,18 +46,18 @@ class TestGitLabCredentials:
 class TestForgeAccountConfig:
     def test_github_pat_account(self):
         acct = ForgeAccountConfig(
-            forge="github-com",
+            service="github-com",
             credentials=GitHubPatAuth(token="ghp_test"),
             git_user_name="bot",
             git_user_email="bot@example.com",
         )
-        assert acct.forge == "github-com"
+        assert acct.service == "github-com"
         assert acct.credentials.kind == "pat"
         assert acct.git_user_name == "bot"
 
     def test_github_app_account(self):
         acct = ForgeAccountConfig(
-            forge="github-com",
+            service="github-com",
             credentials=GitHubAppAuth(
                 app_id="12345",
                 installation_id=67890,
@@ -71,24 +71,24 @@ class TestForgeAccountConfig:
 
     def test_gitlab_pat_account(self):
         acct = ForgeAccountConfig(
-            forge="my-gitlab",
+            service="my-gitlab",
             credentials=GitLabCredentials(token="glpat-xyz"),
         )
-        assert acct.forge == "my-gitlab"
+        assert acct.service == "my-gitlab"
         assert acct.credentials.kind == "gitlab-pat"
         assert acct.git_user_name == ""
         assert acct.git_user_email == ""
 
     def test_round_trip_json(self):
         acct = ForgeAccountConfig(
-            forge="github-com",
+            service="github-com",
             credentials=GitHubPatAuth(token="ghp_test"),
             git_user_name="bot",
             git_user_email="bot@thorn",
         )
         data = acct.model_dump()
         restored = ForgeAccountConfig.model_validate(data)
-        assert restored.forge == acct.forge
+        assert restored.service == acct.service
         assert restored.credentials.kind == "pat"
         assert restored.credentials.token == "ghp_test"
         assert restored.git_user_name == "bot"
@@ -97,22 +97,23 @@ class TestForgeAccountConfig:
 class TestAgentAccountsConfig:
     def test_empty_default(self):
         cfg = AgentAccountsConfig()
-        assert cfg.forge_accounts == []
+        assert cfg.accounts == []
+        assert cfg.forge_accounts() == []
 
     def test_multiple_accounts(self):
-        cfg = AgentAccountsConfig(forge_accounts=[
+        cfg = AgentAccountsConfig(accounts=[
             ForgeAccountConfig(
-                forge="github-com",
+                service="github-com",
                 credentials=GitHubPatAuth(token="ghp_1"),
             ),
             ForgeAccountConfig(
-                forge="my-gitlab",
+                service="my-gitlab",
                 credentials=GitLabCredentials(token="glpat-2"),
             ),
         ])
-        assert len(cfg.forge_accounts) == 2
-        assert cfg.forge_accounts[0].forge == "github-com"
-        assert cfg.forge_accounts[1].forge == "my-gitlab"
+        assert len(cfg.forge_accounts()) == 2
+        assert cfg.forge_accounts()[0].service == "github-com"
+        assert cfg.forge_accounts()[1].service == "my-gitlab"
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +132,9 @@ def _make_agent_with_accounts(
 
 class TestResolveForgeAccount:
     def test_finds_matching_account(self):
-        accounts = AgentAccountsConfig(forge_accounts=[
+        accounts = AgentAccountsConfig(accounts=[
             ForgeAccountConfig(
-                forge="github-com",
+                service="github-com",
                 credentials=GitHubPatAuth(token="ghp_abc"),
                 git_user_name="bot",
                 git_user_email="bot@thorn",
@@ -141,18 +142,18 @@ class TestResolveForgeAccount:
         ])
         agent = _make_agent_with_accounts(accounts)
         result = resolve_forge_account(agent, "github-com")
-        assert result.forge == "github-com"
+        assert result.service == "github-com"
         assert result.credentials.token == "ghp_abc"
         assert result.git_user_name == "bot"
 
     def test_finds_second_account(self):
-        accounts = AgentAccountsConfig(forge_accounts=[
+        accounts = AgentAccountsConfig(accounts=[
             ForgeAccountConfig(
-                forge="github-com",
+                service="github-com",
                 credentials=GitHubPatAuth(token="ghp_first"),
             ),
             ForgeAccountConfig(
-                forge="my-gitlab",
+                service="my-gitlab",
                 credentials=GitLabCredentials(token="glpat-second"),
             ),
         ])
@@ -161,9 +162,9 @@ class TestResolveForgeAccount:
         assert result.credentials.kind == "gitlab-pat"
 
     def test_raises_for_missing_forge(self):
-        accounts = AgentAccountsConfig(forge_accounts=[
+        accounts = AgentAccountsConfig(accounts=[
             ForgeAccountConfig(
-                forge="github-com",
+                service="github-com",
                 credentials=GitHubPatAuth(token="ghp_abc"),
             ),
         ])

@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -317,34 +316,45 @@ def _expand_credentials(cred_data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _deserialize_accounts(
-    raw_accounts: dict[str, Any],
+    raw_accounts: list[dict[str, Any]] | dict[str, Any],
 ) -> Any:
-    """Parse the ``"accounts"`` dict from an agent JSON file.
+    """Parse the ``"accounts"`` value from an agent JSON file.
 
-    Applies env-var expansion only to secret credential fields.
+    The on-disk shape is a flat JSON array of account objects, each
+    of which has a ``service`` discriminator and a ``credentials``
+    block.  Env-var expansion is applied only to the secret fields
+    of ``credentials`` so that literal values elsewhere are not
+    misinterpreted as ``$ENV_VAR`` references.
+
     Returns an :class:`AgentAccountsConfig` instance.
     """
     from thorn.core._account import AgentAccountsConfig
 
-    forge_accounts_raw = raw_accounts.get("forge_accounts", [])
+    if not isinstance(raw_accounts, list):
+        raise ValueError(
+            "Agent JSON 'accounts' must be a JSON array of account "
+            f"objects, got {type(raw_accounts).__name__}.  See the "
+            "agent identity-file documentation for the expected shape."
+        )
+
     expanded: list[dict[str, Any]] = []
-    for acct in forge_accounts_raw:
+    for acct in raw_accounts:
         acct_copy = dict(acct)
         if "credentials" in acct_copy and isinstance(acct_copy["credentials"], dict):
             acct_copy["credentials"] = _expand_credentials(acct_copy["credentials"])
         expanded.append(acct_copy)
 
-    return AgentAccountsConfig.model_validate({"forge_accounts": expanded})
+    return AgentAccountsConfig.model_validate({"accounts": expanded})
 
 
-def _serialize_accounts(agent: Agent) -> dict[str, Any] | None:
-    """Serialize the agent's accounts to a JSON-safe dict.
+def _serialize_accounts(agent: Agent) -> list[dict[str, Any]] | None:
+    """Serialize the agent's accounts to a JSON-safe list.
 
-    Returns ``None`` when the agent has no accounts configured,
-    so the key can be omitted from the output JSON entirely.
+    Returns ``None`` when the agent has no accounts configured, so
+    the key can be omitted from the output JSON entirely.
 
     Credential fields that originated from ``$ENV_VAR`` references
-    are written as their *expanded* values — the original ``$``
+    are written as their *expanded* values -- the original ``$``
     reference is not preserved.  Users are expected to keep the
     ``$ENV_VAR`` form in their hand-edited config files; the
     serializer round-trips the resolved values.
@@ -352,26 +362,10 @@ def _serialize_accounts(agent: Agent) -> dict[str, Any] | None:
     from thorn.core._account import AgentAccountsConfig
 
     accounts: AgentAccountsConfig | None = getattr(agent, "accounts", None)
-    if accounts is None or not accounts.forge_accounts:
+    if accounts is None or not accounts.accounts:
         return None
-    return accounts.model_dump(mode="json")
-
-
-_LEGACY_IDENTITY_KEYS = {"git_user_name", "git_user_email", "project"}
-
-
-def _warn_legacy_agent_metadata(metadata: dict[str, Any]) -> None:
-    """Emit a deprecation warning when legacy identity keys are in metadata."""
-    found = _LEGACY_IDENTITY_KEYS & metadata.keys()
-    if found:
-        warnings.warn(
-            f"Agent metadata contains legacy identity key(s) "
-            f"{sorted(found)!r}. Migrate to the 'accounts' section "
-            f"of the agent JSON file. Legacy metadata keys will stop "
-            f"being honored in a future release.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
+    dumped = accounts.model_dump(mode="json")
+    return dumped.get("accounts", [])
 
 
 # ---------------------------------------------------------------------------
@@ -395,11 +389,17 @@ class JsonSessionSerializer:
         identity file intact.  Callers can therefore rely on the
         post-crash state always being a complete, loadable agent
         record (either the previous one or the new one, never
-        torn)."""
+        torn).
+
+        The agent's ``id`` is intentionally **not** written: the
+        identity file's path stem encodes it via
+        :func:`safe_dirname`, and on load the ``AgentID`` is derived
+        from that stem.  This collapses the historical ``id`` /
+        ``name`` duplication into the single human-facing ``name``.
+        """
         agent_data: dict[str, Any] = {
-            "id": str(agent.id) if agent.id is not None else None,
-            "agent_class": type(agent).__name__,
             "name": agent.name,
+            "agent_class": type(agent).__name__,
             "metadata": agent.metadata,
         }
         accounts_data = _serialize_accounts(agent)
@@ -411,12 +411,20 @@ class JsonSessionSerializer:
         )
 
     def load_agent(self, path: Path) -> Agent:
+        from thorn.runtime._paths import unsafe_dirname
+
         agent_data = json.loads(path.read_text(encoding="utf-8"))
 
         agent_cls = _resolve_agent_class(agent_data.get("agent_class", "Agent"))
 
-        id_raw = agent_data.get("id")
-        agent_id = AgentID(id_raw) if id_raw is not None else None
+        # Derive the AgentID from the file's path stem so that the
+        # store's directory layout is the single source of truth for
+        # agent identity.  When the JSON also carries an explicit
+        # ``name``, prefer that for the human label; otherwise fall
+        # back to the path-derived value so the ``name`` field is
+        # still populated.
+        path_stem_id = AgentID(unsafe_dirname(path.stem))
+        name = agent_data.get("name") or str(path_stem_id)
 
         metadata = agent_data.get("metadata") or {}
 
@@ -424,12 +432,10 @@ class JsonSessionSerializer:
         raw_accounts = agent_data.get("accounts")
         if raw_accounts is not None:
             kwargs["accounts"] = _deserialize_accounts(raw_accounts)
-        elif metadata:
-            _warn_legacy_agent_metadata(metadata)
 
         return agent_cls(
-            id=agent_id,
-            name=agent_data.get("name"),
+            id=path_stem_id,
+            name=name,
             metadata=metadata,
             **kwargs,
         )

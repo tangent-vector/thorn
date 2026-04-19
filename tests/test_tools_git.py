@@ -140,6 +140,7 @@ class TestGitAuthEnv:
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools.forge import (
+            ForkConfig,
             GitLabForgeService,
             GitLabForgeServiceConfig,
             ProjectService,
@@ -157,7 +158,9 @@ class TestGitAuthEnv:
         )
         runtime.register_service(
             ProjectService(
-                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                ProjectServiceConfig(forks=[
+                    ForkConfig(forge="gl-forge", native_id="1"),
+                ]),
                 service_name="my-proj",
             ),
         )
@@ -193,6 +196,7 @@ class TestGitAuthEnv:
             GitHubPatAuth,
         )
         from thorn.tools.forge import (
+            ForkConfig,
             GitHubForgeService,
             ProjectService,
             ProjectServiceConfig,
@@ -207,7 +211,9 @@ class TestGitAuthEnv:
         )
         runtime.register_service(
             ProjectService(
-                ProjectServiceConfig(forge="gh-forge", native_id="o/r"),
+                ProjectServiceConfig(forks=[
+                    ForkConfig(forge="gh-forge", native_id="o/r"),
+                ]),
                 service_name="proj",
             ),
         )
@@ -235,6 +241,7 @@ class TestGitAuthEnv:
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools.forge import (
+            ForkConfig,
             GitLabForgeService,
             GitLabForgeServiceConfig,
             ProjectService,
@@ -252,13 +259,15 @@ class TestGitAuthEnv:
         )
         runtime.register_service(
             ProjectService(
-                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                ProjectServiceConfig(forks=[
+                    ForkConfig(forge="gl-forge", native_id="1"),
+                ]),
                 service_name="my-proj",
             ),
         )
-        accounts = AgentAccountsConfig(forge_accounts=[
+        accounts = AgentAccountsConfig(accounts=[
             ForgeAccountConfig(
-                forge="gl-forge",
+                service="gl-forge",
                 credentials=GitLabCredentials(token="account-token"),
                 git_user_name="bot",
                 git_user_email="bot@thorn",
@@ -292,6 +301,7 @@ class TestRunGitAuthInjection:
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools.forge import (
+            ForkConfig,
             GitLabForgeService,
             GitLabForgeServiceConfig,
             ProjectService,
@@ -309,7 +319,9 @@ class TestRunGitAuthInjection:
         )
         runtime.register_service(
             ProjectService(
-                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                ProjectServiceConfig(forks=[
+                    ForkConfig(forge="gl-forge", native_id="1"),
+                ]),
                 service_name="my-proj",
             ),
         )
@@ -349,6 +361,7 @@ class TestRunGitAuthInjection:
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools.forge import (
+            ForkConfig,
             GitLabForgeService,
             GitLabForgeServiceConfig,
             ProjectService,
@@ -366,7 +379,9 @@ class TestRunGitAuthInjection:
         )
         runtime.register_service(
             ProjectService(
-                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                ProjectServiceConfig(forks=[
+                    ForkConfig(forge="gl-forge", native_id="1"),
+                ]),
                 service_name="my-proj",
             ),
         )
@@ -415,6 +430,7 @@ class TestRunGitAuthInjection:
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools.forge import (
+            ForkConfig,
             GitLabForgeService,
             GitLabForgeServiceConfig,
             ProjectService,
@@ -436,7 +452,9 @@ class TestRunGitAuthInjection:
         )
         runtime.register_service(
             ProjectService(
-                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                ProjectServiceConfig(forks=[
+                    ForkConfig(forge="gl-forge", native_id="1"),
+                ]),
                 service_name="my-proj",
             ),
         )
@@ -619,6 +637,7 @@ class TestGitIdentityEnvWithAccounts:
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools.forge import (
+            ForkConfig,
             GitLabForgeService,
             GitLabForgeServiceConfig,
             ProjectService,
@@ -636,13 +655,15 @@ class TestGitIdentityEnvWithAccounts:
         )
         runtime.register_service(
             ProjectService(
-                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                ProjectServiceConfig(forks=[
+                    ForkConfig(forge="gl-forge", native_id="1"),
+                ]),
                 service_name="my-proj",
             ),
         )
-        accounts = AgentAccountsConfig(forge_accounts=[
+        accounts = AgentAccountsConfig(accounts=[
             ForgeAccountConfig(
-                forge="gl-forge",
+                service="gl-forge",
                 credentials=GitLabCredentials(token="t"),
                 git_user_name="account-bot",
                 git_user_email="account-bot@thorn",
@@ -702,9 +723,9 @@ class TestGitIdentityEnvWithAccounts:
         from thorn.core._context import ExecutionContext
         from thorn.core._provider import MockProvider
 
-        accounts = AgentAccountsConfig(forge_accounts=[
+        accounts = AgentAccountsConfig(accounts=[
             ForgeAccountConfig(
-                forge="gl-forge",
+                service="gl-forge",
                 credentials=GitLabCredentials(token="t"),
                 git_user_name="account-bot",
                 git_user_email="account-bot@thorn",
@@ -945,6 +966,7 @@ class TestGitClone:
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools.forge import (
+            ForkConfig,
             GitLabForgeService,
             GitLabForgeServiceConfig,
             ProjectService,
@@ -963,7 +985,9 @@ class TestGitClone:
         )
         runtime.register_service(
             ProjectService(
-                ProjectServiceConfig(forge="gl-forge", native_id="1"),
+                ProjectServiceConfig(forks=[
+                    ForkConfig(forge="gl-forge", native_id="1"),
+                ]),
                 service_name="my-proj",
             ),
         )

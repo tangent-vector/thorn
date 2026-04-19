@@ -70,8 +70,12 @@ class GitLabSourceConfig(BaseModel):
     project_id_to_name: dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "Mapping from stringified GitLab project ID to logical "
-            "project name, used for project-name-based session keys."
+            "Mapping from a GitLab project's identifier (either its "
+            "numeric ID as a string, or its full path-with-namespace "
+            "such as 'group/project') to the logical project name "
+            "used for session-key routing.  Both key forms are "
+            "consulted at lookup time so the producer of this dict "
+            "can use whichever it has handy."
         ),
     )
 
@@ -139,6 +143,29 @@ def _noteable_from_todo(todo: Any) -> Noteable:
     return Noteable(kind=kind, number=todo.target["iid"])
 
 
+def _lookup_project_name(
+    todo_project: dict[str, Any],
+    project_id_to_name: dict[str, str] | None,
+) -> str:
+    """Resolve the logical project name for a GitLab TODO's project.
+
+    The mapping may be keyed by either the numeric project ID (as a
+    string) or the project's full ``path_with_namespace``; both forms
+    are consulted so that path-based ``gateway.json`` configurations
+    work without requiring an extra API round-trip to translate
+    paths into numeric IDs.
+    """
+    if not project_id_to_name:
+        return ""
+    pid = todo_project.get("id")
+    path = todo_project.get("path_with_namespace", "")
+    if path and path in project_id_to_name:
+        return project_id_to_name[path]
+    if pid is not None and str(pid) in project_id_to_name:
+        return project_id_to_name[str(pid)]
+    return ""
+
+
 def _make_session_key(
     todo: Any,
     project_id_to_name: dict[str, str] | None = None,
@@ -149,7 +176,7 @@ def _make_session_key(
     directly; delegates to :func:`route_gitlab_todo`.
     """
     pid = todo.project["id"]
-    proj_name = (project_id_to_name or {}).get(str(pid), "")
+    proj_name = _lookup_project_name(todo.project, project_id_to_name)
     return route_gitlab_todo(
         project_id=pid,
         noteable=_noteable_from_todo(todo),
@@ -180,7 +207,7 @@ def _make_event(
     """Convert a GitLab TODO into an ``IncomingEvent``."""
     project = todo.project
     pid = project["id"]
-    proj_name = (project_id_to_name or {}).get(str(pid), "")
+    proj_name = _lookup_project_name(project, project_id_to_name)
     session_key = route_gitlab_todo(
         project_id=pid,
         noteable=_noteable_from_todo(todo),

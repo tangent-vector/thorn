@@ -2,9 +2,8 @@
 
 Creates the agent identity file (``<agent-id>.json``), the agent's
 home directory, a ``MEMORY.md`` containing project-specific knowledge,
-and a ``gateway.json`` service configuration (forge definition,
-project definition, and the agency's workspace path -- no event
-sources, as those are inferred at startup).
+and a ``gateway.json`` service configuration (workspace + project
+definition; forges are inferred from the project URL).
 
 The bootstrap takes two filesystem roots, matching the
 home-vs-workspace split that ``AgencyPaths`` already exposes for the
@@ -20,10 +19,12 @@ gateway runtime:
   written into ``gateway.json`` so that ``thorn serve`` can locate it
   later without having to ask for the workspace on every startup.
 
-All non-secret values (forge ``base_url``, project metadata, git
-identity, agency workspace path) are written *literally* into the
-on-disk JSON.  Only the secret access token uses an ``$ENV_VAR``
-reference, in line with the "config in JSON, secrets via env" model.
+The new on-disk shape (see :mod:`thorn.gateway._config`) lets the
+project entry be just ``{name, url}`` for the common single-fork
+case; the forge type, name, and API URL are inferred from the URL
+host at startup, and the per-fork ``native_id`` and ``clone_url``
+are parsed from the same URL.  Only the secret access token uses an
+``$ENV_VAR`` reference.
 
 Usage from code::
 
@@ -32,24 +33,9 @@ Usage from code::
     bootstrap_coordinator(
         agency_home=Path("/home/me/.thorn"),
         agency_workspace=Path("/home/me/thorn-workspace"),
-        agent_id="lace-coordinator",
-        project_name="lace",
-        clone_url="https://gitlab-master.nvidia.com/lace/lace.git",
-        default_branch="main",
-        native_project_id="214768",
-        forge_type="gitlab",
-        forge_base_url="https://gitlab-master.nvidia.com/api/v4",
-    )
-
-    bootstrap_coordinator(
-        agency_home=Path("/home/me/.thorn"),
-        agency_workspace=Path("/home/me/thorn-workspace"),
-        agent_id="gh-coordinator",
-        project_name="my-repo",
-        clone_url="https://github.com/owner/repo.git",
-        native_project_id="owner/repo",
-        forge_type="github",
-        forge_base_url="https://api.github.com",
+        agent_id="thorn",
+        project_name="tiny-talk",
+        project_url="https://github.com/tangent-vector/tiny-talk",
     )
 
 GitHub uses PAT authentication (``$GITHUB_TOKEN`` by default).  GitHub
@@ -64,7 +50,10 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from thorn.gateway._config import GATEWAY_CONFIG_FILENAME
+from thorn.gateway._config import (
+    GATEWAY_CONFIG_FILENAME,
+    derive_forge_type_from_url,
+)
 from thorn.runtime._session import AgentID
 
 log = logging.getLogger(__name__)
@@ -87,16 +76,20 @@ def _ensure_gateway_config(
     agency_home: Path,
     *,
     workspace_path: str,
-    forge_entry: dict[str, Any],
     project_entry: dict[str, Any],
 ) -> None:
-    """Create or update ``gateway.json`` with workspace, forge, and project entries.
+    """Create or update ``gateway.json`` with workspace and project entry.
 
     The agency's workspace path is written as a top-level
-    ``"workspace"`` string (overwriting any prior value).  Forge and
-    project entries are upserted by name so that re-running the
-    bootstrap for additional coordinators in the same agency accretes
-    rather than clobbering.
+    ``"workspace"`` string (overwriting any prior value).  The project
+    entry is upserted by name so re-running the bootstrap for an
+    additional project in the same agency accretes rather than
+    clobbering.
+
+    No ``forges:`` block is written.  The new gateway config infers
+    the matching forge entry from the project URL at load time;
+    operators only need to write an explicit ``forges:`` array when
+    targeting a self-hosted forge whose type cannot be inferred.
     """
     config_path = agency_home / GATEWAY_CONFIG_FILENAME
 
@@ -105,15 +98,9 @@ def _ensure_gateway_config(
     else:
         data = {}
 
-    # Always write the workspace path; the bootstrap is the canonical
-    # place to set it, and a later bootstrap call against the same
-    # agency home should normally be using the same workspace anyway.
     data["workspace"] = workspace_path
 
-    forges: list[dict[str, Any]] = data.setdefault("forges", [])
     projects: list[dict[str, Any]] = data.setdefault("projects", [])
-
-    _upsert_by_name(forges, forge_entry)
     _upsert_by_name(projects, project_entry)
 
     config_path.write_text(
@@ -135,13 +122,8 @@ def bootstrap_coordinator(
     agency_workspace: Path,
     agent_id: str,
     project_name: str,
-    clone_url: str,
-    default_branch: str = "main",
-    native_project_id: str = "",
-    forge_type: str = "gitlab",
+    project_url: str,
     access_token_env: str | None = None,
-    forge_base_url: str = "",
-    forge_service_name: str = "",
     git_user_name: str = "",
     git_user_email: str = "",
 ) -> AgentID:
@@ -162,28 +144,33 @@ def bootstrap_coordinator(
     that misconfigured/unwritable workspaces fail at bootstrap rather
     than at first session.
 
-    *forge_base_url* is written literally into the gateway forge entry.
-    The gateway then resolves the base URL from JSON at startup; no
-    environment variable lookup is performed for the URL.  Only the
-    access token (a real secret) is referenced via ``$ENV_VAR`` in the
-    agent identity file.  Event sources are inferred at startup from
-    the agent's account on the forge — no explicit event source entry
-    is written.
+    *project_url* is the human-facing URL of the project on its forge
+    (e.g. ``"https://github.com/owner/repo"`` or
+    ``"https://gitlab.com/group/project"``).  The forge entry is
+    inferred from the URL host at load time; only the secret access
+    token (a real secret) is referenced via ``$ENV_VAR`` in the agent
+    identity file.
 
-    The agent identity includes an ``"accounts"`` section with forge
-    credentials (``$ENV_VAR`` for the secret token) and literal git
-    identity.  ``metadata.project`` is also set for backward
-    compatibility with code that reads it.
-
-    GitHub always uses PAT authentication (default ``$GITHUB_TOKEN``).
+    The agent identity uses the new ``"accounts"`` shape: a flat
+    list of account objects discriminated on ``service``.  GitHub
+    accounts always use PAT authentication (default
+    ``$GITHUB_TOKEN``) -- the inferred Notifications event source
+    requires user-scoped credentials.
 
     Returns the ``AgentID`` of the created agent.
     """
-    if not forge_service_name:
-        forge_service_name = f"{project_name}-forge"
+    forge_type = derive_forge_type_from_url(project_url)
+    if forge_type is None:
+        raise ValueError(
+            f"Cannot infer forge type from project URL {project_url!r}: "
+            "host is not a well-known forge.  Bootstrap currently only "
+            "supports github.com and gitlab.com URLs; for self-hosted "
+            "forges, write gateway.json by hand with an explicit "
+            "`forges:` entry."
+        )
 
     if access_token_env is None:
-        access_token_env = _DEFAULT_TOKEN_ENV.get(forge_type, "GITLAB_TOKEN")
+        access_token_env = _DEFAULT_TOKEN_ENV[forge_type]
 
     aid = AgentID(agent_id)
 
@@ -199,39 +186,42 @@ def bootstrap_coordinator(
     resolved_git_name = git_user_name or agent_id
     resolved_git_email = git_user_email or f"{agent_id}@thorn"
 
-    # -- Build credentials for the agent account ----------------------------
-
+    # Build credentials for the agent account.  The forge type
+    # inferred from the URL host selects the credential discriminator.
     if forge_type == "github":
         credentials_block: dict[str, Any] = {
             "kind": "pat",
             "token": f"${access_token_env}",
         }
+        service_name = "github"
     else:
         credentials_block = {
             "kind": "gitlab-pat",
             "token": f"${access_token_env}",
         }
+        service_name = "gitlab"
 
     # -- Agent identity ------------------------------------------------------
 
     identity_path = agents_root / f"{agent_id}.json"
     agent_data: dict[str, Any] = {
-        "id": str(aid),
-        "agent_class": "ProjectCoordinator",
         "name": agent_id,
+        "agent_class": "ProjectCoordinator",
         "metadata": {
+            # ``metadata.project`` is intentionally retained for now;
+            # killing it requires a follow-up redesign of git
+            # identity resolution (see the deferred items in the
+            # gateway-config-cleanup plan).
             "project": project_name,
         },
-        "accounts": {
-            "forge_accounts": [
-                {
-                    "forge": forge_service_name,
-                    "credentials": credentials_block,
-                    "git_user_name": resolved_git_name,
-                    "git_user_email": resolved_git_email,
-                },
-            ],
-        },
+        "accounts": [
+            {
+                "service": service_name,
+                "credentials": credentials_block,
+                "git_user_name": resolved_git_name,
+                "git_user_email": resolved_git_email,
+            },
+        ],
     }
 
     identity_path.write_text(
@@ -250,8 +240,7 @@ def bootstrap_coordinator(
         f"# {project_name} Coordinator Memory",
         "",
         f"- **Project service**: `{project_name}`",
-        f"- **Clone URL**: {clone_url}",
-        f"- **Default branch**: {default_branch}",
+        f"- **Project URL**: {project_url}",
     ]
 
     memory_lines.extend([
@@ -277,30 +266,14 @@ def bootstrap_coordinator(
 
     # -- Gateway configuration -----------------------------------------------
 
-    forge_entry: dict[str, Any] = {
-        "name": forge_service_name,
-        "type": forge_type,
-    }
-    if forge_base_url:
-        forge_entry["base_url"] = forge_base_url
-
     project_entry: dict[str, Any] = {
         "name": project_name,
-        "default_branch": default_branch,
-        "forks": [
-            {
-                "forge": forge_service_name,
-                "native_id": native_project_id,
-                "name": "upstream",
-                "clone_url": clone_url,
-            },
-        ],
+        "url": project_url,
     }
 
     _ensure_gateway_config(
         agency_home,
         workspace_path=str(agency_workspace),
-        forge_entry=forge_entry,
         project_entry=project_entry,
     )
 
