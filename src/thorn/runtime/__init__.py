@@ -21,6 +21,7 @@ from thorn.runtime._address import (
     ServiceAddress,
     SessionAddress,
 )
+from thorn.runtime._cli_dispatcher import make_cli_prompt_dispatcher
 from thorn.runtime._dispatch import (
     DispatchError,
     apply_handling_transition,
@@ -114,6 +115,7 @@ __all__ = [
     "dispatch_step_two",
     "inbox_prompt_dispatcher",
     "list_inbox_items",
+    "make_cli_prompt_dispatcher",
     "read_inbox_item",
     "rebuild_in_flight_index",
     "run_startup_sweep",

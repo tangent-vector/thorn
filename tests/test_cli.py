@@ -160,6 +160,74 @@ class TestRunResultFile:
         assert not (tmp_path / "result.json").exists()
 
 
+class TestRunPipelineStructure:
+    """``thorn run`` should flow through the in-process scheduler+inbox.
+
+    Phase 2 of the CLI/gateway unification routes ``thorn run`` through
+    an :class:`AgentScheduler` driven by ``make_cli_prompt_dispatcher``,
+    posting the user's prompt as a notification on a per-invocation
+    session inbox.  These tests verify the structural side effects of
+    that pipeline (inbox directory created, then drained) rather than
+    just the user-facing result, so a future regression that bypasses
+    the scheduler -- e.g. by calling ``run_agent_loop`` directly again
+    -- would be caught.
+    """
+
+    def test_session_inbox_dir_created_and_drained(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="ok"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--no-tools", "--no-discover", "--no-mcp",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+        # Per-invocation session keys are ``run-<8 hex chars>``;
+        # inbox dirs land at <home>/agents/local/sessions/<key>/inbox/.
+        sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
+        assert sessions_root.is_dir(), (
+            "the runtime should have created an agent sessions root"
+        )
+        run_session_dirs = [
+            d for d in sessions_root.iterdir()
+            if d.is_dir() and d.name.startswith("run-")
+        ]
+        assert len(run_session_dirs) == 1, (
+            f"expected exactly one ephemeral run-* session dir, "
+            f"found {sorted(d.name for d in run_session_dirs)}"
+        )
+        inbox_dir = run_session_dirs[0] / "inbox"
+        assert inbox_dir.is_dir(), (
+            "the SessionInbox constructor should have mkdir'd the inbox dir"
+        )
+        # The dispatcher deletes the notification it processes, so no
+        # ``*.json`` notification files should remain at the inbox root.
+        leftover_notifications = [
+            p for p in inbox_dir.iterdir()
+            if p.is_file() and p.suffix == ".json"
+        ]
+        assert leftover_notifications == [], (
+            "the CLI dispatcher must remove the notification it "
+            "processed; otherwise the scheduler would loop on it"
+        )
+
+
 class TestChat:
     """``thorn chat`` REPL drives turns through ``session.prompt``.
 

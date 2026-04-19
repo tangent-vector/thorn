@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from thorn.core._discovery import discover_tools
 from thorn.core._func import _prepare_tools, prompt
 from thorn.core._loop import run_agent_loop, _WrappedTool
 from thorn.core._provider import load_provider_from_env
+from thorn.core._session import Session
 from thorn.core._tools import ALL_BUILTIN_TOOLS, FILE_WRITING, run_shell
 from thorn.tools.git import GIT_TOOLS
 
@@ -38,7 +40,16 @@ Includes file operations (read + write), shell access, and git tools.
 The ``ask_user`` tool is added separately depending on interactivity.
 """
 from thorn.core.errors import SkillError, ThornError
-from thorn.runtime import AgentID, Runtime, SessionKey
+from thorn.runtime import (
+    AgentID,
+    AgentScheduler,
+    NotificationSpec,
+    Runtime,
+    SessionAddress,
+    SessionInbox,
+    SessionKey,
+    make_cli_prompt_dispatcher,
+)
 
 console = Console()
 
@@ -316,9 +327,20 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
     ctx_holder: list[ExecutionContext] = []
 
     async def _run() -> str:
+        # Phase 2 of the CLI/gateway unification: route ``thorn run``
+        # through the in-process ``AgentScheduler`` rather than
+        # invoking ``run_agent_loop`` directly.  The notification
+        # round-trip is overkill for a one-shot request on its own,
+        # but it lets ``thorn run``, ``thorn chat`` (post-Phase 4),
+        # and the gateway daemon all drive sessions through the same
+        # scheduler+dispatcher pipeline -- which is the whole point
+        # of the unification.  A future-based dispatcher
+        # (``make_cli_prompt_dispatcher``) bridges the scheduler's
+        # fire-and-forget shape back to the synchronous "give me the
+        # answer" shape ``thorn run`` needs.
         async with runtime:
             ctx_holder.append(runtime.context)
-            _ensure_cli_agent(runtime)
+            agent = _ensure_cli_agent(runtime)
             async with AsyncExitStack() as stack:
                 tools = await _collect_all_tools(
                     stack,
@@ -326,17 +348,71 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
                     no_discover=no_discover,
                     no_mcp=no_mcp,
                 )
-                sys_prompts = [
-                    "You are executing a single non-interactive request. "
-                    "Complete the task and report results concisely. "
-                    "Do not offer follow-up actions or ask questions.",
-                ]
-                return await run_agent_loop(
-                    context=runtime.context,
-                    user_prompt=prompt_text,
-                    tools=tools,
-                    system_prompts=sys_prompts,
+
+                # Each ``thorn run`` invocation gets a fresh session
+                # under a unique key.  Phase 5 will formalise the
+                # naming convention (``ephemeral/{uuid}`` or similar)
+                # and wire shutdown housekeeping into session close;
+                # for now the in-memory session is never persisted
+                # (``save_session=None`` below) so the only on-disk
+                # artefact is the session's inbox directory, which
+                # ends up empty after the dispatcher deletes the one
+                # notification it processes.  Acceptable litter for
+                # the duration of Phase 2.
+                if agent.id is None:
+                    raise RuntimeError(
+                        "CLI agent has no id; cannot build a session inbox"
+                    )
+                session_key = SessionKey(f"run-{uuid.uuid4().hex[:8]}")
+                session = Session(
+                    agent=agent,
+                    key=session_key,
+                    workspace_root=runtime.workspace_root,
                 )
+
+                session_address = SessionAddress(agent.id, session_key)
+                inbox = SessionInbox(
+                    runtime.paths.session_inbox_dir(agent.id, session_key),
+                    session_address,
+                    in_flight_index=runtime.in_flight_index,
+                )
+                runtime.address_book.register(session_address, inbox)
+
+                loop = asyncio.get_running_loop()
+                result_future: asyncio.Future[str] = loop.create_future()
+                dispatcher = make_cli_prompt_dispatcher(
+                    result_future=result_future,
+                    extra_tools=tools,
+                    extra_system=(
+                        "You are executing a single non-interactive request. "
+                        "Complete the task and report results concisely. "
+                        "Do not offer follow-up actions or ask questions."
+                    ),
+                )
+                # ``save_session=None``: ``thorn run`` is ephemeral.
+                # Phase 5 will revisit when the local-agency defaults
+                # land and persistence semantics get redesigned.
+                scheduler = AgentScheduler(
+                    agent=agent,
+                    prompt_dispatcher=dispatcher,
+                    save_session=None,
+                )
+                try:
+                    inbox.post(NotificationSpec(
+                        source="user",
+                        content=prompt_text,
+                        target=session_address,
+                    ))
+                    await scheduler.submit(session, inbox)
+                    return await result_future
+                finally:
+                    # Bounded grace period so a misbehaving dispatcher
+                    # cannot wedge process exit indefinitely.  By the
+                    # time we get here the future has resolved, the
+                    # dispatcher has returned, and the driver has
+                    # parked on its idle wait, so shutdown is
+                    # essentially instantaneous in the success case.
+                    await scheduler.shutdown(timeout=5.0)
 
     outcome = "success"
     error_msg: str | None = None
