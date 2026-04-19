@@ -11,12 +11,11 @@ from thorn.gateway._config import (
     ForkSpec,
     GatewayConfig,
     ProjectSpec,
-    ServiceSpec,
+    ServiceTypeRegistry,
     expand_env_vars,
+    get_service_type_registry,
     infer_event_sources,
-    instantiate_new_format,
     instantiate_services,
-    instantiate_sources,
     load_gateway_config,
 )
 from thorn.gateway._event import EventSource, IncomingEvent
@@ -31,11 +30,10 @@ __all__ = [
     "IncomingEvent",
     "ProjectCoordinator",
     "ProjectSpec",
-    "ServiceSpec",
+    "ServiceTypeRegistry",
     "expand_env_vars",
+    "get_service_type_registry",
     "infer_event_sources",
-    "instantiate_new_format",
     "instantiate_services",
-    "instantiate_sources",
     "load_gateway_config",
 ]

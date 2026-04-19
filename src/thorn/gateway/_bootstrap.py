@@ -5,9 +5,10 @@ directory, a ``MEMORY.md`` containing project-specific knowledge, and
 a ``gateway.json`` service configuration (forge definition and project
 definition -- no event sources, as those are inferred at startup).
 
-The agent identity file includes an ``"accounts"`` section with forge
-credentials (using ``$ENV_VAR`` references for secrets) and literal
-git identity fields.
+All non-secret values (forge ``base_url``, project metadata, git
+identity) are written *literally* into the on-disk JSON.  Only the
+secret access token uses an ``$ENV_VAR`` reference, in line with the
+"config in JSON, secrets via env" model.
 
 Usage from code::
 
@@ -34,9 +35,9 @@ Usage from code::
         forge_base_url="https://api.github.com",
     )
 
-GitHub uses PAT authentication (``$GITHUB_TOKEN``).  GitHub App
-installation tokens are not supported for the event source
-(Notifications API requires user-scoped auth).
+GitHub uses PAT authentication (``$GITHUB_TOKEN`` by default).  GitHub
+App installation tokens are not supported for the inferred event
+source (the Notifications API requires user-scoped auth).
 """
 
 from __future__ import annotations
@@ -96,9 +97,9 @@ def _ensure_gateway_config(
     log.info("Wrote gateway config: %s", config_path)
 
 
-_FORGE_DEFAULTS: dict[str, tuple[str, str]] = {
-    "gitlab": ("GITLAB_TOKEN", "GITLAB_URL"),
-    "github": ("GITHUB_TOKEN", "GITHUB_API_URL"),
+_DEFAULT_TOKEN_ENV: dict[str, str] = {
+    "gitlab": "GITLAB_TOKEN",
+    "github": "GITHUB_TOKEN",
 }
 
 
@@ -116,11 +117,6 @@ def bootstrap_coordinator(
     forge_service_name: str = "",
     git_user_name: str = "",
     git_user_email: str = "",
-    # Legacy parameters (accepted but mapped to new fields)
-    project_id: int | None = None,
-    forge_url_env: str | None = None,
-    gitlab_url_env: str = "",
-    github_auth_mode: str = "pat",
 ) -> AgentID:
     """Create a ProjectCoordinator agent in the given Runtime directory.
 
@@ -131,31 +127,28 @@ def bootstrap_coordinator(
     - ``<runtime_root>/.thorn/agents/<agent_id>/MEMORY.md``
     - ``<runtime_root>/.thorn/gateway.json``
 
-    The gateway config includes a forge definition and a project
-    definition.  Event sources are inferred at startup from the
-    agent's account on the forge (no explicit event source entry).
+    *forge_base_url* is written literally into the gateway forge entry.
+    The gateway then resolves the base URL from JSON at startup; no
+    environment variable lookup is performed for the URL.  Only the
+    access token (a real secret) is referenced via ``$ENV_VAR`` in the
+    agent identity file.  Event sources are inferred at startup from
+    the agent's account on the forge — no explicit event source entry
+    is written.
 
     The agent identity includes an ``"accounts"`` section with forge
-    credentials (``$ENV_VAR`` for secrets) and literal git identity.
-    ``metadata.project`` is also set for backward compatibility with
-    code that reads it.
+    credentials (``$ENV_VAR`` for the secret token) and literal git
+    identity.  ``metadata.project`` is also set for backward
+    compatibility with code that reads it.
 
-    GitHub always uses PAT authentication (``$GITHUB_TOKEN``).
+    GitHub always uses PAT authentication (default ``$GITHUB_TOKEN``).
 
     Returns the ``AgentID`` of the created agent.
     """
-    if gitlab_url_env:
-        forge_url_env = gitlab_url_env
-    if project_id is not None and not native_project_id:
-        native_project_id = str(project_id)
     if not forge_service_name:
         forge_service_name = f"{project_name}-forge"
 
-    default_token, _default_url_env = _FORGE_DEFAULTS.get(
-        forge_type, ("GITLAB_TOKEN", "GITLAB_URL"),
-    )
     if access_token_env is None:
-        access_token_env = default_token
+        access_token_env = _DEFAULT_TOKEN_ENV.get(forge_type, "GITLAB_TOKEN")
 
     aid = AgentID(agent_id)
     thorn_dir = runtime_root / ".thorn"

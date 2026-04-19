@@ -1,36 +1,29 @@
-"""GitLab API operations as ``@tool``-decorated functions for thorn agents.
+"""GitLab API client used by forge services and the TODOs event source.
 
-Provides tools for interacting with a GitLab instance: reading issues,
-posting comments, creating merge requests, and querying MR details.
+Provides :class:`GitLabClient`, a thin wrapper around ``python-gitlab``
+that exposes purpose-built methods so that downstream code never has to
+touch ``python-gitlab`` objects directly.
+
+This module deliberately does **not** define agent-facing ``@tool``
+functions of its own.  Agent-facing forge operations live in
+:mod:`thorn.tools.forge` as project-name-based tools (``forge_*``) that
+resolve credentials from the current agent's
+:class:`~thorn.core._account.ForgeAccountConfig` and the forge service
+registered in the runtime.  Forge URL and auth therefore come from
+``.thorn/gateway.json`` and the agent's identity JSON, never from
+process-wide environment variable singletons.
 
 Requires ``python-gitlab`` (install via ``pip install thorn[gitlab]``).
 The module gracefully defers the import error until a tool is actually
 called, so importing ``thorn.tools.gitlab`` never fails.
-
-Usage::
-
-    from thorn.tools import gitlab
-
-    agent = Agent(..., tools=[gitlab.GITLAB_TOOLS, ...])
-
-Configuration is loaded from environment variables:
-
-- ``GITLAB_URL``   -- GitLab instance URL (e.g. ``https://gitlab.example.com``)
-- ``GITLAB_TOKEN`` -- Personal Access Token with ``api`` scope
-
-Adapted from ``thorn-bot/src/thorn_bot/_gitlab.py``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, Field
-
-from thorn.core._func import tool
 
 log = logging.getLogger(__name__)
 
@@ -63,35 +56,15 @@ def _require_gitlab() -> None:
 
 
 class GitLabConfig(BaseModel):
-    """Configuration for connecting to a GitLab instance.
+    """Connection settings for a single GitLab instance.
 
-    Typically loaded from environment variables via
-    ``GitLabConfig.from_env()``.
+    Built up by :class:`~thorn.tools.forge.GitLabForgeService` (which
+    pulls ``url`` from the gateway forge entry and ``token`` from an
+    agent's credentials) and consumed by :class:`GitLabClient`.
     """
 
     url: str = Field(description="GitLab instance URL (no trailing slash)")
     token: str = Field(description="Personal Access Token with 'api' scope")
-
-    @classmethod
-    def from_env(cls) -> GitLabConfig:
-        """Load configuration from ``GITLAB_URL`` and ``GITLAB_TOKEN``
-        environment variables.
-
-        Raises ``ValueError`` if either variable is not set.
-        """
-        url = os.environ.get("GITLAB_URL")
-        token = os.environ.get("GITLAB_TOKEN")
-        missing = [
-            name
-            for name, val in [("GITLAB_URL", url), ("GITLAB_TOKEN", token)]
-            if not val
-        ]
-        if missing:
-            raise ValueError(
-                f"Missing required environment variable(s): {', '.join(missing)}. "
-                "Set GITLAB_URL and GITLAB_TOKEN to use GitLab tools."
-            )
-        return cls(url=url, token=token)  # type: ignore[arg-type]
 
 
 class GitLabClient:
@@ -404,268 +377,7 @@ class GitLabClient:
         self._gl.http_post(f"/todos/{todo_id}/mark_as_done")
 
 
-# ---------------------------------------------------------------------------
-# Module-level client accessor
-# ---------------------------------------------------------------------------
-
-_client: GitLabClient | None = None
-
-
-def get_client() -> GitLabClient:
-    """Return the module-level ``GitLabClient``, creating it lazily.
-
-    Configuration is loaded from environment variables on first access.
-    Subsequent calls return the same client instance.
-    """
-    global _client
-    if _client is None:
-        config = GitLabConfig.from_env()
-        _client = GitLabClient(config)
-    return _client
-
-
-def set_client(client: GitLabClient | None) -> None:
-    """Replace the module-level client (useful for testing or custom configs)."""
-    global _client
-    _client = client
-
-
-# ---------------------------------------------------------------------------
-# @tool functions
-# ---------------------------------------------------------------------------
-
-NoteableKind = Literal["Issue", "MergeRequest"]
-
-
-@tool
-async def gitlab_read_issue(project_id: int, issue_iid: int) -> str:
-    """Read a GitLab issue, returning its title, description, labels, and assignees.
-
-    *project_id* is the numeric project ID.  *issue_iid* is the
-    issue number within the project (the ``#N`` in the UI).
-    """
-    client = get_client()
-    info = await asyncio.to_thread(client.get_issue, project_id, issue_iid)
-    lines = [
-        f"Issue #{info['iid']}: {info['title']}",
-        f"State: {info['state']}",
-        f"Labels: {', '.join(info['labels']) or '(none)'}",
-        f"Assignees: {', '.join(info['assignees']) or '(none)'}",
-        f"URL: {info['web_url']}",
-        "",
-        info["description"] or "(no description)",
-    ]
-    return "\n".join(lines)
-
-
-@tool
-async def gitlab_post_comment(
-    project_id: int,
-    noteable_type: NoteableKind,
-    noteable_iid: int,
-    body: str,
-) -> str:
-    """Post a comment on a GitLab issue or merge request.
-
-    *noteable_type* must be either ``"Issue"`` or ``"MergeRequest"``.
-    *noteable_iid* is the issue/MR number within the project.
-    """
-    client = get_client()
-    await asyncio.to_thread(
-        client.post_note, project_id, noteable_type, noteable_iid, body,
-    )
-    return f"Posted comment on {noteable_type} #{noteable_iid} in project {project_id}."
-
-
-@tool
-async def gitlab_create_merge_request(
-    project_id: int,
-    source_branch: str,
-    title: str,
-    description: str = "",
-    target_branch: str = "main",
-) -> str:
-    """Create a new merge request on GitLab.
-
-    Opens an MR from *source_branch* into *target_branch* (default
-    ``main``) in the specified project.
-    """
-    client = get_client()
-    info = await asyncio.to_thread(
-        client.create_merge_request,
-        project_id=project_id,
-        source_branch=source_branch,
-        title=title,
-        target_branch=target_branch,
-        description=description,
-    )
-    return (
-        f"Created MR !{info['iid']}: {info['title']}\n"
-        f"  {info['source_branch']} -> {info['target_branch']}\n"
-        f"  URL: {info['web_url']}"
-    )
-
-
-@tool
-async def gitlab_get_merge_request(project_id: int, mr_iid: int) -> str:
-    """Read details of a GitLab merge request.
-
-    Returns the MR title, state, branches, merge status, and description.
-    """
-    client = get_client()
-    info = await asyncio.to_thread(
-        client.get_merge_request, project_id, mr_iid,
-    )
-    lines = [
-        f"MR !{info['iid']}: {info['title']}",
-        f"State: {info['state']}",
-        f"Branches: {info['source_branch']} -> {info['target_branch']}",
-        f"Merge status: {info['merge_status']}",
-        f"URL: {info['web_url']}",
-        "",
-        info["description"] or "(no description)",
-    ]
-    return "\n".join(lines)
-
-
-@tool
-async def gitlab_list_merge_requests(
-    project_id: int,
-    state: Literal["opened", "closed", "merged", "all"] = "opened",
-) -> str:
-    """List merge requests in a GitLab project.
-
-    Filters by *state* (default ``"opened"``).  Returns a formatted
-    list of MR numbers, titles, and authors.
-    """
-    client = get_client()
-    mrs = await asyncio.to_thread(
-        client.list_merge_requests, project_id, state,
-    )
-    if not mrs:
-        return f"No {state} merge requests in project {project_id}."
-    lines = []
-    for mr in mrs:
-        author = mr["author"] or "unknown"
-        lines.append(f"  !{mr['iid']}: {mr['title']} ({mr['state']}, by {author})")
-    header = f"{len(mrs)} {state} merge request(s) in project {project_id}:"
-    return "\n".join([header, *lines])
-
-
-@tool
-async def gitlab_get_project_info(project_id: int) -> str:
-    """Get information about a GitLab project.
-
-    Returns the project's name, clone URL (HTTPS), default branch,
-    namespace path, and web URL.
-    """
-    client = get_client()
-    info = await asyncio.to_thread(client.get_project_info, project_id)
-    lines = [
-        f"Project: {info['name_with_namespace']}",
-        f"Path: {info['path_with_namespace']}",
-        f"Clone URL (HTTPS): {info['http_url_to_repo']}",
-        f"Clone URL (SSH): {info['ssh_url_to_repo']}",
-        f"Default branch: {info['default_branch']}",
-        f"Web URL: {info['web_url']}",
-    ]
-    if info["description"]:
-        lines.append(f"Description: {info['description']}")
-    return "\n".join(lines)
-
-
-@tool
-async def gitlab_read_file(
-    project_id: int,
-    file_path: str,
-    ref: str = "HEAD",
-) -> str:
-    """Read a file from a GitLab repository via the API.
-
-    Useful for inspecting files without cloning the entire repository.
-    *ref* can be a branch name, tag, or commit SHA.
-    """
-    client = get_client()
-    info = await asyncio.to_thread(client.read_file, project_id, file_path, ref)
-    return f"--- {info['file_path']} (ref: {info['ref']}) ---\n{info['content']}"
-
-
-@tool
-async def gitlab_list_notes(
-    project_id: int,
-    noteable_type: NoteableKind,
-    noteable_iid: int,
-    include_system_notes: bool = False,
-) -> str:
-    """List comments/notes on a GitLab issue or merge request.
-
-    Returns all human-authored notes in chronological order.  Useful
-    for reading reviewer feedback, discussion threads, and prior
-    comments.
-
-    *noteable_type* must be ``"Issue"`` or ``"MergeRequest"``.
-    Set *include_system_notes* to ``True`` to also show auto-generated
-    notes (label changes, assignments, etc.).
-    """
-    client = get_client()
-    notes = await asyncio.to_thread(
-        client.list_notes, project_id, noteable_type, noteable_iid,
-    )
-    if not include_system_notes:
-        notes = [n for n in notes if not n["system"]]
-
-    if not notes:
-        kind = "issue" if noteable_type == "Issue" else "MR"
-        return f"No comments on {kind} #{noteable_iid} in project {project_id}."
-
-    lines: list[str] = []
-    for note in notes:
-        lines.append(f"[{note['author']}] ({note['created_at']}):")
-        lines.append(note["body"])
-        lines.append("")
-    return "\n".join(lines)
-
-
-@tool
-async def gitlab_mark_todo_done(todo_id: int) -> str:
-    """Mark a GitLab TODO item as done.
-
-    *todo_id* is the numeric ID of the TODO (not the issue/MR number).
-    This is a GitLab-specific operation -- it marks one of your
-    GitLab TODO notifications as resolved.
-    """
-    client = get_client()
-    await asyncio.to_thread(client.mark_todo_done, todo_id)
-    return f"Marked GitLab TODO {todo_id} as done."
-
-
-GITLAB_TOOLS: list[object] = [
-    gitlab_read_issue,
-    gitlab_post_comment,
-    gitlab_create_merge_request,
-    gitlab_get_merge_request,
-    gitlab_list_merge_requests,
-    gitlab_list_notes,
-    gitlab_get_project_info,
-    gitlab_read_file,
-    gitlab_mark_todo_done,
-]
-"""All GitLab tools as a list, suitable for use in ``tools=[GITLAB_TOOLS, ...]``."""
-
 __all__ = [
-    "GitLabConfig",
     "GitLabClient",
-    "get_client",
-    "set_client",
-    "NoteableKind",
-    "gitlab_read_issue",
-    "gitlab_post_comment",
-    "gitlab_create_merge_request",
-    "gitlab_get_merge_request",
-    "gitlab_list_merge_requests",
-    "gitlab_list_notes",
-    "gitlab_get_project_info",
-    "gitlab_read_file",
-    "gitlab_mark_todo_done",
-    "GITLAB_TOOLS",
+    "GitLabConfig",
 ]

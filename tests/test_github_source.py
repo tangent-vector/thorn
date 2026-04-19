@@ -442,56 +442,11 @@ class TestGitHubNotificationsSourceStart:
 
 
 # ---------------------------------------------------------------------------
-# GitHubNotificationsSourceConfig
-# ---------------------------------------------------------------------------
-
-
-class TestGitHubNotificationsSourceConfig:
-    def test_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
-
-        monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
-        monkeypatch.setenv("GITHUB_API_URL", "https://gh.corp.example.com")
-        monkeypatch.setenv("THORN_POLL_INTERVAL", "15")
-
-        config = GitHubNotificationsSourceConfig.from_env()
-        assert config.token == "ghp_secret"
-        assert config.base_url == "https://gh.corp.example.com"
-        assert config.poll_interval == 15
-
-    def test_from_env_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
-
-        monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
-        monkeypatch.delenv("GITHUB_API_URL", raising=False)
-        monkeypatch.delenv("THORN_POLL_INTERVAL", raising=False)
-
-        config = GitHubNotificationsSourceConfig.from_env()
-        assert config.base_url == "https://api.github.com"
-        assert config.poll_interval == 30
-
-    def test_from_env_missing_token_raises(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        from thorn.gateway.sources._github import GitHubNotificationsSourceConfig
-
-        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        with pytest.raises(ValueError, match="GITHUB_TOKEN"):
-            GitHubNotificationsSourceConfig.from_env()
-
-
-# ---------------------------------------------------------------------------
 # Source registry
 # ---------------------------------------------------------------------------
 
 
 class TestGitHubSourceRegistry:
-    def test_github_registered(self) -> None:
-        from thorn.gateway.sources import get_registered_source
-        from thorn.gateway.sources._github import GitHubNotificationsSource
-
-        assert get_registered_source("github") is GitHubNotificationsSource
-
     def test_github_source_has_config_attribute(self) -> None:
         from thorn.gateway.sources._github import (
             GitHubNotificationsSource,
@@ -499,37 +454,3 @@ class TestGitHubSourceRegistry:
         )
 
         assert GitHubNotificationsSource.Config is GitHubNotificationsSourceConfig
-
-
-# ---------------------------------------------------------------------------
-# instantiate_sources integration (legacy format)
-# ---------------------------------------------------------------------------
-
-
-class TestGitHubInstantiateSources:
-    def test_instantiates_github_event_source(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        from thorn.gateway._config import (
-            GatewayConfig,
-            ServiceSpec,
-            instantiate_sources,
-        )
-        from thorn.gateway.sources._github import (
-            GitHubNotificationsSource,
-        )
-
-        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
-
-        config = GatewayConfig(services=[
-            ServiceSpec(
-                name="test-gh",
-                type="github-events",
-                config={
-                    "token": "$GITHUB_TOKEN",
-                },
-            ),
-        ])
-        sources = instantiate_sources(config)
-        assert len(sources) == 1
-        assert isinstance(sources[0], GitHubNotificationsSource)

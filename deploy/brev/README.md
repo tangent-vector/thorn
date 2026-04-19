@@ -13,6 +13,12 @@ Minimal scripts for running the Thorn gateway on an [NVIDIA Brev](https://brev.n
 
 ## Secrets (recommended)
 
+Thorn only reads **secrets** from environment variables.  Forge base
+URLs, repository identifiers, polling intervals, and similar non-secret
+configuration are written into `.thorn/gateway.json` and the per-agent
+identity JSON by `thorn serve bootstrap`; you do not need to (and
+should not) set them as Brev secrets.
+
 Configure credentials with [Brev secrets](https://docs.nvidia.com/brev/latest/cli/advanced-commands#secrets-management) so nothing sensitive is copied to the instance as a `.env` file. Each name becomes an environment variable on the instance. Create one secret per variable you need:
 
 **LLM (required for `thorn run` / `thorn serve`):**
@@ -25,27 +31,14 @@ brev secret create OPENAI_API_MODEL_NAME
 # brev secret create OPENAI_MAX_TOKENS
 ```
 
-**GitHub (required for GitHub-based gateways):**
+**Forge access tokens (set whichever forge(s) you use):**
 
 ```bash
-# Bot user PAT (recommended):
+# GitHub bot user PAT (default name; configurable via --access-token-env)
 brev secret create GITHUB_TOKEN
-# Repository to monitor (owner/repo):
-brev secret create THORN_GITHUB_REPOSITORY
-# Optional REST API base (defaults to https://api.github.com):
-# brev secret create GITHUB_API_URL
 
-# Alternative: GitHub App auth (higher rate limits).
-# brev secret create GITHUB_APP_ID
-# brev secret create GITHUB_APP_INSTALLATION_ID
-# brev secret create GITHUB_APP_PRIVATE_KEY
-```
-
-**GitLab (only if you use GitLab event sources or forge config):**
-
-```bash
-brev secret create GITLAB_URL
-brev secret create GITLAB_TOKEN
+# GitLab PAT (default name; configurable via --access-token-env)
+# brev secret create GITLAB_TOKEN
 ```
 
 Each `brev secret create` prompts for the value. Secrets are encrypted at rest and **injected when the instance starts** ([Brev docs](https://docs.nvidia.com/brev/latest/cli/advanced-commands#secrets-management)). If you add or change secrets while the instance is already running, **stop and start** the instance (or restart it) so the new values appear in the environment before you rely on them for `thorn serve`.
@@ -152,9 +145,13 @@ thorn serve bootstrap \
     --project-name my-project \
     --clone-url https://github.com/org/repo.git \
     --forge-type github \
-    --native-project-id org/repo \
-    --url-env GITHUB_API_URL
+    --native-project-id org/repo
 ```
+
+For a self-hosted GitHub Enterprise instance pass
+`--forge-base-url https://ghe.example.com/api/v3`.  For GitLab,
+`--forge-base-url` is **required** (e.g.
+`--forge-base-url https://gitlab.example.com/api/v4`).
 
 **Clone from a state repo** (future; not yet implemented):
 
@@ -228,7 +225,7 @@ The setup script installs into the system Python.  Run
 `pip install -e ".[github,gitlab]"` manually from `/home/ubuntu/workspace/thorn`.
 
 **Environment variable errors on `thorn serve`:**
-Confirm required variables are set in the **same** environment where `thorn serve` runs (interactive shell or tmux). With Brev secrets, restart the instance after changing secrets. Check with `env | grep OPENAI`, `env | grep GITHUB`, or `env | grep GITLAB` as appropriate. If you use a `.env` file instead, it must live in the thorn repo directory (where you run `thorn serve`).
+Confirm required **secrets** are set in the **same** environment where `thorn serve` runs (interactive shell or tmux). With Brev secrets, restart the instance after changing secrets. Check with `env | grep OPENAI`, `env | grep GITHUB_TOKEN`, or `env | grep GITLAB_TOKEN` as appropriate. If you use a `.env` file instead, it must live in the thorn repo directory (where you run `thorn serve`). Non-secret configuration (forge base URL, project ID, etc.) lives in `.thorn/gateway.json` and `.thorn/agents/<id>.json`; if those are wrong, edit the files rather than the environment.
 
 **Instance IP changed after restart:**
 Run `brev refresh` on your dev machine to update SSH config.

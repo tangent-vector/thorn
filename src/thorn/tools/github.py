@@ -1,34 +1,30 @@
-"""GitHub API operations as ``@tool``-decorated functions for thorn agents.
+"""GitHub API client used by forge services and the notifications source.
 
-Provides tools for interacting with a GitHub instance: reading issues,
-posting comments, creating pull requests, and querying PR details.
+Provides :class:`GitHubClient`, a thin wrapper around ``PyGithub`` plus a
+few raw REST calls (e.g. notification thread mark-as-read/done) that
+PyGithub does not expose.
+
+This module deliberately does **not** define agent-facing ``@tool``
+functions of its own.  Agent-facing forge operations live in
+:mod:`thorn.tools.forge` as project-name-based tools (``forge_*``) that
+resolve credentials from the current agent's
+:class:`~thorn.core._account.ForgeAccountConfig` and the forge service
+registered in the runtime.  Forge URL and auth therefore come from
+``.thorn/gateway.json`` and the agent's identity JSON, never from
+process-wide environment variable singletons.
 
 Requires ``PyGithub`` (install via ``pip install thorn[github]``).
 The module gracefully defers the import error until a tool is actually
 called, so importing ``thorn.tools.github`` never fails.
-
-Usage::
-
-    from thorn.tools import github
-
-    agent = Agent(..., tools=[github.GITHUB_TOOLS, ...])
-
-Configuration is loaded from environment variables — either PAT mode
-(``GITHUB_TOKEN``) or GitHub App mode (``GITHUB_APP_ID``,
-``GITHUB_APP_INSTALLATION_ID``, and a private key). Use
-``GITHUB_API_URL`` for the REST API base (not the website URL); see
-:class:`~thorn.tools._github_connection.GitHubConnectionConfig`.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, Literal
 
 import httpx
 
-from thorn.core._func import tool
 from thorn.tools._github_connection import (
     GitHubAppAuth,
     GitHubConnectionConfig,
@@ -74,6 +70,9 @@ def build_pygithub_auth(auth: GitHubPatAuth | GitHubAppAuth) -> Any:
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
+
+
+CommentableKind = Literal["Issue", "PullRequest"]
 
 
 class GitHubClient:
@@ -417,282 +416,9 @@ class GitHubClient:
         response.raise_for_status()
 
 
-# ---------------------------------------------------------------------------
-# Module-level client accessor
-# ---------------------------------------------------------------------------
-
-_client: GitHubClient | None = None
-
-
-def get_client() -> GitHubClient:
-    """Return the module-level ``GitHubClient``, creating it lazily.
-
-    Configuration is loaded from environment variables on first access.
-    Subsequent calls return the same client instance.
-    """
-    global _client
-    if _client is None:
-        config = GitHubConnectionConfig.from_env()
-        _client = GitHubClient(config)
-    return _client
-
-
-def set_client(client: GitHubClient | None) -> None:
-    """Replace the module-level client (useful for testing or custom configs)."""
-    global _client
-    _client = client
-
-
-# ---------------------------------------------------------------------------
-# @tool functions
-# ---------------------------------------------------------------------------
-
-CommentableKind = Literal["Issue", "PullRequest"]
-
-
-@tool
-async def github_read_issue(repo: str, issue_number: int) -> str:
-    """Read a GitHub issue, returning its title, body, labels, and assignees.
-
-    *repo* is the repository in ``owner/repo`` format (e.g.
-    ``"octocat/hello-world"``).  *issue_number* is the issue number
-    (the ``#N`` in the UI).
-    """
-    client = get_client()
-    info = await asyncio.to_thread(client.get_issue, repo, issue_number)
-    lines = [
-        f"Issue #{info['number']}: {info['title']}",
-        f"State: {info['state']}",
-        f"Labels: {', '.join(info['labels']) or '(none)'}",
-        f"Assignees: {', '.join(info['assignees']) or '(none)'}",
-        f"URL: {info['html_url']}",
-        "",
-        info["body"] or "(no description)",
-    ]
-    return "\n".join(lines)
-
-
-@tool
-async def github_post_comment(
-    repo: str,
-    commentable_type: CommentableKind,
-    commentable_number: int,
-    body: str,
-) -> str:
-    """Post a comment on a GitHub issue or pull request.
-
-    *repo* is the repository in ``owner/repo`` format.
-    *commentable_type* must be ``"Issue"`` or ``"PullRequest"``
-    (GitHub's API unifies these, but the type clarifies intent).
-    *commentable_number* is the issue or PR number.
-    """
-    client = get_client()
-    await asyncio.to_thread(
-        client.post_comment, repo, commentable_number, body,
-    )
-    return (
-        f"Posted comment on {commentable_type} "
-        f"#{commentable_number} in {repo}."
-    )
-
-
-@tool
-async def github_create_pull_request(
-    repo: str,
-    head: str,
-    title: str,
-    body: str = "",
-    base: str = "main",
-) -> str:
-    """Create a new pull request on GitHub.
-
-    Opens a PR from *head* branch into *base* branch (default
-    ``main``) in the specified repository.  *repo* is in
-    ``owner/repo`` format.
-    """
-    client = get_client()
-    info = await asyncio.to_thread(
-        client.create_pull_request,
-        repo=repo,
-        head=head,
-        title=title,
-        base=base,
-        body=body,
-    )
-    return (
-        f"Created PR #{info['number']}: {info['title']}\n"
-        f"  {info['head']} -> {info['base']}\n"
-        f"  URL: {info['html_url']}"
-    )
-
-
-@tool
-async def github_get_pull_request(repo: str, pr_number: int) -> str:
-    """Read details of a GitHub pull request.
-
-    Returns the PR title, state, branches, mergeable status, and body.
-    *repo* is in ``owner/repo`` format.
-    """
-    client = get_client()
-    info = await asyncio.to_thread(
-        client.get_pull_request, repo, pr_number,
-    )
-    merged_indicator = " (merged)" if info["merged"] else ""
-    lines = [
-        f"PR #{info['number']}: {info['title']}",
-        f"State: {info['state']}{merged_indicator}",
-        f"Branches: {info['head']} -> {info['base']}",
-        f"Mergeable: {info['mergeable']} ({info['mergeable_state']})",
-        f"URL: {info['html_url']}",
-        "",
-        info["body"] or "(no description)",
-    ]
-    return "\n".join(lines)
-
-
-@tool
-async def github_list_pull_requests(
-    repo: str,
-    state: Literal["open", "closed", "all"] = "open",
-) -> str:
-    """List pull requests in a GitHub repository.
-
-    Filters by *state* (default ``"open"``).  Returns a formatted
-    list of PR numbers, titles, and authors.  *repo* is in
-    ``owner/repo`` format.
-    """
-    client = get_client()
-    prs = await asyncio.to_thread(
-        client.list_pull_requests, repo, state,
-    )
-    if not prs:
-        return f"No {state} pull requests in {repo}."
-    lines = []
-    for pr in prs:
-        author = pr["author"] or "unknown"
-        lines.append(
-            f"  #{pr['number']}: {pr['title']} ({pr['state']}, by {author})"
-        )
-    header = f"{len(prs)} {state} pull request(s) in {repo}:"
-    return "\n".join([header, *lines])
-
-
-@tool
-async def github_list_comments(
-    repo: str,
-    commentable_type: CommentableKind,
-    commentable_number: int,
-    include_bot_comments: bool = False,
-) -> str:
-    """List comments on a GitHub issue or pull request.
-
-    Returns human-authored comments in chronological order.  Useful
-    for reading reviewer feedback, discussion threads, and prior
-    comments.
-
-    *repo* is in ``owner/repo`` format.
-    *commentable_type* must be ``"Issue"`` or ``"PullRequest"``.
-    Set *include_bot_comments* to ``True`` to also show comments
-    from bot accounts.
-    """
-    client = get_client()
-    comments = await asyncio.to_thread(
-        client.list_comments, repo, commentable_number,
-    )
-    if not include_bot_comments:
-        comments = [c for c in comments if not c["is_bot"]]
-
-    if not comments:
-        kind = "issue" if commentable_type == "Issue" else "PR"
-        return f"No comments on {kind} #{commentable_number} in {repo}."
-
-    lines: list[str] = []
-    for comment in comments:
-        lines.append(f"[{comment['author']}] ({comment['created_at']}):")
-        lines.append(comment["body"])
-        lines.append("")
-    return "\n".join(lines)
-
-
-@tool
-async def github_get_repo_info(repo: str) -> str:
-    """Get information about a GitHub repository.
-
-    Returns the repository's full name, clone URLs, default branch,
-    and description.  *repo* is in ``owner/repo`` format.
-    """
-    client = get_client()
-    info = await asyncio.to_thread(client.get_repo_info, repo)
-    lines = [
-        f"Repository: {info['full_name']}",
-        f"Clone URL (HTTPS): {info['clone_url']}",
-        f"Clone URL (SSH): {info['ssh_url']}",
-        f"Default branch: {info['default_branch']}",
-        f"Web URL: {info['html_url']}",
-    ]
-    if info["description"]:
-        lines.append(f"Description: {info['description']}")
-    return "\n".join(lines)
-
-
-@tool
-async def github_read_file(
-    repo: str,
-    file_path: str,
-    ref: str = "HEAD",
-) -> str:
-    """Read a file from a GitHub repository via the API.
-
-    Useful for inspecting files without cloning the entire repository.
-    *repo* is in ``owner/repo`` format.  *ref* can be a branch name,
-    tag, or commit SHA.
-    """
-    client = get_client()
-    info = await asyncio.to_thread(client.read_file, repo, file_path, ref)
-    return f"--- {info['file_path']} (ref: {info['ref']}) ---\n{info['content']}"
-
-
-@tool
-async def github_mark_notification_read(thread_id: str) -> str:
-    """Mark a GitHub notification thread as read.
-
-    *thread_id* is the notification thread ID (a numeric string from
-    the GitHub Notifications API).  This marks the notification as
-    read so it no longer appears in your unread notifications.
-    """
-    client = get_client()
-    await asyncio.to_thread(client.mark_notification_read, thread_id)
-    return f"Marked GitHub notification thread {thread_id} as read."
-
-
-GITHUB_TOOLS: list[object] = [
-    github_read_issue,
-    github_post_comment,
-    github_create_pull_request,
-    github_get_pull_request,
-    github_list_pull_requests,
-    github_list_comments,
-    github_get_repo_info,
-    github_read_file,
-    github_mark_notification_read,
-]
-"""All GitHub tools as a list, suitable for use in ``tools=[GITHUB_TOOLS, ...]``."""
-
 __all__ = [
-    "GitHubConnectionConfig",
-    "GitHubClient",
-    "build_pygithub_auth",
-    "get_client",
-    "set_client",
     "CommentableKind",
-    "github_read_issue",
-    "github_post_comment",
-    "github_create_pull_request",
-    "github_get_pull_request",
-    "github_list_pull_requests",
-    "github_list_comments",
-    "github_get_repo_info",
-    "github_read_file",
-    "github_mark_notification_read",
-    "GITHUB_TOOLS",
+    "GitHubClient",
+    "GitHubConnectionConfig",
+    "build_pygithub_auth",
 ]

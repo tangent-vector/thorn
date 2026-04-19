@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -53,8 +52,8 @@ def _require_gitlab() -> None:
 class GitLabSourceConfig(BaseModel):
     """Configuration for the GitLab TODOs event source.
 
-    Typically loaded from environment variables via
-    :meth:`from_env`.
+    Built from a gateway forge entry plus an agent's GitLab credentials
+    by :func:`~thorn.gateway._config.infer_event_sources`.
     """
 
     url: str = Field(description="GitLab instance URL (no trailing slash)")
@@ -75,34 +74,6 @@ class GitLabSourceConfig(BaseModel):
             "project name, used for project-name-based session keys."
         ),
     )
-
-    @classmethod
-    def from_env(cls) -> GitLabSourceConfig:
-        """Load configuration from environment variables.
-
-        - ``GITLAB_URL`` -- GitLab instance URL
-        - ``GITLAB_TOKEN`` -- Personal Access Token
-        - ``THORN_GITLAB_USERNAME`` -- bot username (default ``thorn-bot``)
-        - ``THORN_POLL_INTERVAL`` -- seconds between polls (default ``30``)
-        """
-        url = os.environ.get("GITLAB_URL")
-        token = os.environ.get("GITLAB_TOKEN")
-        missing = [
-            name
-            for name, val in [("GITLAB_URL", url), ("GITLAB_TOKEN", token)]
-            if not val
-        ]
-        if missing:
-            raise ValueError(
-                f"Missing required environment variable(s): {', '.join(missing)}. "
-                "Set GITLAB_URL and GITLAB_TOKEN to use the GitLab event source."
-            )
-        return cls(
-            url=url,  # type: ignore[arg-type]
-            token=token,  # type: ignore[arg-type]
-            username=os.environ.get("THORN_GITLAB_USERNAME", "thorn-bot"),
-            poll_interval=int(os.environ.get("THORN_POLL_INTERVAL", "30")),
-        )
 
 
 # ---------------------------------------------------------------------------

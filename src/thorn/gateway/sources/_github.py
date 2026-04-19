@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -73,27 +72,6 @@ class GitHubNotificationsSourceConfig(BaseModel):
             "logical project name, used for project-name-based session keys."
         ),
     )
-
-    @classmethod
-    def from_env(cls) -> GitHubNotificationsSourceConfig:
-        """Load from environment variables.
-
-        - ``GITHUB_TOKEN`` -- Personal access token (required)
-        - ``GITHUB_API_URL`` -- REST API base URL (optional)
-        - ``THORN_POLL_INTERVAL`` -- seconds between polls (default 30)
-        """
-        token = os.environ.get("GITHUB_TOKEN")
-        if not token:
-            raise ValueError(
-                "GITHUB_TOKEN is required for the GitHub notifications source "
-                "(personal access token with 'notifications' scope).",
-            )
-        base_url = os.environ.get("GITHUB_API_URL", _DEFAULT_API_BASE)
-        return cls(
-            token=token,
-            base_url=base_url.rstrip("/"),
-            poll_interval=int(os.environ.get("THORN_POLL_INTERVAL", "30")),
-        )
 
 
 # ---------------------------------------------------------------------------

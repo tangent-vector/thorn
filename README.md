@@ -28,8 +28,11 @@ $ cd thorn
 
 ### 2. Create a `.env` file
 
-The gateway reads credentials and configuration from environment
-variables. Create a `.env` file at the repository root:
+The gateway only reads **secrets** from environment variables; all
+other configuration (forge base URL, project metadata, polling cadence,
+etc.) lives in `gateway.json` and the per-agent identity JSON files
+that `thorn serve bootstrap` writes for you.  Create a `.env` file at
+the repository root with just the secrets:
 
 ```dotenv
 # LLM provider (any OpenAI-compatible API)
@@ -37,11 +40,13 @@ OPENAI_API_URL=https://api.openai.com/v1
 OPENAI_API_KEY=sk-...
 OPENAI_API_MODEL_NAME=gpt-4o
 
-# GitHub (PAT auth)
+# GitHub (PAT auth) -- the only required forge secret for GitHub.
 GITHUB_TOKEN=ghp_...
-GITHUB_API_URL=https://api.github.com
-THORN_GITHUB_REPOSITORY=owner/repo
 ```
+
+For GitLab, set `GITLAB_TOKEN` instead (and pass `--forge-type gitlab
+--forge-base-url https://your-gitlab.example.com/api/v4` to bootstrap
+in step 4).
 
 > **Do not commit `.env` to version control.** It contains secrets.
 
@@ -73,13 +78,18 @@ $ docker run --rm --env-file .env \
       --forge-type github
 ```
 
+For a self-hosted GitHub Enterprise instance (or any non-default
+host), pass `--forge-base-url https://ghe.example.com/api/v3`.  For
+GitLab, `--forge-base-url` is **required** since GitLab has no
+canonical default host.
+
 This writes three files under `.thorn/`:
 
 | File | Purpose |
 |------|---------|
-| `agents/my-coordinator.json` | Agent identity and metadata |
+| `agents/my-coordinator.json` | Agent identity, including the forge account and a `$GITHUB_TOKEN` reference for the secret token. |
 | `agents/my-coordinator/MEMORY.md` | Persistent memory (project facts, active work) |
-| `gateway.json` | Service config (forge credentials, event source, project) |
+| `gateway.json` | Forge entries (with literal `base_url`) and project metadata.  No secrets live here -- the agent identity references them via `$ENV_VAR`. |
 
 ### 5. Start the gateway
 
@@ -112,31 +122,39 @@ issue, and respond.
 Configuration
 -------------
 
+### Configuration model
+
+Thorn distinguishes **secrets** (held only in environment variables)
+from all other configuration (held in JSON on disk).  The on-disk
+files live under `.thorn/`:
+
+- `gateway.json` -- forge entries (name, type, literal `base_url`) and
+  project metadata.  Contains *no* secrets and *no* `$ENV_VAR`
+  references.
+- `agents/<agent-id>.json` -- the agent identity, including a
+  `forge_accounts` list whose `credentials.token` field is a
+  `$ENV_VAR` reference (e.g. `"$GITHUB_TOKEN"`) that the gateway
+  resolves at startup.
+
+To change a forge URL, edit `gateway.json` (no env-var indirection
+needed).  To rotate a secret, change the env var the agent identity
+points to and restart the gateway.
+
 ### Environment variables
+
+Only secrets are read from the environment:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `OPENAI_API_URL` | Yes | Base URL of an OpenAI-compatible LLM API |
 | `OPENAI_API_KEY` | Yes | API key for the LLM provider |
 | `OPENAI_API_MODEL_NAME` | Yes | Model name (e.g. `gpt-4o`, `claude-sonnet-4-20250514`) |
-| `GITHUB_TOKEN` | For GitHub (PAT) | Personal access token with repo scope |
-| `GITHUB_API_URL` | For GitHub | GitHub API base URL (default: `https://api.github.com`) |
-| `THORN_GITHUB_REPOSITORY` | For GitHub | Repository to monitor (`owner/repo`) |
-| `GITLAB_URL` | For GitLab | GitLab instance URL |
-| `GITLAB_TOKEN` | For GitLab | Personal access token with API scope |
-| `THORN_POLL_INTERVAL` | No | Seconds between poll cycles (default: 30) |
+| `GITHUB_TOKEN` | For GitHub | Personal access token with `repo`, `notifications`, and (if needed) `read:org` scopes.  Default name written by `bootstrap`; any name may be used by editing the agent identity JSON. |
+| `GITLAB_TOKEN` | For GitLab | Personal access token with API scope.  Default name written by `bootstrap`; any name may be used by editing the agent identity JSON. |
 
-### GitHub App authentication
-
-Instead of a PAT, you can authenticate as a GitHub App installation.
-Pass `--github-auth-mode app` to `thorn serve bootstrap` and set
-these environment variables:
-
-```dotenv
-GITHUB_APP_ID=...
-GITHUB_APP_INSTALLATION_ID=...
-GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n"
-```
+The polling interval, GitLab username, GitHub repository list, and
+similar non-secret values now live in `gateway.json` (or the
+inferred-source defaults).  Edit the JSON to change them.
 
 ### Docker Compose
 

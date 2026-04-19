@@ -1,6 +1,11 @@
-"""Tests for thorn.tools.gitlab -- GitLab API tools.
+"""Tests for thorn.tools.gitlab -- the GitLabClient wrapper.
 
-Uses mock objects instead of a real GitLab instance.
+The agent-facing ``@tool`` functions have moved to
+:mod:`thorn.tools.forge`; this module now only owns the low-level
+``GitLabClient`` plus its ``GitLabConfig``, so the tests focus on the
+client's translation between python-gitlab objects and plain dicts.
+Mocks stand in for ``python-gitlab`` so the tests run without a real
+GitLab.
 """
 
 from __future__ import annotations
@@ -10,50 +15,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from thorn.tools.gitlab import (
-    GITLAB_TOOLS,
-    GitLabClient,
-    GitLabConfig,
-    get_client,
-    gitlab_create_merge_request,
-    gitlab_get_merge_request,
-    gitlab_list_merge_requests,
-    gitlab_list_notes,
-    gitlab_mark_todo_done,
-    gitlab_post_comment,
-    gitlab_read_issue,
-    set_client,
-)
+from thorn.tools.gitlab import GitLabClient, GitLabConfig
 
 
 # ---------------------------------------------------------------------------
-# GitLabConfig
-# ---------------------------------------------------------------------------
-
-
-class TestGitLabConfig:
-    def test_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("GITLAB_URL", "https://gitlab.example.com")
-        monkeypatch.setenv("GITLAB_TOKEN", "glpat-secret")
-        config = GitLabConfig.from_env()
-        assert config.url == "https://gitlab.example.com"
-        assert config.token == "glpat-secret"
-
-    def test_from_env_missing_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("GITLAB_URL", raising=False)
-        monkeypatch.delenv("GITLAB_TOKEN", raising=False)
-        with pytest.raises(ValueError, match="GITLAB_URL"):
-            GitLabConfig.from_env()
-
-    def test_from_env_missing_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("GITLAB_URL", "https://gitlab.example.com")
-        monkeypatch.delenv("GITLAB_TOKEN", raising=False)
-        with pytest.raises(ValueError, match="GITLAB_TOKEN"):
-            GitLabConfig.from_env()
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
+# Mock factories & fixtures
 # ---------------------------------------------------------------------------
 
 
@@ -104,14 +70,6 @@ def mock_client() -> GitLabClient:
         config = GitLabConfig(url="https://gitlab.example.com", token="test-token")
         client = GitLabClient(config)
     return client
-
-
-@pytest.fixture(autouse=True)
-def _install_mock_client(mock_client: GitLabClient) -> None:
-    """Install the mock client as the module-level client for all tests."""
-    set_client(mock_client)
-    yield
-    set_client(None)
 
 
 # ---------------------------------------------------------------------------
@@ -230,170 +188,3 @@ class TestGitLabClientListNotes:
     def test_invalid_type_raises(self, mock_client: GitLabClient) -> None:
         with pytest.raises(ValueError, match="Unsupported noteable_type"):
             mock_client.list_notes(1, "Snippet", 1)
-
-
-# ---------------------------------------------------------------------------
-# @tool functions
-# ---------------------------------------------------------------------------
-
-
-class TestReadIssueTool:
-    async def test_formats_output(self, mock_client: GitLabClient) -> None:
-        mock_issue = _make_mock_issue()
-        mock_client._gl.projects.get.return_value.issues.get.return_value = mock_issue
-
-        result = await gitlab_read_issue(1, 42)
-        assert "Fix the widget" in result
-        assert "#42" in result
-        assert "bug" in result
-        assert "alice" in result
-
-
-class TestPostCommentTool:
-    async def test_posts_and_confirms(self, mock_client: GitLabClient) -> None:
-        mock_project = MagicMock()
-        mock_client._gl.projects.get.return_value = mock_project
-
-        result = await gitlab_post_comment(1, "Issue", 42, "Hello!")
-        assert "Issue" in result
-        assert "#42" in result
-
-
-class TestCreateMergeRequestTool:
-    async def test_creates_and_formats(self, mock_client: GitLabClient) -> None:
-        mock_mr = _make_mock_mr()
-        mock_client._gl.projects.get.return_value.mergerequests.create.return_value = (
-            mock_mr
-        )
-        result = await gitlab_create_merge_request(1, "fix-widget", "Fix widget")
-        assert "!7" in result
-        assert "fix-widget" in result
-
-
-class TestGetMergeRequestTool:
-    async def test_formats_output(self, mock_client: GitLabClient) -> None:
-        mock_mr = _make_mock_mr()
-        mock_client._gl.projects.get.return_value.mergerequests.get.return_value = (
-            mock_mr
-        )
-        result = await gitlab_get_merge_request(1, 7)
-        assert "!7" in result
-        assert "can_be_merged" in result
-
-
-class TestListMergeRequestsTool:
-    async def test_formats_list(self, mock_client: GitLabClient) -> None:
-        mock_client._gl.projects.get.return_value.mergerequests.list.return_value = [
-            _make_mock_mr(iid=1, title="First MR"),
-            _make_mock_mr(iid=2, title="Second MR"),
-        ]
-        result = await gitlab_list_merge_requests(1)
-        assert "2" in result
-        assert "First MR" in result
-        assert "Second MR" in result
-
-    async def test_empty_list(self, mock_client: GitLabClient) -> None:
-        mock_client._gl.projects.get.return_value.mergerequests.list.return_value = []
-        result = await gitlab_list_merge_requests(1)
-        assert "No" in result
-
-
-class TestListNotesTool:
-    def _make_mock_note(self, **overrides: Any) -> MagicMock:
-        note = MagicMock()
-        note.id = overrides.get("id", 100)
-        note.author = overrides.get("author", {"username": "reviewer"})
-        note.body = overrides.get("body", "Please fix the naming.")
-        note.created_at = overrides.get("created_at", "2026-04-08T10:00:00Z")
-        note.system = overrides.get("system", False)
-        return note
-
-    async def test_formats_mr_notes(self, mock_client: GitLabClient) -> None:
-        notes = [
-            self._make_mock_note(id=1, body="Looks good overall."),
-            self._make_mock_note(
-                id=2,
-                body="Please rename the variable.",
-                author={"username": "alice"},
-            ),
-        ]
-        mock_project = MagicMock()
-        mock_project.mergerequests.get.return_value.notes.list.return_value = notes
-        mock_client._gl.projects.get.return_value = mock_project
-
-        result = await gitlab_list_notes(1, "MergeRequest", 7)
-        assert "[reviewer]" in result
-        assert "Looks good overall." in result
-        assert "[alice]" in result
-        assert "Please rename the variable." in result
-
-    async def test_filters_system_notes_by_default(
-        self, mock_client: GitLabClient,
-    ) -> None:
-        notes = [
-            self._make_mock_note(id=1, body="Real comment", system=False),
-            self._make_mock_note(id=2, body="added label ~bug", system=True),
-        ]
-        mock_project = MagicMock()
-        mock_project.mergerequests.get.return_value.notes.list.return_value = notes
-        mock_client._gl.projects.get.return_value = mock_project
-
-        result = await gitlab_list_notes(1, "MergeRequest", 7)
-        assert "Real comment" in result
-        assert "added label" not in result
-
-    async def test_includes_system_notes_when_requested(
-        self, mock_client: GitLabClient,
-    ) -> None:
-        notes = [
-            self._make_mock_note(id=1, body="Real comment", system=False),
-            self._make_mock_note(id=2, body="added label ~bug", system=True),
-        ]
-        mock_project = MagicMock()
-        mock_project.mergerequests.get.return_value.notes.list.return_value = notes
-        mock_client._gl.projects.get.return_value = mock_project
-
-        result = await gitlab_list_notes(
-            1, "MergeRequest", 7, include_system_notes=True,
-        )
-        assert "Real comment" in result
-        assert "added label" in result
-
-    async def test_empty_notes(self, mock_client: GitLabClient) -> None:
-        mock_project = MagicMock()
-        mock_project.issues.get.return_value.notes.list.return_value = []
-        mock_client._gl.projects.get.return_value = mock_project
-
-        result = await gitlab_list_notes(1, "Issue", 42)
-        assert "No comments" in result
-        assert "#42" in result
-
-    async def test_issue_notes(self, mock_client: GitLabClient) -> None:
-        notes = [self._make_mock_note(id=5, body="Issue feedback")]
-        mock_project = MagicMock()
-        mock_project.issues.get.return_value.notes.list.return_value = notes
-        mock_client._gl.projects.get.return_value = mock_project
-
-        result = await gitlab_list_notes(1, "Issue", 42)
-        assert "Issue feedback" in result
-
-
-# ---------------------------------------------------------------------------
-# GITLAB_TOOLS list
-# ---------------------------------------------------------------------------
-
-
-class TestGitLabToolsList:
-    def test_all_tools_have_thorn_tool_marker(self) -> None:
-        for fn in GITLAB_TOOLS:
-            assert getattr(fn, "_thorn_tool", False), (
-                f"{fn.__name__} is missing the @tool decorator"  # type: ignore[union-attr]
-            )
-
-    def test_expected_count(self) -> None:
-        assert len(GITLAB_TOOLS) == 9
-
-    def test_includes_project_info(self) -> None:
-        names = [getattr(fn, "__name__", "?") for fn in GITLAB_TOOLS]
-        assert "gitlab_get_project_info" in names
-        assert "gitlab_read_file" in names
