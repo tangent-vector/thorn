@@ -540,13 +540,33 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
 @click.option("-v", "--verbose", count=True, help="Increase output detail (-v, -vv).")
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except errors.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
-@click.option("--workspace", "workspace_path", type=click.Path(exists=True, file_okay=False), default=None, help="Override workspace root directory.")
+@click.option(
+    "--agency",
+    "agency_path",
+    type=click.Path(file_okay=False),
+    default=None,
+    help=(
+        "Agency home directory (contains gateway.json and the agents/ tree). "
+        "Defaults to ~/.thorn."
+    ),
+)
+@click.option(
+    "--workspace",
+    "workspace_path",
+    type=click.Path(file_okay=False),
+    default=None,
+    help=(
+        "Override the agency workspace directory.  Takes precedence over "
+        "the 'workspace' field in gateway.json."
+    ),
+)
 @click.pass_context
 def serve(
     ctx: click.Context,
     verbose: int,
     quiet: bool,
     trace_path: str | None,
+    agency_path: str | None,
     workspace_path: str | None,
 ) -> None:
     """Start the Thorn gateway daemon (or an MCP server via 'thorn serve mcp')."""
@@ -554,6 +574,7 @@ def serve(
     ctx.obj["verbose"] = verbose
     ctx.obj["quiet"] = quiet
     ctx.obj["trace_path"] = trace_path
+    ctx.obj["agency_path"] = agency_path
     ctx.obj["workspace_path"] = workspace_path
 
     if ctx.invoked_subcommand is not None:
@@ -563,8 +584,70 @@ def serve(
         verbose=verbose,
         quiet=quiet,
         trace_path=trace_path,
+        agency_path=agency_path,
         workspace_path=workspace_path,
     )
+
+
+def _resolve_agency_home(agency_path: str | None) -> Path:
+    """Resolve the agency home directory for ``thorn serve``.
+
+    Uses *agency_path* when provided; otherwise falls back to
+    ``~/.thorn`` (the local-agency convention from the architecture
+    doc).  Errors out with a clear message if the directory does not
+    exist or does not contain a ``gateway.json``.
+    """
+    from thorn.gateway._config import GATEWAY_CONFIG_FILENAME
+
+    if agency_path is not None:
+        agency_home = Path(agency_path).expanduser().resolve()
+    else:
+        agency_home = (Path.home() / ".thorn").resolve()
+
+    if not agency_home.is_dir():
+        console.print(
+            f"[red]Error:[/red] Agency home directory does not exist: {agency_home}\n"
+            "Pass --agency <dir> to point at an existing agency home, or run "
+            "'thorn serve bootstrap --agency-home <dir> --agency-workspace <dir> ...' "
+            "to create a new one."
+        )
+        sys.exit(1)
+
+    if not (agency_home / GATEWAY_CONFIG_FILENAME).is_file():
+        console.print(
+            f"[red]Error:[/red] No {GATEWAY_CONFIG_FILENAME} in agency home: {agency_home}\n"
+            "Run 'thorn serve bootstrap --agency-home <dir> --agency-workspace <dir> ...' "
+            "to create one."
+        )
+        sys.exit(1)
+
+    return agency_home
+
+
+def _resolve_serve_workspace(
+    *,
+    cli_workspace: str | None,
+    config_workspace: Path | None,
+    agency_home: Path,
+) -> Path:
+    """Pick the workspace root for ``thorn serve``.
+
+    CLI ``--workspace`` wins over the value from ``gateway.json``;
+    if neither is set, this prints an error and exits.
+    """
+    if cli_workspace is not None:
+        return Path(cli_workspace).expanduser().resolve()
+
+    if config_workspace is not None:
+        return config_workspace
+
+    console.print(
+        "[red]Error:[/red] No workspace directory configured.\n"
+        f"Either pass --workspace <dir> to 'thorn serve', or set the "
+        f"'workspace' field in {agency_home / 'gateway.json'} (re-run "
+        "'thorn serve bootstrap' with --agency-workspace to do that)."
+    )
+    sys.exit(1)
 
 
 def _serve_gateway(
@@ -572,17 +655,18 @@ def _serve_gateway(
     verbose: int,
     quiet: bool,
     trace_path: str | None,
+    agency_path: str | None,
     workspace_path: str | None,
 ) -> None:
     """Run the gateway daemon (called when ``thorn serve`` has no subcommand).
 
-    Loads service configuration from ``.thorn/gateway.json`` and
-    instantiates event sources accordingly.
+    Loads ``gateway.json`` from the agency home directory (defaulting
+    to ``~/.thorn``) and resolves the workspace root from the CLI
+    override or the ``workspace`` field in the config.
     """
     import logging
     from rich.logging import RichHandler
 
-    from thorn import infer_workspace_root
     from thorn.gateway import (
         Gateway,
         infer_event_sources,
@@ -602,14 +686,19 @@ def _serve_gateway(
 
     from thorn.runtime._paths import AgencyPaths
 
-    ws_root = Path(workspace_path).resolve() if workspace_path else infer_workspace_root()
-    thorn_dir = ws_root / ".thorn"
+    agency_home = _resolve_agency_home(agency_path)
 
     try:
-        gateway_config = load_gateway_config(thorn_dir)
+        gateway_config = load_gateway_config(agency_home)
     except FileNotFoundError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
+
+    ws_root = _resolve_serve_workspace(
+        cli_workspace=workspace_path,
+        config_workspace=gateway_config.resolve_workspace(agency_home),
+        agency_home=agency_home,
+    )
 
     try:
         all_services = instantiate_services(gateway_config)
@@ -618,14 +707,14 @@ def _serve_gateway(
         sys.exit(1)
 
     paths = AgencyPaths.for_gateway(
-        agency_dir=thorn_dir,
+        agency_dir=agency_home,
         workspace_dir=ws_root,
     )
 
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
         runtime = _build_runtime(
-            verbosity, trace_file=trace_file, workspace=workspace_path,
+            verbosity, trace_file=trace_file, workspace=str(ws_root),
             interactive=False, paths=paths,
         )
     except ThornError as exc:
@@ -646,7 +735,7 @@ def _serve_gateway(
     if not sources:
         console.print(
             "[yellow]Warning:[/yellow] No event sources could be inferred "
-            f"from {thorn_dir / 'gateway.json'} and agent accounts. "
+            f"from {agency_home / 'gateway.json'} and agent accounts. "
             "The gateway will start but will not receive any events."
         )
 
@@ -709,7 +798,27 @@ _GITHUB_DEFAULT_BASE_URL = "https://api.github.com"
 )
 @click.option("--git-user-name", default=None, help="Git author/committer name for this agent (default: agent-id).")
 @click.option("--git-user-email", default=None, help="Git author/committer email for this agent (default: <agent-id>@thorn).")
-@click.option("--workspace", "workspace_path", type=click.Path(file_okay=False), default=".", help="Runtime root directory (default: current dir).")
+@click.option(
+    "--agency-home",
+    "agency_home_path",
+    type=click.Path(file_okay=False),
+    required=True,
+    help=(
+        "Agency home directory: holds gateway.json and the agents/ tree. "
+        "Created if missing.  No .thorn/ subdirectory is appended."
+    ),
+)
+@click.option(
+    "--agency-workspace",
+    "agency_workspace_path",
+    type=click.Path(file_okay=False),
+    required=True,
+    help=(
+        "Agency workspace directory: where agent sessions do their work.  "
+        "Recorded as the 'workspace' field of gateway.json so 'thorn serve' "
+        "can locate it.  Created if missing."
+    ),
+)
 @click.pass_context
 def serve_bootstrap(
     ctx: click.Context,
@@ -723,9 +832,10 @@ def serve_bootstrap(
     forge_base_url: str | None,
     git_user_name: str | None,
     git_user_email: str | None,
-    workspace_path: str,
+    agency_home_path: str,
+    agency_workspace_path: str,
 ) -> None:
-    """Bootstrap a ProjectCoordinator agent in the runtime directory."""
+    """Bootstrap a ProjectCoordinator agent in an agency home directory."""
     from pathlib import Path
     from thorn.gateway._bootstrap import bootstrap_coordinator
 
@@ -742,9 +852,11 @@ def serve_bootstrap(
             )
             sys.exit(1)
 
-    runtime_root = Path(workspace_path).resolve()
+    agency_home = Path(agency_home_path).expanduser().resolve()
+    agency_workspace = Path(agency_workspace_path).expanduser().resolve()
     aid = bootstrap_coordinator(
-        runtime_root=runtime_root,
+        agency_home=agency_home,
+        agency_workspace=agency_workspace,
         agent_id=agent_id,
         project_name=project_name,
         clone_url=clone_url,
@@ -756,11 +868,12 @@ def serve_bootstrap(
         git_user_name=git_user_name or "",
         git_user_email=git_user_email or "",
     )
-    gateway_config_path = runtime_root / ".thorn" / "gateway.json"
+    gateway_config_path = agency_home / "gateway.json"
     console.print(f"[green]Bootstrapped coordinator:[/green] {aid}")
-    console.print(f"  Identity: {runtime_root / '.thorn' / 'agents' / f'{aid}.json'}")
+    console.print(f"  Identity: {agency_home / 'agents' / f'{aid}.json'}")
+    console.print(f"  Agent home: {agency_home / 'agents' / str(aid)}")
     console.print(f"  Gateway config: {gateway_config_path}")
-    console.print(f"  Workspace: {runtime_root / '.thorn' / 'agents' / str(aid)}")
+    console.print(f"  Agent workspace: {agency_workspace / str(aid)}")
     console.print(
         f"\nSet ${token_env} before running 'thorn serve'. "
         f"The forge base URL ({forge_base_url}) is recorded literally in "

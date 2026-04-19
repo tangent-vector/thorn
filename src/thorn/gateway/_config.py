@@ -1,14 +1,17 @@
-"""Gateway configuration: loading services from ``.thorn/gateway.json``.
+"""Gateway configuration: loading services from an agency's ``gateway.json``.
 
-The gateway configuration file declares forges and projects.  Forges
-are external platforms that host version-controlled repositories;
-projects are logical software projects with one or more forks hosted
-on those forges.
+The gateway configuration file lives in the *agency home* directory
+(``<agency_home>/gateway.json``) and declares the agency's workspace
+directory along with its forges and projects.  Forges are external
+platforms that host version-controlled repositories; projects are
+logical software projects with one or more forks hosted on those
+forges.
 
-The on-disk format uses top-level typed arrays — currently
-``"forges"`` and ``"projects"``::
+The on-disk format uses a top-level ``"workspace"`` string and typed
+arrays — currently ``"forges"`` and ``"projects"``::
 
     {
+      "workspace": "/home/me/thorn-workspace",
       "forges": [
         {
           "name": "github-com",
@@ -31,6 +34,13 @@ The on-disk format uses top-level typed arrays — currently
         }
       ]
     }
+
+The ``"workspace"`` value identifies the agency's *workspace root*:
+where agent sessions do their work (clone repositories, edit files,
+run builds).  It is independent of the agency home directory that
+holds this config file.  An absolute path is used as-is; a relative
+path is resolved against the directory containing ``gateway.json``
+(the agency home) — see :meth:`GatewayConfig.resolve_workspace`.
 
 Future plug-in service categories will be added as additional typed
 arrays alongside ``forges:`` and ``projects:`` (for example, a
@@ -203,14 +213,43 @@ class ProjectSpec(BaseModel):
 
 
 class GatewayConfig(BaseModel):
-    """Top-level model for ``.thorn/gateway.json``.
+    """Top-level model for an agency's ``gateway.json``.
 
-    Future plug-in service categories will appear as additional typed
-    array fields (for example, ``messaging_services: list[...]``).
+    Carries the agency's workspace directory along with its declared
+    forges and projects.  Future plug-in service categories will
+    appear as additional typed array fields (for example,
+    ``messaging_services: list[...]``).
     """
 
+    workspace: str = Field(
+        default="",
+        description=(
+            "Filesystem path to the agency's workspace root.  Absolute "
+            "paths are used as-is; relative paths are resolved against "
+            "the directory containing gateway.json (the agency home).  "
+            "Empty string means no workspace was configured at bootstrap; "
+            "in that case 'thorn serve' must be given an explicit "
+            "--workspace override."
+        ),
+    )
     forges: list[ForgeSpec] = Field(default_factory=list)
     projects: list[ProjectSpec] = Field(default_factory=list)
+
+    def resolve_workspace(self, agency_home: Path) -> Path | None:
+        """Resolve the configured workspace path against *agency_home*.
+
+        Absolute paths are returned unchanged (after :meth:`Path.resolve`);
+        relative paths are resolved relative to *agency_home*.  Returns
+        ``None`` when no workspace is configured (``workspace == ""``),
+        in which case the caller is expected to require an explicit
+        override.
+        """
+        if not self.workspace:
+            return None
+        candidate = Path(self.workspace)
+        if not candidate.is_absolute():
+            candidate = agency_home / candidate
+        return candidate.resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -364,12 +403,14 @@ def _register_builtin_forges(registry: ServiceTypeRegistry) -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_gateway_config(thorn_dir: Path) -> GatewayConfig:
-    """Load and parse ``gateway.json`` from the given ``.thorn/`` directory.
+def load_gateway_config(agency_home: Path) -> GatewayConfig:
+    """Load and parse ``gateway.json`` from the given agency home directory.
 
-    Raises :class:`FileNotFoundError` if the config file does not exist.
+    *agency_home* is the directory containing ``gateway.json`` (the
+    agency's home root).  Raises :class:`FileNotFoundError` if the
+    config file does not exist.
     """
-    config_path = thorn_dir / GATEWAY_CONFIG_FILENAME
+    config_path = agency_home / GATEWAY_CONFIG_FILENAME
     if not config_path.is_file():
         raise FileNotFoundError(
             f"Gateway configuration file not found: {config_path}\n"

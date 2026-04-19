@@ -3,16 +3,23 @@
 ``AgencyPaths`` captures the two directory roots that an agency needs:
 
 - **home_root**: where agent state lives (identities, sessions, memory,
-  journals).  In CLI mode this is ``{cwd}/.thorn/``; in gateway mode it
-  is a user-chosen directory.
+  journals, service queues, and ``gateway.json``).  In CLI mode this is
+  ``{cwd}/.thorn/`` (auto-nested inside the workspace); in gateway mode
+  it is a user-chosen directory taken verbatim — typically
+  ``~/.thorn/`` per the local-agency convention from the architecture
+  doc — with **no** ``.thorn/`` subdirectory appended.
 
-- **workspace_root**: where agents do work (clone repositories, edit
-  files, run builds).  In CLI mode this is ``{cwd}`` itself; in gateway
-  mode it is a separate directory.
+- **workspace_root**: where agent sessions do their work (clone
+  repositories, edit files, run builds).  In CLI mode this is ``{cwd}``
+  itself; in gateway mode it is a separate directory whose path is
+  recorded in ``gateway.json`` (top-level ``"workspace"`` field) so that
+  ``thorn serve`` can locate it from the agency home alone.
 
-The distinction matters because CLI mode nests the home directory *under*
-the workspace (``{cwd}/.thorn/`` inside the project checkout), while
-gateway mode keeps them fully independent.
+The distinction matters because CLI mode deliberately nests the home
+directory *under* the workspace (``{cwd}/.thorn/`` inside the project
+checkout), while gateway mode keeps the two roots fully independent —
+an agency typically lives at ``~/.thorn/`` and serves a workspace
+elsewhere on the filesystem.
 """
 
 from __future__ import annotations
@@ -296,6 +303,10 @@ class AgencyPaths:
         """Construct paths for gateway mode (``thorn serve``).
 
         Home and workspace are fully independent directories.
+        *agency_dir* is used as ``home_root`` verbatim — no ``.thorn/``
+        subdirectory is auto-nested.  *workspace_dir* is normally
+        sourced from the ``"workspace"`` field of ``gateway.json``,
+        possibly overridden by the ``--workspace`` CLI option.
         """
         return cls(
             home_root=agency_dir,

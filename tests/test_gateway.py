@@ -238,7 +238,8 @@ class TestGateway:
         monkeypatch.setenv("GITLAB_TOKEN", "fake-token-for-test")
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="my-coord",
             project_name="proj",
             clone_url="https://example.com/proj.git",
@@ -1608,9 +1609,14 @@ class TestServeCliGroup:
         from thorn._cli import main as cli_main
 
         runner = CliRunner()
-        result = runner.invoke(cli_main, ["serve", "--workspace", str(tmp_path)])
+        # Point --agency at an existing-but-empty tmp_path so the test
+        # never accidentally probes the developer's real ~/.thorn home.
+        result = runner.invoke(cli_main, ["serve", "--agency", str(tmp_path)])
         assert result.exit_code != 0
-        assert "Gateway configuration file not found" in result.output
+        assert (
+            "gateway.json" in result.output
+            or "Gateway configuration file not found" in result.output
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1693,7 +1699,8 @@ class TestEndToEndWiring:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="e2e-coord",
             project_name="test-proj",
             clone_url="https://gitlab.example.com/group/test-proj.git",
@@ -2427,7 +2434,8 @@ class TestBootstrapCoordinator:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         aid = bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="test-coord",
             project_name="my-project",
             clone_url="https://gitlab.example.com/group/my-project.git",
@@ -2481,13 +2489,15 @@ class TestBootstrapCoordinator:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="first-coord",
             project_name="proj-a",
             clone_url="https://example.com/a.git",
         )
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="second-coord",
             project_name="proj-b",
             clone_url="https://example.com/b.git",
@@ -2504,13 +2514,15 @@ class TestBootstrapCoordinator:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="my-coord",
             project_name="proj",
             clone_url="https://example.com/proj.git",
         )
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="my-coord",
             project_name="proj",
             clone_url="https://example.com/proj-v2.git",
@@ -2528,7 +2540,8 @@ class TestBootstrapCoordinator:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="custom",
             project_name="proj",
             clone_url="https://example.com/proj.git",
@@ -2550,7 +2563,8 @@ class TestBootstrapCoordinator:
         monkeypatch.setenv("GITLAB_TOKEN", "fake-token")
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="loadable",
             project_name="proj",
             clone_url="https://example.com/proj.git",
@@ -2575,7 +2589,8 @@ class TestBootstrapCoordinator:
             "--project-name", "test-proj",
             "--clone-url", "https://example.com/test-proj.git",
             "--forge-base-url", "https://gitlab.example.com/api/v4",
-            "--workspace", str(tmp_path),
+            "--agency-home", str(tmp_path / ".thorn"),
+            "--agency-workspace", str(tmp_path),
         ])
         assert result.exit_code == 0
         assert "cli-test" in result.output
@@ -2600,7 +2615,8 @@ class TestBootstrapCoordinator:
             "--agent-id", "needs-url",
             "--project-name", "proj",
             "--clone-url", "https://example.com/proj.git",
-            "--workspace", str(tmp_path),
+            "--agency-home", str(tmp_path / ".thorn"),
+            "--agency-workspace", str(tmp_path),
         ])
         assert result.exit_code != 0
         assert "--forge-base-url" in result.output or "base_url" in result.output
@@ -2617,7 +2633,8 @@ class TestBootstrapCoordinator:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="literal",
             project_name="proj",
             clone_url="https://gitlab.example.com/g/proj.git",
@@ -2636,7 +2653,8 @@ class TestBootstrapCoordinator:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="gh-coord",
             project_name="my-repo",
             clone_url="https://github.com/owner/repo.git",
@@ -2672,7 +2690,8 @@ class TestBootstrapCoordinator:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="gh-pat-only",
             project_name="my-repo",
             clone_url="https://github.com/owner/repo.git",
@@ -2692,7 +2711,8 @@ class TestBootstrapCoordinator:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="gh-coord",
             project_name="my-repo",
             clone_url="https://github.com/owner/repo.git",
@@ -2711,7 +2731,8 @@ class TestBootstrapCoordinator:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="id-test",
             project_name="proj",
             clone_url="https://example.com/proj.git",
@@ -2729,7 +2750,8 @@ class TestBootstrapCoordinator:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="custom-id",
             project_name="proj",
             clone_url="https://example.com/proj.git",
@@ -2756,7 +2778,8 @@ class TestBootstrapCoordinator:
             "--clone-url", "https://github.com/owner/repo.git",
             "--forge-type", "github",
             "--native-project-id", "owner/repo",
-            "--workspace", str(tmp_path),
+            "--agency-home", str(tmp_path / ".thorn"),
+            "--agency-workspace", str(tmp_path),
         ])
         assert result.exit_code == 0, result.output
         assert "gh-cli-test" in result.output
@@ -2780,7 +2803,8 @@ class TestBootstrapCoordinator:
             "--project-name", "proj",
             "--clone-url", "https://example.com/proj.git",
             "--forge-base-url", "https://gitlab.example.com/api/v4",
-            "--workspace", str(tmp_path),
+            "--agency-home", str(tmp_path / ".thorn"),
+            "--agency-workspace", str(tmp_path),
         ])
         assert result.exit_code == 0, result.output
 
@@ -2817,7 +2841,8 @@ class TestBootstrapCoordinator:
             "--clone-url", "https://github.com/owner/repo.git",
             "--forge-type", "github",
             "--native-project-id", "owner/repo",
-            "--workspace", str(tmp_path),
+            "--agency-home", str(tmp_path / ".thorn"),
+            "--agency-workspace", str(tmp_path),
         ])
         assert result.exit_code == 0, result.output
 
@@ -2857,7 +2882,8 @@ class TestBootstrapCoordinator:
             )
 
             bootstrap_coordinator(
-                runtime_root=tmp_path,
+                agency_home=tmp_path / ".thorn",
+                agency_workspace=tmp_path,
                 agent_id="bot",
                 project_name="proj",
                 clone_url="https://gitlab.example.com/g/proj.git",
@@ -2878,6 +2904,277 @@ class TestBootstrapCoordinator:
             sources = infer_event_sources(config, [agent])
             assert len(sources) == 1
             assert sources[0]._config.url == "https://gitlab.example.com/api/v4"
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap: home/workspace split
+# ---------------------------------------------------------------------------
+
+
+class TestBootstrapHomeWorkspaceSplit:
+    """Verify the new agency-home / agency-workspace separation."""
+
+    def test_bootstrap_writes_workspace_into_gateway_config(
+        self, tmp_path: Path,
+    ):
+        """The absolute workspace path is recorded in ``gateway.json``."""
+        import json
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        agency_home = tmp_path / "agency"
+        agency_workspace = tmp_path / "work"
+
+        bootstrap_coordinator(
+            agency_home=agency_home,
+            agency_workspace=agency_workspace,
+            agent_id="ws-coord",
+            project_name="proj",
+            clone_url="https://example.com/proj.git",
+        )
+
+        gw_data = json.loads(
+            (agency_home / "gateway.json").read_text(encoding="utf-8"),
+        )
+        assert gw_data["workspace"] == str(agency_workspace.resolve())
+
+    def test_bootstrap_does_not_nest_dot_thorn(self, tmp_path: Path):
+        """Bootstrap treats ``agency_home`` as the home root verbatim.
+
+        Older versions used to nest a ``.thorn/`` subdirectory under
+        the supplied path, so we explicitly verify that no such
+        directory is created under either the home or the workspace.
+        """
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        agency_home = tmp_path / "agency"
+        agency_workspace = tmp_path / "work"
+
+        bootstrap_coordinator(
+            agency_home=agency_home,
+            agency_workspace=agency_workspace,
+            agent_id="no-nest",
+            project_name="proj",
+            clone_url="https://example.com/proj.git",
+        )
+
+        assert not (agency_home / ".thorn").exists()
+        assert not (agency_workspace / ".thorn").exists()
+        assert (agency_home / "gateway.json").is_file()
+        assert (agency_home / "agents" / "no-nest.json").is_file()
+
+    def test_bootstrap_creates_per_agent_workspace_prefix(
+        self, tmp_path: Path,
+    ):
+        """The ``<agency_workspace>/<agent_id>/`` prefix is created eagerly."""
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        agency_home = tmp_path / "agency"
+        agency_workspace = tmp_path / "work"
+
+        bootstrap_coordinator(
+            agency_home=agency_home,
+            agency_workspace=agency_workspace,
+            agent_id="eager",
+            project_name="proj",
+            clone_url="https://example.com/proj.git",
+        )
+
+        assert (agency_workspace / "eager").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# GatewayConfig: workspace field resolution
+# ---------------------------------------------------------------------------
+
+
+class TestGatewayConfigWorkspace:
+    def test_resolve_workspace_returns_none_when_unset(self, tmp_path: Path):
+        from thorn.gateway._config import GatewayConfig
+
+        config = GatewayConfig()
+        assert config.resolve_workspace(tmp_path) is None
+
+    def test_resolve_workspace_absolute_path_returned_as_is(
+        self, tmp_path: Path,
+    ):
+        from thorn.gateway._config import GatewayConfig
+
+        target = tmp_path / "abs-ws"
+        target.mkdir()
+        config = GatewayConfig(workspace=str(target))
+        # Use a different agency_home to prove the absolute path wins.
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        assert config.resolve_workspace(elsewhere) == target.resolve()
+
+    def test_resolve_workspace_relative_resolved_against_agency_home(
+        self, tmp_path: Path,
+    ):
+        from thorn.gateway._config import GatewayConfig
+
+        agency_home = tmp_path / "agency"
+        agency_home.mkdir()
+        (agency_home / "ws").mkdir()
+        config = GatewayConfig(workspace="ws")
+        resolved = config.resolve_workspace(agency_home)
+        assert resolved == (agency_home / "ws").resolve()
+
+    def test_load_gateway_config_round_trips_workspace(self, tmp_path: Path):
+        """The ``workspace`` field survives a write/read cycle."""
+        import json
+        from thorn.gateway._config import load_gateway_config
+
+        agency_home = tmp_path / "agency"
+        agency_home.mkdir()
+        (agency_home / "gateway.json").write_text(
+            json.dumps({"workspace": "../shared-ws"}),
+            encoding="utf-8",
+        )
+        config = load_gateway_config(agency_home)
+        assert config.workspace == "../shared-ws"
+        # Relative paths resolve against the agency home.
+        expected = (agency_home / "../shared-ws").resolve()
+        assert config.resolve_workspace(agency_home) == expected
+
+
+# ---------------------------------------------------------------------------
+# thorn serve: workspace resolution priority
+# ---------------------------------------------------------------------------
+
+
+class TestServeWorkspaceResolution:
+    """``thorn serve`` picks workspace via CLI > config > error."""
+
+    def _bootstrap(
+        self,
+        *,
+        agency_home: Path,
+        agency_workspace: Path,
+    ) -> None:
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        bootstrap_coordinator(
+            agency_home=agency_home,
+            agency_workspace=agency_workspace,
+            agent_id="srv-coord",
+            project_name="proj",
+            clone_url="https://example.com/proj.git",
+            forge_base_url="https://gitlab.example.com/api/v4",
+        )
+
+    def _strip_workspace_from_config(self, agency_home: Path) -> None:
+        """Mutate gateway.json to remove the workspace field.
+
+        Used to simulate a config that was hand-written without a
+        workspace, so that the missing-workspace error branch can be
+        exercised.
+        """
+        import json
+
+        config_path = agency_home / "gateway.json"
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        data.pop("workspace", None)
+        config_path.write_text(
+            json.dumps(data, indent=2) + "\n", encoding="utf-8",
+        )
+
+    def test_cli_workspace_overrides_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """``--workspace`` on ``serve`` wins over the config value.
+
+        We capture the resolved workspace by patching ``AgencyPaths.for_gateway``
+        instead of actually starting the gateway daemon.
+        """
+        from click.testing import CliRunner
+        from thorn._cli import main as cli_main
+
+        agency_home = tmp_path / "agency"
+        config_workspace = tmp_path / "config-ws"
+        cli_workspace = tmp_path / "cli-ws"
+        cli_workspace.mkdir()
+
+        self._bootstrap(
+            agency_home=agency_home,
+            agency_workspace=config_workspace,
+        )
+
+        captured: dict[str, Path] = {}
+
+        def fake_for_gateway(*, agency_dir: Path, workspace_dir: Path):
+            captured["workspace_dir"] = workspace_dir
+            captured["agency_dir"] = agency_dir
+            # Bail out before _build_runtime tries to do real work.
+            raise SystemExit(0)
+
+        monkeypatch.setattr(
+            "thorn.runtime._paths.AgencyPaths.for_gateway", fake_for_gateway,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli_main, [
+            "serve",
+            "--agency", str(agency_home),
+            "--workspace", str(cli_workspace),
+        ])
+        # SystemExit(0) from our patch propagates as exit_code=0.
+        assert result.exit_code == 0, result.output
+        assert captured["workspace_dir"] == cli_workspace.resolve()
+        assert captured["agency_dir"] == agency_home.resolve()
+
+    def test_config_workspace_used_when_no_cli_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Without ``--workspace``, the config's ``workspace`` is used."""
+        from click.testing import CliRunner
+        from thorn._cli import main as cli_main
+
+        agency_home = tmp_path / "agency"
+        config_workspace = tmp_path / "config-ws"
+
+        self._bootstrap(
+            agency_home=agency_home,
+            agency_workspace=config_workspace,
+        )
+
+        captured: dict[str, Path] = {}
+
+        def fake_for_gateway(*, agency_dir: Path, workspace_dir: Path):
+            captured["workspace_dir"] = workspace_dir
+            raise SystemExit(0)
+
+        monkeypatch.setattr(
+            "thorn.runtime._paths.AgencyPaths.for_gateway", fake_for_gateway,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli_main, [
+            "serve",
+            "--agency", str(agency_home),
+        ])
+        assert result.exit_code == 0, result.output
+        assert captured["workspace_dir"] == config_workspace.resolve()
+
+    def test_missing_both_workspaces_errors_clearly(
+        self, tmp_path: Path,
+    ):
+        """No CLI ``--workspace`` and no config ``workspace`` → error."""
+        from click.testing import CliRunner
+        from thorn._cli import main as cli_main
+
+        agency_home = tmp_path / "agency"
+        self._bootstrap(
+            agency_home=agency_home,
+            agency_workspace=tmp_path / "ws",
+        )
+        self._strip_workspace_from_config(agency_home)
+
+        runner = CliRunner()
+        result = runner.invoke(cli_main, [
+            "serve", "--agency", str(agency_home),
+        ])
+        assert result.exit_code != 0
+        assert "workspace" in result.output.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -3445,7 +3742,8 @@ class TestGatewayWorkspaceRouting:
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
-            runtime_root=tmp_path,
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
             agent_id="my-coord",
             project_name="proj",
             clone_url="https://example.com/proj.git",
