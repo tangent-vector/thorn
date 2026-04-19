@@ -26,7 +26,11 @@ from pathlib import Path
 from thorn.core._agent import Agent
 from thorn.core._session import Session
 from thorn.runtime._paths import safe_dirname, unsafe_dirname
-from thorn.runtime._serializer import JsonSessionSerializer, SessionSerializer
+from thorn.runtime._serializer import (
+    JsonSessionSerializer,
+    SessionSerializer,
+    _SESSION_FILE,
+)
 from thorn.runtime._session import AgentID, SessionKey
 
 
@@ -157,7 +161,10 @@ class SessionStore:
         """Load a previously persisted session for the given agent.
 
         Raises ``KeyError`` if no session with the given key exists
-        under the agent.
+        under the agent.  Existence here is determined by directory
+        presence so that custom serializers with non-default file
+        layouts continue to work; callers that want the stronger
+        "metadata is present" check should use :meth:`session_exists`.
         """
         if not isinstance(key, SessionKey):
             key = SessionKey(key)
@@ -169,15 +176,37 @@ class SessionStore:
         return self._serializer.load_session(directory, agent)
 
     def session_exists(self, agent_id: AgentID | str, key: SessionKey | str) -> bool:
-        """Check whether a session exists under the given agent."""
+        """Check whether a session has been persisted under the given agent.
+
+        A session "exists" when its ``session.json`` metadata file is
+        present.  The bare directory is not enough: callers (notably the
+        CLI's lock-then-load flow) routinely mkdir the session directory
+        as a side effect of acquiring an advisory lock, and treating
+        such a directory as a real session would cause ``load_session``
+        to fail attempting to read non-existent metadata.
+
+        Note: this check is specific to the default
+        :class:`JsonSessionSerializer` layout.  Custom serializers that
+        store their metadata under a different filename will report
+        their sessions as nonexistent here -- but ``load_session``
+        still succeeds for them based on directory presence alone.
+        Removing that asymmetry would require extending the serializer
+        protocol; for now it is documented rather than fixed.
+        """
         if not isinstance(agent_id, AgentID):
             agent_id = AgentID(agent_id)
         if not isinstance(key, SessionKey):
             key = SessionKey(key)
-        return self._session_dir(agent_id, key).is_dir()
+        return (self._session_dir(agent_id, key) / _SESSION_FILE).is_file()
 
     def list_session_keys(self, agent_id: AgentID | str) -> list[SessionKey]:
-        """Return all persisted session keys for the given agent, sorted."""
+        """Return all persisted session keys for the given agent, sorted.
+
+        Mirrors :meth:`session_exists`: a directory is only counted if
+        its ``session.json`` is present.  Lock-only or otherwise empty
+        session directories are skipped.  See :meth:`session_exists` for
+        the same caveat about custom serializer layouts.
+        """
         if not isinstance(agent_id, AgentID):
             agent_id = AgentID(agent_id)
         sessions_dir = self._sessions_dir(agent_id)
@@ -186,7 +215,7 @@ class SessionStore:
         return sorted(
             SessionKey(_unsafe_dirname(d.name))
             for d in sessions_dir.iterdir()
-            if d.is_dir()
+            if d.is_dir() and (d / _SESSION_FILE).is_file()
         )
 
     def delete_session(self, agent_id: AgentID | str, key: SessionKey | str) -> None:

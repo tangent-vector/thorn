@@ -48,6 +48,14 @@ CLI_AGENT_ID = AgentID("local")
 CLI_SESSION_KEY = SessionKey("default")
 """Default session key for CLI mode (single-session per workspace)."""
 
+CHAT_SYSTEM_PROMPT = (
+    "You are in an interactive chat session with a human user. "
+    "You may ask clarifying questions and suggest next steps."
+)
+"""System prompt fragment appended to the agent's role prompts during
+``thorn chat`` turns.  Communicates that the human is on the other side
+of the conversation and that asking back is welcome."""
+
 
 def _ensure_cli_agent(runtime: Runtime) -> "Agent":
     """Get or create the CLI local agent, persisting identity to disk.
@@ -405,10 +413,17 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
     console.print("[bold]thorn[/bold] interactive chat  (Ctrl+C to exit)\n")
 
     async def _chat() -> None:
-        from thorn.core._history import TurnNode, ToolCallNode, UserPromptNode
-        from thorn.core._messages import UserMessage, AssistantMessage, ToolResultMessage
-        from thorn.core._loop import _execute_tool_calls
-        from thorn.core._provider import TextChunk, ToolCallChunk, FinishChunk
+        # The hand-rolled provider+tool-dispatch loop that used to live
+        # here predated `session.prompt`/`run_agent_loop` gaining feature
+        # parity with what chat needed (compaction, housekeeping, retry,
+        # advisory nodes, scope-enter/exit events).  It also drifted out
+        # of sync with the `_execute_tool_calls` and `HistoryTree`
+        # contracts and was effectively broken.  Phase 1 of the
+        # CLI/gateway unification plan collapses chat down to repeated
+        # `session.prompt(...)` calls so it benefits from every
+        # improvement to the shared agent loop automatically.  Phase 4
+        # will route this through the in-process scheduler instead of
+        # calling `session.prompt` directly.
         from thorn.runtime._lock import SessionLockError, session_lock
 
         async with runtime:
@@ -417,6 +432,11 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
             session_key = CLI_SESSION_KEY
             session_dir = runtime.sessions._session_dir(agent.id, session_key)
 
+            # Advisory file lock prevents two concurrent `thorn chat`
+            # processes from racing on the same session's history.  The
+            # PID-suffixed fallback is a temporary workaround that Phase
+            # 5 will obsolete by generating a unique session key per CLI
+            # invocation.
             try:
                 lock_ctx = session_lock(session_dir)
                 lock_ctx.__enter__()
@@ -435,18 +455,13 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
                     agent, session_key,
                     workspace_root=runtime.workspace_root,
                 )
-                history = session._history
 
-                if history.nodes:
+                if session._history.nodes:
                     console.print(
-                        f"[dim]Resuming session with {len(history.nodes)} history entries.[/dim]\n"
+                        f"[dim]Resuming session with "
+                        f"{len(session._history.nodes)} history entries.[/dim]\n"
                     )
 
-                ctx = runtime.context
-                ctx.system_prompts.append(
-                    "You are in an interactive chat session with a human user. "
-                    "You may ask clarifying questions and suggest next steps."
-                )
                 async with AsyncExitStack() as stack:
                     tools = await _collect_all_tools(
                         stack,
@@ -454,11 +469,6 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
                         no_discover=no_discover,
                         no_mcp=no_mcp,
                     )
-                    tool_schemas = [t.schema for t in tools]
-                    tool_dispatch = {
-                        t.schema.get("function", {}).get("name", ""): t
-                        for t in tools
-                    }
 
                     while True:
                         try:
@@ -468,53 +478,23 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
                         if not user_input.strip():
                             continue
 
-                        user_msg = UserMessage(content=user_input)
-                        history.append(UserPromptNode(user_msg))
-                        messages = history.render()
-
-                        for _ in range(50):
-                            text_parts: list[str] = []
-                            tool_call_chunks: list = []
-                            finish_reason = "stop"
-
-                            response = ctx.provider.complete(
-                                ctx.system_prompts, tool_schemas, messages,
+                        try:
+                            await session.prompt(
+                                user_input,
+                                tools=tools,
+                                system=CHAT_SYSTEM_PROMPT,
                             )
-                            async for chunk in response:
-                                await ctx.event_sink.on_response_chunk(chunk, scope=ctx.scope)
-                                match chunk:
-                                    case TextChunk():
-                                        text_parts.append(chunk.text)
-                                    case ToolCallChunk():
-                                        tool_call_chunks.append(chunk)
-                                    case FinishChunk():
-                                        finish_reason = chunk.reason
-
-                            text = "".join(text_parts)
-                            tool_calls = [tc.to_tool_call() for tc in tool_call_chunks]
-
-                            tc_nodes: list[ToolCallNode] = []
-                            if tool_calls:
-                                result_msgs, _ = await _execute_tool_calls(
-                                    tool_calls=tool_calls,
-                                    tool_dispatch=tool_dispatch,
-                                    context=ctx,
-                                    result_type=None,
-                                )
-                                for tc, rm in zip(tool_calls, result_msgs):
-                                    tc_nodes.append(ToolCallNode(tool_call=tc, result=rm))
-
-                            turn = TurnNode(
-                                assistant_content=text,
-                                tool_call_nodes=tc_nodes,
+                        except SkillError as exc:
+                            console.print(
+                                f"\n[red]Agent error:[/red] {exc.detail}"
                             )
-                            history.append(turn)
+                        except ThornError as exc:
+                            console.print(f"\n[red]Error:[/red] {exc}")
 
-                            if not tool_calls:
-                                break
-
-                            messages = history.render()
-
+                        # Persist after every turn so a crash mid-session
+                        # doesn't lose progress.  History was mutated in
+                        # place by `session.prompt` even if it raised, so
+                        # saving on the error path is intentional.
                         runtime.save_session(session)
                         console.print()
             finally:
