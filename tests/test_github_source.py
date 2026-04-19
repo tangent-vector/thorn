@@ -147,12 +147,16 @@ class TestMakeIncomingEvent:
         assert ev.metadata["repo_id"] == 456
         assert ev.metadata["repo_full_name"] == "octocat/hello-world"
         assert "Please fix this" in ev.content
-        # Source-namespaced external_key keyed on the API base URL
-        # and the notification thread id -- this is what the
-        # InFlightIndex consults for cross-poll and cross-restart
-        # deduplication.
+        # Source-namespaced external_key keyed on the API base URL,
+        # the notification thread id, *and* the thread's
+        # ``updated_at`` snapshot -- this is what the InFlightIndex
+        # consults for cross-poll and cross-restart deduplication.
+        # Including ``updated_at`` ensures that two genuinely distinct
+        # events on the same thread (which share a stable thread ID
+        # but have different ``updated_at`` values) are treated as
+        # distinct logical notifications.
         assert ev.external_key == (
-            "github:https://api.github.com:thread:100"
+            "github:https://api.github.com:thread:100:updated:2026-04-15T10:00:00Z"
         )
         # The content no longer instructs the agent to close out the
         # notification itself: the source marks the thread read on
@@ -232,9 +236,16 @@ class TestMakeIncomingEvent:
 
 
 class TestGitHubNotificationsSourceFetchNewNotifications:
-    """Exercise :meth:`GitHubNotificationsSource._fetch_new_notifications` directly."""
+    """Exercise :meth:`GitHubNotificationsSource._fetch_new_notifications` directly.
 
-    def test_first_fetch_primes_and_returns_empty(self) -> None:
+    The source no longer maintains client-side dedup state -- it
+    returns one ``IncomingEvent`` per currently-unread thread on every
+    poll.  "Already processed" is tracked server-side via the
+    Notifications API's read/unread bit (see the startup-drain test
+    below and the ``_poll_once`` mark-read tests).
+    """
+
+    def test_fetch_emits_event_for_each_returned_thread(self) -> None:
         from thorn.gateway.sources._github import (
             GitHubNotificationsSource,
             GitHubNotificationsSourceConfig,
@@ -243,37 +254,16 @@ class TestGitHubNotificationsSourceFetchNewNotifications:
         config = GitHubNotificationsSourceConfig(token="ghp_test")
         source = GitHubNotificationsSource(config)
 
-        thread = _make_notification_thread(thread_id="111")
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.raise_for_status = MagicMock()
-        mock_resp.json.return_value = [thread]
-        mock_resp.headers = {}
-
-        with patch.object(source._http, "get", return_value=mock_resp):
-            result = source._fetch_new_notifications()
-
-        assert result == []
-        assert source._primed is True
-        assert "111" in source._seen_thread_ids
-
-    def test_subsequent_fetch_returns_only_new_ids(self) -> None:
-        from thorn.gateway.sources._github import (
-            GitHubNotificationsSource,
-            GitHubNotificationsSourceConfig,
+        thread_a = _make_notification_thread(
+            thread_id="111", updated_at="2026-04-15T10:00:00Z",
         )
-
-        config = GitHubNotificationsSourceConfig(token="ghp_test")
-        source = GitHubNotificationsSource(config)
-
-        thread_old = _make_notification_thread(thread_id="111")
-        thread_new = _make_notification_thread(thread_id="222", reason="assign")
-
-        call_count = 0
+        thread_b = _make_notification_thread(
+            thread_id="222",
+            reason="assign",
+            updated_at="2026-04-15T11:00:00Z",
+        )
 
         def mock_get(url: str, **kwargs: Any) -> MagicMock:
-            nonlocal call_count
             if "/issues/comments/" in url:
                 resp = MagicMock()
                 resp.status_code = 200
@@ -281,24 +271,177 @@ class TestGitHubNotificationsSourceFetchNewNotifications:
                 resp.json.return_value = {"body": "comment text"}
                 return resp
 
-            call_count += 1
             resp = MagicMock()
             resp.status_code = 200
             resp.raise_for_status = MagicMock()
             resp.headers = {}
-            if call_count == 1:
-                resp.json.return_value = [thread_old]
-            else:
-                resp.json.return_value = [thread_new, thread_old]
+            # Return them in non-chronological order so the test also
+            # exercises the chronological sort.
+            resp.json.return_value = [thread_b, thread_a]
             return resp
 
         with patch.object(source._http, "get", side_effect=mock_get):
-            assert source._fetch_new_notifications() == []
-            second = source._fetch_new_notifications()
+            result = source._fetch_new_notifications()
 
-        assert len(second) == 1
-        assert second[0].metadata["notification_id"] == "222"
-        assert second[0].source == "github"
+        assert [ev.metadata["notification_id"] for ev in result] == ["111", "222"]
+        assert all(ev.source == "github" for ev in result)
+
+    def test_fetch_returns_empty_on_304(self) -> None:
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        config = GitHubNotificationsSourceConfig(token="ghp_test")
+        source = GitHubNotificationsSource(config)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 304
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.headers = {}
+
+        with patch.object(source._http, "get", return_value=mock_resp):
+            assert source._fetch_new_notifications() == []
+
+
+class TestGitHubNotificationsSourceDrainExistingUnread:
+    """Exercise the startup-drain step."""
+
+    def test_drain_marks_each_unread_thread_read_without_emitting(self) -> None:
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        config = GitHubNotificationsSourceConfig(token="ghp_test")
+        source = GitHubNotificationsSource(config)
+
+        thread_a = _make_notification_thread(thread_id="111")
+        thread_b = _make_notification_thread(thread_id="222", reason="assign")
+
+        list_resp = MagicMock()
+        list_resp.status_code = 200
+        list_resp.raise_for_status = MagicMock()
+        list_resp.json.return_value = [thread_a, thread_b]
+        list_resp.headers = {}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 205
+        patch_resp.raise_for_status = MagicMock()
+
+        patch_calls: list[str] = []
+
+        def mock_patch(url: str, **kwargs: Any) -> MagicMock:
+            patch_calls.append(url)
+            return patch_resp
+
+        with (
+            patch.object(source._http, "get", return_value=list_resp),
+            patch.object(source._http, "patch", side_effect=mock_patch),
+        ):
+            count = source._drain_existing_unread()
+
+        assert count == 2
+        assert sorted(patch_calls) == [
+            "/notifications/threads/111",
+            "/notifications/threads/222",
+        ]
+        # The drain must clear ``_last_modified`` so the first
+        # steady-state poll isn't short-circuited to 304 against
+        # the snapshot it just consumed.
+        assert source._last_modified is None
+
+    def test_new_activity_on_previously_drained_thread_is_delivered(self) -> None:
+        """Regression test: the original bug.
+
+        A thread that was unread at startup (and so got marked read
+        in the drain) must still produce an event on the next poll
+        if new activity flips it back to unread (with a fresh
+        ``updated_at``).  Under the old client-side seen-set this
+        new activity was silently dropped.
+        """
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        config = GitHubNotificationsSourceConfig(token="ghp_test")
+        source = GitHubNotificationsSource(config)
+
+        thread_v1 = _make_notification_thread(
+            thread_id="111", updated_at="2026-04-15T10:00:00Z",
+        )
+        thread_v2 = _make_notification_thread(
+            thread_id="111", updated_at="2026-04-15T12:00:00Z",
+        )
+
+        list_responses = [
+            # Drain sees the v1 snapshot.
+            [thread_v1],
+            # Steady-state poll sees the same thread re-flipped to
+            # unread with a newer updated_at.
+            [thread_v2],
+        ]
+
+        def mock_get(url: str, **kwargs: Any) -> MagicMock:
+            if "/issues/comments/" in url:
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.raise_for_status = MagicMock()
+                resp.json.return_value = {"body": "new comment"}
+                return resp
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock()
+            resp.headers = {}
+            resp.json.return_value = list_responses.pop(0)
+            return resp
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 205
+        patch_resp.raise_for_status = MagicMock()
+
+        with (
+            patch.object(source._http, "get", side_effect=mock_get),
+            patch.object(source._http, "patch", return_value=patch_resp),
+        ):
+            source._drain_existing_unread()
+            events = source._fetch_new_notifications()
+
+        assert len(events) == 1
+        assert events[0].metadata["notification_id"] == "111"
+        assert events[0].metadata["updated_at"] == "2026-04-15T12:00:00Z"
+        assert "2026-04-15T12:00:00Z" in events[0].external_key
+
+
+class TestGitHubExternalKey:
+    def test_external_key_includes_updated_at(self) -> None:
+        from thorn.gateway.sources._github import _make_incoming_event
+
+        thread_v1 = _make_notification_thread(
+            thread_id="111", updated_at="2026-04-15T10:00:00Z",
+        )
+        thread_v2 = _make_notification_thread(
+            thread_id="111", updated_at="2026-04-15T12:00:00Z",
+        )
+
+        ev_v1 = _make_incoming_event(
+            thread=thread_v1,
+            comment_body="",
+            native_id_to_project_name={},
+            base_url="https://api.github.com",
+        )
+        ev_v2 = _make_incoming_event(
+            thread=thread_v2,
+            comment_body="",
+            native_id_to_project_name={},
+            base_url="https://api.github.com",
+        )
+
+        assert ev_v1.external_key != ev_v2.external_key
+        # Same thread => same session inbox; the InFlightIndex is the
+        # only thing that distinguishes the two versions.
+        assert ev_v1.session_key == ev_v2.session_key
 
 
 class TestGitHubNotificationsSourcePollOnce:
@@ -313,7 +456,6 @@ class TestGitHubNotificationsSourcePollOnce:
 
         config = GitHubNotificationsSourceConfig(token="ghp_test")
         source = GitHubNotificationsSource(config)
-        source._primed = True
 
         thread = _make_notification_thread(thread_id="300")
 
@@ -363,7 +505,6 @@ class TestGitHubNotificationsSourcePollOnce:
 
         config = GitHubNotificationsSourceConfig(token="ghp_test")
         source = GitHubNotificationsSource(config)
-        source._primed = True
 
         thread = _make_notification_thread(thread_id="301")
 

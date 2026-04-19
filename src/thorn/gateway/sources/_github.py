@@ -4,6 +4,15 @@ Polls ``GET /notifications`` (the user-scoped Notifications API) to
 discover @-mentions, assignments, review requests, and other activity
 directed at the authenticated bot user.
 
+Read/unread state lives on GitHub.  After delivering an
+``IncomingEvent`` for a notification thread, the source ``PATCH``-es
+the thread to ``read`` so the next poll won't see it again.  At
+startup the source drains the existing unread set the same way so
+the agent isn't flooded with whatever accumulated while the gateway
+was down.  No client-side "seen" cache is maintained; cross-poll
+deduplication of in-flight events is handled by the gateway's
+:class:`~thorn.runtime._in_flight_index.InFlightIndex`.
+
 The Notifications API requires a personal access token (classic) with
 the ``notifications`` scope.  GitHub App installation tokens cannot
 access this API.
@@ -143,16 +152,30 @@ def _format_notification_content(
     return "\n".join(lines)
 
 
-def _make_external_key(base_url: str, thread_id: str) -> str:
-    """Build the source-namespaced ``external_key`` for a GitHub thread.
+def _make_external_key(base_url: str, thread_id: str, updated_at: str) -> str:
+    """Build the source-namespaced ``external_key`` for a GitHub thread version.
 
-    GitHub thread IDs are unique within an instance; the API base URL
-    is included so that a single agency polling multiple GitHub
-    instances (e.g. github.com plus a GitHub Enterprise server) does
-    not collide.  See :mod:`thorn.runtime._in_flight_index` for the
-    wider contract.
+    GitHub thread IDs are stable per subscription (per issue / PR /
+    discussion), not per event.  A thread accumulates new activity
+    over its lifetime, and each new event flips the thread back to
+    "unread" and bumps its ``updated_at`` timestamp.  Two genuinely
+    distinct events on the same thread therefore share a thread ID
+    but have different ``updated_at`` values.
+
+    The ``InFlightIndex`` contract (see :mod:`thorn.runtime._in_flight_index`)
+    is that two events with the same ``external_key`` represent the
+    same logical notification and should be deduplicated.  To match
+    that contract, the key encodes a specific *version* of a thread
+    (the ``updated_at`` snapshot at the time the source observed it).
+    Two distinct versions of the same thread are intentionally treated
+    as distinct events; they end up in the same session inbox (the
+    session key is per-thread), so the agent sees both items.
+
+    The API base URL is included so that a single agency polling
+    multiple GitHub instances (e.g. github.com plus a GitHub
+    Enterprise server) does not collide.
     """
-    return f"github:{base_url}:thread:{thread_id}"
+    return f"github:{base_url}:thread:{thread_id}:updated:{updated_at}"
 
 
 def _make_incoming_event(
@@ -221,7 +244,7 @@ def _make_incoming_event(
             "project_name": project_name,
             "updated_at": updated_at,
         },
-        external_key=_make_external_key(base_url, thread_id),
+        external_key=_make_external_key(base_url, thread_id, updated_at),
     )
 
 
@@ -255,8 +278,14 @@ class GitHubNotificationsSource(EventSource):
             },
             timeout=30.0,
         )
-        self._seen_thread_ids: set[str] = set()
-        self._primed: bool = False
+        # ``_last_modified`` is purely a transport optimisation: it lets
+        # the steady-state poll get a 304 from the Notifications API
+        # when nothing has changed.  Correctness does *not* depend on
+        # it -- if it ever drifted, the worst case is a wasted body
+        # parse, since deduplication of in-flight events is handled by
+        # the gateway's :class:`~thorn.runtime._in_flight_index.InFlightIndex`,
+        # and "this thread has already been processed" is tracked
+        # server-side via the Notifications API's read/unread state.
         self._last_modified: str | None = None
         self._stop_event: asyncio.Event | None = None
 
@@ -275,6 +304,14 @@ class GitHubNotificationsSource(EventSource):
             "GitHub notifications source authenticated as %s",
             user_info["login"],
         )
+
+        drained = await asyncio.to_thread(self._drain_existing_unread)
+        log.info(
+            "GitHub source: drained %d pre-existing unread notification(s) "
+            "so they are not delivered to the agent",
+            drained,
+        )
+
         log.info(
             "Polling GitHub notifications every %ds",
             self._config.poll_interval,
@@ -342,8 +379,40 @@ class GitHubNotificationsSource(EventSource):
                     self._mark_thread_read, str(thread_id),
                 )
 
-    def _fetch_new_notifications(self) -> list[IncomingEvent]:
-        """Return new notifications since last poll."""
+    def _drain_existing_unread(self) -> int:
+        """Mark every currently-unread notification as read without emitting events.
+
+        Called once at startup so the agent isn't flooded with whatever
+        accumulated while the gateway was down.  We don't track these
+        threads client-side: the read/unread bit lives on GitHub.
+
+        Best-effort per thread: a failed PATCH on one thread is logged
+        and we keep going.  Threads we fail to mark read here will
+        simply resurface on the next steady-state poll and be handled
+        normally (delivered + marked read) at that point.
+
+        Returns the number of threads observed (not the number
+        successfully PATCHed); the difference, if any, is visible in
+        the per-thread error logs.
+        """
+        threads = self._fetch_unread_thread_list()
+        for thread in threads:
+            tid = thread.get("id")
+            if not tid:
+                continue
+            self._mark_thread_read(str(tid))
+        # The drain just consumed a (possibly cached) Last-Modified
+        # snapshot; clear it so the first steady-state poll isn't
+        # short-circuited to 304 against pre-drain state.
+        self._last_modified = None
+        return len(threads)
+
+    def _fetch_unread_thread_list(self) -> list[dict[str, Any]]:
+        """GET the current unread notifications, honouring ``If-Modified-Since``.
+
+        Returns ``[]`` on 304.  Updates ``self._last_modified`` from
+        the response when present.
+        """
         headers: dict[str, str] = {}
         if self._last_modified is not None:
             headers["If-Modified-Since"] = self._last_modified
@@ -361,28 +430,23 @@ class GitHubNotificationsSource(EventSource):
         if "Last-Modified" in resp.headers:
             self._last_modified = resp.headers["Last-Modified"]
 
-        threads: list[dict[str, Any]] = resp.json()
+        return resp.json()
 
-        if not self._primed:
-            for t in threads:
-                self._seen_thread_ids.add(t["id"])
-            self._primed = True
-            log.info(
-                "GitHub source: primed with %d existing notification(s); "
-                "only newer activity will be delivered",
-                len(self._seen_thread_ids),
-            )
-            return []
+    def _fetch_new_notifications(self) -> list[IncomingEvent]:
+        """Return one ``IncomingEvent`` per currently-unread notification thread.
+
+        Has no client-side dedup state: threads we have already
+        processed are filtered out by GitHub's own read/unread state
+        (we mark each thread read after posting, and the startup drain
+        clears the pre-existing unread set).  Cross-poll deduplication
+        of *in-flight* notifications is handled by the gateway's
+        :class:`~thorn.runtime._in_flight_index.InFlightIndex`.
+        """
+        threads = self._fetch_unread_thread_list()
 
         incoming: list[IncomingEvent] = []
         for thread in threads:
-            tid = thread["id"]
-            if tid in self._seen_thread_ids:
-                continue
-            self._seen_thread_ids.add(tid)
-
             comment_body = self._fetch_latest_comment(thread)
-
             incoming.append(
                 _make_incoming_event(
                     thread=thread,
@@ -400,13 +464,17 @@ class GitHubNotificationsSource(EventSource):
         """Mark a notification thread as read on GitHub.
 
         Best-effort: a failed PATCH is logged and swallowed.  The
-        ``_seen_thread_ids`` cache prevents a re-emit within this
-        process; on restart the source re-primes from GitHub's own
-        unread state, so a missed mark-read simply means the thread
-        is dropped by the prime (since by then it will have been
-        read or otherwise aged out of the notifications feed) or
-        picked up again as a "new" thread and deduplicated by the
-        gateway's :class:`InFlightIndex` if still in flight.
+        gateway's :class:`~thorn.runtime._in_flight_index.InFlightIndex`
+        deduplicates a re-emit while the original event is still in
+        flight, so a transient PATCH failure is harmless: the next
+        poll re-fetches the (still-unread) thread, the duplicate
+        ``IncomingEvent`` is dropped at the gateway, and the source
+        retries the PATCH.
+
+        The unhandled edge case is a *persistent* PATCH failure
+        combined with the agent finishing the in-flight item before
+        the next poll; that would result in a duplicate inbox entry.
+        Persistent failures are operator-visible via these log lines.
         """
         try:
             resp = self._http.patch(f"/notifications/threads/{thread_id}")

@@ -3443,6 +3443,9 @@ class TestGitHubNotificationsSource:
 
     @pytest.mark.asyncio
     async def test_delivers_new_notifications(self):
+        """The startup drain marks pre-existing unread notifications as
+        read (without emitting events), and the next steady-state poll
+        delivers any threads that surface as unread after that."""
         from thorn.gateway.sources._github import (
             GitHubNotificationsSource,
             GitHubNotificationsSourceConfig,
@@ -3454,7 +3457,7 @@ class TestGitHubNotificationsSource:
         )
         source = GitHubNotificationsSource(cfg, service_name="test")
 
-        priming_thread = _make_notification_thread(thread_id="1")
+        existing_unread_thread = _make_notification_thread(thread_id="1")
         new_thread = _make_notification_thread(thread_id="2", reason="assign")
 
         mock_user_resp = MagicMock()
@@ -3462,10 +3465,14 @@ class TestGitHubNotificationsSource:
         mock_user_resp.raise_for_status = MagicMock()
         mock_user_resp.json.return_value = {"login": "bot", "name": "", "html_url": ""}
 
-        poll_count = 0
+        # The first /notifications GET (the drain) sees the
+        # pre-existing unread thread; subsequent GETs see the new
+        # thread (real GitHub stops returning the first one once we
+        # PATCH it to read).
+        list_call_count = 0
 
         def mock_get(url: str, **kwargs: Any) -> Any:
-            nonlocal poll_count
+            nonlocal list_call_count
             if url == "/user":
                 return mock_user_resp
             if "/issues/comments/" in url:
@@ -3475,18 +3482,27 @@ class TestGitHubNotificationsSource:
                 resp.json.return_value = {"body": "comment text"}
                 return resp
 
-            poll_count += 1
+            list_call_count += 1
             resp = MagicMock()
             resp.status_code = 200
             resp.raise_for_status = MagicMock()
             resp.headers = {}
-            if poll_count == 1:
-                resp.json.return_value = [priming_thread]
-            elif poll_count == 2:
-                resp.json.return_value = [priming_thread, new_thread]
+            if list_call_count == 1:
+                resp.json.return_value = [existing_unread_thread]
+            elif list_call_count == 2:
+                resp.json.return_value = [new_thread]
             else:
                 resp.json.return_value = []
             return resp
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 205
+        patch_resp.raise_for_status = MagicMock()
+        patch_calls: list[str] = []
+
+        def mock_patch(url: str, **kwargs: Any) -> Any:
+            patch_calls.append(url)
+            return patch_resp
 
         events_received: list[IncomingEvent] = []
 
@@ -3494,14 +3510,24 @@ class TestGitHubNotificationsSource:
             events_received.append(event)
             await source.stop()
 
-        with patch.object(source._http, "get", side_effect=mock_get):
+        with (
+            patch.object(source._http, "get", side_effect=mock_get),
+            patch.object(source._http, "patch", side_effect=mock_patch),
+        ):
             await source.start(on_event)
 
+        # The pre-existing unread thread was drained (PATCHed) and not
+        # delivered as an event; the new thread was delivered and then
+        # PATCHed at post time.
         assert len(events_received) == 1
         ev = events_received[0]
         assert ev.metadata["notification_id"] == "2"
         assert ev.metadata["reason"] == "assign"
         assert "comment text" in ev.content
+        assert patch_calls == [
+            "/notifications/threads/1",
+            "/notifications/threads/2",
+        ]
 
     @pytest.mark.asyncio
     async def test_304_not_modified_skipped(self):
@@ -3512,10 +3538,10 @@ class TestGitHubNotificationsSource:
 
         cfg = GitHubNotificationsSourceConfig(token="ghp-test", poll_interval=5)
         source = GitHubNotificationsSource(cfg, service_name="test")
-        source._primed = True
 
         resp_304 = MagicMock()
         resp_304.status_code = 304
+        resp_304.headers = {}
 
         with patch.object(source._http, "get", return_value=resp_304):
             result = await asyncio.to_thread(source._fetch_new_notifications)
