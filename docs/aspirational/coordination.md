@@ -7,7 +7,7 @@ It is a sibling of `architecture.md` and follows the same spirit: a "point on th
 It does not yet match the implementation.
 At the time of writing:
 
-- Session keys use untyped, positional segments (`<project>/issue/<n>`, `<project>/change-request/<n>`) and `_routing.py` is hard-coded per forge.
+- Session keys use a path-shaped form (`<project>/issue/<n>`, `<project>/change-request/<n>`) but `_routing.py` is hard-coded per forge: there is no template registry that defines what session keys are *allowed* to exist, no machinery for extracting bindings back out of a key, and no notion of one session being an ancestor of another.
 - There is no cross-session notification mechanism: events only enter from external `EventSource` instances; there is no internal sender, no timer/heartbeat source.
 - Memory is shared agent-wide.
   Session-aligned memory scopes are convention only.
@@ -50,55 +50,69 @@ Non-goals:
 Core model
 ----------
 
-### Typed-segment session keys
+### Session keys
 
-Today: `tiny-talk/issue/7` (forge-agnostic but positional).
+Session keys are path-shaped, human-readable strings — the same shape they have today.
+Examples:
 
-Proposed: `project:tiny-talk/fork:gitlab-master/issue:42`.
-Each segment is `<kind>:<id>`.
+- `projects/tiny-talk/forks/gitlab-master/issues/42`
+- `projects/tiny-talk/forks/gitlab-master/change-requests/47`
+- `peers/tess/dms/telegram`
 
-Properties this gives us:
+Keys are what surfaces to humans (in logs, in directory paths, in URLs) and to agents (in tool inputs and outputs).
+They are the *only* form a session key takes on the wire and on disk.
+They map directly onto filesystem paths for workspaces and memory, with no escaping or rewriting.
 
-- **Structural ancestry.**
-  The parent of any session is its key with the rightmost segment dropped: `project:tiny-talk/fork:gitlab-master` is the parent of the issue session, and `project:tiny-talk` is the parent of the fork.
-  No template lookup needed.
-- **Cross-fork visibility.**
-  A project session can address two of its fork descendants (e.g., when `gitlab-master` and `github-mirror` need to be kept in sync) without any of them needing knowledge of each other.
-- **Free routing for the file system.**
-  The runtime already turns a session key into a workspace directory.
-  The typed form maps cleanly onto a directory layout — `agents/<id>/sessions/project:foo/fork:gitlab-master/issue:42/` — and sidesteps any ambiguity about what an intermediate path means.
-- **Backwards compatibility.**
-  Existing on-disk sessions keep their legacy keys; the framework treats untyped legacy keys as opaque (no parent computable) and refuses to fit them into the hierarchy.
-  Migration is opt-in per session.
+The framework does *not* require segments to be `<kind>:<value>` pairs.
+Some segments carry bindings, some are tags, some are pluralizing connectives (`issues`, `forks`, `peers`).
+What gives meaning to each segment is the **session template** that the key is an instance of, not the key itself.
 
-Constraint: segment kinds are drawn from a declared vocabulary (`project`, `fork`, `issue`, `change-request`, `peer`, `dms`, ...).
-Unknown kinds are rejected at parse.
+Backwards compatibility: existing on-disk sessions already use this shape; nothing about the on-disk layout changes.
+What changes is that the framework gains the ability to recognize a key as an *instance of a declared template*, which unlocks ancestor relationships, address validation, and the rest of this design.
 
-### Routing template registry
+### Session templates
 
-The hard-coded per-forge routing functions become data-driven.
-A template is a small record:
+A **session template** is the central concept of this design.
+A template enumerates a class of allowed sessions, defining what their keys look like, how to derive a key from an incoming event, how to recover the bindings from a key, and what policy applies to sessions that are instances of it.
 
-- Name (e.g., `project_issue`).
-- A match shape: required tags + key/value patterns on incoming events (matches the design in `architecture.md`).
-- A session-key template: `project:{p}/fork:{f}/issue:{n}`.
-- An optional `parent` template name, which lets us declare hierarchies explicitly when multiple templates produce the same logical level.
-- A heartbeat policy (none / interval) for sessions matching the template.
-- A cross-tree-send policy: `subtree-only` (default) / `siblings-allowed` / `unrestricted`.
+A template carries:
+
+- **Name** — a stable identifier (e.g., `project_issue`).
+- **Match shape** — required tags + key/value patterns on incoming events.
+  Determines which template handles a given event during inbound routing.
+  Matches the routing-rule design in `architecture.md`: a set of required tags, a set of required keys, with each key's value being either a literal or a wildcard binding (`{p}`, `{f}`, ...).
+- **Forward mapping (key template)** — a path-shaped string with `{}`-named holes that are filled from the wildcard bindings, e.g., `projects/{p}/forks/{f}/issues/{n}`.
+  Holes can be entire path segments or sub-strings of segments (`projects/{p}/issues/{f}-{n}` is a valid template).
+- **Inverse mapping (key parser)** — derived from the key template.
+  Given a session key, produces the bindings (or fails if the key is not an instance).
+  Required so the framework can recover bindings from a key for ancestor computation, address validation, and policy checks.
+- **Parent template** (explicit, optional) — name of the template whose sessions are this template's parents.
+  When given, the framework validates that the parent's match shape is in fact a generalization of this template's match shape (subset of required tags; subset of required keys; wildcards in the parent for any keys this template binds to specific values).
+- **Heartbeat policy** — none / interval (see *Heartbeats*; deferred to its own push, see *Forward pointers*).
+- **Cross-tree-send policy** — `subtree-only` (default) / `siblings-allowed` / `unrestricted`.
 
 Templates are declared in `gateway.json` (or a sibling `routing.json`) alongside forges and projects.
 The same registry is consulted for both inbound routing and outbound `send_notification` validation.
 
+Two notational conveniences worth calling out:
+
+- A typed-shape string like `project:{p}/fork:{f}/issue:{n}` may be used inside a template definition as syntactic sugar that *derives* both the match shape and the key template.
+  When provided, the framework infers a match shape with key/wildcard pairs `project={p}, fork={f}, issue={n}`, plus a key template like `projects/{p}/forks/{f}/issues/{n}` (the pluralization rule is convention).
+  Tag segments in the typed form (e.g., the `dms` in `peer:{p}/dms/service:{s}`) are treated as required tags rather than key/value pairs.
+  This is purely a description-level shorthand; the underlying template still has explicit forward and inverse mappings, and authors who want full control can write them by hand instead of using the shorthand.
+- The session-key vocabulary (which segment names exist, how they pluralize) is *not* fixed in the framework.
+  It is whatever the agency's templates collectively define.
+
 ### The hierarchy of coordination sessions
 
-Three runtime roles for sessions, distinguished by the depth at which the template lands them:
+Three runtime roles for sessions, distinguished by which template they are an instance of:
 
-- **Noteable sessions** — leaves of the tree (`project:.../fork:.../issue:N` and `change-request:N`).
+- **Noteable sessions** — leaves of the tree (`projects/<p>/forks/<f>/issues/<n>` and `projects/<p>/forks/<f>/change-requests/<n>`).
   Their only job is to do their own work and report to their parent.
-- **Fork coordinator** — `project:.../fork:F`.
+- **Fork coordinator** — `projects/<p>/forks/<f>`.
   Owns the dependency graph for its fork: which issues are ready, which are blocked, which are in flight, which CRs close which issues.
   Single point of decision for "what should happen next *in this fork*".
-- **Project coordinator** — `project:P`.
+- **Project coordinator** — `projects/<p>`.
   Owns the cross-fork agenda: "the umbrella push", sync between forks, project-level priorities.
   Often the human's primary interaction point for setting direction.
 
@@ -110,7 +124,10 @@ The notification policy
 
 ### Send rule (default: ancestor/descendant only)
 
-An agent may only send a notification to a session that is an ancestor or descendant of the current session in the typed-key tree.
+An agent may only send a notification to a session that is an ancestor or descendant of the current session.
+Ancestry lives at the *template* level (each template declares its parent), and the template tree is projected onto the session-key space via each template's inverse mapping: a session S' is an ancestor of S iff S's template chains up to S''s template, and S''s key is what you get by re-rendering S''s template using the bindings extracted from S's key (restricted to the keys S' actually binds).
+The cleanest way to think about this is "ancestry of templates first, ancestry of sessions follows mechanically".
+
 So:
 
 - A noteable session may report up to its fork coordinator (and grandparent project coordinator), and may post to existing sibling noteables only if the template explicitly opts into `siblings-allowed`.
@@ -136,6 +153,7 @@ Three new agent-facing tools, modeled after the existing inbox tools:
 
 - `list_sessions(pattern: str = "./**", *, addressable: bool = False)` — lists existing sessions matching a glob-like pattern interpreted relative to the current session.
   `.` is the current session, `..` is its parent, `./**` is the current session and all its descendants, `../*` is the current session and its siblings, and so on.
+  Patterns are over clean session-key paths (e.g., `projects/foo/**`, `./forks/*`).
   Results are annotated with whether each session is *addressable* from the current session under the active policy; passing `addressable=True` filters out non-addressable results.
   This tool also surfaces templates whose target key would lie under the pattern (so the agent can see what new sessions could be created by sending to them); template results are similarly annotated/filtered by addressability.
 - `send_notification(target_or_template, content, *, bindings=None, metadata=None)` — posts a fresh notification.
@@ -159,8 +177,8 @@ A notification carries:
 The rendered prompt for a forwarded item shows the original source plus a compact trail, e.g.:
 
 > Originally from `gitlab-todos`.
-> Forwarded by `project:foo/fork:gitlab-master/change-request:47` ("MR 47 merged; closes #23").
-> Forwarded by `project:foo/fork:gitlab-master` ("rolling up to project for cross-fork review").
+> Forwarded by `projects/foo/forks/gitlab-master/change-requests/47` ("MR 47 merged; closes #23").
+> Forwarded by `projects/foo/forks/gitlab-master` ("rolling up to project for cross-fork review").
 
 For dispatch, the *current target* address is what matters for routing decisions; the trail is informational.
 RSVP-style return paths (today's dispatch redirect to original sender) follow the original source, not the trail.
@@ -171,9 +189,9 @@ Prompt conventions
 Tool affordances are not enough on their own; the agent needs to know its role.
 The system prompt for each session includes:
 
-- Its own session address (typed form).
-- Its parent address (if any).
-- A role statement keyed to the session's deepest typed segment.
+- Its own session address.
+- The name of the template it is an instance of, plus its parent address (if any).
+- A role statement keyed to the template.
   Noteable sessions are told "do not initiate work outside your scope; report changes upward".
   Coordinator sessions are told "you are the dispatcher for this scope; serialize incoming reports into outgoing dispatches".
 
@@ -211,7 +229,7 @@ The coordinator's `MEMORY.md` (under `~/projects/<p>/forks/<f>/` per the archite
 Memory layout
 -------------
 
-Falls out of the typed-key form:
+Memory layout mirrors the session-key paths directly:
 
 - `~/projects/<p>/MEMORY.md` for project-level state (the umbrella push, cross-fork concerns).
 - `~/projects/<p>/forks/<f>/MEMORY.md` for fork-level state (the dependency graph, in-flight work).
@@ -250,9 +268,9 @@ Trade-offs and risks
   If the agent ignores it, problem 2 can re-emerge.
   Mitigation: short, repeated, role-keyed prompt content; failure-mode review during dogfooding.
 - **Migration.**
-  Existing sessions on disk use the old key shape.
-  Acceptable to leave them on the legacy regime; new sessions adopt typed segments going forward.
-  We add a small adapter so the inbox tools work on both.
+  Existing sessions on disk already use a path-shaped key; no on-disk rewrite is needed.
+  What does change is the *interpretation* of those keys: a legacy session whose key matches a newly-declared template becomes an instance of that template, and inherits the template's parent, policy, etc. automatically.
+  A legacy session whose key matches no template stays unattached to the hierarchy — it can still receive notifications via its existing inbox, but is excluded from ancestor-based send/forward operations until a template covering it is declared.
 - **Multi-coordinator-per-agent.**
   A single agent will now host O(projects × forks) coordinator sessions in addition to the noteable ones.
   Today's per-agent scheduler should handle this fine; worth measuring with a multi-project agency to confirm.
@@ -263,10 +281,9 @@ Phasing
 A proposed sequence of independently reviewable phases.
 Each is later expanded into its own plan document.
 
-- **Phase 1 — Typed-segment keys + template registry.**
-  Replace hard-coded routing with declared templates.
-  Add a key parser that yields parent/ancestor/descendant relationships.
-  Backwards-compat for legacy keys.
+- **Phase 1 — Session template registry.**
+  Replace the hard-coded per-forge routing functions with declared templates that carry forward (event → key + bindings) and inverse (key → bindings) mappings, an explicit parent template (optional), and the basic policy fields.
+  Existing path-shaped keys keep their on-disk form; what they gain is template-based interpretation that yields parent/ancestor/descendant relationships.
   No agent-visible behavior change yet.
 - **Phase 2 — Cross-session send/forward tools with policy enforcement.**
   Build `list_sessions`, `send_notification`, `forward_notification`.
@@ -291,14 +308,14 @@ Ancestor-existence invariant
 Templates declare a `parent` template name; that declaration defines a tree of templates.
 At session-creation time, the runtime enforces the invariant that **if a session exists, then every ancestor session along its template chain also exists**.
 
-Concretely: when an inbound event causes the runtime to materialize a session for template T with bindings B, the runtime first ensures that the session for T's parent template (with B restricted to the parent template's parameters) exists, recursing up to a template with no parent.
+Concretely: when an inbound event causes the runtime to materialize a session for template T with bindings B, the runtime first ensures that the session for T's parent template (rendered from the subset of B that the parent template binds) exists, recursing up to a template with no parent.
 Each ancestor session is created with an empty inbox; it does not receive a notification of its own.
 This means the project coordinator and fork coordinator are always alive by the time a noteable session is created under them, ready to receive forwarded notifications without a special bootstrap step.
 
 This invariant resolves what would otherwise be a separate "how do we bootstrap the project coordinator?" question: there is no separate bootstrap step, because ancestor materialization is part of every session creation.
 
 The invariant assumes a strict tree of templates.
-A future cross-cutting coordinator (e.g., a `topic:authentication` session that should be a parent of issue sessions across multiple projects) would require generalizing to a DAG.
+A future cross-cutting coordinator (e.g., a `topics/authentication` session that should be a parent of issue sessions across multiple projects) would require generalizing to a DAG.
 That generalization is deferred: every concrete coordination role identified so far (project, fork, noteable, peer-DM) fits a tree, and the simplification is worth keeping until a real workload demands otherwise.
 
 Resolved decisions
@@ -306,8 +323,12 @@ Resolved decisions
 
 Decisions made during the design discussion that are now part of the spec above:
 
+- **Session keys use the clean human-readable form** (e.g., `projects/foo/forks/gitlab-master/issues/42`).
+  Typed `kind:value` notation is descriptive only, used inside template definitions to derive the forward and inverse mappings; it does not appear in keys themselves, on the wire, or on disk.
+- **Templates carry both forward and inverse mappings** as first-class fields.
+  This is what lets the framework recover bindings from a key and supports ancestor relationships without requiring keys to be self-describing.
 - **Issue and change-request as siblings under the fork.**
-  `issue:N` and `change-request:N` are both children of `project:.../fork:F`.
+  Both `projects/<p>/forks/<f>/issues/<n>` and `projects/<p>/forks/<f>/change-requests/<n>` are children of `projects/<p>/forks/<f>`.
   No PR-tracker level between fork and CR.
 - **Per-template cross-tree send policy.**
   Each template declares its own `subtree-only` / `siblings-allowed` / `unrestricted` policy at registration.
@@ -322,9 +343,44 @@ Decisions made during the design discussion that are now part of the spec above:
 Things still worth pinning down before Phase 1
 ----------------------------------------------
 
-- Whether the typed-segment vocabulary (`project`, `fork`, `issue`, `change-request`, `peer`, `dms`) is fixed in the framework or extensible by an agency's configuration.
-  Most likely answer: small fixed set in the framework, with templates referencing them by name; agency-defined kinds added later if a real need appears.
-- The exact on-disk file layout for declared templates and template parents (a separate `routing.json` vs. a section inside `gateway.json`).
+- The exact on-disk file layout for declared templates: a separate `routing.json` (or `templates.json`) vs. a section inside `gateway.json`, and whether YAML becomes warranted once we start carrying multi-line text (system prompts, etc.) on templates.
   This is a small concern but the answer affects Phase 1's data model and the shape of `_config.py` loading code.
-- A migration strategy for the small number of existing on-disk sessions on legacy keys: do we leave them on the legacy regime indefinitely, or write a one-shot `thorn migrate-sessions` command that rewrites them into typed form?
-  Provisional take: leave them; new sessions adopt typed segments; the legacy adapter is small.
+- The exact rendering rules used by the framework when an inbound event maps to a template via the typed-shape shorthand — in particular, the pluralization convention (e.g., `peer` → `peers/`) for derived key templates.
+  We could either (a) hard-code a small pluralization map, (b) require authors to spell out plurals when the default would be wrong, or (c) skip the shorthand entirely and always write match shape and key template explicitly.
+- The shape and validation of cross-template parent declarations: do we require `parent:` to be declared explicitly, or do we infer it from match-shape generality, and how does the framework report ambiguity when multiple templates could plausibly be the parent?
+  See the forward-pointer note on implicit ancestry below.
+
+Forward pointers
+----------------
+
+These are larger themes that arose during design discussion but are deliberately *not* part of the spec above.
+They are recorded here so they are not lost; each is likely to want its own design pass and its own push.
+
+- **Templates as the unit of role specialization (replacing `Agent` sub-classes).**
+  A session template is a natural place to attach not just routing/policy info but also the system-prompt content, skills, and tool sets that should apply to sessions of that kind.
+  In the limit, this would replace the current `Agent` sub-class mechanism: a single underlying agent "wears many hats" by virtue of which template a given session is an instance of, with neither user nor agent needing to think about class hierarchies.
+  This is a much bigger reframing than what this doc currently captures, and we should settle the smaller mechanics first before pulling it in.
+
+- **`AGENTS.md` (and related context) attached to each template.**
+  Once templates carry role-shaped content, the most natural place to put per-template system-prompt text is a directory in the agent's home that mirrors the template's key shape (with wildcards filled in by a fixed sentinel, e.g., `~/projects/_/forks/_/issues/_/AGENTS.md`).
+  An `AGENTS.md.jinja` variant could let the template's bindings appear in the rendered prompt (`{{project}}`, `{{fork}}`).
+  Skills, tools, and other per-role configuration could live in a sibling `.agents/` directory under the same path.
+  This depends on the templates-as-roles reframing above and should be designed jointly with it.
+
+- **Implicit parent inference from match-shape generality.**
+  A template whose match shape is a strict subset of another's (subset of required tags, subset of required keys, with the parent using wildcards or the same literal value for any keys the child binds) is a natural ancestor candidate.
+  The framework could infer the parent template automatically rather than requiring an explicit `parent:` declaration.
+  Open issues with the implicit approach: tie-breaking when multiple templates are equally-general; edge cases like a template with no required tags or keys claiming parenthood of everything; the risk that a small change to one template's match shape silently re-parents another.
+  Provisional preference: keep explicit `parent:` as the authoritative mechanism, but have the framework *validate* that the declared parent's match shape is in fact a generalization of the child's — and consider implicit inference later if explicit declarations turn out to be tedious in practice.
+
+- **Scheduled tasks (heartbeats are one case).**
+  The heartbeat machinery sketched in the *Heartbeats* section is really one specific case of a more general "scheduled tasks" feature: per-session and per-template lists of tasks, each carrying either a one-shot UTC timestamp or a `cron`-style recurrence, plus a prompt string that becomes the content of the resulting notification.
+  Scheduled tasks should be configurable as ordinary files in the agent-accessible memory hierarchy (e.g., `timers.yaml` under the relevant session-key path or template-shape path) so that the agent itself can add, remove, and edit them via ordinary file-write tools.
+  The runtime watches (or periodically scans) those files and fires notifications accordingly.
+  This is big enough that it deserves its own push.
+  When it lands, the heartbeat mechanism in this doc collapses into "a default scheduled task on coordinator templates".
+
+- **Template inheritance of configuration.**
+  If templates form a tree (or a DAG) and carry meaningful policy/configuration, it is natural for a child template to inherit configuration from its ancestors.
+  Whether template-inheritance and session-ancestry should align mechanically (a child template's session inherits from its parent template's *corresponding* session) or independently (a child template inherits configuration from its parent template, full stop) is a question worth working through.
+  Do not need to answer it for the initial phases.

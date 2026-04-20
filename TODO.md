@@ -55,6 +55,8 @@
 
 - A `thorn trace view` command that opens a local web page to visualize JSONL trace files (produced by `--trace`) as an interactive execution tree with timing
 
+- `JsonLinesSink` doesn't override `EventSink.on_advisory`, so advisories emitted by status providers fall through to the default implementation that delegates to `on_status`. As a result, `--trace` JSONL records advisories as plain `status` entries with the `[source] content` text spliced into the message, losing the structured `source`/`content` split. Override `on_advisory` on `JsonLinesSink` to emit a dedicated `advisory` event type with `source` and `content` as separate fields.
+
 - The LLM provider (`_provider.py`) does not set `max_tokens` on API requests, so a degenerate model response can produce unbounded output. The agent loop (`_loop.py`) also has no repetition detection. Together these allow a stuck LLM to spin forever repeating tokens. Short-term: add a configurable `max_tokens` to `OpenAIProvider.complete`. Longer-term: add repetition/loop detection in the agent loop itself.
 
 - Terminal output from `thorn run` can be truncated when the process completes, making it hard to diagnose issues from the log alone. Consider flushing/syncing output before exit, or writing a separate structured trace log.

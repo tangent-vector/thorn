@@ -21,6 +21,7 @@ from thorn.runtime._address import (
     ServiceAddress,
     SessionAddress,
 )
+from thorn.runtime._chat_router import ChatPromptRouter
 from thorn.runtime._cli_dispatcher import make_cli_prompt_dispatcher
 from thorn.runtime._dispatch import (
     DispatchError,
@@ -82,6 +83,7 @@ __all__ = [
     "AgentID",
     "AgentScheduler",
     "ArrivalKind",
+    "ChatPromptRouter",
     "DEFAULT_AGENT_CONCURRENCY",
     "DEFAULT_PROGRESS_STRIKES",
     "DispatchError",

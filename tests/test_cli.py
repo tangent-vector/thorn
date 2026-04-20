@@ -431,14 +431,15 @@ class TestRunEventBusWiring:
 
 
 class TestChat:
-    """``thorn chat`` REPL drives turns through ``session.prompt``.
+    """``thorn chat`` REPL drives turns through the in-process scheduler.
 
-    These tests exercise the REPL by feeding stdin via ``CliRunner``;
-    because the mock provider yields canned chunks synchronously and the
-    REPL exits cleanly on EOF, no real concurrency is in play.  The
-    chat command's blocking ``console.input`` call inside an ``async``
-    function is fine in this single-user model but is a known watch-item
-    once Phase 4 puts a scheduler under the REPL.
+    Phase 4 of the CLI/gateway unification routes each user input
+    through ``ChatPromptRouter`` + ``AgentScheduler`` (rather than
+    calling ``session.prompt`` directly).  These tests exercise the
+    REPL by feeding stdin via ``CliRunner``; because the mock provider
+    yields canned chunks synchronously and the REPL exits cleanly on
+    EOF, no real concurrency is in play, but the scheduler's drain
+    loop and per-turn save callback are exercised end-to-end.
     """
 
     def test_eof_exits_cleanly_with_no_input(
@@ -601,6 +602,59 @@ class TestChat:
         )
         assert result.exit_code == 0
         assert "Resuming session" in result.output
+
+    def test_session_inbox_dir_created_and_drained(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Phase 4 wiring: chat posts to a session inbox the scheduler drains.
+
+        The notification per turn must be removed by the router before
+        ``router.turn`` returns, so after the REPL exits the inbox
+        directory exists (created by ``SessionInbox.__init__``) but
+        contains no leftover notification files.  Catches a regression
+        in which the chat REPL silently bypasses the scheduler/router
+        path and goes back to calling ``session.prompt`` directly.
+        """
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="answer"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--no-tools", "--no-discover", "--no-mcp",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            input="please answer\n",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+        inbox_dir = (
+            tmp_path / ".thorn" / "agents" / "local"
+            / "sessions" / "default" / "inbox"
+        )
+        assert inbox_dir.is_dir(), (
+            "the SessionInbox constructor should have mkdir'd "
+            "the per-session inbox dir"
+        )
+        leftover_notifications = [
+            p for p in inbox_dir.iterdir()
+            if p.is_file() and p.suffix == ".json"
+        ]
+        assert leftover_notifications == [], (
+            "ChatPromptRouter must remove notifications after each "
+            "turn; otherwise the scheduler's progress guarantee "
+            "would eventually evict them"
+        )
 
     def test_skill_error_does_not_terminate_repl(
         self, tmp_path: Path, monkeypatch,

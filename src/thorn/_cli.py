@@ -44,6 +44,7 @@ from thorn.core.errors import SkillError, ThornError
 from thorn.runtime import (
     AgentID,
     AgentScheduler,
+    ChatPromptRouter,
     NotificationSpec,
     Runtime,
     SessionAddress,
@@ -498,6 +499,53 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
 # thorn chat
 # ---------------------------------------------------------------------------
 
+async def _chat_loop(
+    *,
+    router: ChatPromptRouter,
+    scheduler: AgentScheduler,
+    session: Session,
+    inbox: SessionInbox,
+) -> None:
+    """Read user input forever and route each turn through the scheduler.
+
+    Returns when the user signals end-of-input (``EOFError``) or when
+    a non-Thorn exception escapes ``router.turn`` and reaches the
+    caller's ``finally`` block.  ``SkillError`` and ``ThornError`` are
+    caught and printed so the REPL stays responsive.
+
+    ``console.input`` is a blocking call; we run it on the default
+    executor so the scheduler's drain task and any background event
+    listeners get loop time while the user is typing.  Without this,
+    the scheduler could not even dispatch the round we just submitted
+    until the user hit return for the *next* turn, and the chat REPL
+    would no longer be a useful test bed for the scheduler-driven
+    pipeline Phase 4 is putting in place.
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            user_input = await loop.run_in_executor(
+                None, lambda: console.input("[green]you>[/green] "),
+            )
+        except EOFError:
+            return
+        if not user_input.strip():
+            continue
+
+        try:
+            await router.turn(
+                scheduler=scheduler,
+                session=session,
+                inbox=inbox,
+                prompt_text=user_input,
+            )
+        except SkillError as exc:
+            console.print(f"\n[red]Agent error:[/red] {exc.detail}")
+        except ThornError as exc:
+            console.print(f"\n[red]Error:[/red] {exc}")
+        console.print()
+
+
 @main.command()
 @click.option(
     "--no-tools",
@@ -536,21 +584,30 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
     console.print("[bold]thorn[/bold] interactive chat  (Ctrl+C to exit)\n")
 
     async def _chat() -> None:
-        # The hand-rolled provider+tool-dispatch loop that used to live
-        # here predated `session.prompt`/`run_agent_loop` gaining feature
-        # parity with what chat needed (compaction, housekeeping, retry,
-        # advisory nodes, scope-enter/exit events).  It also drifted out
-        # of sync with the `_execute_tool_calls` and `HistoryTree`
-        # contracts and was effectively broken.  Phase 1 of the
-        # CLI/gateway unification plan collapses chat down to repeated
-        # `session.prompt(...)` calls so it benefits from every
-        # improvement to the shared agent loop automatically.  Phase 4
-        # will route this through the in-process scheduler instead of
-        # calling `session.prompt` directly.
+        # Phase 4 of the CLI/gateway unification: route the chat REPL
+        # through the in-process ``AgentScheduler`` rather than calling
+        # ``session.prompt`` directly.  Each user input is posted as a
+        # notification on the session's inbox; the scheduler invokes
+        # ``ChatPromptRouter.dispatcher`` which calls ``session.prompt``
+        # and resolves a per-turn future the REPL awaits.  The scheduler
+        # also runs ``save_session`` after every successful round, so
+        # the per-turn ``runtime.save_session`` call from Phase 1 is
+        # gone.
+        #
+        # Phase 1's hand-rolled provider/tool-dispatch loop collapsed to
+        # repeated ``session.prompt`` calls; Phase 4 moves the *driver*
+        # of those calls into the scheduler so chat, ``thorn run``, and
+        # the gateway daemon all share one execution pipeline.  The
+        # local agency / per-invocation session-key work is left for
+        # Phase 5.
         from thorn.runtime._lock import SessionLockError, session_lock
 
         async with runtime:
             agent = _ensure_cli_agent(runtime)
+            if agent.id is None:
+                raise RuntimeError(
+                    "CLI agent has no id; cannot build a session inbox"
+                )
 
             session_key = CLI_SESSION_KEY
             session_dir = runtime.sessions._session_dir(agent.id, session_key)
@@ -585,21 +642,19 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
                         f"{len(session._history.nodes)} history entries.[/dim]\n"
                     )
 
-                # Phase 3: subscribe a per-session console listener
-                # to the runtime's event bus.  Today the chat REPL is
-                # the only producer of events on this runtime so the
-                # filter is a no-op, but it's the same shape Phase 4
-                # will need once chat goes through the scheduler and
-                # background sessions can run concurrently.
+                # Subscribe a per-session console listener (Phase 3
+                # bus pattern); the filter scopes output to events
+                # tagged with this session key, so any background
+                # session that lands later under a shared local-agency
+                # runtime won't bleed into the REPL output.
                 bus = _runtime_event_bus(runtime)
                 console_listener: EventSink = ConsoleEventSink(
                     verbosity=verbosity,
                 )
-                subscription = bus.subscribe(
+                with bus.subscribe(
                     console_listener,
                     scope_filter=in_session(session_key),
-                )
-                try:
+                ):
                     async with AsyncExitStack() as stack:
                         tools = await _collect_all_tools(
                             stack,
@@ -608,38 +663,66 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
                             no_mcp=no_mcp,
                         )
 
-                        while True:
-                            try:
-                                user_input = console.input(
-                                    "[green]you>[/green] ",
-                                )
-                            except EOFError:
-                                break
-                            if not user_input.strip():
-                                continue
+                        # Per-session inbox + scheduler wiring.  The
+                        # inbox lives under the agent's data root so a
+                        # crash leaves the in-flight notification on
+                        # disk for the startup sweep to reconcile -- a
+                        # property that becomes load-bearing once Phase
+                        # 5 introduces the local-agency daemon.
+                        session_address = SessionAddress(
+                            agent.id, session_key,
+                        )
+                        inbox = SessionInbox(
+                            runtime.paths.session_inbox_dir(
+                                agent.id, session_key,
+                            ),
+                            session_address,
+                            in_flight_index=runtime.in_flight_index,
+                        )
+                        runtime.address_book.register(
+                            session_address, inbox,
+                        )
 
-                            try:
-                                await session.prompt(
-                                    user_input,
-                                    tools=tools,
-                                    system=CHAT_SYSTEM_PROMPT,
-                                )
-                            except SkillError as exc:
-                                console.print(
-                                    f"\n[red]Agent error:[/red] {exc.detail}"
-                                )
-                            except ThornError as exc:
-                                console.print(f"\n[red]Error:[/red] {exc}")
+                        router = ChatPromptRouter(
+                            target=session_address,
+                            extra_tools=tools,
+                            extra_system=CHAT_SYSTEM_PROMPT,
+                        )
 
-                            # Persist after every turn so a crash mid-
-                            # session doesn't lose progress.  History was
-                            # mutated in place by `session.prompt` even
-                            # if it raised, so saving on the error path
-                            # is intentional.
-                            runtime.save_session(session)
-                            console.print()
-                finally:
-                    subscription.unsubscribe()
+                        async def _save_session_async(
+                            sess: Session,
+                        ) -> None:
+                            """Async adapter around the sync save.
+
+                            Mirrors the gateway's pattern (named so
+                            scheduler exception logs point at a real
+                            qualified name).  The save is small;
+                            running it on the loop thread is fine
+                            because the scheduler already serialises
+                            per-session, so there is no contention to
+                            offload.
+                            """
+                            runtime.save_session(sess)
+
+                        scheduler = AgentScheduler(
+                            agent=agent,
+                            prompt_dispatcher=router.dispatcher,
+                            save_session=_save_session_async,
+                        )
+
+                        try:
+                            await _chat_loop(
+                                router=router,
+                                scheduler=scheduler,
+                                session=session,
+                                inbox=inbox,
+                            )
+                        finally:
+                            # Bounded grace period mirrors ``thorn
+                            # run``: in the success case the driver is
+                            # parked on its idle wait, so shutdown is
+                            # essentially instantaneous.
+                            await scheduler.shutdown(timeout=5.0)
             finally:
                 lock_ctx.__exit__(None, None, None)
 
