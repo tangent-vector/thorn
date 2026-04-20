@@ -23,9 +23,14 @@ from thorn.core._provider import (
     ToolCallChunk,
     _iter_sse_chunks,
     _message_to_openai,
+    _parse_retry_after,
     load_provider_from_env,
 )
-from thorn.core.errors import ProviderError
+from thorn.core.errors import (
+    ProviderError,
+    RateLimitError,
+    TransientProviderError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -315,15 +320,242 @@ class TestOpenAIProviderMaxTokens:
 
 
 class _FakeHttpResponse:
-    """Minimal stand-in for httpx.Response with status_code and aiter_lines."""
+    """Minimal stand-in for httpx.Response with status_code and aiter_lines.
 
-    def __init__(self, status_code: int, lines: list[str]) -> None:
+    Supports two failure modes for exercising the provider's error
+    handling: a non-200 ``status_code`` (with an optional response
+    ``text`` and ``headers`` mapping for ``Retry-After`` tests),
+    and a mid-stream ``raise_in_stream`` exception that is raised
+    after yielding any preamble lines.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        lines: list[str],
+        *,
+        text: str = "",
+        headers: dict[str, str] | None = None,
+        raise_in_stream: BaseException | None = None,
+    ) -> None:
         self.status_code = status_code
         self._lines = lines
+        self.text = text
+        self.headers = headers or {}
+        self._raise_in_stream = raise_in_stream
 
     async def aiter_lines(self):
         for line in self._lines:
             yield line
+        if self._raise_in_stream is not None:
+            raise self._raise_in_stream
 
     async def aread(self) -> None:
         pass
+
+
+# ---------------------------------------------------------------------------
+# _parse_retry_after
+# ---------------------------------------------------------------------------
+
+class TestParseRetryAfter:
+    """``Retry-After`` header parsing accepts seconds and HTTP-dates."""
+
+    def test_none_and_empty_return_none(self):
+        assert _parse_retry_after(None) is None
+        assert _parse_retry_after("") is None
+        assert _parse_retry_after("   ") is None
+
+    def test_integer_seconds(self):
+        assert _parse_retry_after("30") == 30.0
+
+    def test_float_seconds(self):
+        # RFC technically requires integer seconds, but real-world
+        # servers occasionally return fractional values.  Accept
+        # them rather than misclassify as "unparseable" and fall
+        # back to no hint.
+        assert _parse_retry_after("2.5") == 2.5
+
+    def test_negative_seconds_clamp_to_zero(self):
+        # A negative "seconds" value is not spec-legal, but a bug
+        # in the server should not translate to a negative sleep
+        # that fires immediately with complaint; clamp to 0.
+        assert _parse_retry_after("-5") == 0.0
+
+    def test_http_date_future(self):
+        from email.utils import format_datetime
+        from datetime import datetime, timedelta, timezone
+
+        future = datetime.now(tz=timezone.utc) + timedelta(seconds=45)
+        header = format_datetime(future, usegmt=True)
+        parsed = _parse_retry_after(header)
+        # Allow slack for the clock read between format and parse.
+        assert parsed is not None
+        assert 40.0 <= parsed <= 50.0
+
+    def test_http_date_in_past_clamps_to_zero(self):
+        # Past HTTP-date: behavior of a server that happened to
+        # pick a date whose value has already elapsed.  Zero means
+        # "retry now"; we do not want to return a negative sleep.
+        from email.utils import format_datetime
+        from datetime import datetime, timedelta, timezone
+
+        past = datetime.now(tz=timezone.utc) - timedelta(seconds=30)
+        header = format_datetime(past, usegmt=True)
+        assert _parse_retry_after(header) == 0.0
+
+    def test_garbage_returns_none(self):
+        # Unrecognised value: the caller treats None as "no hint"
+        # and falls back to its own backoff, which is safer than
+        # crashing the session.
+        assert _parse_retry_after("not a date") is None
+
+
+# ---------------------------------------------------------------------------
+# OpenAIProvider error mapping
+# ---------------------------------------------------------------------------
+
+def _mock_streaming_provider(
+    response: "_FakeHttpResponse | None" = None,
+    *,
+    raise_on_stream: BaseException | None = None,
+) -> OpenAIProvider:
+    """Build an ``OpenAIProvider`` whose ``_client.stream`` is stubbed.
+
+    Either yields a fixed ``_FakeHttpResponse`` or raises the given
+    exception from the ``stream()`` context manager itself (used
+    for pre-stream transport errors like ``ConnectError``).
+    """
+    from contextlib import asynccontextmanager
+
+    config = OpenAIProviderConfig(
+        api_url="http://localhost:1234",
+        api_key="test",
+        model_name="test-model",
+    )
+    provider = OpenAIProvider(config)
+
+    @asynccontextmanager
+    async def stub_stream(method, url, *, json=None, **kwargs):
+        if raise_on_stream is not None:
+            raise raise_on_stream
+        yield response
+
+    provider._client.stream = stub_stream  # type: ignore[assignment]
+    return provider
+
+
+class TestOpenAIProviderErrorMapping:
+    async def test_remote_protocol_error_mid_stream_becomes_transient(self):
+        """A ``RemoteProtocolError`` raised while reading the SSE stream
+        must surface as :class:`TransientProviderError` so the agent-loop
+        retry logic can absorb it instead of letting a raw ``httpx``
+        exception escape into the scheduler.
+        """
+        import httpx
+
+        response = _FakeHttpResponse(
+            200,
+            [
+                'data: {"choices":[{"delta":{"content":"partial"},'
+                '"finish_reason":null}]}',
+            ],
+            raise_in_stream=httpx.RemoteProtocolError("server disconnected"),
+        )
+        provider = _mock_streaming_provider(response)
+        with pytest.raises(TransientProviderError, match="transport error"):
+            async for _ in provider.complete(
+                ["sys"], [], [UserMessage(content="hi")],
+            ):
+                pass
+
+    async def test_connect_error_becomes_transient(self):
+        import httpx
+
+        provider = _mock_streaming_provider(
+            raise_on_stream=httpx.ConnectError("refused"),
+        )
+        with pytest.raises(TransientProviderError, match="transport error"):
+            async for _ in provider.complete(
+                ["sys"], [], [UserMessage(content="hi")],
+            ):
+                pass
+
+    async def test_timeout_becomes_transient(self):
+        import httpx
+
+        provider = _mock_streaming_provider(
+            raise_on_stream=httpx.ReadTimeout("timeout"),
+        )
+        with pytest.raises(TransientProviderError, match="transport error"):
+            async for _ in provider.complete(
+                ["sys"], [], [UserMessage(content="hi")],
+            ):
+                pass
+
+    async def test_429_becomes_rate_limit_with_retry_after(self):
+        response = _FakeHttpResponse(
+            429, [], text="slow down", headers={"retry-after": "12"},
+        )
+        provider = _mock_streaming_provider(response)
+        with pytest.raises(RateLimitError) as exc_info:
+            async for _ in provider.complete(
+                ["sys"], [], [UserMessage(content="hi")],
+            ):
+                pass
+        assert exc_info.value.retry_after == 12.0
+
+    async def test_429_without_header_has_no_retry_after(self):
+        response = _FakeHttpResponse(429, [], text="no hint", headers={})
+        provider = _mock_streaming_provider(response)
+        with pytest.raises(RateLimitError) as exc_info:
+            async for _ in provider.complete(
+                ["sys"], [], [UserMessage(content="hi")],
+            ):
+                pass
+        assert exc_info.value.retry_after is None
+
+    @pytest.mark.parametrize("status", [502, 503, 504])
+    async def test_5xx_becomes_transient(self, status: int):
+        """502/503/504 are modeled as transport-ish transient errors
+        and routed to the retry budget, not the agent-failure budget.
+        """
+        response = _FakeHttpResponse(
+            status, [], text="overloaded",
+            headers={"retry-after": "5"} if status == 503 else {},
+        )
+        provider = _mock_streaming_provider(response)
+        with pytest.raises(TransientProviderError) as exc_info:
+            async for _ in provider.complete(
+                ["sys"], [], [UserMessage(content="hi")],
+            ):
+                pass
+        if status == 503:
+            assert exc_info.value.retry_after == 5.0
+        else:
+            assert exc_info.value.retry_after is None
+
+    async def test_500_is_not_transient(self):
+        # 500 is *deliberately* excluded from the transient set:
+        # a generic internal error is usually a server bug rather
+        # than an overload condition, so we fail faster via the
+        # regular :class:`ProviderError` path.
+        response = _FakeHttpResponse(500, [], text="kaboom")
+        provider = _mock_streaming_provider(response)
+        with pytest.raises(ProviderError) as exc_info:
+            async for _ in provider.complete(
+                ["sys"], [], [UserMessage(content="hi")],
+            ):
+                pass
+        assert not isinstance(exc_info.value, TransientProviderError)
+
+    async def test_400_is_not_transient(self):
+        response = _FakeHttpResponse(400, [], text="bad request")
+        provider = _mock_streaming_provider(response)
+        with pytest.raises(ProviderError) as exc_info:
+            async for _ in provider.complete(
+                ["sys"], [], [UserMessage(content="hi")],
+            ):
+                pass
+        assert not isinstance(exc_info.value, TransientProviderError)
+        assert not isinstance(exc_info.value, RateLimitError)

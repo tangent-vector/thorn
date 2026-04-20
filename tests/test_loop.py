@@ -8,9 +8,26 @@ from thorn.core._context import ExecutionContext, StatusProvider, scoped_status_
 from thorn.core._func import wrap_function
 from thorn.core._history import AdvisoryNode, CollapseState, HistoryTree, TurnNode
 from thorn.core._loop import _WrappedTool, _normalize_tool_name, _tool_name, run_agent_loop
-from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
+from thorn.core._provider import (
+    FinishChunk,
+    LLMProvider,
+    MockProvider,
+    ResponseChunk,
+    TextChunk,
+    ToolCallChunk,
+    UsageChunk,
+)
+from thorn.core._retry import RetryPolicy
 from thorn.core._validation_tracker import ValidationTracker
-from thorn.core.errors import LoopLimitError, SkillError
+from thorn.core.errors import (
+    AgentFailureError,
+    LoopLimitError,
+    ProviderError,
+    ProviderUnavailableError,
+    RateLimitError,
+    SkillError,
+    TransientProviderError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -891,3 +908,212 @@ def _make_tool_call_node(call_id: str, name: str, result_content: str):
     tc = ToolCall(call_id=call_id, name=name, arguments="{}")
     result = ToolResultMessage(call_id=call_id, content=result_content)
     return ToolCallNode(tc, result)
+
+
+# ---------------------------------------------------------------------------
+# Provider retry behaviour
+# ---------------------------------------------------------------------------
+
+class _FlakyProvider(LLMProvider):
+    """Provider that raises a scripted sequence of exceptions, then succeeds.
+
+    Each entry in ``errors`` is raised on the corresponding call to
+    :meth:`complete`; once the list is exhausted the provider
+    behaves like :class:`MockProvider` and returns
+    ``success_chunks`` (a canned sequence of response chunks).
+    Used to exercise the retry loop without pulling in real
+    ``httpx`` machinery.
+    """
+
+    def __init__(
+        self,
+        errors: list[BaseException],
+        *,
+        success_chunks: list[ResponseChunk] | None = None,
+    ) -> None:
+        self._errors = list(errors)
+        self._success_chunks = success_chunks or [
+            TextChunk(text="ok"),
+            UsageChunk(
+                prompt_tokens=0, completion_tokens=0, total_tokens=0,
+            ),
+            FinishChunk(reason="stop"),
+        ]
+        self.call_count = 0
+
+    async def complete(self, system_prompts, tools, messages):
+        self.call_count += 1
+        if self._errors:
+            exc = self._errors.pop(0)
+            # ``AsyncGenerator`` bodies must contain at least one
+            # ``yield`` for Python to treat them as generators; an
+            # unconditional ``raise`` before the yield still makes
+            # this a valid async generator because the ``yield``
+            # below is unreachable but statically present.
+            raise exc
+            yield  # pragma: no cover -- see above
+        for chunk in self._success_chunks:
+            yield chunk
+
+
+@pytest.fixture
+def fast_retry_policy(monkeypatch):
+    """Patch the module-level retry policy to wait essentially no time.
+
+    Tests that exercise retry counting do not care about the real
+    sleep durations; a policy with ``base`` and ``cap`` of a few
+    milliseconds keeps the suite fast while still going through
+    the real backoff code path.
+    """
+    import thorn.core._loop as loop_mod
+
+    fast = RetryPolicy(
+        base=0.001,
+        cap=0.005,
+        max_rate_limit_retries=3,
+        max_transient_retries=3,
+        retry_after_jitter=0.0,
+    )
+    monkeypatch.setattr(loop_mod, "_DEFAULT_RETRY_POLICY", fast)
+    return fast
+
+
+class TestTransientRetry:
+    """``TransientProviderError`` should be absorbed by the call-site
+    retry loop up to the policy's transient budget, and only surface
+    as :class:`ProviderUnavailableError` on exhaustion."""
+
+    async def test_transient_then_success(self, fast_retry_policy):
+        provider = _FlakyProvider(
+            errors=[
+                TransientProviderError("disconnect 1"),
+                TransientProviderError("disconnect 2"),
+            ],
+        )
+        ctx = ExecutionContext(provider=provider)
+        result = await run_agent_loop(
+            context=ctx, user_prompt="hi", tools=[],
+        )
+        assert result == "ok"
+        assert provider.call_count == 3
+
+    async def test_transient_exhausted_raises_unavailable(
+        self, fast_retry_policy,
+    ):
+        # One more error than the transient budget: exhausts the
+        # inner retry and surfaces as ``ProviderUnavailableError``,
+        # NOT as ``AgentFailureError`` (which is reserved for
+        # non-transient failures).
+        budget = fast_retry_policy.max_transient_retries
+        errors = [
+            TransientProviderError(f"blip {i}")
+            for i in range(budget + 1)
+        ]
+        provider = _FlakyProvider(errors=errors)
+        ctx = ExecutionContext(provider=provider)
+        with pytest.raises(ProviderUnavailableError) as exc_info:
+            await run_agent_loop(
+                context=ctx, user_prompt="hi", tools=[],
+            )
+        assert exc_info.value.attempts == budget + 1
+        assert provider.call_count == budget + 1
+
+
+class TestRateLimitRetry:
+    async def test_rate_limit_then_success(self, fast_retry_policy):
+        provider = _FlakyProvider(
+            errors=[RateLimitError("slow down")],
+        )
+        ctx = ExecutionContext(provider=provider)
+        result = await run_agent_loop(
+            context=ctx, user_prompt="hi", tools=[],
+        )
+        assert result == "ok"
+        assert provider.call_count == 2
+
+    async def test_rate_limit_exhausted_raises_unavailable(
+        self, fast_retry_policy,
+    ):
+        budget = fast_retry_policy.max_rate_limit_retries
+        errors = [
+            RateLimitError(f"slow {i}") for i in range(budget + 1)
+        ]
+        provider = _FlakyProvider(errors=errors)
+        ctx = ExecutionContext(provider=provider)
+        with pytest.raises(ProviderUnavailableError):
+            await run_agent_loop(
+                context=ctx, user_prompt="hi", tools=[],
+            )
+
+    async def test_retry_after_is_honoured(self, monkeypatch):
+        # A long ``Retry-After`` value must flow into the sleep
+        # call as a floor.  We swap ``asyncio.sleep`` out for a
+        # recorder so the test does not actually wait that long.
+        import thorn.core._loop as loop_mod
+
+        fast = RetryPolicy(
+            base=0.001, cap=0.005,
+            max_rate_limit_retries=3, max_transient_retries=3,
+            retry_after_jitter=0.0,
+        )
+        monkeypatch.setattr(loop_mod, "_DEFAULT_RETRY_POLICY", fast)
+
+        sleeps: list[float] = []
+
+        async def _record_sleep(delay):
+            sleeps.append(delay)
+
+        monkeypatch.setattr(loop_mod.asyncio, "sleep", _record_sleep)
+
+        provider = _FlakyProvider(
+            errors=[RateLimitError("slow", retry_after=7.5)],
+        )
+        ctx = ExecutionContext(provider=provider)
+        result = await run_agent_loop(
+            context=ctx, user_prompt="hi", tools=[],
+        )
+        assert result == "ok"
+        # Exactly one backoff sleep (for the single rate-limit
+        # retry) and it must be >= retry_after.
+        assert len(sleeps) == 1
+        assert sleeps[0] >= 7.5
+
+
+class TestNonTransientProviderError:
+    """Raw :class:`ProviderError` (neither transient nor rate-limit)
+    keeps the old behavior: counted against ``max_failures`` and
+    raising :class:`AgentFailureError` on exhaustion.  This is the
+    path for things like HTTP 400 "bad request" that will not clear
+    by waiting."""
+
+    async def test_provider_error_exhausted_raises_agent_failure(
+        self, fast_retry_policy,
+    ):
+        provider = _FlakyProvider(
+            errors=[
+                ProviderError(f"hard fail {i}") for i in range(6)
+            ],
+        )
+        ctx = ExecutionContext(provider=provider)
+        with pytest.raises(AgentFailureError) as exc_info:
+            await run_agent_loop(
+                context=ctx, user_prompt="hi", tools=[],
+                max_failures=5,
+            )
+        assert exc_info.value.failures == 5
+
+    async def test_provider_error_then_success_resets_budget(
+        self, fast_retry_policy,
+    ):
+        # Four transient hard failures (below the default
+        # max_failures=5) then success: the loop should recover
+        # and return a result without raising.
+        provider = _FlakyProvider(
+            errors=[ProviderError(f"fail {i}") for i in range(4)],
+        )
+        ctx = ExecutionContext(provider=provider)
+        result = await run_agent_loop(
+            context=ctx, user_prompt="hi", tools=[],
+        )
+        assert result == "ok"
+        assert provider.call_count == 5

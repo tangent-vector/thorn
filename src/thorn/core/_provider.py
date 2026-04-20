@@ -7,12 +7,14 @@ to the agent loop in ``_loop.py``.
 
 from __future__ import annotations
 
+import email.utils
 import json
 import logging
 import os
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -24,7 +26,11 @@ from thorn.core._messages import (
     ToolResultMessage,
     UserMessage,
 )
-from thorn.core.errors import ProviderError, RateLimitError
+from thorn.core.errors import (
+    ProviderError,
+    RateLimitError,
+    TransientProviderError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +259,19 @@ class OpenAIProvider(LLMProvider):
                 if response.status_code == 429:
                     await response.aread()
                     raise RateLimitError(
-                        f"rate limited (HTTP 429): {response.text}"
+                        f"rate limited (HTTP 429): {response.text}",
+                        retry_after=_parse_retry_after(
+                            response.headers.get("retry-after"),
+                        ),
+                    )
+                if response.status_code in _TRANSIENT_HTTP_STATUSES:
+                    await response.aread()
+                    raise TransientProviderError(
+                        f"provider returned transient HTTP "
+                        f"{response.status_code}: {response.text}",
+                        retry_after=_parse_retry_after(
+                            response.headers.get("retry-after"),
+                        ),
                     )
                 if response.status_code != 200:
                     await response.aread()
@@ -262,11 +280,82 @@ class OpenAIProvider(LLMProvider):
                         f"{response.text}"
                     )
 
+                # Stream parsing lives inside the ``try`` so that
+                # transport-level failures that surface mid-stream
+                # (notably ``httpx.RemoteProtocolError`` when the
+                # server closes the SSE connection early) are
+                # converted to a typed transient error the agent
+                # loop can retry, rather than propagating as a raw
+                # httpx exception that nothing above knows how to
+                # categorize.
                 async for chunk in _iter_sse_chunks(response):
                     yield chunk
 
-        except (httpx.ConnectError, httpx.TimeoutException) as exc:
-            raise ProviderError(f"connection error: {exc}") from exc
+        except httpx.TransportError as exc:
+            # ``TransportError`` is the ``httpx`` superclass for
+            # connection errors, timeouts, network errors, and
+            # protocol errors (including ``RemoteProtocolError``).
+            # Wrapping the whole family as transient matches
+            # industry practice for REST clients -- the caller
+            # will decide whether to retry based on its policy.
+            raise TransientProviderError(
+                f"transport error talking to provider: {exc}",
+            ) from exc
+
+
+# HTTP status codes that almost always represent a transient
+# server-side condition worth retrying at the call site.  500 is
+# deliberately excluded: a generic "internal server error" is
+# often a server-side bug that will not clear on its own, and we
+# would rather surface it quickly through the non-transient
+# ``ProviderError`` path than spend a big retry budget on it.  The
+# four listed here are the ones spec'd (502/504) or widely
+# implemented (503) as transient gateway/overload conditions.
+_TRANSIENT_HTTP_STATUSES = frozenset({502, 503, 504})
+
+
+def _parse_retry_after(header: str | None) -> float | None:
+    """Parse an HTTP ``Retry-After`` header value into seconds.
+
+    The RFC allows two formats:
+
+    - A non-negative integer expressing a delay in seconds, e.g.
+      ``Retry-After: 30``.
+    - An HTTP-date, e.g. ``Retry-After: Wed, 21 Oct 2015 07:28:00 GMT``,
+      interpreted as the absolute time at which the client may
+      retry.  We convert the latter to a delay by subtracting the
+      current time; negative results clamp to 0.
+
+    Returns ``None`` when the header is absent, empty, or
+    unparseable -- callers treat that as "no explicit guidance"
+    and fall back to their usual backoff.
+    """
+    if header is None:
+        return None
+    raw = header.strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        pass
+    else:
+        return max(0.0, seconds)
+    # ``parsedate_to_datetime`` raises ``ValueError`` (and, on some
+    # Python versions, ``TypeError``) for unparseable inputs rather
+    # than returning ``None``.  Swallow those to fall through to
+    # the "no explicit guidance" path.
+    try:
+        parsed = email.utils.parsedate_to_datetime(raw)
+    except (ValueError, TypeError):
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    now = datetime.now(tz=timezone.utc)
+    delta = (parsed - now).total_seconds()
+    return max(0.0, delta)
 
 
 async def _iter_sse_chunks(

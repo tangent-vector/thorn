@@ -84,6 +84,18 @@ oldest item eventually.  A :class:`SessionSaver` exception is
 similarly logged and the loop continues; the scheduler does not
 treat persistence failures as prompt failures.
 
+:class:`~thorn.core.errors.ProviderUnavailableError` is treated
+specially: it signals that the LLM provider is unreachable /
+unresponsive, which is not attributable to any particular session
+or agent.  The driver does *not* increment its forward-progress
+strike counter on this exception, so a provider outage cannot
+cause notifications to be evicted-as-errored.  The driver
+additionally sleeps for
+:data:`DEFAULT_PROVIDER_UNAVAILABLE_BACKOFF` (plus jitter) before
+looping back, releasing the agent-level concurrency slot for the
+duration of the wait so a dead provider cannot starve other
+schedulers sharing the same cap.
+
 Shutdown
 --------
 
@@ -103,8 +115,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import random
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from thorn.core.errors import ProviderUnavailableError
 from thorn.runtime._dispatch import DispatchError, apply_handling_transition
 from thorn.runtime._inbox import SessionInbox
 from thorn.runtime._notification import NotificationStatus
@@ -185,6 +200,60 @@ scheduler will then loop indefinitely on stuck sessions, which is
 sometimes useful for tests and for integrations that want to supply
 their own progress policy out of band.
 """
+
+
+DEFAULT_PROVIDER_UNAVAILABLE_BACKOFF = 30.0
+"""Baseline post-round sleep when a round exits with a provider outage.
+
+When the dispatcher exits with :class:`ProviderUnavailableError`,
+the driver sleeps this many seconds (plus a uniform jitter of up
+to :data:`DEFAULT_PROVIDER_UNAVAILABLE_BACKOFF_JITTER`) before
+looping back to the top and trying again.
+
+Kept above the inner retry cap so that a session that has already
+spent its per-call transient/rate-limit budget does not immediately
+re-enter the same retry spiral.  Configurable via the
+``THORN_PROVIDER_UNAVAILABLE_BACKOFF`` env var for operators who
+need to tune the post-outage cooldown.
+"""
+
+
+DEFAULT_PROVIDER_UNAVAILABLE_BACKOFF_JITTER = 15.0
+"""Random jitter (seconds) added on top of the provider-outage backoff.
+
+Exists for the usual thundering-herd reason: when a provider
+recovers, we do not want every stalled session on the gateway to
+come back in lockstep and immediately knock it over again.
+Configurable via ``THORN_PROVIDER_UNAVAILABLE_BACKOFF_JITTER``.
+"""
+
+
+def _provider_unavailable_backoff() -> float:
+    """Return the post-outage backoff delay for the current process.
+
+    Reads ``THORN_PROVIDER_UNAVAILABLE_BACKOFF`` and
+    ``THORN_PROVIDER_UNAVAILABLE_BACKOFF_JITTER`` at call time so
+    tests can monkeypatch the environment per-case without
+    restarting the interpreter.  The result is
+    ``base + uniform(0, jitter)``, clamped to a non-negative
+    value.
+    """
+    base_raw = os.environ.get("THORN_PROVIDER_UNAVAILABLE_BACKOFF")
+    jitter_raw = os.environ.get("THORN_PROVIDER_UNAVAILABLE_BACKOFF_JITTER")
+    try:
+        base = float(base_raw) if base_raw else DEFAULT_PROVIDER_UNAVAILABLE_BACKOFF
+    except ValueError:
+        base = DEFAULT_PROVIDER_UNAVAILABLE_BACKOFF
+    try:
+        jitter = (
+            float(jitter_raw) if jitter_raw
+            else DEFAULT_PROVIDER_UNAVAILABLE_BACKOFF_JITTER
+        )
+    except ValueError:
+        jitter = DEFAULT_PROVIDER_UNAVAILABLE_BACKOFF_JITTER
+    base = max(0.0, base)
+    jitter = max(0.0, jitter)
+    return base + random.uniform(0, jitter)
 
 
 # ---------------------------------------------------------------------------
@@ -503,20 +572,41 @@ class _SessionDriver:
         set.  Additions to the inbox during the round do not count as
         progress -- only closures do -- because the guarantee is
         specifically about the session's ability to clear the items
-        it was already shown.  A dispatcher that raises is treated as
-        making no progress.
+        it was already shown.  A dispatcher that raises an "ordinary"
+        exception (anything other than
+        :class:`ProviderUnavailableError`) is treated as making no
+        progress; a dispatcher that raises
+        :class:`ProviderUnavailableError` is *not* treated as a
+        strike against the session, because the failure is not
+        attributable to the session's content or behavior.
         """
+        dispatcher_raised = False
+        provider_unavailable = False
         async with self._semaphore:
             before_ids = frozenset(
                 item.id for item in self._inbox.prompt_pending()
             )
-            dispatcher_raised = False
             try:
                 await self._dispatcher(self._session, self._inbox)
             except asyncio.CancelledError:
                 # Shutdown tore through the dispatcher.  Propagate
                 # so the drain task ends.
                 raise
+            except ProviderUnavailableError as exc:
+                # The LLM provider was unreachable for the whole
+                # inner retry budget.  Do not blame the session:
+                # leave the strike counter alone, skip save_session
+                # (no new session state was produced), and arrange
+                # to back off after releasing the semaphore.
+                log.warning(
+                    "Prompt dispatcher reported provider unavailable for "
+                    "agent=%r session=%r after %d attempt(s); not counting "
+                    "as a stall. Reason: %s",
+                    self._session.agent.id, self._session.key,
+                    exc.attempts, exc,
+                )
+                dispatcher_raised = True
+                provider_unavailable = True
             except Exception:
                 log.exception(
                     "Prompt dispatcher raised for agent=%r session=%r; "
@@ -531,23 +621,40 @@ class _SessionDriver:
             closed_out = before_ids - after_ids
             if closed_out:
                 self._stall_count = 0
-            else:
+            elif not provider_unavailable:
+                # A provider outage means the session never got a
+                # real chance to make progress -- do not advance
+                # the strike counter toward eviction.
                 self._stall_count += 1
 
             await self._maybe_evict_for_progress()
 
-        if dispatcher_raised or self._save_session is None:
-            return
-        try:
-            await self._save_session(self._session)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception(
-                "save_session callback raised for agent=%r session=%r; "
-                "continuing drain loop",
-                self._session.agent.id, self._session.key,
+        if not dispatcher_raised and self._save_session is not None:
+            try:
+                await self._save_session(self._session)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "save_session callback raised for agent=%r session=%r; "
+                    "continuing drain loop",
+                    self._session.agent.id, self._session.key,
+                )
+
+        # Provider-unavailable cooldown is deliberately outside the
+        # semaphore block so a stuck provider does not hold the
+        # agent-level concurrency slot and starve sibling sessions.
+        if provider_unavailable:
+            delay = _provider_unavailable_backoff()
+            log.info(
+                "Provider-unavailable backoff for agent=%r session=%r: "
+                "sleeping %.1fs before next round",
+                self._session.agent.id, self._session.key, delay,
             )
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
 
     async def _maybe_evict_for_progress(self) -> None:
         """Invoke the installed evictor if the strike threshold has been hit.
@@ -664,6 +771,8 @@ __all__ = [
     "AgentScheduler",
     "DEFAULT_AGENT_CONCURRENCY",
     "DEFAULT_PROGRESS_STRIKES",
+    "DEFAULT_PROVIDER_UNAVAILABLE_BACKOFF",
+    "DEFAULT_PROVIDER_UNAVAILABLE_BACKOFF_JITTER",
     "PromptDispatcher",
     "ProgressEvictor",
     "SessionSaver",

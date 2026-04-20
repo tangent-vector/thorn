@@ -45,7 +45,7 @@ from thorn.core._validation import ValidationRule
 from thorn.core._validation_tracker import ValidationStatus, ValidationTracker
 from thorn.core._file_access import FileAccessLevel, FileAccessPolicy, FileAccessRule, RelativeTo
 from thorn.core._func import prompt, skill, tool, wrap_function
-from thorn.core._retry import bound_retries
+from thorn.core._retry import RetryPolicy, bound_retries
 from thorn.core._loop import _WrappedTool, run_agent_loop
 from thorn.core._provider import LLMProvider, MockProvider, UsageChunk, load_provider_from_env
 from thorn.core._housekeeping import (
@@ -82,9 +82,11 @@ from thorn.core.errors import (
     AgentFailureError,
     LoopLimitError,
     ProviderError,
+    ProviderUnavailableError,
     RateLimitError,
     SkillError,
     ThornError,
+    TransientProviderError,
 )
 from thorn.core._trace import CompositeEventSink, JsonLinesSink
 from thorn.core._event_bus import (
@@ -151,6 +153,7 @@ __all__ = [
     "tool",
     "wrap_function",
     # Retry
+    "RetryPolicy",
     "bound_retries",
     # Loop
     "_WrappedTool",
@@ -191,9 +194,11 @@ __all__ = [
     "AgentFailureError",
     "LoopLimitError",
     "ProviderError",
+    "ProviderUnavailableError",
     "RateLimitError",
     "SkillError",
     "ThornError",
+    "TransientProviderError",
     # Tracing
     "CompositeEventSink",
     "JsonLinesSink",

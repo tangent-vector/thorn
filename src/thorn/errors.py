@@ -8,16 +8,20 @@ from thorn.core.errors import (
     AgentFailureError,
     LoopLimitError,
     ProviderError,
+    ProviderUnavailableError,
     RateLimitError,
     SkillError,
     ThornError,
+    TransientProviderError,
 )
 
 __all__ = [
     "AgentFailureError",
     "LoopLimitError",
     "ProviderError",
+    "ProviderUnavailableError",
     "RateLimitError",
     "SkillError",
     "ThornError",
+    "TransientProviderError",
 ]

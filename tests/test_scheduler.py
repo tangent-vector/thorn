@@ -32,6 +32,7 @@ import pytest
 
 from thorn.core._agent import Agent
 from thorn.core._session import Session
+from thorn.core.errors import ProviderUnavailableError
 from thorn.runtime._address import SessionAddress
 from thorn.runtime._inbox import SessionInbox
 from thorn.runtime._notification import NotificationSpec, NotificationStatus
@@ -1100,3 +1101,168 @@ class TestDefaultProgressEvictor:
         # All items were evicted (marked errored and parked in
         # errored/ since no RSVP was set).
         assert inbox.prompt_pending() == []
+
+
+# ---------------------------------------------------------------------------
+# ProviderUnavailableError handling (Phase 1 QoS)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fast_provider_unavailable_backoff(monkeypatch):
+    """Reduce provider-unavailable backoff to essentially zero.
+
+    Tests in this section care about *which* bookkeeping changes
+    around a provider-unavailable round, not about how long the
+    cooldown is.  Setting base/jitter to small values keeps the
+    tests fast while still exercising the real backoff path.
+    """
+    monkeypatch.setenv("THORN_PROVIDER_UNAVAILABLE_BACKOFF", "0.0")
+    monkeypatch.setenv("THORN_PROVIDER_UNAVAILABLE_BACKOFF_JITTER", "0.005")
+
+
+class TestProviderUnavailableHandling:
+    """Phase 1 QoS: a ``ProviderUnavailableError`` from the dispatcher
+    is not blamed on the session.
+
+    Contract verified here:
+
+    - The strike counter does not advance; even a session that sees
+      nothing but :class:`ProviderUnavailableError` never triggers
+      :data:`default_progress_evictor`.
+    - ``save_session`` is not invoked for such a round (no new
+      session state was produced).
+    - The driver stays alive (a provider outage should not kill the
+      session's long-lived drain task).
+    """
+
+    async def test_provider_unavailable_does_not_increment_stall(
+        self,
+        tmp_path: Path,
+        fast_provider_unavailable_backoff,
+    ) -> None:
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address))
+
+        probe = _DispatcherProbe(
+            raises=ProviderUnavailableError("outage", attempts=3),
+        )
+        evictor = _RecordingEvictor(mode="noop")
+        # A tight threshold of 2 would fire quickly if the driver
+        # mistakenly counted these as stalls; the assertion is
+        # "no eviction even after many rounds".
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=evictor,
+            progress_strikes=2,
+        )
+
+        await sched.submit(session, inbox)
+        await _wait_for(lambda: probe.call_count >= 5)
+        await sched.shutdown(timeout=0)
+
+        assert probe.call_count >= 5
+        assert evictor.calls == []
+        assert inbox.prompt_pending()  # unchanged
+
+    async def test_skips_save_session_on_provider_unavailable(
+        self,
+        tmp_path: Path,
+        fast_provider_unavailable_backoff,
+    ) -> None:
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address))
+
+        probe = _DispatcherProbe(
+            raises=ProviderUnavailableError("outage", attempts=3),
+        )
+        save_calls: list[SessionKey] = []
+
+        async def saver(sess: Session) -> None:
+            save_calls.append(sess.key)
+
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            save_session=saver,
+            progress_evictor=None,
+        )
+        await sched.submit(session, inbox)
+        await _wait_for(lambda: probe.call_count >= 3)
+        await sched.shutdown(timeout=0)
+
+        # The dispatcher raised on every call; no completed round
+        # was produced, so no save.
+        assert save_calls == []
+
+    async def test_recovery_resets_behavior(
+        self,
+        tmp_path: Path,
+        fast_provider_unavailable_backoff,
+    ) -> None:
+        # Provider outage for the first two rounds, then normal
+        # behaviour: the dispatcher closes out the item and the
+        # driver goes idle with an empty inbox.  The strike counter
+        # never advanced during the outage, so no eviction fired.
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address))
+
+        call_log: list[int] = []
+
+        def flaky_action(session_arg, inbox_arg, call_index) -> None:
+            call_log.append(call_index)
+            if call_index < 2:
+                raise ProviderUnavailableError("outage", attempts=3)
+            # Normal progress: close out the oldest item.
+            _default_handle_one(session_arg, inbox_arg, call_index)
+
+        probe = _DispatcherProbe(action=flaky_action)
+        evictor = _RecordingEvictor(mode="noop")
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=evictor,
+            progress_strikes=2,
+        )
+
+        await sched.submit(session, inbox)
+        await _wait_for(lambda: inbox.prompt_pending() == [])
+        await sched.shutdown(timeout=0)
+
+        assert inbox.prompt_pending() == []
+        assert evictor.calls == []
+
+    async def test_driver_survives_provider_unavailable(
+        self,
+        tmp_path: Path,
+        fast_provider_unavailable_backoff,
+    ) -> None:
+        # The driver must not terminate on
+        # ``ProviderUnavailableError``; subsequent kicks should
+        # keep finding it alive and able to retry.
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address))
+
+        probe = _DispatcherProbe(
+            raises=ProviderUnavailableError("outage", attempts=3),
+        )
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            progress_evictor=None,
+        )
+        await sched.submit(session, inbox)
+        await _wait_for(lambda: probe.call_count >= 3)
+
+        driver = sched._drivers[session.key]
+        assert driver.task is not None
+        assert not driver.task.done()
+        await sched.shutdown(timeout=0)

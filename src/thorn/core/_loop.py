@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
 import time
 from typing import Any
 
@@ -35,6 +34,7 @@ from thorn.core._messages import (
     UserMessage,
 )
 from thorn.core._provider import FinishChunk, TextChunk, ToolCallChunk, UsageChunk
+from thorn.core._retry import RetryPolicy
 from thorn.core._schema import (
     RAISE_ERROR_SCHEMA,
     make_return_result_schema,
@@ -45,15 +45,21 @@ from thorn.core.errors import (
     AgentFailureError,
     LoopLimitError,
     ProviderError,
+    ProviderUnavailableError,
     RateLimitError,
     SkillError,
+    TransientProviderError,
 )
 
 logger = logging.getLogger(__name__)
 
-_BACKOFF_BASE = 1.0
-_BACKOFF_CAP = 60.0
-_BACKOFF_MAX_RETRIES = 5
+# The default retry policy for provider-level calls is loaded from
+# environment variables at module import.  Tests that need to
+# exercise backoff boundaries without waiting for real seconds
+# monkeypatch this attribute (or pass ``asyncio.sleep`` replacements
+# into the retry loop via the test harness).  Operators override by
+# setting ``THORN_PROVIDER_RETRY_*`` before the daemon starts.
+_DEFAULT_RETRY_POLICY = RetryPolicy.from_env()
 
 # Sentinel returned by _execute_tool_calls when the structured-mode
 # ``return_result`` tool is invoked.
@@ -283,9 +289,20 @@ def _estimate_overhead(
 # Completion request (with retry)
 # ---------------------------------------------------------------------------
 
-async def _backoff_retry(attempt: int, reason: str = "rate limited") -> None:
-    delay = min(_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1), _BACKOFF_CAP)
-    logger.info("%s, retrying in %.1fs (attempt %d)", reason, delay, attempt + 1)
+
+async def _sleep_with_backoff(
+    policy: RetryPolicy,
+    attempt: int,
+    *,
+    retry_after: float | None,
+    reason: str,
+) -> None:
+    """Sleep for ``policy``'s backoff delay, honouring ``retry_after``."""
+    delay = policy.backoff_delay(attempt, retry_after=retry_after)
+    logger.info(
+        "%s, retrying in %.1fs (attempt %d)",
+        reason, delay, attempt + 1,
+    )
     await asyncio.sleep(delay)
 
 
@@ -297,9 +314,39 @@ async def _request_completion(
     messages: list[Message],
     consecutive_failures: int,
     max_failures: int,
+    retry_policy: RetryPolicy | None = None,
 ) -> tuple[str, list[ToolCall], str, dict[str, int] | None]:
-    """Return ``(text, tool_calls, finish_reason, usage)``."""
+    """Return ``(text, tool_calls, finish_reason, usage)``.
+
+    Retry policy:
+
+    - :class:`RateLimitError` (HTTP 429 or equivalent) -- retried
+      with full-jitter exponential backoff up to
+      ``retry_policy.max_rate_limit_retries`` attempts, honouring
+      any ``Retry-After`` hint from the server.  Exhaustion raises
+      :class:`ProviderUnavailableError`.
+    - :class:`TransientProviderError` (transport-level failures,
+      502/503/504) -- same backoff shape, bounded by
+      ``retry_policy.max_transient_retries``.  Exhaustion raises
+      :class:`ProviderUnavailableError`.
+    - Non-transient :class:`ProviderError` -- counted against
+      ``max_failures``.  Exhaustion raises
+      :class:`AgentFailureError`.  These are almost always
+      indicative of a configuration or request-shape problem (4xx
+      responses other than 429) rather than a network issue, so
+      they stay on the agent-loop's own failure budget.
+
+    The ``consecutive_failures`` counter is seeded from the caller
+    so that successive calls to this function (one per tool round)
+    can share a budget; the caller resets it to zero on a
+    successful return.  Rate-limit and transient-retry budgets are
+    per-call and do not accumulate across rounds -- a few network
+    blips spaced across many rounds should not lock the session
+    out of making progress.
+    """
+    policy = retry_policy or _DEFAULT_RETRY_POLICY
     rate_limit_retries = 0
+    transient_retries = 0
 
     while True:
         try:
@@ -339,21 +386,55 @@ async def _request_completion(
             tool_calls = [tc.to_tool_call() for tc in tool_call_chunks]
             return text, tool_calls, finish_reason, usage
 
-        except RateLimitError:
+        except RateLimitError as exc:
+            if rate_limit_retries >= policy.max_rate_limit_retries:
+                raise ProviderUnavailableError(
+                    f"rate-limit retries exhausted after "
+                    f"{rate_limit_retries + 1} attempt(s): {exc}",
+                    attempts=rate_limit_retries + 1,
+                ) from exc
+            await _sleep_with_backoff(
+                policy,
+                rate_limit_retries,
+                retry_after=exc.retry_after,
+                reason="rate limited",
+            )
             rate_limit_retries += 1
-            if rate_limit_retries > _BACKOFF_MAX_RETRIES:
-                raise
-            await _backoff_retry(rate_limit_retries - 1)
+
+        except TransientProviderError as exc:
+            if transient_retries >= policy.max_transient_retries:
+                raise ProviderUnavailableError(
+                    f"transient provider retries exhausted after "
+                    f"{transient_retries + 1} attempt(s): {exc}",
+                    attempts=transient_retries + 1,
+                ) from exc
+            await _sleep_with_backoff(
+                policy,
+                transient_retries,
+                retry_after=exc.retry_after,
+                reason="transient provider error",
+            )
+            transient_retries += 1
 
         except ProviderError:
+            # Non-transient provider error: counts against the
+            # agent-level failure budget rather than the per-call
+            # transient budget, so repeated hard failures across
+            # multiple tool rounds eventually break out of the
+            # loop with :class:`AgentFailureError` (rather than
+            # being masked as "transient" forever).
             consecutive_failures += 1
             if consecutive_failures >= max_failures:
                 raise AgentFailureError(
-                    f"too many consecutive provider failures ({consecutive_failures})",
+                    f"too many consecutive provider failures "
+                    f"({consecutive_failures})",
                     consecutive_failures,
                 )
-            await _backoff_retry(
-                consecutive_failures - 1, reason="provider error"
+            await _sleep_with_backoff(
+                policy,
+                consecutive_failures - 1,
+                retry_after=None,
+                reason="provider error",
             )
 
 
