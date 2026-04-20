@@ -545,6 +545,59 @@ class TestGateway:
 # ---------------------------------------------------------------------------
 
 
+class TestGatewayHealthMonitor:
+    """Phase 2 wiring: a single shared monitor reaches every scheduler."""
+
+    def _make_runtime(self, tmp_path: Path) -> Runtime:
+        return Runtime(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_monitor_constructed(self, tmp_path: Path) -> None:
+        from thorn.runtime import ProviderHealthMonitor
+
+        runtime = self._make_runtime(tmp_path)
+        gateway = Gateway(runtime=runtime, sources=[])
+        assert isinstance(gateway.health_monitor, ProviderHealthMonitor)
+        # Convenience snapshot accessor.
+        snap = gateway.health_snapshot()
+        assert snap.state.value == "healthy"
+
+    @pytest.mark.asyncio
+    async def test_explicit_monitor_is_shared_across_schedulers(
+        self, tmp_path: Path,
+    ) -> None:
+        # When the same monitor is wired into multiple schedulers,
+        # ``_ensure_scheduler_for_agent`` must hand each scheduler
+        # the same instance.  This is the property the gateway-wide
+        # circuit breaker relies on.
+        from thorn.runtime import ProviderHealthMonitor
+
+        monitor = ProviderHealthMonitor()
+        runtime = self._make_runtime(tmp_path)
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[],
+            health_monitor=monitor,
+        )
+
+        async with runtime:
+            agent_a = Agent(id=AgentID("a"), name="a")
+            agent_b = Agent(id=AgentID("b"), name="b")
+            sched_a = gateway._ensure_scheduler_for_agent(agent_a)
+            sched_b = gateway._ensure_scheduler_for_agent(agent_b)
+
+            # Both schedulers should reference the gateway's monitor.
+            assert sched_a._health_monitor is monitor
+            assert sched_b._health_monitor is monitor
+            assert gateway.health_monitor is monitor
+
+            await sched_a.shutdown(timeout=0)
+            await sched_b.shutdown(timeout=0)
+
+
 class TestGatewayInboxIntegration:
     # Integration tests under this class drive the real ``Gateway``
     # lifecycle (``gateway.run()`` + shutdown).  They override the

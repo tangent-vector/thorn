@@ -50,6 +50,11 @@ from thorn.runtime._notification_queue import (
     NotificationQueue,
 )
 from thorn.runtime._paths import AgencyPaths, safe_dirname, unsafe_dirname
+from thorn.runtime._provider_health import (
+    ProviderHealthMonitor,
+    ProviderHealthSnapshot,
+    ProviderHealthState,
+)
 from thorn.runtime._prompt_format import (
     build_inbox_prompt,
     inbox_prompt_dispatcher,
@@ -100,6 +105,9 @@ __all__ = [
     "NotificationStatus",
     "ProgressEvictor",
     "PromptDispatcher",
+    "ProviderHealthMonitor",
+    "ProviderHealthSnapshot",
+    "ProviderHealthState",
     "Runtime",
     "ServiceAddress",
     "SessionAddress",

@@ -38,6 +38,10 @@ from thorn.runtime._inbox import SessionInbox
 from thorn.runtime._notification import NotificationSpec, NotificationStatus
 from thorn.runtime._address import AddressBook, ServiceAddress
 from thorn.runtime._notification_queue import NotificationQueue
+from thorn.runtime._provider_health import (
+    ProviderHealthMonitor,
+    ProviderHealthState,
+)
 from thorn.runtime._scheduler import (
     DEFAULT_AGENT_CONCURRENCY,
     DEFAULT_PROGRESS_STRIKES,
@@ -1266,3 +1270,265 @@ class TestProviderUnavailableHandling:
         assert driver.task is not None
         assert not driver.task.done()
         await sched.shutdown(timeout=0)
+
+
+# ---------------------------------------------------------------------------
+# ProviderHealthMonitor integration (Phase 2 QoS)
+# ---------------------------------------------------------------------------
+
+class TestSchedulerWithHealthMonitor:
+    """Phase 2 QoS: a shared monitor coordinates pacing across sessions.
+
+    Contract verified here:
+
+    - A successful round reports success to the monitor (clearing
+      any prior failure history in the rolling window).
+    - A :class:`ProviderUnavailableError` round reports failure;
+      after enough failures the monitor flips to ``DEGRADED`` and
+      every session driver sharing the monitor blocks at
+      ``wait_until_healthy`` instead of barreling ahead with its
+      own retries.
+    - When the monitor recovers (via a successful probe), all
+      blocked drivers resume.
+    - An installed monitor causes the scheduler to skip the
+      per-driver provider-unavailable backoff sleep, since the
+      monitor's cooldown is now the cross-session-coordinated
+      equivalent.
+    - The monitor-aware default evictor does not fire while the
+      monitor is degraded, even if some other path managed to
+      elevate the strike counter.
+    """
+
+    async def test_dispatcher_success_reports_to_monitor(
+        self, tmp_path: Path,
+    ) -> None:
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address))
+
+        # Pre-seed the monitor with a stale failure so we can
+        # confirm a successful round clears it.
+        monitor = ProviderHealthMonitor(
+            failure_threshold=10,
+            failure_window_seconds=120.0,
+        )
+        await monitor.report_failure()
+        assert monitor.snapshot().recent_failure_count == 1
+
+        probe = _DispatcherProbe()
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            health_monitor=monitor,
+        )
+        await sched.submit(session, inbox)
+        await _wait_for(lambda: probe.call_count >= 1)
+        await sched.shutdown(timeout=1.0)
+
+        # The successful round should have called report_success,
+        # clearing the pre-seeded failure.
+        assert monitor.snapshot().recent_failure_count == 0
+        assert monitor.is_healthy
+
+    async def test_provider_unavailable_reports_to_monitor(
+        self, tmp_path: Path,
+    ) -> None:
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address))
+
+        monitor = ProviderHealthMonitor(
+            failure_threshold=2,
+            base_cooldown_seconds=60.0,
+            max_cooldown_seconds=60.0,
+            cooldown_jitter_seconds=0.0,
+        )
+
+        probe = _DispatcherProbe(
+            raises=ProviderUnavailableError("outage", attempts=3),
+        )
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            health_monitor=monitor,
+        )
+        await sched.submit(session, inbox)
+        # Two failures should be enough to trip the threshold.  We
+        # then wait briefly for the third call to discover the
+        # degraded state and block at wait_until_healthy.
+        await _wait_for(
+            lambda: monitor.state == ProviderHealthState.DEGRADED,
+        )
+        # With a 60s cooldown, the dispatcher should *not* be hit
+        # again after the breaker trips.
+        calls_at_degrade = probe.call_count
+        await asyncio.sleep(0.05)
+        assert probe.call_count == calls_at_degrade
+
+        await sched.shutdown(timeout=0)
+
+    async def test_monitor_serializes_recovery_probe(
+        self, tmp_path: Path,
+    ) -> None:
+        # Two sessions sharing a monitor.  After the breaker trips,
+        # the next round in either session is a probe; a successful
+        # probe releases the other session as well.
+        agent = _make_agent()
+        s1 = _make_session(agent, "s1")
+        s2 = _make_session(agent, "s2")
+        ibx1 = _make_inbox(tmp_path, agent, "s1")
+        ibx2 = _make_inbox(tmp_path, agent, "s2")
+        ibx1.post(_spec(ibx1.address))
+        ibx2.post(_spec(ibx2.address))
+
+        monitor = ProviderHealthMonitor(
+            failure_threshold=2,
+            base_cooldown_seconds=0.05,
+            max_cooldown_seconds=0.05,
+            cooldown_jitter_seconds=0.0,
+        )
+
+        # Outage for the first 2 dispatcher calls (across both
+        # sessions), then recovery.
+        call_log: list[int] = []
+
+        def flaky(session_arg, inbox_arg, idx) -> None:
+            call_log.append(idx)
+            if idx < 2:
+                raise ProviderUnavailableError("outage", attempts=3)
+            _default_handle_one(session_arg, inbox_arg, idx)
+
+        probe = _DispatcherProbe(action=flaky)
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            concurrency=2,
+            health_monitor=monitor,
+        )
+        await sched.submit(s1, ibx1)
+        await sched.submit(s2, ibx2)
+
+        # Both inboxes should drain once the probe succeeds.
+        await _wait_for(
+            lambda: ibx1.prompt_pending() == [] and ibx2.prompt_pending() == [],
+            timeout=5.0,
+        )
+        await sched.shutdown(timeout=1.0)
+
+        # After recovery, the monitor must be Healthy.
+        assert monitor.is_healthy
+
+    async def test_monitor_skips_per_driver_backoff(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        # When a monitor is wired, the per-driver provider-
+        # unavailable sleep is suppressed (the monitor's cooldown
+        # is the cross-session-coordinated equivalent).  We force
+        # the per-driver sleep to be huge; if it were used the
+        # driver could not loop quickly enough to hit the
+        # threshold.
+        monkeypatch.setenv("THORN_PROVIDER_UNAVAILABLE_BACKOFF", "10.0")
+        monkeypatch.setenv("THORN_PROVIDER_UNAVAILABLE_BACKOFF_JITTER", "0.0")
+
+        agent = _make_agent()
+        session = _make_session(agent, "s1")
+        inbox = _make_inbox(tmp_path, agent, "s1")
+        inbox.post(_spec(inbox.address))
+
+        monitor = ProviderHealthMonitor(
+            failure_threshold=3,
+            base_cooldown_seconds=60.0,
+            max_cooldown_seconds=60.0,
+            cooldown_jitter_seconds=0.0,
+        )
+        probe = _DispatcherProbe(
+            raises=ProviderUnavailableError("outage", attempts=3),
+        )
+        sched = AgentScheduler(
+            agent=agent,
+            prompt_dispatcher=probe,
+            health_monitor=monitor,
+        )
+        await sched.submit(session, inbox)
+        # If the per-driver backoff (10s) were applied we could
+        # not reach 3 failures within a brief test window.  The
+        # monitor's wait_until_healthy returns immediately while
+        # Healthy, and only blocks after the trip.
+        await _wait_for(
+            lambda: monitor.state == ProviderHealthState.DEGRADED,
+            timeout=2.0,
+        )
+        await sched.shutdown(timeout=0)
+
+
+class TestMonitorAwareEvictor:
+    """``default_progress_evictor(health_monitor=...)`` defers to the monitor."""
+
+    async def test_evictor_no_op_while_degraded(
+        self, tmp_path: Path,
+    ) -> None:
+        inbox = _make_inbox(tmp_path, _make_agent(), "s1")
+        inbox.post(_spec(inbox.address, content="first"))
+        inbox.post(_spec(inbox.address, content="second"))
+        ab = AddressBook()
+
+        monitor = ProviderHealthMonitor(
+            failure_threshold=1,
+            base_cooldown_seconds=60.0,
+            max_cooldown_seconds=60.0,
+            cooldown_jitter_seconds=0.0,
+        )
+        await monitor.report_failure()
+        assert not monitor.is_healthy
+
+        evictor = default_progress_evictor(ab, health_monitor=monitor)
+        await evictor(inbox)
+
+        # Both items still pending; evictor refused to fire.
+        assert len(inbox.prompt_pending()) == 2
+
+    async def test_evictor_fires_again_after_recovery(
+        self, tmp_path: Path,
+    ) -> None:
+        inbox = _make_inbox(tmp_path, _make_agent(), "s1")
+        inbox.post(_spec(inbox.address, content="first"))
+        inbox.post(_spec(inbox.address, content="second"))
+        ab = AddressBook()
+
+        monitor = ProviderHealthMonitor(
+            failure_threshold=1,
+            base_cooldown_seconds=60.0,
+            max_cooldown_seconds=60.0,
+            cooldown_jitter_seconds=0.0,
+        )
+        evictor = default_progress_evictor(ab, health_monitor=monitor)
+
+        # Trip the breaker; eviction is suppressed.
+        await monitor.report_failure()
+        await evictor(inbox)
+        assert len(inbox.prompt_pending()) == 2
+
+        # Recover; now eviction proceeds normally.
+        await monitor.report_success()
+        assert monitor.is_healthy
+        await evictor(inbox)
+        assert len(inbox.prompt_pending()) == 1
+
+    async def test_evictor_without_monitor_unchanged(
+        self, tmp_path: Path,
+    ) -> None:
+        # Default behavior (no monitor argument) must remain
+        # exactly the same as the Phase 1 evictor: oldest item
+        # gets evicted unconditionally.
+        inbox = _make_inbox(tmp_path, _make_agent(), "s1")
+        first = inbox.post(_spec(inbox.address, content="first"))
+        inbox.post(_spec(inbox.address, content="second"))
+
+        evictor = default_progress_evictor(AddressBook())
+        await evictor(inbox)
+
+        pending_ids = [n.id for n in inbox.prompt_pending()]
+        assert first.id not in pending_ids
+        assert len(pending_ids) == 1

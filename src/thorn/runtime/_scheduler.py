@@ -96,6 +96,21 @@ looping back, releasing the agent-level concurrency slot for the
 duration of the wait so a dead provider cannot starve other
 schedulers sharing the same cap.
 
+When a :class:`~thorn.runtime.ProviderHealthMonitor` is wired in
+(via the ``health_monitor`` constructor argument), each driver
+also awaits :meth:`ProviderHealthMonitor.wait_until_healthy`
+*before* calling the dispatcher.  That gates every session in
+the gateway behind the shared circuit-breaker state, so a
+provider outage observed by one session pauses every other
+session sharing the monitor until either the provider recovers
+or the session in question is selected as the next probe.  Round
+outcomes are reported back to the monitor: a normal completion
+calls :meth:`ProviderHealthMonitor.report_success`, a
+:class:`~thorn.core.errors.ProviderUnavailableError` calls
+:meth:`ProviderHealthMonitor.report_failure`.  Other exceptions
+are not reported -- they are session-/agent-attributable and
+should not influence cross-session health.
+
 Shutdown
 --------
 
@@ -123,6 +138,7 @@ from thorn.core.errors import ProviderUnavailableError
 from thorn.runtime._dispatch import DispatchError, apply_handling_transition
 from thorn.runtime._inbox import SessionInbox
 from thorn.runtime._notification import NotificationStatus
+from thorn.runtime._provider_health import ProviderHealthMonitor
 
 if TYPE_CHECKING:
     from thorn.core._agent import Agent
@@ -285,6 +301,7 @@ class AgentScheduler:
         save_session: SessionSaver | None = None,
         progress_strikes: int = DEFAULT_PROGRESS_STRIKES,
         progress_evictor: ProgressEvictor | None = None,
+        health_monitor: ProviderHealthMonitor | None = None,
     ) -> None:
         if concurrency < 1:
             raise ValueError(
@@ -301,6 +318,7 @@ class AgentScheduler:
         self._concurrency = concurrency
         self._progress_strikes = progress_strikes
         self._progress_evictor = progress_evictor
+        self._health_monitor = health_monitor
         self._semaphore = asyncio.Semaphore(concurrency)
         self._drivers: dict["SessionKey", _SessionDriver] = {}
         self._drivers_lock = asyncio.Lock()
@@ -367,6 +385,7 @@ class AgentScheduler:
                     save_session=self._save_session,
                     progress_strikes=self._progress_strikes,
                     progress_evictor=self._progress_evictor,
+                    health_monitor=self._health_monitor,
                 )
                 self._drivers[session.key] = driver
                 driver.start()
@@ -457,8 +476,8 @@ class _SessionDriver:
 
     __slots__ = (
         "_session", "_inbox", "_semaphore", "_dispatcher", "_save_session",
-        "_progress_strikes", "_progress_evictor", "_stall_count",
-        "_wake", "_task", "_stop",
+        "_progress_strikes", "_progress_evictor", "_health_monitor",
+        "_stall_count", "_wake", "_task", "_stop",
     )
 
     def __init__(
@@ -471,6 +490,7 @@ class _SessionDriver:
         save_session: SessionSaver | None,
         progress_strikes: int,
         progress_evictor: ProgressEvictor | None,
+        health_monitor: ProviderHealthMonitor | None = None,
     ) -> None:
         self._session = session
         self._inbox = inbox
@@ -479,6 +499,7 @@ class _SessionDriver:
         self._save_session = save_session
         self._progress_strikes = progress_strikes
         self._progress_evictor = progress_evictor
+        self._health_monitor = health_monitor
         self._stall_count = 0
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -579,7 +600,29 @@ class _SessionDriver:
         :class:`ProviderUnavailableError` is *not* treated as a
         strike against the session, because the failure is not
         attributable to the session's content or behavior.
+
+        When a :class:`ProviderHealthMonitor` is wired in, the
+        round first awaits :meth:`ProviderHealthMonitor.wait_until_healthy`
+        *before* acquiring the agent's concurrency semaphore.  This
+        avoids tying up an agent slot while the monitor's cooldown
+        elapses, and it means that during a degraded period the
+        round only proceeds when either the provider is believed
+        healthy again or this driver was nominated as the next
+        probe.  After the dispatcher returns, the round reports
+        the outcome to the monitor: a clean return calls
+        :meth:`ProviderHealthMonitor.report_success`, a
+        :class:`ProviderUnavailableError` calls
+        :meth:`ProviderHealthMonitor.report_failure`, and any other
+        exception is *not* reported (it is session-attributable, not
+        provider-attributable).
         """
+        # Wait for the monitor outside the semaphore so a degraded
+        # provider does not pin agent-level concurrency slots while
+        # the cooldown elapses.  Returns immediately when the
+        # monitor is healthy or when this caller is the next probe.
+        if self._health_monitor is not None:
+            await self._health_monitor.wait_until_healthy()
+
         dispatcher_raised = False
         provider_unavailable = False
         async with self._semaphore:
@@ -641,10 +684,29 @@ class _SessionDriver:
                     self._session.agent.id, self._session.key,
                 )
 
+        # Report round outcome to the health monitor (when wired).
+        # We deliberately treat any non-provider-unavailable exception
+        # as "do not report": those are session-/agent-attributable
+        # and should not influence cross-session pacing.  A clean
+        # return is treated as a successful real call -- in production
+        # the prompt dispatcher always issues at least one LLM round
+        # trip, so a clean return is reliable evidence the provider
+        # responded.
+        if self._health_monitor is not None:
+            if provider_unavailable:
+                await self._health_monitor.report_failure()
+            elif not dispatcher_raised:
+                await self._health_monitor.report_success()
+
         # Provider-unavailable cooldown is deliberately outside the
         # semaphore block so a stuck provider does not hold the
         # agent-level concurrency slot and starve sibling sessions.
-        if provider_unavailable:
+        # When a monitor is wired we skip this per-driver sleep:
+        # the monitor's wait_until_healthy at the top of the next
+        # round is now the cross-session-coordinated equivalent of
+        # this back-off, so doing both would double-pace the driver
+        # and lose the coordination benefit.
+        if provider_unavailable and self._health_monitor is None:
             delay = _provider_unavailable_backoff()
             log.info(
                 "Provider-unavailable backoff for agent=%r session=%r: "
@@ -710,6 +772,8 @@ a stuck session should look at logs for the exact count."""
 
 def default_progress_evictor(
     address_book: "AddressBook",
+    *,
+    health_monitor: ProviderHealthMonitor | None = None,
 ) -> ProgressEvictor:
     """Build a :data:`ProgressEvictor` that errors the oldest inbox item.
 
@@ -732,9 +796,34 @@ def default_progress_evictor(
     status, so the item is gone from ``prompt_pending()`` and the
     stall is resolved; the startup sweep will reconcile the
     abandoned step 2 on the next runtime entry.
+
+    Monitor-awareness: when ``health_monitor`` is supplied and its
+    state is not :attr:`ProviderHealthState.HEALTHY`, the evictor
+    no-ops with a debug log line.  This is defense in depth on top
+    of the scheduler's per-driver suppression of stall-counter
+    increments during ``ProviderUnavailableError``: even if some
+    other code path elevated the stall counter (e.g. an unrelated
+    exception that happened to coincide with a degraded provider),
+    we still suppress eviction while the provider is known to be
+    unhealthy.  Operators see no notifications evicted-as-errored
+    purely because the LLM was down.
     """
 
     async def _evict(inbox: SessionInbox) -> None:
+        if health_monitor is not None and not health_monitor.is_healthy:
+            # Defense in depth: never evict while the provider is
+            # known degraded.  The session driver already declines
+            # to advance the strike counter on
+            # ProviderUnavailableError, but other exception paths
+            # could in principle elevate the counter while a
+            # provider outage is in progress; this guard ensures we
+            # never blame a session for the gateway-wide outage.
+            log.info(
+                "default_progress_evictor: provider monitor reports %s; "
+                "skipping eviction on inbox %r until provider recovers",
+                health_monitor.state.value, inbox.address,
+            )
+            return
         pending = inbox.prompt_pending()
         if not pending:
             log.debug(

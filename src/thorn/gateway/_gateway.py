@@ -64,6 +64,8 @@ from thorn.runtime import (
     AgentScheduler,
     NotificationSpec,
     PromptDispatcher,
+    ProviderHealthMonitor,
+    ProviderHealthSnapshot,
     Runtime,
     SessionAddress,
     SessionInbox,
@@ -113,6 +115,17 @@ class Gateway:
             scheduler on gateway shutdown.  ``None`` waits
             indefinitely; ``0`` cancels immediately.  Defaults to
             :data:`DEFAULT_SHUTDOWN_TIMEOUT_SECONDS`.
+        health_monitor: Shared :class:`ProviderHealthMonitor` for
+            gateway-wide LLM provider circuit-breaking.  When
+            supplied, the same instance is wired into every
+            scheduler created by the gateway, so a provider outage
+            observed by any session pauses every session sharing
+            this gateway until the provider recovers.  When
+            ``None`` (the default), the gateway constructs one
+            from environment variables via
+            :meth:`ProviderHealthMonitor.from_env`; pass an
+            explicit instance for tests or to share a monitor
+            across multiple gateways in the same process.
     """
 
     def __init__(
@@ -124,6 +137,7 @@ class Gateway:
         agent_concurrency: int = DEFAULT_AGENT_CONCURRENCY,
         prompt_dispatcher: PromptDispatcher | None = None,
         shutdown_timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+        health_monitor: ProviderHealthMonitor | None = None,
     ) -> None:
         self._runtime = runtime
         self._sources = sources
@@ -133,12 +147,39 @@ class Gateway:
             prompt_dispatcher or inbox_prompt_dispatcher
         )
         self._shutdown_timeout = shutdown_timeout
+        # Construct the monitor up-front (rather than lazily on
+        # first scheduler) so callers can ``snapshot()`` even before
+        # any agent has been seen.  ``from_env`` returns a default-
+        # configured monitor when no THORN_PROVIDER_HEALTH_* vars
+        # are set, so this is also a safe no-config-required path.
+        self._health_monitor: ProviderHealthMonitor = (
+            health_monitor or ProviderHealthMonitor.from_env()
+        )
 
         self._stop_event: asyncio.Event | None = None
         self._source_tasks: list[asyncio.Task[None]] = []
         self._schedulers: dict[AgentID, AgentScheduler] = {}
         self._inboxes: dict[SessionAddress, SessionInbox] = {}
         self._started = False
+
+    @property
+    def health_monitor(self) -> ProviderHealthMonitor:
+        """The shared provider-health monitor wired into every scheduler.
+
+        Exposed for tests and operator status pages -- callers can
+        ``snapshot()`` it to render current state without reaching
+        into per-scheduler internals.
+        """
+        return self._health_monitor
+
+    def health_snapshot(self) -> ProviderHealthSnapshot:
+        """Convenience accessor: ``self.health_monitor.snapshot()``.
+
+        Provided so the common observability case does not require
+        importing :class:`ProviderHealthSnapshot` just to call
+        ``.snapshot()``.
+        """
+        return self._health_monitor.snapshot()
 
     async def run(self) -> None:
         """Enter the runtime context and run all sources until shutdown.
@@ -319,7 +360,10 @@ class Gateway:
           :meth:`Runtime.save_session`;
         - the canonical :func:`default_progress_evictor` so stalled
           sessions get their oldest item evicted at the N-strikes
-          threshold.
+          threshold;
+        - the gateway's shared :class:`ProviderHealthMonitor`,
+          which gates every prompt round on the breaker's state and
+          also suppresses eviction while the provider is degraded.
 
         Scheduler instances are kept in the gateway's
         ``_schedulers`` map keyed by :class:`AgentID`.  On shutdown
@@ -338,7 +382,9 @@ class Gateway:
             save_session=self._save_session_async,
             progress_evictor=default_progress_evictor(
                 self._runtime.address_book,
+                health_monitor=self._health_monitor,
             ),
+            health_monitor=self._health_monitor,
         )
         self._schedulers[agent.id] = scheduler
         return scheduler
