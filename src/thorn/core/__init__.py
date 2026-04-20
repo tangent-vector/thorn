@@ -87,6 +87,13 @@ from thorn.core.errors import (
     ThornError,
 )
 from thorn.core._trace import CompositeEventSink, JsonLinesSink
+from thorn.core._event_bus import (
+    EventBus,
+    ScopeFilter,
+    Subscription,
+    accept_all,
+    in_session,
+)
 
 try:
     from thorn.core._mcp import MCPServerConfig, MCPToolSource, load_mcp_configs, serve_tools
@@ -190,4 +197,10 @@ __all__ = [
     # Tracing
     "CompositeEventSink",
     "JsonLinesSink",
+    # Event bus
+    "EventBus",
+    "ScopeFilter",
+    "Subscription",
+    "accept_all",
+    "in_session",
 ]

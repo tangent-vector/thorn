@@ -22,6 +22,7 @@ from thorn.core._context import (
     Verbosity,
 )
 from thorn.core._discovery import discover_tools
+from thorn.core._event_bus import EventBus, in_session
 from thorn.core._func import _prepare_tools, prompt
 from thorn.core._loop import run_agent_loop, _WrappedTool
 from thorn.core._provider import load_provider_from_env
@@ -110,18 +111,26 @@ def _resolve_verbosity(verbose: int, quiet: bool) -> Verbosity:
 
 
 def _build_runtime(
-    verbosity: Verbosity = Verbosity.NORMAL,
     trace_file: Any | None = None,
     workspace: str | None = None,
     *,
     interactive: bool = True,
     paths: "AgencyPaths | None" = None,
 ) -> Runtime:
-    """Create a ``Runtime`` from environment variables.
+    """Create a ``Runtime`` whose event sink is an :class:`EventBus`.
+
+    The runtime always carries an :class:`EventBus`, never a bare
+    console sink.  Per-command code (``_run``, ``_chat``,
+    ``_serve_gateway``) subscribes its own console listener with the
+    appropriate scope filter and verbosity; that lets concurrent
+    sessions on the same runtime route their output independently
+    without each event sink seeing every other session's events.
 
     When *trace_file* is an open file handle, a :class:`JsonLinesSink`
-    is composed alongside the console sink so that a structured JSONL
-    trace is written in parallel.
+    is subscribed *here* (without any scope filter) so the trace
+    captures everything regardless of which session emitted it.  Trace
+    is an operator-audit channel; per-session filtering would defeat
+    its purpose.
 
     *workspace* overrides the workspace root.  When ``None``, the
     heuristic in :func:`thorn.infer_workspace_root` is used.
@@ -137,15 +146,11 @@ def _build_runtime(
     from thorn.runtime._paths import AgencyPaths
 
     provider = load_provider_from_env()
-    console_sink: EventSink = ConsoleEventSink(verbosity=verbosity)
 
+    bus = EventBus()
     if trace_file is not None:
-        from thorn.core._trace import CompositeEventSink, JsonLinesSink
-        sink: EventSink = CompositeEventSink([
-            console_sink, JsonLinesSink(trace_file),
-        ])
-    else:
-        sink = console_sink
+        from thorn.core._trace import JsonLinesSink
+        bus.subscribe(JsonLinesSink(trace_file))
 
     ws_root = Path(workspace).resolve() if workspace else infer_workspace_root()
 
@@ -154,13 +159,31 @@ def _build_runtime(
 
     return Runtime(
         provider=provider,
-        event_sink=sink,
+        event_sink=bus,
         workspace_root=ws_root,
         workspace_instructions=load_workspace_instructions(ws_root),
         global_ignores=load_global_ignores(ws_root),
         ask_user_handler=_rich_ask_user if interactive else None,
         paths=paths,
     )
+
+
+def _runtime_event_bus(runtime: Runtime) -> EventBus:
+    """Return *runtime*'s event sink, asserting it is an :class:`EventBus`.
+
+    Every CLI-built runtime (created via :func:`_build_runtime`) carries
+    a bus, so this is essentially a typed accessor.  Lifted out as a
+    helper so the assertion is centralised and tests that build a
+    runtime by hand get a helpful error message rather than an attribute
+    error if they forget the bus.
+    """
+    sink = runtime.event_sink
+    if not isinstance(sink, EventBus):
+        raise TypeError(
+            f"CLI commands require runtime.event_sink to be an EventBus, "
+            f"got {type(sink).__name__}"
+        )
+    return sink
 
 
 async def _collect_all_tools(
@@ -311,9 +334,10 @@ def _write_result_file(
 @click.option("--result-file", "result_file_path", type=click.Path(), default=None, help="Write a JSON result summary (outcome, duration, token usage).")
 def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, result_file_path: str | None) -> None:
     """Execute a single prompt and print the result."""
+    verbosity = _resolve_verbosity(verbose, quiet)
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        runtime = _build_runtime(_resolve_verbosity(verbose, quiet), trace_file=trace_file, workspace=workspace_path)
+        runtime = _build_runtime(trace_file=trace_file, workspace=workspace_path)
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         if trace_file:
@@ -364,55 +388,77 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
                         "CLI agent has no id; cannot build a session inbox"
                     )
                 session_key = SessionKey(f"run-{uuid.uuid4().hex[:8]}")
-                session = Session(
-                    agent=agent,
-                    key=session_key,
-                    workspace_root=runtime.workspace_root,
-                )
 
-                session_address = SessionAddress(agent.id, session_key)
-                inbox = SessionInbox(
-                    runtime.paths.session_inbox_dir(agent.id, session_key),
-                    session_address,
-                    in_flight_index=runtime.in_flight_index,
+                # Phase 3: the runtime carries an ``EventBus`` rather
+                # than a single sink; subscribe a console listener
+                # that only fires for *this* session's events so
+                # background activity in other sessions (none today
+                # under ``thorn run``, but plausible once the local
+                # agency lands in Phase 5) won't bleed into our
+                # console output.  Subscribing here -- *before* the
+                # session is submitted -- ensures we don't miss the
+                # initial agent scope-enter event.
+                bus = _runtime_event_bus(runtime)
+                console_listener: EventSink = ConsoleEventSink(
+                    verbosity=verbosity,
                 )
-                runtime.address_book.register(session_address, inbox)
+                with bus.subscribe(
+                    console_listener,
+                    scope_filter=in_session(session_key),
+                ):
+                    session = Session(
+                        agent=agent,
+                        key=session_key,
+                        workspace_root=runtime.workspace_root,
+                    )
 
-                loop = asyncio.get_running_loop()
-                result_future: asyncio.Future[str] = loop.create_future()
-                dispatcher = make_cli_prompt_dispatcher(
-                    result_future=result_future,
-                    extra_tools=tools,
-                    extra_system=(
-                        "You are executing a single non-interactive request. "
-                        "Complete the task and report results concisely. "
-                        "Do not offer follow-up actions or ask questions."
-                    ),
-                )
-                # ``save_session=None``: ``thorn run`` is ephemeral.
-                # Phase 5 will revisit when the local-agency defaults
-                # land and persistence semantics get redesigned.
-                scheduler = AgentScheduler(
-                    agent=agent,
-                    prompt_dispatcher=dispatcher,
-                    save_session=None,
-                )
-                try:
-                    inbox.post(NotificationSpec(
-                        source="user",
-                        content=prompt_text,
-                        target=session_address,
-                    ))
-                    await scheduler.submit(session, inbox)
-                    return await result_future
-                finally:
-                    # Bounded grace period so a misbehaving dispatcher
-                    # cannot wedge process exit indefinitely.  By the
-                    # time we get here the future has resolved, the
-                    # dispatcher has returned, and the driver has
-                    # parked on its idle wait, so shutdown is
-                    # essentially instantaneous in the success case.
-                    await scheduler.shutdown(timeout=5.0)
+                    session_address = SessionAddress(agent.id, session_key)
+                    inbox = SessionInbox(
+                        runtime.paths.session_inbox_dir(
+                            agent.id, session_key,
+                        ),
+                        session_address,
+                        in_flight_index=runtime.in_flight_index,
+                    )
+                    runtime.address_book.register(session_address, inbox)
+
+                    loop = asyncio.get_running_loop()
+                    result_future: asyncio.Future[str] = loop.create_future()
+                    dispatcher = make_cli_prompt_dispatcher(
+                        result_future=result_future,
+                        extra_tools=tools,
+                        extra_system=(
+                            "You are executing a single non-interactive "
+                            "request. Complete the task and report results "
+                            "concisely. Do not offer follow-up actions or "
+                            "ask questions."
+                        ),
+                    )
+                    # ``save_session=None``: ``thorn run`` is ephemeral.
+                    # Phase 5 will revisit when the local-agency defaults
+                    # land and persistence semantics get redesigned.
+                    scheduler = AgentScheduler(
+                        agent=agent,
+                        prompt_dispatcher=dispatcher,
+                        save_session=None,
+                    )
+                    try:
+                        inbox.post(NotificationSpec(
+                            source="user",
+                            content=prompt_text,
+                            target=session_address,
+                        ))
+                        await scheduler.submit(session, inbox)
+                        return await result_future
+                    finally:
+                        # Bounded grace period so a misbehaving
+                        # dispatcher cannot wedge process exit
+                        # indefinitely.  By the time we get here the
+                        # future has resolved, the dispatcher has
+                        # returned, and the driver has parked on its
+                        # idle wait, so shutdown is essentially
+                        # instantaneous in the success case.
+                        await scheduler.shutdown(timeout=5.0)
 
     outcome = "success"
     error_msg: str | None = None
@@ -477,9 +523,10 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
 @click.option("--workspace", "workspace_path", type=click.Path(exists=True, file_okay=False), default=None, help="Override workspace root directory.")
 def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None) -> None:
     """Start an interactive chat session."""
+    verbosity = _resolve_verbosity(verbose, quiet)
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        runtime = _build_runtime(_resolve_verbosity(verbose, quiet), trace_file=trace_file, workspace=workspace_path)
+        runtime = _build_runtime(trace_file=trace_file, workspace=workspace_path)
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         if trace_file:
@@ -538,41 +585,61 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
                         f"{len(session._history.nodes)} history entries.[/dim]\n"
                     )
 
-                async with AsyncExitStack() as stack:
-                    tools = await _collect_all_tools(
-                        stack,
-                        no_tools=no_tools,
-                        no_discover=no_discover,
-                        no_mcp=no_mcp,
-                    )
+                # Phase 3: subscribe a per-session console listener
+                # to the runtime's event bus.  Today the chat REPL is
+                # the only producer of events on this runtime so the
+                # filter is a no-op, but it's the same shape Phase 4
+                # will need once chat goes through the scheduler and
+                # background sessions can run concurrently.
+                bus = _runtime_event_bus(runtime)
+                console_listener: EventSink = ConsoleEventSink(
+                    verbosity=verbosity,
+                )
+                subscription = bus.subscribe(
+                    console_listener,
+                    scope_filter=in_session(session_key),
+                )
+                try:
+                    async with AsyncExitStack() as stack:
+                        tools = await _collect_all_tools(
+                            stack,
+                            no_tools=no_tools,
+                            no_discover=no_discover,
+                            no_mcp=no_mcp,
+                        )
 
-                    while True:
-                        try:
-                            user_input = console.input("[green]you>[/green] ")
-                        except EOFError:
-                            break
-                        if not user_input.strip():
-                            continue
+                        while True:
+                            try:
+                                user_input = console.input(
+                                    "[green]you>[/green] ",
+                                )
+                            except EOFError:
+                                break
+                            if not user_input.strip():
+                                continue
 
-                        try:
-                            await session.prompt(
-                                user_input,
-                                tools=tools,
-                                system=CHAT_SYSTEM_PROMPT,
-                            )
-                        except SkillError as exc:
-                            console.print(
-                                f"\n[red]Agent error:[/red] {exc.detail}"
-                            )
-                        except ThornError as exc:
-                            console.print(f"\n[red]Error:[/red] {exc}")
+                            try:
+                                await session.prompt(
+                                    user_input,
+                                    tools=tools,
+                                    system=CHAT_SYSTEM_PROMPT,
+                                )
+                            except SkillError as exc:
+                                console.print(
+                                    f"\n[red]Agent error:[/red] {exc.detail}"
+                                )
+                            except ThornError as exc:
+                                console.print(f"\n[red]Error:[/red] {exc}")
 
-                        # Persist after every turn so a crash mid-session
-                        # doesn't lose progress.  History was mutated in
-                        # place by `session.prompt` even if it raised, so
-                        # saving on the error path is intentional.
-                        runtime.save_session(session)
-                        console.print()
+                            # Persist after every turn so a crash mid-
+                            # session doesn't lose progress.  History was
+                            # mutated in place by `session.prompt` even
+                            # if it raised, so saving on the error path
+                            # is intentional.
+                            runtime.save_session(session)
+                            console.print()
+                finally:
+                    subscription.unsubscribe()
             finally:
                 lock_ctx.__exit__(None, None, None)
 
@@ -770,7 +837,7 @@ def _serve_gateway(
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
         runtime = _build_runtime(
-            verbosity, trace_file=trace_file, workspace=str(ws_root),
+            trace_file=trace_file, workspace=str(ws_root),
             interactive=False, paths=paths,
         )
     except ThornError as exc:
@@ -778,6 +845,14 @@ def _serve_gateway(
         if trace_file:
             trace_file.close()
         sys.exit(1)
+
+    # Daemon-mode console listener: no scope filter, since the gateway
+    # operator wants to see every session's events (this is the
+    # operator log).  Per-session filtering would obscure exactly the
+    # cross-cutting view ``-vvv`` is asked for.
+    _runtime_event_bus(runtime).subscribe(
+        ConsoleEventSink(verbosity=verbosity),
+    )
 
     for service in all_services:
         runtime.register_service(service)

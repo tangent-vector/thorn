@@ -103,6 +103,11 @@ from thorn.core import (
     ThornError,
     CompositeEventSink,
     JsonLinesSink,
+    EventBus,
+    ScopeFilter,
+    Subscription,
+    accept_all,
+    in_session,
 )
 
 from thorn import tools
@@ -155,6 +160,11 @@ __all__ = [
     "ConsoleEventSink",
     "CompositeEventSink",
     "JsonLinesSink",
+    "EventBus",
+    "ScopeFilter",
+    "Subscription",
+    "accept_all",
+    "in_session",
     "Verbosity",
     "Scope",
     "UsageTracker",
