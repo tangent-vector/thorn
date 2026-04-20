@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from thorn._cli import main as cli_main
@@ -15,6 +16,30 @@ from thorn.core._provider import (
     ToolCallChunk,
     UsageChunk,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cli_agency_home(monkeypatch, tmp_path):
+    """Redirect the CLI's default ``~/.thorn`` agency home into ``tmp_path``.
+
+    Phase 5 of the CLI/gateway unification switched the CLI's default
+    agency home to ``~/.thorn``.  Without this fixture every test that
+    invokes ``thorn run`` or ``thorn chat`` without an explicit
+    ``--agency`` would create agent directories under the developer's
+    real home directory, polluting it and breaking test isolation.
+
+    We patch :func:`pathlib.Path.home` to point at ``tmp_path``; the
+    CLI's agency-home resolver calls ``Path.home() / '.thorn'``, so
+    the effective default agency becomes ``tmp_path/.thorn`` for the
+    lifetime of each test.  Tests that want to inspect the resulting
+    agency tree continue to assert on ``tmp_path / '.thorn' / ...``
+    just like they did under the pre-Phase-5 ``for_cli`` layout.
+
+    Autouse so new tests added here inherit the isolation by default;
+    a test that explicitly wants the real home dir can override the
+    fixture in its own scope.
+    """
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
 
 
 def _mock_provider_factory(provider: MockProvider):
@@ -180,6 +205,131 @@ class TestRunResultFile:
         assert not (tmp_path / "result.json").exists()
 
 
+class TestAgencyHomeResolution:
+    """``thorn run`` / ``thorn chat`` honour ``--agency`` and the ``~/.thorn`` default.
+
+    Phase 5 of the CLI/gateway unification switched the CLI's default
+    agency home from ``{ws}/.thorn/`` (old ``for_cli`` nested layout)
+    to ``~/.thorn/`` (local-agency convention).  These tests lock
+    down both paths: an explicit ``--agency`` override wins over the
+    default, and the default actually lands at ``Path.home() /
+    '.thorn'`` (which the autouse fixture redirects to ``tmp_path``
+    so we are really asserting "the resolver consulted
+    ``Path.home()``").
+    """
+
+    def test_explicit_agency_override_beats_default(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """``--agency`` routes agent state to a caller-chosen directory."""
+        from thorn.runtime._paths import unsafe_dirname
+
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="ok"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        agency_dir = tmp_path / "custom-agency"
+        workspace_dir = tmp_path / "elsewhere"
+        workspace_dir.mkdir()
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--no-tools", "--no-discover", "--no-mcp",
+                "--workspace", str(workspace_dir),
+                "--agency", str(agency_dir),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+        # The agency home should hold the agent tree; the workspace
+        # must stay untouched (no stray .thorn/ inside it).
+        sessions_root = agency_dir / "agents" / "local" / "sessions"
+        assert sessions_root.is_dir(), (
+            "explicit --agency directory should hold the agent/session tree"
+        )
+        cli_dirs = [
+            d for d in sessions_root.iterdir()
+            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
+        ]
+        assert len(cli_dirs) == 1, (
+            "one ephemeral cli/... session dir should live under --agency"
+        )
+        assert not (workspace_dir / ".thorn").exists(), (
+            "Phase 5 decouples workspace from agency home; the "
+            "workspace must not sprout a nested .thorn/ when --agency "
+            "is set explicitly"
+        )
+
+    def test_default_agency_is_home_dot_thorn(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """With no ``--agency``, state lands under ``Path.home() / '.thorn'``.
+
+        The autouse ``_isolate_cli_agency_home`` fixture redirects
+        ``Path.home()`` to ``tmp_path``, so the effective default is
+        ``tmp_path/.thorn``.  Asserting on that directory exercises
+        the full resolution path (resolver consulted ``Path.home()``,
+        appended ``.thorn``, and the runtime used the result).
+        """
+        from thorn.runtime._paths import unsafe_dirname
+
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="ok"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        workspace_dir = tmp_path / "some-workspace"
+        workspace_dir.mkdir()
+        monkeypatch.chdir(workspace_dir)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--no-tools", "--no-discover", "--no-mcp",
+                "--workspace", str(workspace_dir),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+        default_home = tmp_path / ".thorn"
+        assert default_home.is_dir(), (
+            "the default agency home should be auto-created at "
+            "~/.thorn on first use"
+        )
+        sessions_root = default_home / "agents" / "local" / "sessions"
+        assert sessions_root.is_dir(), (
+            "agent/session tree should live under the default ~/.thorn"
+        )
+        cli_dirs = [
+            d for d in sessions_root.iterdir()
+            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
+        ]
+        assert len(cli_dirs) == 1
+
+        # And we should *not* have written a nested .thorn inside the
+        # workspace -- the Phase 5 clean-break behavior.
+        assert not (workspace_dir / ".thorn").exists(), (
+            "Phase 5 clean break: the default CLI path no longer "
+            "drops .thorn/ inside the workspace root"
+        )
+
+
 class TestRunPipelineStructure:
     """``thorn run`` should flow through the in-process scheduler+inbox.
 
@@ -218,21 +368,28 @@ class TestRunPipelineStructure:
         )
         assert result.exit_code == 0
 
-        # Per-invocation session keys are ``run-<8 hex chars>``;
-        # inbox dirs land at <home>/agents/local/sessions/<key>/inbox/.
+        # Per-invocation CLI session keys are
+        # ``cli/<workspace-basename>/<8 hex chars>``; inbox dirs land
+        # at ``<home>/agents/local/sessions/<safe-encoded-key>/inbox/``.
+        # The key's ``/`` separators become ``%2F`` in the flat on-disk
+        # layout (see AgencyPaths.session_metadata_dir), so we decode
+        # the directory name back into the logical key before checking
+        # the prefix.
+        from thorn.runtime._paths import unsafe_dirname
+
         sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
         assert sessions_root.is_dir(), (
             "the runtime should have created an agent sessions root"
         )
-        run_session_dirs = [
+        cli_session_dirs = [
             d for d in sessions_root.iterdir()
-            if d.is_dir() and d.name.startswith("run-")
+            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
         ]
-        assert len(run_session_dirs) == 1, (
-            f"expected exactly one ephemeral run-* session dir, "
-            f"found {sorted(d.name for d in run_session_dirs)}"
+        assert len(cli_session_dirs) == 1, (
+            f"expected exactly one ephemeral cli/... session dir, "
+            f"found {sorted(d.name for d in sessions_root.iterdir() if d.is_dir())}"
         )
-        inbox_dir = run_session_dirs[0] / "inbox"
+        inbox_dir = cli_session_dirs[0] / "inbox"
         assert inbox_dir.is_dir(), (
             "the SessionInbox constructor should have mkdir'd the inbox dir"
         )
@@ -352,7 +509,7 @@ class TestRunEventBusWiring:
         assert result.exit_code == 0
 
         # The agent round must have produced at least scope_enter and
-        # scope_exit events tagged with the run-XXX session key.
+        # scope_exit events tagged with the ephemeral CLI session key.
         scope_events = [
             (ev, key) for ev, key in captured_events
             if ev in {"scope_enter", "scope_exit"}
@@ -361,12 +518,12 @@ class TestRunEventBusWiring:
             f"expected scope events on the bus subscriber; got "
             f"{captured_events}"
         )
-        # Every captured scope event should be tagged with the
-        # ephemeral run session key.
+        # Every captured scope event should be tagged with a
+        # ``cli/...`` ephemeral key (Phase 5 naming convention).
         for ev, key in scope_events:
-            assert key is not None and key.startswith("run-"), (
+            assert key is not None and key.startswith("cli/"), (
                 f"event {ev!r} carried session_key={key!r}; expected "
-                f"a 'run-*' tag"
+                f"a 'cli/...' tag"
             )
 
     def test_listener_filtered_to_other_session_sees_nothing(
@@ -394,8 +551,8 @@ class TestRunEventBusWiring:
             rt = original_build(*args, **kwargs)
             assert isinstance(rt.event_sink, EventBus)
             # Filter is for a session that will never exist in this
-            # invocation: the run-* keys are random hex, "other-key"
-            # cannot collide.
+            # invocation: the ``cli/...`` keys are random-hex-suffixed,
+            # "other-key" cannot collide.
             rt.event_sink.subscribe(
                 _SilentExceptStatus(), scope_filter=in_session("other-key"),
             )
@@ -500,12 +657,20 @@ class TestChat:
         assert result.exit_code == 0
         assert "hello back" in result.output
 
-        sessions_dir = (
-            tmp_path / ".thorn" / "agents" / "local" / "sessions" / "default"
+        # Phase 5: chat keys are ``cli/<basename>/<uuid8>``; look up
+        # whatever single session was created in this invocation.
+        from thorn.runtime._paths import unsafe_dirname
+
+        sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
+        cli_session_dirs = [
+            d for d in sessions_root.iterdir()
+            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
+        ]
+        assert len(cli_session_dirs) == 1, (
+            f"expected exactly one chat session dir, got "
+            f"{sorted(d.name for d in cli_session_dirs)}"
         )
-        assert sessions_dir.is_dir(), (
-            "session directory should have been created"
-        )
+        sessions_dir = cli_session_dirs[0]
         # History file contents are an implementation detail of the
         # serializer; just confirm something was written.
         assert any(sessions_dir.iterdir()), (
@@ -550,58 +715,62 @@ class TestChat:
             "both canned responses should have been consumed"
         )
 
-    def test_resuming_session_shows_history_entry_count(
+    def test_each_invocation_creates_fresh_session(
         self, tmp_path: Path, monkeypatch,
     ):
-        """Re-invoking ``thorn chat`` should report the resumed history."""
-        first_provider = MockProvider(canned_responses=[
-            [
-                TextChunk(text="one"),
-                FinishChunk(reason="stop"),
-            ],
-        ])
-        monkeypatch.setattr(
-            "thorn._cli.load_provider_from_env",
-            _mock_provider_factory(first_provider),
-        )
+        """Two ``thorn chat`` invocations must land in two separate session dirs.
+
+        Phase 5 replaces the static ``default`` session key with a
+        per-invocation ``cli/<basename>/<uuid8>`` key.  Running chat
+        twice in the same workspace must therefore produce two
+        distinct on-disk session directories, neither of which shows
+        the "Resuming session" banner (there is nothing to resume --
+        the session is brand-new).  This test guards against a
+        regression in which the key-generation helper is bypassed and
+        a stable ``default`` key sneaks back in.
+        """
+        from thorn.runtime._paths import unsafe_dirname
+
+        def _one_turn(text: str) -> str:
+            provider = MockProvider(canned_responses=[
+                [TextChunk(text=text), FinishChunk(reason="stop")],
+            ])
+            monkeypatch.setattr(
+                "thorn._cli.load_provider_from_env",
+                _mock_provider_factory(provider),
+            )
+            runner = CliRunner()
+            result = runner.invoke(
+                cli_main,
+                [
+                    "chat",
+                    "--no-tools", "--no-discover", "--no-mcp",
+                    "--workspace", str(tmp_path),
+                ],
+                input="hi\n",
+                catch_exceptions=False,
+            )
+            assert result.exit_code == 0
+            assert "Resuming session" not in result.output, (
+                "Phase 5 dropped implicit per-workspace resume; the "
+                "REPL must not claim to be resuming anything"
+            )
+            return result.output
+
         monkeypatch.chdir(tmp_path)
 
-        runner = CliRunner()
-        result = runner.invoke(
-            cli_main,
-            [
-                "chat",
-                "--no-tools", "--no-discover", "--no-mcp",
-                "--workspace", str(tmp_path),
-                "--quiet",
-            ],
-            input="hello\n",
-            catch_exceptions=False,
-        )
-        assert result.exit_code == 0
+        _one_turn("answer alpha")
+        _one_turn("answer beta")
 
-        second_provider = MockProvider(canned_responses=[
-            [
-                TextChunk(text="two"),
-                FinishChunk(reason="stop"),
-            ],
-        ])
-        monkeypatch.setattr(
-            "thorn._cli.load_provider_from_env",
-            _mock_provider_factory(second_provider),
+        sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
+        cli_dirs = [
+            d for d in sessions_root.iterdir()
+            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
+        ]
+        assert len(cli_dirs) == 2, (
+            f"expected two distinct ephemeral chat sessions on disk, "
+            f"got {sorted(d.name for d in cli_dirs)}"
         )
-        result = runner.invoke(
-            cli_main,
-            [
-                "chat",
-                "--no-tools", "--no-discover", "--no-mcp",
-                "--workspace", str(tmp_path),
-            ],
-            input="hello again\n",
-            catch_exceptions=False,
-        )
-        assert result.exit_code == 0
-        assert "Resuming session" in result.output
 
     def test_session_inbox_dir_created_and_drained(
         self, tmp_path: Path, monkeypatch,
@@ -638,10 +807,20 @@ class TestChat:
         )
         assert result.exit_code == 0
 
-        inbox_dir = (
-            tmp_path / ".thorn" / "agents" / "local"
-            / "sessions" / "default" / "inbox"
+        # Phase 5: chat keys are ``cli/<basename>/<uuid8>``; find the
+        # one session dir created this invocation.
+        from thorn.runtime._paths import unsafe_dirname
+
+        sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
+        cli_dirs = [
+            d for d in sessions_root.iterdir()
+            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
+        ]
+        assert len(cli_dirs) == 1, (
+            f"expected exactly one chat session dir, got "
+            f"{sorted(d.name for d in cli_dirs)}"
         )
+        inbox_dir = cli_dirs[0] / "inbox"
         assert inbox_dir.is_dir(), (
             "the SessionInbox constructor should have mkdir'd "
             "the per-session inbox dir"
@@ -654,6 +833,128 @@ class TestChat:
             "ChatPromptRouter must remove notifications after each "
             "turn; otherwise the scheduler's progress guarantee "
             "would eventually evict them"
+        )
+
+    def test_shutdown_housekeeping_runs_by_default(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Clean REPL exit triggers one more ``session.prompt`` for housekeeping.
+
+        The provider is pre-loaded with *two* canned responses but only
+        one user turn is typed.  With shutdown housekeeping enabled
+        (the default), the second canned response is consumed by the
+        framework-driven housekeeping turn that runs after ``_chat_loop``
+        returns.  Guarding on ``canned_responses == []`` therefore
+        proves the housekeeping code path actually reaches the
+        provider; counting any other way (history length, session
+        files) would be fooled by the no-op echo fallback.
+        """
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="answer"), FinishChunk(reason="stop")],
+            [TextChunk(text="noted"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--no-tools", "--no-discover", "--no-mcp",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            input="hi there\n",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert provider.canned_responses == [], (
+            "shutdown housekeeping should have consumed the second "
+            "canned response on clean REPL exit"
+        )
+
+    def test_no_housekeeping_flag_skips_shutdown_turn(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """``--no-housekeeping`` must suppress the extra shutdown prompt.
+
+        Complement to ``test_shutdown_housekeeping_runs_by_default``:
+        with the opt-out flag set, the second canned response is left
+        untouched, which is the only observable difference from the
+        default behaviour under the mock provider.  Tests that pass
+        the flag implicitly (e.g. to avoid provider-queue
+        bookkeeping) rely on this semantic.
+        """
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="answer"), FinishChunk(reason="stop")],
+            [TextChunk(text="should-not-be-used"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--no-tools", "--no-discover", "--no-mcp",
+                "--workspace", str(tmp_path),
+                "--no-housekeeping",
+                "--quiet",
+            ],
+            input="hi there\n",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert len(provider.canned_responses) == 1, (
+            "with --no-housekeeping, the second canned response must "
+            "be left untouched -- there is no shutdown turn to "
+            "consume it"
+        )
+
+    def test_shutdown_housekeeping_skipped_on_no_input(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """EOF without a single turn must not provoke a housekeeping call.
+
+        Running housekeeping on a brand-new, never-prompted session
+        would be pure overhead (nothing in history to journal) and
+        would burn a provider round in the common case of typing
+        ``thorn chat`` and immediately realising you meant something
+        else.  Empty-history fast-exit path.
+        """
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="should-not-be-used"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--no-tools", "--no-discover", "--no-mcp",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            input="",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert len(provider.canned_responses) == 1, (
+            "no user turn was typed, so nothing should have gone to "
+            "the provider -- including the housekeeping prompt"
         )
 
     def test_skill_error_does_not_terminate_repl(

@@ -1,21 +1,26 @@
 """Harness-driven history housekeeping.
 
-When deterministic compaction (collapse/expand) cannot bring the context
-within budget, the housekeeping flow trims old history after giving the
-agent a chance to journal important information.
+Two distinct flavours of housekeeping live here:
 
-The flow, run inside ``run_agent_loop`` after every assistant turn:
+1. **Context-compaction housekeeping** (:func:`perform_housekeeping`).
+   Runs *inside* ``run_agent_loop`` after a normal assistant turn when
+   deterministic compaction (collapse/expand) cannot bring the context
+   within budget.  Walks through: select a cut point, insert a
+   boundary marker, run a restricted sub-loop where the agent can
+   journal anything worth keeping, then trim everything above the
+   cut.  Transparent to callers of ``session.prompt()`` -- plumbing,
+   not porcelain.
 
-1. Select a *cut point* — everything before it will be removed.
-2. Insert a context-boundary marker at the cut point so the agent can
-   see what is about to be lost.
-3. Run a restricted sub-loop (journal + read tools only) where the
-   agent writes anything important to its journal.
-4. Trim: replace removed nodes with an ``ArchiveMarkerNode``, wrap
-   the housekeeping interaction in a ``HousekeepingNode``.
-
-The entire mechanism is transparent to callers of ``session.prompt()``
-— it is plumbing, not porcelain.
+2. **Shutdown housekeeping**
+   (:func:`perform_shutdown_housekeeping`).  Runs *outside* the agent
+   loop when a session is about to be discarded (today: CLI exit).
+   Gives the agent one last turn to write anything important to
+   journal or memory before the session goes away.  No cut point, no
+   history surgery -- the history is being thrown away anyway.  See
+   the aspirational architecture doc's "CLI Sessions" section for
+   the motivation: *"When the CLI app exits, the session is always
+   prompted to perform housekeeping and migrate all relevant
+   information out to the journal or durable memory."*
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ from thorn.core._messages import UserMessage
 if TYPE_CHECKING:
     from thorn.core._context import ExecutionContext
     from thorn.core._loop import _WrappedTool
+    from thorn.core._session import Session
 
 logger = logging.getLogger(__name__)
 
@@ -259,3 +265,106 @@ async def perform_housekeeping(
         nodes_trimmed=nodes_to_trim,
         journal_date=journal_date,
     )
+
+
+# ---------------------------------------------------------------------------
+# Shutdown housekeeping
+# ---------------------------------------------------------------------------
+
+SHUTDOWN_HOUSEKEEPING_PROMPT: str = (
+    "This session is about to end and will be discarded. Before that "
+    "happens, review the conversation above and write down anything "
+    "worth remembering in your journal.\n\n"
+    "Good candidates for a journal entry include:\n"
+    "- Decisions that were made or work that was completed.\n"
+    "- Open threads or follow-ups that a future session would want "
+    "to pick up on.\n"
+    "- Observations about the user's preferences, the project, or "
+    "the environment that aren't already captured in your memory.\n\n"
+    "Use ``write_journal`` (and ``read_journal`` if you want to "
+    "check for duplicates first) to record what matters.  If there "
+    "is genuinely nothing notable, a brief acknowledgement that the "
+    "session ended uneventfully is fine."
+)
+"""Prompt shown to the agent at session shutdown.
+
+Deliberately low-pressure: we want the agent to write *something* in
+the useful case but not feel compelled to manufacture entries when
+the session was trivial.  The exact wording is tuned for the base
+``Agent`` role which has ``write_journal`` / ``read_journal`` as
+default role tools; specialised agents that override those tools
+will need to adapt the prompt (out of scope for Phase 5).
+"""
+
+
+async def perform_shutdown_housekeeping(
+    session: "Session",
+    *,
+    extra_system: str | None = None,
+) -> None:
+    """Run one final journaling turn before *session* is discarded.
+
+    Intended for CLI exit: ``thorn chat`` invokes this after the REPL
+    loop ends so the agent has a chance to migrate anything valuable
+    from the session's volatile history into its durable journal.
+    The session itself can still be persisted afterwards via
+    ``save_session`` -- shutdown housekeeping mutates only the
+    in-memory history to record the housekeeping turn itself; it
+    doesn't trim or surgically modify the tree like
+    :func:`perform_housekeeping` does.
+
+    Why this is a separate function from :func:`perform_housekeeping`
+    rather than a flag on it:
+
+    - Context-compaction housekeeping's whole point is the trim; it
+      selects a cut point, inserts a boundary marker, and reshapes
+      history around it.  Shutdown housekeeping has no trim step --
+      the history goes in the bin on CLI exit regardless -- so the
+      cut-point and ``HousekeepingNode`` machinery would be dead
+      weight here.
+    - The two flows also want different prompts (*"context is full"*
+      vs. *"session is about to end"*) and different call sites
+      (inside ``run_agent_loop`` vs. around a ``session.prompt`` call
+      at REPL shutdown).  Sharing the function would force the caller
+      to know which half to use.
+
+    Behaviour:
+
+    - Invokes ``session.prompt(SHUTDOWN_HOUSEKEEPING_PROMPT,
+      tools=[], system=extra_system)``.  Passing ``tools=[]`` strips
+      whatever CLI-default extras the REPL was running with (shell,
+      git, file writing) so the agent's tool surface shrinks to the
+      base ``Agent`` role tools -- which for the CLI's local agent
+      is just ``write_journal`` / ``read_journal`` / inbox tools.
+      Restricting further (e.g. to the
+      :data:`_HOUSEKEEPING_TOOL_ALLOWLIST` used by compaction) would
+      require a parallel code path around ``run_agent_loop``
+      bypassing ``session.prompt``'s memory/journal/AGENTS.md
+      injection; not worth it for Phase 5.
+    - All expected exceptions (``SkillError``, ``ThornError``,
+      ``LoopLimitError``) are caught and logged at ``INFO`` level.
+      Shutdown housekeeping running into trouble must never block
+      CLI exit -- the user has already closed their terminal input
+      and is waiting for the process to finish.
+    - :class:`asyncio.CancelledError` and other ``BaseException``
+      subclasses propagate, so ``Ctrl+C`` during housekeeping still
+      tears the session down rather than being silently swallowed.
+    - Sessions with an empty history are short-circuited: there is
+      nothing for the agent to journal, and asking it to do so would
+      only burn a provider round.  This is the ``thorn chat`` EOF-at-
+      the-prompt path, which is otherwise common enough to care about.
+    """
+    from thorn.core.errors import LoopLimitError, SkillError, ThornError
+
+    if not session._history.nodes:
+        logger.debug("shutdown housekeeping: empty history, skipping")
+        return
+
+    try:
+        await session.prompt(
+            SHUTDOWN_HOUSEKEEPING_PROMPT,
+            tools=[],
+            system=extra_system,
+        )
+    except (SkillError, ThornError, LoopLimitError) as exc:
+        logger.info("shutdown housekeeping ended early: %s", exc)

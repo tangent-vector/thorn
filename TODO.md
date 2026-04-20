@@ -55,6 +55,8 @@
 
 - A `thorn trace view` command that opens a local web page to visualize JSONL trace files (produced by `--trace`) as an interactive execution tree with timing
 
+- Interactive CLI commands (`thorn chat`, eventually `thorn run` long-running cases) should offer a way to interrupt an in-flight turn without tearing down the whole REPL. Today `KeyboardInterrupt` propagates out of `asyncio.run` and ends the session; the desired behaviour is "cancel the running prompt round, keep the REPL alive". Needs a cooperative cancellation path through `ChatPromptRouter`/`AgentScheduler` (e.g. cancelling the active driver task without closing the scheduler) and some UI affordance (Ctrl+C once to interrupt the turn, twice to exit?). Can be layered on later; not a blocker for the CLI/gateway unification phases.
+
 - `JsonLinesSink` doesn't override `EventSink.on_advisory`, so advisories emitted by status providers fall through to the default implementation that delegates to `on_status`. As a result, `--trace` JSONL records advisories as plain `status` entries with the `[source] content` text spliced into the message, losing the structured `source`/`content` split. Override `on_advisory` on `JsonLinesSink` to emit a dedicated `advisory` event type with `source` and `content` as separate fields.
 
 - The LLM provider (`_provider.py`) does not set `max_tokens` on API requests, so a degenerate model response can produce unbounded output. The agent loop (`_loop.py`) also has no repetition detection. Together these allow a stuck LLM to spin forever repeating tokens. Short-term: add a configurable `max_tokens` to `OpenAIProvider.complete`. Longer-term: add repetition/loop detection in the agent loop itself.
@@ -78,6 +80,8 @@
   As a possibly-questionable extension/abuse of that concept, we could make it so that when the tool sees a `SKILL.md` file it extracts the `description:` from the YAML front-matter and uses that as the hint text intead of trying to scrape for a title in the Markdown content. With that kind of subtle policy tweak, a simple `ls`-like tool call on `.agents/skills/` directory would "automatically" yield a listing of available skills and their descriptions.
 
 - Some kind of config file under `.thorn/` that can be used to specify options even for sub-tools (like the gateway server).
+
+- Explicit session resume for the CLI. Today every `thorn run` / `thorn chat` invocation mints a fresh `cli/{cwd-basename}/{uuid8}` session; there is no first-class way to re-attach to a previous one. Once we have a use case, add something like `--resume KEY` (or a `/resume` meta-command inside `thorn chat`) that loads an existing session from the session store instead of creating a new one. Needs decisions about how to list available sessions, handle stale locks, and reconcile the resumed session's workspace/agency with the current invocation's.
 
 - Agent should signal awareness of GitLab messages via emoji reactions, to help users have visibility into what it might be doing behind the scenes.
 

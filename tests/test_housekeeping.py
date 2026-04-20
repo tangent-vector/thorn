@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from thorn.core._context import ExecutionContext, NullEventSink, Scope
 from thorn.core._history import (
     ArchiveMarkerNode,
@@ -15,9 +17,11 @@ from thorn.core._history import (
 from thorn.core._housekeeping import (
     CONTEXT_BOUNDARY_TEXT,
     HOUSEKEEPING_PROMPT,
+    SHUTDOWN_HOUSEKEEPING_PROMPT,
     _HOUSEKEEPING_TOOL_ALLOWLIST,
     filter_housekeeping_tools,
     perform_housekeeping,
+    perform_shutdown_housekeeping,
     select_cut_point,
 )
 from thorn.core._loop import _WrappedTool, run_agent_loop
@@ -734,3 +738,150 @@ class TestPostHousekeepingStructure:
         assert isinstance(tree.nodes[0], ArchiveMarkerNode)
         # The old marker was trimmed and replaced by a new one
         assert tree.nodes[0].node_count > 0
+
+
+# ---------------------------------------------------------------------------
+# perform_shutdown_housekeeping
+# ---------------------------------------------------------------------------
+
+
+class TestPerformShutdownHousekeeping:
+    """Unit tests for :func:`perform_shutdown_housekeeping`.
+
+    These complement the CLI-level integration coverage in
+    ``tests/test_cli.py::TestChat`` by exercising the function directly
+    against a real ``Session`` / ``Agent`` pair.  The integration tests
+    prove the wiring from the REPL is correct; these tests pin down
+    the contract of the helper itself so a refactor that, say,
+    dropped the empty-history guard or stopped passing ``tools=[]``
+    would fail here independently of the CLI plumbing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_history_short_circuits(self, tmp_path):
+        """No history → no provider round (nothing to journal)."""
+        from thorn.core._agent import Agent
+        from thorn.core._context import set_context, reset_context
+        from thorn.core._session import Session
+
+        provider = MockProvider()
+        original_complete = provider.complete
+        call_count = 0
+
+        async def counting_complete(
+            system_prompts: list[str],
+            tools: list[dict],
+            messages: list,
+        ):
+            nonlocal call_count
+            call_count += 1
+            async for chunk in original_complete(system_prompts, tools, messages):
+                yield chunk
+
+        provider.complete = counting_complete  # type: ignore[assignment]
+
+        ctx = ExecutionContext(provider=provider, workspace_root=tmp_path)
+        token = set_context(ctx)
+        try:
+            agent = Agent(workspace=tmp_path, home=tmp_path)
+            session = Session(agent=agent)
+
+            await perform_shutdown_housekeeping(session)
+
+            assert call_count == 0, (
+                "empty-history sessions must skip the shutdown prompt "
+                "so ``thorn chat`` + EOF does not burn a provider round"
+            )
+        finally:
+            reset_context(token)
+
+    @pytest.mark.asyncio
+    async def test_non_empty_history_sends_shutdown_prompt(self, tmp_path):
+        """With history present, the agent receives the shutdown prompt text."""
+        from thorn.core._agent import Agent
+        from thorn.core._context import set_context, reset_context
+        from thorn.core._session import Session
+
+        provider = MockProvider(
+            canned_responses=[
+                [
+                    TextChunk(text="Noted; nothing critical."),
+                    UsageChunk(
+                        prompt_tokens=5, completion_tokens=3, total_tokens=8,
+                    ),
+                    FinishChunk(reason="stop"),
+                ],
+            ],
+        )
+
+        captured_user_messages: list[str] = []
+        original_complete = provider.complete
+
+        async def spy_complete(
+            system_prompts: list[str],
+            tools: list[dict],
+            messages: list,
+        ):
+            for m in messages:
+                if isinstance(m, UserMessage):
+                    captured_user_messages.append(m.content)
+            async for chunk in original_complete(system_prompts, tools, messages):
+                yield chunk
+
+        provider.complete = spy_complete  # type: ignore[assignment]
+
+        ctx = ExecutionContext(provider=provider, workspace_root=tmp_path)
+        token = set_context(ctx)
+        try:
+            agent = Agent(workspace=tmp_path, home=tmp_path)
+            session = Session(agent=agent)
+            session._history.append_user_prompt("what's 2+2")
+            session._history.append_turn(
+                AssistantMessage(content="4"), [],
+            )
+
+            await perform_shutdown_housekeeping(session)
+
+            assert any(
+                SHUTDOWN_HOUSEKEEPING_PROMPT[:40] in text
+                for text in captured_user_messages
+            ), (
+                "provider should have seen the shutdown housekeeping "
+                f"prompt; got {captured_user_messages!r}"
+            )
+        finally:
+            reset_context(token)
+
+    @pytest.mark.asyncio
+    async def test_swallows_thorn_errors(self, tmp_path):
+        """``SkillError`` / ``LoopLimitError`` must not leak to the caller.
+
+        Shutdown housekeeping fires during CLI teardown; a raised
+        exception there would appear as a post-exit traceback after
+        the user's ``Goodbye.``  That would be a strictly worse UX
+        than quietly logging and moving on.
+        """
+        from thorn.core._agent import Agent
+        from thorn.core._context import set_context, reset_context
+        from thorn.core._session import Session
+        from thorn.core.errors import SkillError
+
+        class ExplodingProvider(MockProvider):
+            async def complete(self, system_prompts, tools, messages):
+                raise SkillError("boom")
+                yield  # pragma: no cover  (keeps this an async-iterator)
+
+        provider = ExplodingProvider()
+        ctx = ExecutionContext(provider=provider, workspace_root=tmp_path)
+        token = set_context(ctx)
+        try:
+            agent = Agent(workspace=tmp_path, home=tmp_path)
+            session = Session(agent=agent)
+            session._history.append_user_prompt("hi")
+            session._history.append_turn(
+                AssistantMessage(content="there"), [],
+            )
+
+            await perform_shutdown_housekeeping(session)
+        finally:
+            reset_context(token)

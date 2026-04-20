@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 import time
 import uuid
@@ -58,8 +57,45 @@ console = Console()
 CLI_AGENT_ID = AgentID("local")
 """Well-known agent ID for the CLI local coding agent."""
 
-CLI_SESSION_KEY = SessionKey("default")
-"""Default session key for CLI mode (single-session per workspace)."""
+
+def _generate_cli_session_key(workspace_root: Path) -> SessionKey:
+    """Generate a fresh session key for a single CLI invocation.
+
+    Phase 5 of the CLI/gateway unification: every ``thorn run`` and
+    every ``thorn chat`` invocation gets a brand-new ephemeral session
+    rather than resuming a stable per-workspace one.  The aspirational
+    architecture doc says:
+
+        Each invocation of ``thorn chat`` or ``thorn run`` creates a
+        fresh session by default, with a key that depends on the
+        current working directory when the command was run, along
+        with a unique ID.
+
+    We encode that as ``cli/<workspace-basename>/<uuid8>`` so that:
+
+    - the top-level ``cli/`` prefix distinguishes ephemeral CLI
+      sessions from the named sessions the gateway uses (peers/...,
+      projects/..., etc.);
+    - the workspace basename makes the on-disk layout scannable
+      ("this dir holds chat sessions started from the thorn project"),
+      without trying to encode the full absolute path -- basenames
+      across different parent dirs can collide, but the uuid tail
+      keeps each individual session unique so collisions are
+      harmless;
+    - the 8-hex-char uuid suffix guarantees uniqueness across
+      invocations and is short enough to type or paste in a future
+      ``/resume <key>`` slash command.
+
+    Characters in the basename that aren't safe as a single directory
+    component are percent-encoded via :func:`safe_dirname`; the rest
+    of the key (``cli/`` and the hex tail) is ASCII-safe so the
+    encoded form round-trips via :func:`unsafe_dirname`.
+    """
+    from thorn.runtime._paths import safe_dirname
+
+    basename = workspace_root.name or "root"
+    safe_basename = safe_dirname(basename)
+    return SessionKey(f"cli/{safe_basename}/{uuid.uuid4().hex[:8]}")
 
 CHAT_SYSTEM_PROMPT = (
     "You are in an interactive chat session with a human user. "
@@ -111,6 +147,31 @@ def _resolve_verbosity(verbose: int, quiet: bool) -> Verbosity:
     return Verbosity.NORMAL
 
 
+def _resolve_cli_agency_home(agency_path: str | None) -> Path:
+    """Resolve the agency home directory for ``thorn run`` / ``thorn chat``.
+
+    Phase 5 of the CLI/gateway unification switches the CLI default
+    agency home from ``{cwd}/.thorn/`` (the old ``for_cli`` nested
+    layout) to ``~/.thorn/`` (the local-agency convention from the
+    architecture doc).  Home is where agent identity, memory, and
+    persisted sessions live; workspace is where the agent does its
+    work.  Decoupling the two lets a single local agency serve chats
+    launched from different project directories.
+
+    When *agency_path* is supplied (``--agency <dir>``), use it
+    verbatim after :func:`~pathlib.Path.expanduser` and
+    :func:`~pathlib.Path.resolve`.  Otherwise fall back to
+    ``~/.thorn``.  The directory is created if missing -- a fresh
+    ``~/.thorn`` is the expected first-run experience.
+    """
+    if agency_path is not None:
+        agency_home = Path(agency_path).expanduser().resolve()
+    else:
+        agency_home = (Path.home() / ".thorn").resolve()
+    agency_home.mkdir(parents=True, exist_ok=True)
+    return agency_home
+
+
 def _build_runtime(
     trace_file: Any | None = None,
     workspace: str | None = None,
@@ -136,8 +197,12 @@ def _build_runtime(
     *workspace* overrides the workspace root.  When ``None``, the
     heuristic in :func:`thorn.infer_workspace_root` is used.
 
-    *paths*, when provided, sets the agency directory layout explicitly.
-    When ``None``, CLI-mode paths are derived from the workspace root.
+    *paths* sets the agency directory layout explicitly.  When
+    ``None``, falls back to the legacy CLI-nested layout
+    (``{ws_root}/.thorn/``) for backwards compatibility with callers
+    that haven't yet adopted the Phase-5 ``~/.thorn`` default; all
+    production CLI entry points pass *paths* explicitly and do not
+    exercise that fallback.
     """
     from pathlib import Path
 
@@ -332,13 +397,36 @@ def _write_result_file(
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
 @click.option("--workspace", "workspace_path", type=click.Path(exists=True, file_okay=False), default=None, help="Override workspace root directory.")
+@click.option(
+    "--agency",
+    "agency_path",
+    type=click.Path(file_okay=False),
+    default=None,
+    help=(
+        "Agency home directory (holds agent identities, sessions, "
+        "and journals).  Defaults to ~/.thorn/; created if missing."
+    ),
+)
 @click.option("--result-file", "result_file_path", type=click.Path(), default=None, help="Write a JSON result summary (outcome, duration, token usage).")
-def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, result_file_path: str | None) -> None:
+def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, result_file_path: str | None) -> None:
     """Execute a single prompt and print the result."""
+    from thorn import infer_workspace_root
+    from thorn.runtime._paths import AgencyPaths
+
     verbosity = _resolve_verbosity(verbose, quiet)
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        runtime = _build_runtime(trace_file=trace_file, workspace=workspace_path)
+        agency_home = _resolve_cli_agency_home(agency_path)
+        ws_root = (
+            Path(workspace_path).resolve() if workspace_path
+            else infer_workspace_root()
+        )
+        paths = AgencyPaths(home_root=agency_home, workspace_root=ws_root)
+        runtime = _build_runtime(
+            trace_file=trace_file,
+            workspace=str(ws_root),
+            paths=paths,
+        )
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         if trace_file:
@@ -374,21 +462,19 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
                     no_mcp=no_mcp,
                 )
 
-                # Each ``thorn run`` invocation gets a fresh session
-                # under a unique key.  Phase 5 will formalise the
-                # naming convention (``ephemeral/{uuid}`` or similar)
-                # and wire shutdown housekeeping into session close;
-                # for now the in-memory session is never persisted
+                # Phase 5: every CLI invocation gets a fresh session
+                # under a unique key (``cli/<workspace-basename>/<uuid>``).
+                # The in-memory session is never persisted
                 # (``save_session=None`` below) so the only on-disk
-                # artefact is the session's inbox directory, which
-                # ends up empty after the dispatcher deletes the one
-                # notification it processes.  Acceptable litter for
-                # the duration of Phase 2.
+                # artefacts are the session's inbox directory (empty
+                # after the dispatcher deletes the one notification it
+                # processes) and, in future, shutdown-housekeeping
+                # journal entries that the agent may choose to write.
                 if agent.id is None:
                     raise RuntimeError(
                         "CLI agent has no id; cannot build a session inbox"
                     )
-                session_key = SessionKey(f"run-{uuid.uuid4().hex[:8]}")
+                session_key = _generate_cli_session_key(runtime.workspace_root)
 
                 # Phase 3: the runtime carries an ``EventBus`` rather
                 # than a single sink; subscribe a console listener
@@ -569,12 +655,45 @@ async def _chat_loop(
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
 @click.option("--workspace", "workspace_path", type=click.Path(exists=True, file_okay=False), default=None, help="Override workspace root directory.")
-def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None) -> None:
+@click.option(
+    "--agency",
+    "agency_path",
+    type=click.Path(file_okay=False),
+    default=None,
+    help=(
+        "Agency home directory (holds agent identities, sessions, "
+        "and journals).  Defaults to ~/.thorn/; created if missing."
+    ),
+)
+@click.option(
+    "--no-housekeeping",
+    is_flag=True,
+    default=False,
+    help=(
+        "Skip the shutdown housekeeping turn that normally runs on "
+        "chat exit (the agent's chance to journal anything worth "
+        "remembering from this session)."
+    ),
+)
+def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, no_housekeeping: bool) -> None:
     """Start an interactive chat session."""
+    from thorn import infer_workspace_root
+    from thorn.runtime._paths import AgencyPaths
+
     verbosity = _resolve_verbosity(verbose, quiet)
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        runtime = _build_runtime(trace_file=trace_file, workspace=workspace_path)
+        agency_home = _resolve_cli_agency_home(agency_path)
+        ws_root = (
+            Path(workspace_path).resolve() if workspace_path
+            else infer_workspace_root()
+        )
+        paths = AgencyPaths(home_root=agency_home, workspace_root=ws_root)
+        runtime = _build_runtime(
+            trace_file=trace_file,
+            workspace=str(ws_root),
+            paths=paths,
+        )
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         if trace_file:
@@ -589,19 +708,14 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
         # ``session.prompt`` directly.  Each user input is posted as a
         # notification on the session's inbox; the scheduler invokes
         # ``ChatPromptRouter.dispatcher`` which calls ``session.prompt``
-        # and resolves a per-turn future the REPL awaits.  The scheduler
-        # also runs ``save_session`` after every successful round, so
-        # the per-turn ``runtime.save_session`` call from Phase 1 is
-        # gone.
+        # and resolves a per-turn future the REPL awaits.
         #
-        # Phase 1's hand-rolled provider/tool-dispatch loop collapsed to
-        # repeated ``session.prompt`` calls; Phase 4 moves the *driver*
-        # of those calls into the scheduler so chat, ``thorn run``, and
-        # the gateway daemon all share one execution pipeline.  The
-        # local agency / per-invocation session-key work is left for
-        # Phase 5.
-        from thorn.runtime._lock import SessionLockError, session_lock
-
+        # Phase 5: each invocation gets a fresh session key, so the
+        # implicit per-workspace resume (and the PID-suffixed
+        # collision-fallback hack) are gone.  The session lock is no
+        # longer useful either -- the uuid-suffixed key cannot collide
+        # across processes -- so it's dropped.  An explicit
+        # ``--resume <key>`` flow is a Phase 5 follow-up.
         async with runtime:
             agent = _ensure_cli_agent(runtime)
             if agent.id is None:
@@ -609,122 +723,125 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
                     "CLI agent has no id; cannot build a session inbox"
                 )
 
-            session_key = CLI_SESSION_KEY
-            session_dir = runtime.sessions._session_dir(agent.id, session_key)
+            session_key = _generate_cli_session_key(runtime.workspace_root)
+            session = runtime.get_or_create_session(
+                agent, session_key,
+                workspace_root=runtime.workspace_root,
+            )
 
-            # Advisory file lock prevents two concurrent `thorn chat`
-            # processes from racing on the same session's history.  The
-            # PID-suffixed fallback is a temporary workaround that Phase
-            # 5 will obsolete by generating a unique session key per CLI
-            # invocation.
-            try:
-                lock_ctx = session_lock(session_dir)
-                lock_ctx.__enter__()
-            except SessionLockError:
-                console.print(
-                    "[yellow]Session is in use by another process; "
-                    "starting a fresh session.[/yellow]\n"
-                )
-                session_key = SessionKey(f"default-{os.getpid()}")
-                session_dir = runtime.sessions._session_dir(agent.id, session_key)
-                lock_ctx = session_lock(session_dir)
-                lock_ctx.__enter__()
-
-            try:
-                session = runtime.get_or_create_session(
-                    agent, session_key,
-                    workspace_root=runtime.workspace_root,
-                )
-
-                if session._history.nodes:
-                    console.print(
-                        f"[dim]Resuming session with "
-                        f"{len(session._history.nodes)} history entries.[/dim]\n"
+            # Subscribe a per-session console listener (Phase 3
+            # bus pattern); the filter scopes output to events
+            # tagged with this session key, so any background
+            # session that lands later under a shared local-agency
+            # runtime won't bleed into the REPL output.
+            bus = _runtime_event_bus(runtime)
+            console_listener: EventSink = ConsoleEventSink(
+                verbosity=verbosity,
+            )
+            with bus.subscribe(
+                console_listener,
+                scope_filter=in_session(session_key),
+            ):
+                async with AsyncExitStack() as stack:
+                    tools = await _collect_all_tools(
+                        stack,
+                        no_tools=no_tools,
+                        no_discover=no_discover,
+                        no_mcp=no_mcp,
                     )
 
-                # Subscribe a per-session console listener (Phase 3
-                # bus pattern); the filter scopes output to events
-                # tagged with this session key, so any background
-                # session that lands later under a shared local-agency
-                # runtime won't bleed into the REPL output.
-                bus = _runtime_event_bus(runtime)
-                console_listener: EventSink = ConsoleEventSink(
-                    verbosity=verbosity,
-                )
-                with bus.subscribe(
-                    console_listener,
-                    scope_filter=in_session(session_key),
-                ):
-                    async with AsyncExitStack() as stack:
-                        tools = await _collect_all_tools(
-                            stack,
-                            no_tools=no_tools,
-                            no_discover=no_discover,
-                            no_mcp=no_mcp,
-                        )
-
-                        # Per-session inbox + scheduler wiring.  The
-                        # inbox lives under the agent's data root so a
-                        # crash leaves the in-flight notification on
-                        # disk for the startup sweep to reconcile -- a
-                        # property that becomes load-bearing once Phase
-                        # 5 introduces the local-agency daemon.
-                        session_address = SessionAddress(
+                    # Per-session inbox + scheduler wiring.  The
+                    # inbox lives under the agent's data root so a
+                    # crash leaves the in-flight notification on
+                    # disk for the startup sweep to reconcile -- a
+                    # property that becomes load-bearing once Phase
+                    # 6 introduces the local-agency daemon.
+                    session_address = SessionAddress(
+                        agent.id, session_key,
+                    )
+                    inbox = SessionInbox(
+                        runtime.paths.session_inbox_dir(
                             agent.id, session_key,
-                        )
-                        inbox = SessionInbox(
-                            runtime.paths.session_inbox_dir(
-                                agent.id, session_key,
-                            ),
-                            session_address,
-                            in_flight_index=runtime.in_flight_index,
-                        )
-                        runtime.address_book.register(
-                            session_address, inbox,
-                        )
+                        ),
+                        session_address,
+                        in_flight_index=runtime.in_flight_index,
+                    )
+                    runtime.address_book.register(
+                        session_address, inbox,
+                    )
 
-                        router = ChatPromptRouter(
-                            target=session_address,
-                            extra_tools=tools,
-                            extra_system=CHAT_SYSTEM_PROMPT,
+                    router = ChatPromptRouter(
+                        target=session_address,
+                        extra_tools=tools,
+                        extra_system=CHAT_SYSTEM_PROMPT,
+                    )
+
+                    async def _save_session_async(
+                        sess: Session,
+                    ) -> None:
+                        """Async adapter around the sync save.
+
+                        Mirrors the gateway's pattern (named so
+                        scheduler exception logs point at a real
+                        qualified name).  The save is small;
+                        running it on the loop thread is fine
+                        because the scheduler already serialises
+                        per-session, so there is no contention to
+                        offload.
+                        """
+                        runtime.save_session(sess)
+
+                    scheduler = AgentScheduler(
+                        agent=agent,
+                        prompt_dispatcher=router.dispatcher,
+                        save_session=_save_session_async,
+                    )
+
+                    try:
+                        await _chat_loop(
+                            router=router,
+                            scheduler=scheduler,
+                            session=session,
+                            inbox=inbox,
                         )
-
-                        async def _save_session_async(
-                            sess: Session,
-                        ) -> None:
-                            """Async adapter around the sync save.
-
-                            Mirrors the gateway's pattern (named so
-                            scheduler exception logs point at a real
-                            qualified name).  The save is small;
-                            running it on the loop thread is fine
-                            because the scheduler already serialises
-                            per-session, so there is no contention to
-                            offload.
-                            """
-                            runtime.save_session(sess)
-
-                        scheduler = AgentScheduler(
-                            agent=agent,
-                            prompt_dispatcher=router.dispatcher,
-                            save_session=_save_session_async,
-                        )
-
-                        try:
-                            await _chat_loop(
-                                router=router,
-                                scheduler=scheduler,
-                                session=session,
-                                inbox=inbox,
+                        # Shutdown housekeeping (Phase 5): gives the
+                        # agent one last turn to journal anything
+                        # worth remembering before the session is
+                        # discarded.  Bypasses the scheduler/router
+                        # -- this is a framework-driven action, not a
+                        # user turn, and the scheduler's drain task
+                        # is about to be torn down.  ``--no-
+                        # housekeeping`` skips the turn entirely for
+                        # scripted / test use.  We run housekeeping
+                        # *only after a clean REPL exit*; if
+                        # ``_chat_loop`` raised (``KeyboardInterrupt``,
+                        # unexpected error) we skip, because the
+                        # agent is unlikely to produce a useful final
+                        # turn mid-panic and the user wants their
+                        # shell prompt back.
+                        if not no_housekeeping:
+                            from thorn.core._housekeeping import (
+                                perform_shutdown_housekeeping,
                             )
-                        finally:
-                            # Bounded grace period mirrors ``thorn
-                            # run``: in the success case the driver is
-                            # parked on its idle wait, so shutdown is
-                            # essentially instantaneous.
-                            await scheduler.shutdown(timeout=5.0)
-            finally:
-                lock_ctx.__exit__(None, None, None)
+                            try:
+                                await perform_shutdown_housekeeping(session)
+                                runtime.save_session(session)
+                            except ThornError as exc:
+                                # Shutdown housekeeping swallows
+                                # Thorn-level errors internally, but
+                                # save_session could still raise
+                                # (disk full, etc.); log and move on
+                                # rather than block exit.
+                                console.print(
+                                    f"[yellow]Shutdown housekeeping "
+                                    f"failed to save:[/yellow] {exc}"
+                                )
+                    finally:
+                        # Bounded grace period mirrors ``thorn
+                        # run``: in the success case the driver is
+                        # parked on its idle wait, so shutdown is
+                        # essentially instantaneous.
+                        await scheduler.shutdown(timeout=5.0)
 
     try:
         asyncio.run(_chat())

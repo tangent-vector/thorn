@@ -46,6 +46,16 @@ return normally so the scheduler still saves.  Cancellation
 (``asyncio.CancelledError``) and other non-recoverable exceptions
 propagate so shutdown semantics are unaffected.
 
+**Open question.**  The exception classes this module treats as
+"recoverable, still save" are hard-coded (``SkillError`` and the
+broader ``ThornError`` base).  A different driver -- e.g. a future
+IPC client that wants every non-cancellation error to be reportable
+without losing history -- would want to extend or replace that set.
+The right configurability shape is not yet obvious (a constructor
+parameter? a subclass override? a broader contract on the scheduler
+itself about when to save?), so the policy is left as-is here and
+flagged for revisit once a second caller actually shows up.
+
 Mismatch between queued futures and dispatched rounds
 -----------------------------------------------------
 
