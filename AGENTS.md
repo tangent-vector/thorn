@@ -13,6 +13,23 @@ This project uses **`uv`** as its package manager. Do not use `pip install`, `py
 
 ---
 
+## What counts as a priority
+
+- Thorn is developed as an end-user application.
+  The priorities, in order, are:
+  1. The `thorn` CLI (`thorn run`, `thorn chat`, and related subcommands).
+  2. The `thorn serve` gateway and the agency / runtime infrastructure it depends on.
+  3. Everything else.
+
+- The library-style public API (`Agent`, `prompt()`, `@skill`, `@tool`, `wrap_function`, `ALL_BUILTIN_TOOLS`, etc.) exists to serve the CLI and the gateway.
+  It is **not** a stable contract.
+  When a legacy library-API shape comes into tension with a forward-looking plan (sandboxing, coordination, skills-as-the-successor-to-user-tools, etc.), the library API is the thing that gives.
+
+- Concretely: do not preserve library-API surface for its own sake, do not add compatibility shims to keep external embedders working, and do not treat "someone might be calling this as a library" as a reason to hold back on a design change.
+  If in doubt about whether something is load-bearing, check whether the CLI or gateway depends on it; if they don't, it's safe to change or remove.
+
+---
+
 - Don't guess or presume. If you aren't exceptionally confident that you understand the situation, the user's intent, etc. then you should ask clarifying questions.
   We are collaborators, and you should leverage the things that the user is good at and the knowledge they have that you may lack.
 

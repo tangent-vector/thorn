@@ -64,8 +64,10 @@ They are the *only* form a session key takes on the wire and on disk.
 They map directly onto filesystem paths for workspaces and memory, with no escaping or rewriting.
 
 The framework does *not* require segments to be `<kind>:<value>` pairs.
-Some segments carry bindings, some are tags, some are pluralizing connectives (`issues`, `forks`, `peers`).
-What gives meaning to each segment is the **session template** that the key is an instance of, not the key itself.
+A session key is just a `/`-separated path whose meaning comes from the **session template** that the key is an instance of, not from the key text itself.
+In particular, path components that are not `{}` splices in the template have no semantic significance — they are decoration chosen by the template author for human readability.
+In `peers/{peer}/dms/{service}`, the literal `peers` is not linked to the memory-key key `peer`; it is just a readable connective.
+A template author who preferred `p/{peer}/d/{service}` would get exactly the same behavior.
 
 Backwards compatibility: existing on-disk sessions already use this shape; nothing about the on-disk layout changes.
 What changes is that the framework gains the ability to recognize a key as an *instance of a declared template*, which unlocks ancestor relationships, address validation, and the rest of this design.
@@ -73,19 +75,20 @@ What changes is that the framework gains the ability to recognize a key as an *i
 ### Session templates
 
 A **session template** is the central concept of this design.
-A template enumerates a class of allowed sessions, defining what their keys look like, how to derive a key from an incoming event, how to recover the bindings from a key, and what policy applies to sessions that are instances of it.
+A template enumerates a class of allowed sessions: what their keys look like, what incoming events they match, how keys and events map bidirectionally onto each other, and what policy applies to sessions that are instances of it.
 
 A template carries:
 
 - **Name** — a stable identifier (e.g., `project_issue`).
-- **Match shape** — required tags + key/value patterns on incoming events.
-  Determines which template handles a given event during inbound routing.
-  Matches the routing-rule design in `architecture.md`: a set of required tags, a set of required keys, with each key's value being either a literal or a wildcard binding (`{p}`, `{f}`, ...).
-- **Forward mapping (key template)** — a path-shaped string with `{}`-named holes that are filled from the wildcard bindings, e.g., `projects/{p}/forks/{f}/issues/{n}`.
-  Holes can be entire path segments or sub-strings of segments (`projects/{p}/issues/{f}-{n}` is a valid template).
-- **Inverse mapping (key parser)** — derived from the key template.
-  Given a session key, produces the bindings (or fails if the key is not an instance).
-  Required so the framework can recover bindings from a key for ancestor computation, address validation, and policy checks.
+- **Match shape** — the memory-key-shaped pattern this template matches against incoming events.
+  A set of required tags, plus a set of required keys where each key's value is either a literal or a `{wildcard}` binding.
+  Matches the routing-rule design in `architecture.md`; see *Memory-scope keys* below for the deeper framing.
+- **Session key template** — a `/`-separated path string with `{}`-named splices, e.g., `projects/{project}/forks/{fork}/issues/{issue}`.
+  Splices must be entire path segments or sub-strings of a segment (`projects/{project}/issues/{fork}-{number}` is valid).
+  By convention, splice names match the memory-key key names from the match shape, so `[peer=*, dms, service=*]` pairs with `peers/{peer}/dms/{service}` (not `peers/{p}/dms/{s}`).
+  Path text outside splices is decoration; the template author chooses it for readability.
+  The bidirectional mapping between memory-scope keys and session keys is entirely determined by this field plus the match shape — no separate "inverse mapping" is needed.
+  The framework validates that every wildcard binding in the match shape is spliced into the session key template (so inversion can fully recover those bindings).
 - **Parent template** (required for any non-root template) — name of the template whose sessions are this template's parents.
   The framework validates that the parent's match shape is in fact a generalization of this template's match shape (subset of required tags; subset of required keys; wildcards in the parent for any keys this template binds to specific values).
   See *Forward pointers* for the implicit-parent-inference variant we considered and deferred.
@@ -95,33 +98,45 @@ A template carries:
 The registry of templates is per-agent — see *On-disk layout* below for where the file lives.
 The same registry is consulted for both inbound routing and outbound `send_notification` validation.
 
-Note that the session-key vocabulary (which segment names exist, how they pluralize) is *not* fixed in the framework.
-It is whatever the agency's templates collectively define.
+The set of memory-scope-key key names and tags the framework recognizes is not fixed — it is whatever the agency's templates collectively reference.
 
 ### Memory-scope keys
 
 The architecture doc gestures at a concept it calls a *memory key* — a structured value of the form `(tags: set[str], kvs: dict[str, str])`, used to identify the semantic scope of routing decisions and (eventually) memory operations.
 This design adopts that concept under the slightly more specific name **memory-scope key**, because in this design it is most useful as the description of a *scope* — a region of conceptual space that some piece of context, policy, or state applies to.
 
-The connection to templates is direct: a session template's *match shape* **is** a memory-scope key shape, where some of the kvs values may be wildcards rather than literals.
-An incoming event also has an associated memory-scope key (its tags + the kvs the event source attached); inbound routing is the operation of finding the most specific template whose match shape's literals and wildcards together accept the event's memory-scope key.
+By convention, memory-key keys are always singular nouns — `peer=sean`, `project=slang`, `issue=42` — and wildcard variants reuse those names as the binding identifier: `peer=*` binds to the name `peer`.
+Everywhere in this document that a value is "shaped like a memory key" (match shapes, wildcard bindings, typed-shape notation) follows this convention.
+
+The connection to session templates is direct:
+
+- A template's *match shape* **is** a memory-scope-key shape with wildcards.
+  An incoming event has an associated memory-scope key (its tags + the kvs the event source attached); inbound routing finds the most specific template whose match shape accepts the event's memory-scope key.
+- A template's *session key template* is a path-shaped rendering of that same memory-scope key.
+  The splices use the same key names, so a match shape `[peer=*, dms, service=*]` pairs naturally with a session key template like `peers/{peer}/dms/{service}`.
+
+Together the two fields give a clean bidirectional mapping without needing a separately-specified inverse:
+
+- *Memory-scope key → session key*: substitute each wildcard binding from the memory-scope key into the matching splice in the session key template.
+- *Session key → memory-scope key*: regex-match the session key against the session key template, pulling the splice values out by name; those become the wildcard-positions of the match shape, and the match shape's own literals and tags fill in the rest.
+
+Non-splice text in the session key template is pure decoration and plays no role in either direction.
 
 #### Typed-shape notation
 
 We do not introduce a `MemoryKey` Python datatype yet; the actual representation stays inside whichever Pydantic models the template registry uses.
-What we do adopt is a compact human-readable notation for memory-scope keys — useful in template definitions, in documentation, in logs, and (later) in things like journal-entry tagging or scope-keyed memory operations.
+What we do adopt is a compact human-readable notation for memory-scope keys — useful in match-shape declarations, in documentation, in logs, and (later) in things like journal-entry tagging or scope-keyed memory operations.
 The notation looks like:
 
-- `project:{p}/fork:{f}/issue:{n}` — kvs `project={p}, fork={f}, issue={n}`, no tags.
-- `peer:{p}/dms/service:{s}` — kvs `peer={p}, service={s}`, tag `dms`.
+- `project:{project}/fork:{fork}/issue:{issue}` — kvs `project={project}, fork={fork}, issue={issue}`, no tags.
+- `peer:{peer}/dms/service:{service}` — kvs `peer={peer}, service={service}`, tag `dms`.
 - `service:gitlab/dms` — kvs `service=gitlab`, tag `dms`.
 
-Read each segment as either a `kind:value` pair (a kvs entry; `value` may be a `{wildcard}`), or a bare `tag` (an entry in the tags set).
+Read each segment as either a `kind:value` pair (a kvs entry; `value` may be a `{wildcard}` that binds to the name to its left), or a bare `tag` (an entry in the tags set).
 
-In a template definition this notation can be supplied as syntactic sugar that *derives* both the match shape and a default key template.
-When provided, the framework infers a match shape exactly as written, and a key template like `projects/{p}/forks/{f}/issues/{n}` from `project:{p}/fork:{f}/issue:{n}` (with pluralization by convention).
-Tag segments in the typed form become required tags rather than key/value pairs.
-This is purely a description-level shorthand; the underlying template still has explicit forward and inverse mappings, and authors who want full control can write them by hand instead of using the shorthand.
+Inside a template definition this notation can be supplied as syntactic sugar for the *match shape* only.
+It does *not* derive a session key template; the session key template is always written separately, because its non-splice text is a readability choice that nothing else can make for you.
+This keeps the shorthand simple and avoids the pluralization-rule problem altogether.
 
 The same notation will be useful well beyond this design once memory-scope keys are made first-class — see *Forward pointers* for the longer arc.
 
@@ -154,14 +169,14 @@ It builds on the per-agent directory layout already described in `architecture.m
 The new pieces:
 
 - **`agents/<name>/session-templates.json`** — the agent's session template registry, sitting alongside `agent.json`.
-  A single JSON file containing the structured fields of every template the agent recognizes (name, match shape, key template, parent, policy fields).
+  A single JSON file containing the structured fields of every template the agent recognizes (name, match shape, session key template, parent, policy fields).
   Lives outside the agent's writable home: the framework owns the templates file, the operator/human edits it.
   The agent cannot rewrite its own routing through ordinary memory writes.
   See *Forward pointers* for the question of when (and how safely) we might let agents modify their own templates.
 
 - **Per-template content under the agent's home, at template-scope paths.**
-  For each template, the framework derives a *scope path* by replacing every `{...}` wildcard in the template's key with the sentinel `_`.
-  For example, template `projects/{p}/forks/{f}/issues/{n}` has scope path `projects/_/forks/_/issues/_/`, and template `projects/{p}/forks/{f}` has scope path `projects/_/forks/_/`.
+  For each template, the framework derives a *scope path* by replacing every `{...}` splice in the session key template with the sentinel `_`.
+  For example, template `projects/{project}/forks/{fork}/issues/{issue}` has scope path `projects/_/forks/_/issues/_/`, and template `projects/{project}/forks/{fork}` has scope path `projects/_/forks/_/`.
   Markdown files at the scope path under `agents/<name>/home/` provide per-template content:
   - `agents/<name>/home/projects/_/forks/_/issues/_/AGENTS.md` — system-prompt guidance for every issue session.
   - `agents/<name>/home/projects/_/forks/_/AGENTS.md` — system-prompt guidance for every fork-coordinator session.
@@ -179,8 +194,8 @@ Layered together these give the agent a clean way to author guidance at the righ
 
 A few small conventions and caveats:
 
-- **Wildcard collapsing within a segment.**
-  When a template has multiple wildcards in a single segment (e.g., `issues/{f}-{n}`), all of them collapse to a single `_` in the scope path (so `issues/_`, not `issues/_-_`).
+- **Splice collapsing within a segment.**
+  When a template has multiple splices in a single segment (e.g., `issues/{fork}-{issue}`), all of them collapse to a single `_` in the scope path (so `issues/_`, not `issues/_-_`).
   Slightly lossy but keeps filesystem paths clean; the small lost expressiveness has not yet mattered for any concrete template we have considered.
 - **Sentinel choice.**
   `_` is unambiguously safe on every relevant filesystem and reads naturally.
@@ -195,7 +210,7 @@ The notification policy
 ### Send rule (default: ancestor/descendant only)
 
 An agent may only send a notification to a session that is an ancestor or descendant of the current session.
-Ancestry lives at the *template* level (each template declares its parent), and the template tree is projected onto the session-key space via each template's inverse mapping: a session S' is an ancestor of S iff S's template chains up to S''s template, and S''s key is what you get by re-rendering S''s template using the bindings extracted from S's key (restricted to the keys S' actually binds).
+Ancestry lives at the *template* level (each template declares its parent), and the template tree is projected onto the session-key space using the (match shape, session key template) pair of each template: a session S' is an ancestor of S iff S's template chains up to S''s template, and S''s key is what you get by re-rendering S''s session key template using the splice values extracted from S's key (restricted to the splices S' actually binds).
 The cleanest way to think about this is "ancestry of templates first, ancestry of sessions follows mechanically".
 
 So:
@@ -354,7 +369,7 @@ A proposed sequence of independently reviewable phases.
 Each is later expanded into its own plan document.
 
 - **Phase 1 — Session template registry.**
-  Replace the hard-coded per-forge routing functions with declared templates that carry forward (event → key + bindings) and inverse (key → bindings) mappings, an explicit parent template (required for any non-root template), and the basic policy fields.
+  Replace the hard-coded per-forge routing functions with declared templates, each specified by a match shape and a session key template, plus an explicit parent template (required for any non-root template) and the basic policy fields.
   Templates live in a per-agent `agents/<name>/session-templates.json` (alongside `agent.json`) and are loaded by the framework at startup.
   Extend the auto-loading convention so per-template `AGENTS.md` content lives at template-scope paths under the agent's home (e.g., `agents/<name>/home/projects/_/forks/_/issues/_/AGENTS.md`).
   Existing path-shaped session keys keep their on-disk form; what they gain is template-based interpretation that yields parent/ancestor/descendant relationships.
@@ -398,9 +413,15 @@ Resolved decisions
 Decisions made during the design discussion that are now part of the spec above:
 
 - **Session keys use the clean human-readable form** (e.g., `projects/foo/forks/gitlab-master/issues/42`).
-  Typed `kind:value` notation is descriptive only, used inside template definitions to derive the forward and inverse mappings; it does not appear in keys themselves, on the wire, or on disk.
-- **Templates carry both forward and inverse mappings** as first-class fields.
-  This is what lets the framework recover bindings from a key and supports ancestor relationships without requiring keys to be self-describing.
+  Typed `kind:value` notation is descriptive only, used inside template definitions as syntactic sugar for match shapes; it does not appear in keys themselves, on the wire, or on disk.
+- **Session-key text outside splices has no semantic significance.**
+  A session key is a `/`-separated path; path components that are not `{}` splices in the template are decoration chosen by the author for human readability, with no framework-level meaning.
+  This eliminates any need for pluralization rules, derived key templates, or other machinery that tries to guess at session-key text from memory-key shape.
+- **Templates are specified by a (match shape, session key template) pair.**
+  Both directions of translation between a memory-scope key and a session key are derivable from that pair; no separately-specified inverse mapping or key parser is needed.
+  The framework validates that every wildcard binding in the match shape is spliced into the session key template.
+- **Memory-key and session-key-splice names match, and are singular.**
+  Memory-key keys use singular nouns (`peer`, not `peers` or `p`), and session key templates reuse those same names for their splices (`peers/{peer}/dms/{service}`).
 - **Issue and change-request as siblings under the fork.**
   Both `projects/<p>/forks/<f>/issues/<n>` and `projects/<p>/forks/<f>/change-requests/<n>` are children of `projects/<p>/forks/<f>`.
   No PR-tracker level between fork and CR.
@@ -414,21 +435,14 @@ Decisions made during the design discussion that are now part of the spec above:
 - **Children are not enumerated in the system prompt by default.**
   Bounded enumeration may be added later if experience demands it.
 - **Memory-scope keys are a first-class concept**, even though no `MemoryKey` Python datatype is introduced in the initial phases.
-  A template's match shape is a memory-scope key shape; the typed-shape shorthand (`project:{p}/fork:{f}/issue:{n}`) is the human-readable notation for memory-scope keys.
+  A template's match shape is a memory-scope key shape; the typed-shape shorthand (`project:{project}/fork:{fork}/issue:{issue}`) is the human-readable notation for memory-scope keys, used only for match shapes — the session key template is always written separately.
 - **Explicit parent declarations only.**
   A template that has any parent must declare that parent by name; the framework validates the declared parent's match shape is in fact a generalization of the child's.
   Implicit inference from match-shape generality is recorded as a forward-pointer item but not built.
 - **Per-agent template registry at `agents/<name>/session-templates.json`** (alongside `agent.json`, outside the agent's writable home).
   Single JSON file containing structured fields only; multi-line textual content (`AGENTS.md`, etc.) lives separately in the agent's home at template-scope paths.
 - **Template-scope-path convention for per-template content.**
-  Each template's wildcards-as-`_` form names a directory under the agent's home where `AGENTS.md` (and future per-template assets) live; the `MEMORY.md` / `AGENTS.md` auto-loading convention walks both the instance axis and the template-scope axis.
-
-Things still worth pinning down before Phase 1
-----------------------------------------------
-
-- The exact rendering rules used by the framework when an inbound event maps to a template via the typed-shape shorthand — in particular, the pluralization convention (e.g., `peer` → `peers/`) for derived key templates.
-  We could either (a) hard-code a small pluralization map, (b) require authors to spell out plurals when the default would be wrong, or (c) skip the shorthand entirely in Phase 1 and always write match shape and key template explicitly.
-  Provisional preference: option (b), with a small built-in pluralization map covering the common cases (`peer`/`peers`, `project`/`projects`, etc.) and an explicit override field on the template when the default is wrong.
+  Each template's splices-as-`_` form names a directory under the agent's home where `AGENTS.md` (and future per-template assets) live; the `MEMORY.md` / `AGENTS.md` auto-loading convention walks both the instance axis and the template-scope axis.
 
 Forward pointers
 ----------------
@@ -448,7 +462,7 @@ They are recorded here so they are not lost; each is likely to want its own desi
 
 - **Memory-scope keys as a first-class datatype.**
   This design treats memory-scope keys (`(tags, kvs)`) as a concept and adopts the typed-shape notation, but does not yet introduce a `MemoryKey` Python datatype.
-  A future push could promote it: a real type with parse/format from typed-shape strings, used to tag journal entries, to scope free-form memory blobs, and to drive a "find me everything I know about scope `peer:{p}`" semantic search across the agent's memory.
+  A future push could promote it: a real type with parse/format from typed-shape strings, used to tag journal entries, to scope free-form memory blobs, and to drive a "find me everything I know about scope `peer:{peer}`" semantic search across the agent's memory.
   Scope-keyed memory becomes especially valuable for cross-cutting concerns (a particular human collaborator, a particular service) that don't fit cleanly into the session-tree shape.
 
 - **Agent self-modification of session templates.**
