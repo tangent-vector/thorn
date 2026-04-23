@@ -387,5 +387,11 @@ async def read_journal(date: str | None = None, days: int = 1) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+from thorn.core._executor import ToolVenue as _ToolVenue
+
+write_journal._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+read_journal._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+
+
 JOURNAL_TOOLS: list = [write_journal, read_journal]
 """Default journal tools added to every agent via ``Agent._collect_tools``."""

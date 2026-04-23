@@ -20,7 +20,6 @@ from thorn.core._context import (
     ExecutionContext,
     Verbosity,
 )
-from thorn.core._discovery import discover_tools
 from thorn.core._event_bus import EventBus, in_session
 from thorn.core._func import _prepare_tools, prompt
 from thorn.core._loop import run_agent_loop, _WrappedTool
@@ -178,6 +177,7 @@ def _build_runtime(
     *,
     interactive: bool = True,
     paths: "AgencyPaths | None" = None,
+    sandbox_executor_enabled: bool = False,
 ) -> Runtime:
     """Create a ``Runtime`` whose event sink is an :class:`EventBus`.
 
@@ -231,6 +231,7 @@ def _build_runtime(
         global_ignores=load_global_ignores(ws_root),
         ask_user_handler=_rich_ask_user if interactive else None,
         paths=paths,
+        sandbox_executor_enabled=sandbox_executor_enabled,
     )
 
 
@@ -279,14 +280,9 @@ async def _collect_all_tools(
             raw.append(ask_user)
 
     if not no_discover:
-        discovered = discover_tools()
-        if discovered:
-            names = [getattr(fn, "__name__", "?") for fn in discovered]
-            console.print(
-                f"[dim]discovered tools:[/dim] {', '.join(names)}",
-                highlight=False,
-            )
-        raw.extend(discovered)
+        # Phase A retired the .agents/thorn/@tool discovery path; the
+        # flag is preserved as a no-op so older invocations still parse.
+        pass
 
     tools = _prepare_tools(raw)
 
@@ -426,6 +422,7 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
             trace_file=trace_file,
             workspace=str(ws_root),
             paths=paths,
+            sandbox_executor_enabled=True,
         )
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -693,6 +690,7 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
             trace_file=trace_file,
             workspace=str(ws_root),
             paths=paths,
+            sandbox_executor_enabled=True,
         )
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -1039,6 +1037,7 @@ def _serve_gateway(
         runtime = _build_runtime(
             trace_file=trace_file, workspace=str(ws_root),
             interactive=False, paths=paths,
+            sandbox_executor_enabled=True,
         )
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -1226,14 +1225,9 @@ def serve_mcp(
     if not no_tools:
         raw.extend(ALL_BUILTIN_TOOLS)
     if not no_discover:
-        discovered = discover_tools()
-        if discovered:
-            names = [getattr(fn, "__name__", "?") for fn in discovered]
-            console.print(
-                f"[dim]serving tools:[/dim] {', '.join(names)}",
-                highlight=False,
-            )
-        raw.extend(discovered)
+        # Phase A retired the .agents/thorn/@tool discovery path; the
+        # flag is preserved as a no-op so older invocations still parse.
+        pass
 
     tools = _prepare_tools(raw)
     if not tools:

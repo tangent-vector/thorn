@@ -302,6 +302,13 @@ async def update_inbox_item(
     return f"Item {updated.id} is now {updated.status.value}."
 
 
+from thorn.core._executor import ToolVenue as _ToolVenue
+
+list_inbox_items._thorn_venue = _ToolVenue.IN_PROCESS  # type: ignore[attr-defined]
+read_inbox_item._thorn_venue = _ToolVenue.IN_PROCESS  # type: ignore[attr-defined]
+update_inbox_item._thorn_venue = _ToolVenue.IN_PROCESS  # type: ignore[attr-defined]
+
+
 INBOX_TOOLS: list = [list_inbox_items, read_inbox_item, update_inbox_item]
 """Default inbox tools added to every agent via ``Agent._collect_tools``."""
 

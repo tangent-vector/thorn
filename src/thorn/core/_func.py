@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from thorn.core._history import ToolCallNode
 
 from thorn.core._context import ExecutionContext, get_context, reset_context, set_context
+from thorn.core._executor import ToolVenue
 from thorn.core._loop import _WrappedTool, run_agent_loop
 from thorn.core._schema import func_to_tool_schema, serialize_for_tool_result
 
@@ -84,8 +85,12 @@ def wrap_function(fn: Callable[..., Any]) -> _WrappedTool:
         return serialize_for_tool_result(result)
 
     call_node_class = getattr(fn, "_thorn_call_node_class", None)
+    venue = getattr(fn, "_thorn_venue", ToolVenue.SANDBOX)
     return _WrappedTool(
-        schema=schema, execute=execute, call_node_class=call_node_class,
+        schema=schema,
+        execute=execute,
+        call_node_class=call_node_class,
+        venue=venue,
     )
 
 
@@ -110,26 +115,102 @@ def _flatten_tools(items: Iterable[Any]) -> Iterable[Any]:
             yield item
 
 
+_KNOWN_BUILTIN_TOOLS: set[Any] | None = None
+
+
+def _known_builtin_tools() -> set[Any]:
+    """Return the set of callable references that are valid Thorn built-ins.
+
+    Used by :func:`_prepare_tools` to enforce the Phase A rule: agents
+    may pass references to known built-ins (and pre-packaged toolset
+    constants like ``FILE_READING``), but arbitrary user-supplied
+    callables are rejected.  The substitute for user-authored behavior
+    is skills + scripts invoked via ``run_shell`` (see
+    ``docs/plans/sandbox_tool_execution_*.plan.md``).
+
+    The set is built lazily because importing the tool modules at
+    decorator-evaluation time would create circular imports against
+    this module.
+    """
+    global _KNOWN_BUILTIN_TOOLS
+    if _KNOWN_BUILTIN_TOOLS is not None:
+        return _KNOWN_BUILTIN_TOOLS
+
+    builtins: set[Any] = set()
+
+    from thorn.core._journal import JOURNAL_TOOLS
+    from thorn.core._tools import ALL_BUILTIN_TOOLS, run_shell, write_file
+
+    for fn in ALL_BUILTIN_TOOLS:
+        builtins.add(fn)
+    builtins.add(run_shell)
+    builtins.add(write_file)
+    builtins.update(JOURNAL_TOOLS)
+
+    try:
+        from thorn.runtime._inbox_tools import INBOX_TOOLS
+
+        builtins.update(INBOX_TOOLS)
+    except ImportError:
+        pass
+
+    try:
+        from thorn.tools.git import GIT_TOOLS
+
+        builtins.update(GIT_TOOLS)
+    except ImportError:
+        pass
+
+    try:
+        from thorn.tools.forge import FORGE_TOOLS
+
+        builtins.update(FORGE_TOOLS)
+    except ImportError:
+        pass
+
+    _KNOWN_BUILTIN_TOOLS = builtins
+    return builtins
+
+
 def _prepare_tools(raw_tools: list[Any] | None) -> list[_WrappedTool]:
     """Normalise a user-supplied tool list into ``_WrappedTool`` instances.
 
     Accepts a mix of:
     - ``_WrappedTool`` instances (passed through)
-    - plain callables (auto-wrapped via ``wrap_function``)
+    - references to **known built-in** Thorn tools (auto-wrapped via
+      ``wrap_function``)
     - nested iterables of the above (recursively flattened)
+
+    Arbitrary Python callables are *not* accepted: in Phase A of the
+    sandbox roadmap the registry is limited to tools the brain and the
+    tool-host daemon both know about statically, and there is no
+    transitional shim for user-supplied callables.  The forward-looking
+    substitute is skills bundled with shell scripts that the agent
+    invokes via ``run_shell``.
     """
     if not raw_tools:
         return []
     result: list[_WrappedTool] = []
+    builtins = None
     for item in _flatten_tools(raw_tools):
         if isinstance(item, _WrappedTool):
             result.append(item)
-        elif callable(item):
-            result.append(wrap_function(item))
-        else:
+            continue
+        if not callable(item):
             raise TypeError(
                 f"Expected a callable or WrappedTool, got {type(item)!r}"
             )
+        if builtins is None:
+            builtins = _known_builtin_tools()
+        if item not in builtins:
+            name = getattr(item, "__name__", repr(item))
+            raise TypeError(
+                f"{name!r} is not a registered Thorn tool. "
+                "Phase A retired user-supplied @tool callables; "
+                "wrap the desired behavior as a script and invoke it "
+                "via run_shell instead."
+            )
+        result.append(wrap_function(item))
     return result
 
 

@@ -161,8 +161,10 @@ class Agent:
                             )
                             self.id = agent_id
                     if agent_id is not None:
+                        from thorn.runtime._paths import safe_dirname
                         self._home = (
-                            agency_root / ".thorn" / "agents" / str(agent_id)
+                            agency_root / ".thorn" / "agents"
+                            / safe_dirname(str(agent_id)) / "home"
                         )
             except RuntimeError:
                 pass
@@ -456,6 +458,11 @@ async def _run_session_prompt(
         file_access_policy=policy,
         session_key=str(session.key) if session.key is not None else None,
     )
+
+    if ctx.runtime is not None and child.sandbox_executor is None:
+        runtime_executor = ctx.runtime.get_or_create_sandbox_executor(agent)
+        if runtime_executor is not None:
+            child.sandbox_executor = runtime_executor
 
     # Override workspace_root when the agent has its own workspace,
     # so file tools, AGENTS.md loading, and policies operate within

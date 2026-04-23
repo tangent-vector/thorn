@@ -46,6 +46,18 @@ from thorn.core._validation_tracker import ValidationStatus, ValidationTracker
 from thorn.core._file_access import FileAccessLevel, FileAccessPolicy, FileAccessRule, RelativeTo
 from thorn.core._func import prompt, skill, tool, wrap_function
 from thorn.core._retry import RetryPolicy, bound_retries
+from thorn.core._executor import (
+    ExecutorRouter,
+    InProcessToolExecutor,
+    OnChunkCallback,
+    ToolExecutor,
+    ToolInvocation,
+    ToolInvocationResult,
+    ToolOutputChunk,
+    ToolRegistry,
+    ToolRegistryEntry,
+    ToolVenue,
+)
 from thorn.core._loop import _WrappedTool, run_agent_loop
 from thorn.core._provider import LLMProvider, MockProvider, UsageChunk, load_provider_from_env
 from thorn.core._housekeeping import (
@@ -158,6 +170,17 @@ __all__ = [
     # Loop
     "_WrappedTool",
     "run_agent_loop",
+    # Tool execution seam
+    "ExecutorRouter",
+    "InProcessToolExecutor",
+    "OnChunkCallback",
+    "ToolExecutor",
+    "ToolInvocation",
+    "ToolInvocationResult",
+    "ToolOutputChunk",
+    "ToolRegistry",
+    "ToolRegistryEntry",
+    "ToolVenue",
     # Provider
     "LLMProvider",
     "MockProvider",

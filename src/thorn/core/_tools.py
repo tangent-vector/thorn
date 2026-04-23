@@ -913,6 +913,25 @@ read_file._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined
 list_directory._thorn_call_node_class = DirectoryListCallNode  # type: ignore[attr-defined]
 
 
+# Phase A venue classification.  Most file / shell tools run inside the
+# sandbox-venue daemon; ``ask_user`` stays in-process because it needs
+# the brain's ``AskUserHandler``.  See
+# docs/plans/sandbox_tool_execution_*.plan.md for the full rationale.
+from thorn.core._executor import ToolVenue as _ToolVenue
+
+read_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+edit_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+create_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+delete_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+move_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+list_directory._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+find_files._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+search_files._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+write_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+run_shell._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
+ask_user._thorn_venue = _ToolVenue.IN_PROCESS  # type: ignore[attr-defined]
+
+
 ALL_BUILTIN_TOOLS = [
     read_file,
     edit_file,

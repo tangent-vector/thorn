@@ -1222,7 +1222,7 @@ class TestCompactionIntegration:
             return "z" * 8000
 
         class BigReader(Agent):
-            tools = [big_read]
+            tools = [wrap_function(big_read)]
 
         responses = []
         for i in range(12):

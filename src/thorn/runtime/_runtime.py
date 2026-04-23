@@ -46,7 +46,9 @@ from thorn.runtime._store import SessionStore
 if TYPE_CHECKING:
     from thorn.core._context import StatusProvider
     from thorn.core._file_access import FileAccessPolicy
+    from thorn.core._executor import ToolExecutor
     from thorn.core._validation_tracker import ValidationTracker
+    from thorn.toolhost._executor import DaemonExecutorConfig
 
 _S = TypeVar("_S", bound=Service)
 
@@ -82,6 +84,7 @@ class Runtime:
         paths: AgencyPaths | None = None,
         address_book: AddressBook | None = None,
         in_flight_index: InFlightIndex | None = None,
+        sandbox_executor_enabled: bool = False,
     ) -> None:
         self.provider = provider
         self.event_sink: EventSink = event_sink or NullEventSink()
@@ -101,8 +104,13 @@ class Runtime:
             )
         self.paths = paths
 
+        # Fail loudly if we're running against a pre-Phase-A on-disk
+        # layout.  No silent migration -- see the plan's "No automatic
+        # migration" section.
+        paths.raise_if_legacy_layout()
+
         if session_store is None:
-            session_store = SessionStore(paths.agents_root)
+            session_store = SessionStore(paths)
         self.sessions = session_store
 
         # Address book and in-flight index are both always present so
@@ -119,6 +127,9 @@ class Runtime:
 
         self._context: ExecutionContext | None = None
         self._context_token: contextvars.Token[ExecutionContext] | None = None
+
+        self._sandbox_executor_enabled = sandbox_executor_enabled
+        self._sandbox_executors: dict[AgentID, ToolExecutor] = {}
 
     # -- Service registry ---------------------------------------------------
 
@@ -218,10 +229,106 @@ class Runtime:
         exc_val: BaseException | None,
         exc_tb: Any,
     ) -> None:
+        executors = list(self._sandbox_executors.values())
+        self._sandbox_executors.clear()
+        for executor in executors:
+            try:
+                await executor.aclose()
+            except Exception:
+                # Best-effort cleanup: keep tearing down the rest even
+                # if one daemon refuses to die cleanly.  The next
+                # process start will recreate its socket.
+                pass
+
         if self._context_token is not None:
             reset_context(self._context_token)
             self._context_token = None
         self._context = None
+
+    # -- Sandbox executor pool ---------------------------------------------
+
+    @property
+    def sandbox_executor_enabled(self) -> bool:
+        """Whether per-agent sandbox executors are enabled.
+
+        When ``True`` (the gateway / CLI default), each agent gets its
+        own :class:`~thorn.toolhost.DaemonToolExecutor`, lazily started
+        on first use.  When ``False`` (the test default), every venue
+        runs in-process and no daemon subprocesses are ever spawned.
+        """
+        return self._sandbox_executor_enabled
+
+    def _build_sandbox_executor(self, agent: Agent) -> ToolExecutor:
+        """Construct a :class:`DaemonToolExecutor` for *agent*.
+
+        Factored out so tests / subclasses can override it with a
+        stub executor (e.g. one driven over an in-memory socket pair)
+        without having to subclass and override the lookup method too.
+        """
+        from thorn.toolhost._executor import (
+            DaemonExecutorConfig,
+            DaemonToolExecutor,
+        )
+
+        if agent.id is None:
+            raise ValueError(
+                "Cannot start a sandbox executor for an agent without an id"
+            )
+
+        control_dir = self.paths.agent_control_dir(agent.id)
+        control_dir.mkdir(parents=True, exist_ok=True)
+        socket_path = self.paths.agent_toolhost_socket(agent.id)
+        log_path = control_dir / "toolhost.log"
+
+        config = DaemonExecutorConfig(
+            socket_path=socket_path,
+            agent_id=str(agent.id),
+            home_path=self.paths.agent_home_mount(agent.id),
+            workspace_root=self.paths.agent_workspace_mount(agent.id),
+            log_path=log_path,
+        )
+        return DaemonToolExecutor(config)
+
+    def get_or_create_sandbox_executor(
+        self, agent: Agent,
+    ) -> ToolExecutor | None:
+        """Return the per-agent sandbox executor, creating it lazily.
+
+        Returns ``None`` when ``sandbox_executor_enabled`` is ``False``
+        (the test default), so call sites can use the result directly
+        as ``ExecutionContext.sandbox_executor`` without conditional
+        wiring.
+
+        The executor itself is started lazily on first :meth:`invoke`;
+        this method only constructs the wrapper and caches it on the
+        runtime so subsequent agent rounds reuse the same daemon.
+        """
+        if not self._sandbox_executor_enabled:
+            return None
+        if agent.id is None:
+            return None
+        existing = self._sandbox_executors.get(agent.id)
+        if existing is not None:
+            return existing
+        executor = self._build_sandbox_executor(agent)
+        self._sandbox_executors[agent.id] = executor
+        return executor
+
+    async def shutdown_sandbox_executor(self, agent_id: AgentID) -> None:
+        """Tear down a single per-agent sandbox executor, if any.
+
+        The gateway calls this if it ever wants to retire a per-agent
+        daemon mid-run (e.g. on an agent-removed admin event).  The
+        normal teardown path is :meth:`__aexit__`, which closes every
+        executor in the pool.
+        """
+        executor = self._sandbox_executors.pop(agent_id, None)
+        if executor is None:
+            return
+        try:
+            await executor.aclose()
+        except Exception:
+            pass
 
     # -- Agent lifecycle ----------------------------------------------------
 
@@ -238,17 +345,18 @@ class Runtime:
 
         When *id* is ``None``, a UUID-based ID is generated.
         When *name* is ``None``, the ID is used as the display name.
-        When *workspace* is ``None``, the agent's home directory (derived
-        from ``AgencyPaths``) is used.
+        When *workspace* is ``None``, the agent's per-agent workspace
+        mount (``<workspace_root>/agents/<id>/workspace/``) is used.
+        The agent's home is always the mounted ``home/`` subtree.
         """
         if id is None:
             id = AgentID(str(uuid.uuid4()))
         elif not isinstance(id, AgentID):
             id = AgentID(id)
 
-        home = self.paths.agent_home(id)
+        home = self.paths.agent_home_mount(id)
         if workspace is None:
-            workspace = home
+            workspace = self.paths.agent_workspace_mount(id)
 
         return agent_class(
             id=id,

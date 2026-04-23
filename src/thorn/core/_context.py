@@ -633,6 +633,17 @@ class ExecutionContext:
     status_providers: list[StatusProvider] = field(default_factory=list)
     agency_root_directory: Path | None = None
     runtime: Any = None
+    sandbox_executor: Any = None
+    """Optional :class:`~thorn.core._executor.ToolExecutor` for ``SANDBOX``.
+
+    When ``None`` (the default), :func:`run_agent_loop` runs every
+    venue in-process -- the historical behavior, retained for tests
+    and for callers that have not opted into the toolhost daemon.
+    When set, the loop builds a split router whose ``SANDBOX`` venue
+    dispatches through this executor (typically a per-agent
+    :class:`~thorn.toolhost.DaemonToolExecutor`) while ``IN_PROCESS``
+    tools (``ask_user``, the inbox tools) still execute inline.
+    """
 
     def add_status_provider(self, provider: StatusProvider) -> None:
         """Register a ``StatusProvider`` for advisory injection."""
@@ -703,6 +714,7 @@ class ExecutionContext:
             status_providers=self.status_providers,
             agency_root_directory=self.agency_root_directory,
             runtime=self.runtime,
+            sandbox_executor=self.sandbox_executor,
         )
 
 

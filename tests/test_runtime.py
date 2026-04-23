@@ -39,6 +39,7 @@ from thorn.runtime import (
     deserialize_history,
     serialize_history,
 )
+from thorn.runtime._paths import AgencyPaths
 
 
 # ---------------------------------------------------------------------------
@@ -701,9 +702,11 @@ class TestJsonSessionSerializerAgent:
         )
 
         serializer = JsonSessionSerializer()
-        # The path stem is the source of truth for the agent ID,
-        # so save into a file whose stem matches the agent's ID.
-        agent_path = tmp_path / "test-agent.json"
+        # The parent directory name is the source of truth for the
+        # agent ID, so place the file under ``<id>/agent.json``.
+        agent_dir = tmp_path / "test-agent"
+        agent_dir.mkdir()
+        agent_path = agent_dir / "agent.json"
         serializer.save_agent(agent, agent_path)
 
         assert agent_path.exists()
@@ -770,21 +773,24 @@ class TestJsonSessionSerializerAgent:
         assert type(restored) is Agent
         assert restored.name == "fb"
 
-    def test_load_derives_id_from_path_stem(self, tmp_path: Path):
-        """``load_agent`` derives the AgentID from the file's path stem.
+    def test_load_derives_id_from_parent_directory(self, tmp_path: Path):
+        """``load_agent`` derives the AgentID from the file's parent dir.
 
         This is the single-source-of-truth design: the on-disk path
-        encodes the ID, the JSON body holds only the human-facing
+        encodes the ID (Phase-A layout puts it in the containing
+        directory name), the JSON body holds only the human-facing
         ``name``.  Even an in-memory agent without a saved-from ID
         gets a well-defined ID once it has been persisted (because
         the persistence step picks the file path).
         """
         agent = Agent(name="display-only")
         serializer = JsonSessionSerializer()
-        agent_path = tmp_path / "stem-derived.json"
+        agent_dir = tmp_path / "dir-derived"
+        agent_dir.mkdir()
+        agent_path = agent_dir / "agent.json"
         serializer.save_agent(agent, agent_path)
         restored = serializer.load_agent(agent_path)
-        assert restored.id == AgentID("stem-derived")
+        assert restored.id == AgentID("dir-derived")
         assert restored.name == "display-only"
 
 
@@ -1419,7 +1425,7 @@ class TestJsonSessionSerializerAtomicWrites:
 
 class TestSessionStoreAgent:
     def test_save_and_load_agent(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = Agent(id=AgentID("a1"), name="stored")
 
         store.save_agent(agent)
@@ -1430,26 +1436,26 @@ class TestSessionStoreAgent:
         assert loaded.name == "stored"
 
     def test_agent_exists_returns_false_for_missing(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         assert not store.agent_exists("nonexistent")
 
     def test_load_missing_agent_raises_key_error(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         with pytest.raises(KeyError, match="nonexistent"):
             store.load_agent("nonexistent")
 
     def test_save_agent_without_id_raises(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = Agent(name="no-id")
         with pytest.raises(ValueError, match="without an id"):
             store.save_agent(agent)
 
     def test_list_agent_ids_empty(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         assert store.list_agent_ids() == []
 
     def test_list_agent_ids_returns_sorted(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         for name in ["charlie", "alice", "bob"]:
             store.save_agent(Agent(id=AgentID(name), name=name))
 
@@ -1457,7 +1463,7 @@ class TestSessionStoreAgent:
         assert ids == [AgentID("alice"), AgentID("bob"), AgentID("charlie")]
 
     def test_delete_agent_removes_identity(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         store.save_agent(Agent(id=AgentID("del-me"), name="doomed"))
         assert store.agent_exists("del-me")
 
@@ -1465,33 +1471,40 @@ class TestSessionStoreAgent:
         assert not store.agent_exists("del-me")
 
     def test_delete_nonexistent_agent_is_noop(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         store.delete_agent("ghost")
 
     def test_overwrite_existing_agent(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         store.save_agent(Agent(id=AgentID("ow"), name="v1"))
         store.save_agent(Agent(id=AgentID("ow"), name="v2"))
         loaded = store.load_agent("ow")
         assert loaded.name == "v2"
 
     def test_list_agent_ids_on_nonexistent_root(self, tmp_path: Path):
-        store = SessionStore(tmp_path / "no-such-dir")
+        store = SessionStore(
+            AgencyPaths(
+                home_root=tmp_path / "no-such-dir",
+                workspace_root=tmp_path / "no-such-dir",
+            ),
+        )
         assert store.list_agent_ids() == []
 
     def test_agent_id_type_preserved(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         store.save_agent(Agent(id=AgentID("typed"), name="t"))
         ids = store.list_agent_ids()
         assert all(isinstance(i, AgentID) for i in ids)
 
     def test_loaded_agent_has_workspace_from_convention(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        paths = AgencyPaths(home_root=tmp_path, workspace_root=tmp_path)
+        store = SessionStore(paths)
         agent = Agent(id=AgentID("dev-1"), name="Dev")
         store.save_agent(agent)
 
         loaded = store.load_agent(AgentID("dev-1"))
-        assert loaded.workspace == tmp_path / "dev-1"
+        assert loaded.workspace == paths.agent_workspace_mount(AgentID("dev-1"))
+        assert loaded.home == paths.agent_home_mount(AgentID("dev-1"))
 
 
 # ---------------------------------------------------------------------------
@@ -1504,7 +1517,7 @@ class TestSessionStoreSession:
         return Agent(id=AgentID(agent_id), name="test")
 
     def test_save_and_load_session(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = self._make_agent()
         session = Session(
             agent=agent,
@@ -1523,35 +1536,35 @@ class TestSessionStoreSession:
         assert len(loaded._history.nodes) == 2
 
     def test_session_exists_returns_false_for_missing(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         assert not store.session_exists("a1", "nonexistent")
 
     def test_load_missing_session_raises_key_error(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = self._make_agent()
         with pytest.raises(KeyError, match="nonexistent"):
             store.load_session(agent, "nonexistent")
 
     def test_save_session_without_key_raises(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = self._make_agent()
         session = Session(agent=agent)
         with pytest.raises(ValueError, match="without a key"):
             store.save_session(session)
 
     def test_save_session_without_agent_id_raises(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = Agent(name="no-id")
         session = Session(agent=agent, key=SessionKey("s1"))
         with pytest.raises(ValueError, match="without an id"):
             store.save_session(session)
 
     def test_list_session_keys_empty(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         assert store.list_session_keys("a1") == []
 
     def test_list_session_keys_returns_sorted(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = self._make_agent()
         for name in ["charlie", "alice", "bob"]:
             session = Session(agent=agent, key=SessionKey(name))
@@ -1565,7 +1578,7 @@ class TestSessionStoreSession:
         ]
 
     def test_delete_session(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = self._make_agent()
         store.save_session(Session(agent=agent, key=SessionKey("del-me")))
         assert store.session_exists(agent.id, "del-me")
@@ -1574,11 +1587,11 @@ class TestSessionStoreSession:
         assert not store.session_exists(agent.id, "del-me")
 
     def test_delete_nonexistent_session_is_noop(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         store.delete_session("a1", "ghost")
 
     def test_overwrite_existing_session(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = self._make_agent()
 
         s1 = Session(
@@ -1599,7 +1612,7 @@ class TestSessionStoreSession:
         assert loaded.metadata == {"version": "v2"}
 
     def test_session_key_type_preserved(self, tmp_path: Path):
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = self._make_agent()
         store.save_session(Session(agent=agent, key=SessionKey("typed")))
         keys = store.list_session_keys(agent.id)
@@ -1626,7 +1639,10 @@ class TestSessionStoreSession:
                 call_log.append("load_session")
                 return Session(agent=agent, key=SessionKey("custom"))
 
-        store = SessionStore(tmp_path, serializer=TrackingSerializer())
+        store = SessionStore(
+            AgencyPaths(home_root=tmp_path, workspace_root=tmp_path),
+            serializer=TrackingSerializer(),
+        )
         agent = Agent(id=AgentID("cs"), name="cs")
         store.save_agent(agent)
         store.load_agent("cs")
@@ -1665,7 +1681,12 @@ class TestRuntime:
         assert rt.sessions.root == expected
 
     def test_custom_session_store(self, tmp_path: Path):
-        custom_store = SessionStore(tmp_path / "custom-agents")
+        custom_store = SessionStore(
+            AgencyPaths(
+                home_root=tmp_path / "custom-agents",
+                workspace_root=tmp_path / "custom-agents",
+            ),
+        )
         rt = self._make_runtime(tmp_path, session_store=custom_store)
         assert rt.sessions is custom_store
 

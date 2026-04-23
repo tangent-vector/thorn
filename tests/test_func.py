@@ -84,15 +84,30 @@ class TestPrepareTools:
     def test_none(self):
         assert _prepare_tools(None) == []
 
-    def test_callable_auto_wrapped(self):
+    def test_known_builtin_callable_auto_wrapped(self):
+        from thorn.core._tools import read_file
+
+        result = _prepare_tools([read_file])
+        assert len(result) == 1
+        assert isinstance(result[0], _WrappedTool)
+        assert result[0].schema["function"]["name"] == "read_file"
+
+    def test_unknown_callable_rejected(self):
         def greet(name: str) -> str:
             """Greet someone."""
             return f"hi {name}"
 
-        result = _prepare_tools([greet])
-        assert len(result) == 1
-        assert isinstance(result[0], _WrappedTool)
-        assert result[0].schema["function"]["name"] == "greet"
+        with pytest.raises(TypeError, match="not a registered Thorn tool"):
+            _prepare_tools([greet])
+
+    def test_unknown_callable_accepted_when_pre_wrapped(self):
+        def greet(name: str) -> str:
+            """Greet someone."""
+            return f"hi {name}"
+
+        wrapped = wrap_function(greet)
+        result = _prepare_tools([wrapped])
+        assert result == [wrapped]
 
     def test_wrapped_tool_passthrough(self):
         def noop() -> str:
@@ -109,7 +124,7 @@ class TestPrepareTools:
             return "a"
 
         fn_b_wrapped = wrap_function(fn_a)
-        result = _prepare_tools([fn_a, fn_b_wrapped])
+        result = _prepare_tools([wrap_function(fn_a), fn_b_wrapped])
         assert len(result) == 2
 
     def test_non_callable_raises(self):
@@ -129,7 +144,9 @@ class TestPrepareTools:
             """C."""
             return "c"
 
-        result = _prepare_tools([[fn_a, fn_b], fn_c])
+        result = _prepare_tools(
+            [[wrap_function(fn_a), wrap_function(fn_b)], wrap_function(fn_c)],
+        )
         assert len(result) == 3
         names = [t.schema["function"]["name"] for t in result]
         assert names == ["fn_a", "fn_b", "fn_c"]
@@ -139,7 +156,7 @@ class TestPrepareTools:
             """A."""
             return "a"
 
-        result = _prepare_tools([[[fn_a]]])
+        result = _prepare_tools([[[wrap_function(fn_a)]]])
         assert len(result) == 1
         assert result[0].schema["function"]["name"] == "fn_a"
 
@@ -148,7 +165,7 @@ class TestPrepareTools:
             """A."""
             return "a"
 
-        result = _prepare_tools([[], fn_a, []])
+        result = _prepare_tools([[], wrap_function(fn_a), []])
         assert len(result) == 1
 
     def test_tuple_flattened(self):
@@ -160,7 +177,7 @@ class TestPrepareTools:
             """B."""
             return "b"
 
-        result = _prepare_tools([(fn_a, fn_b)])
+        result = _prepare_tools([(wrap_function(fn_a), wrap_function(fn_b))])
         assert len(result) == 2
 
     def test_nested_non_callable_raises(self):
@@ -177,7 +194,7 @@ class TestPrepareTools:
             return "b"
 
         wrapped_b = wrap_function(fn_b)
-        result = _prepare_tools([[fn_a], wrapped_b])
+        result = _prepare_tools([[wrap_function(fn_a)], wrapped_b])
         assert len(result) == 2
         assert result[1] is wrapped_b
 
@@ -259,7 +276,7 @@ class TestWrapFunctionCallNodeClass:
             return "content"
         my_reader._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
 
-        result = _prepare_tools([my_reader])
+        result = _prepare_tools([wrap_function(my_reader)])
         assert len(result) == 1
         assert result[0].call_node_class is FileReadCallNode
 
@@ -295,7 +312,7 @@ class TestPromptTextMode:
             """Help."""
             return "helped"
 
-        result = await prompt("use helper", tools=[helper])
+        result = await prompt("use helper", tools=[wrap_function(helper)])
         assert isinstance(result, str)
 
 
@@ -385,7 +402,7 @@ class TestSkillDecorator:
             """Double."""
             return x * 2
 
-        @skill(tools=[helper])
+        @skill(tools=[wrap_function(helper)])
         async def compute(n: int) -> str:
             """Compute something with {n}."""
 
@@ -471,7 +488,7 @@ class TestPromptWithRole:
         class Helper(Agent):
             system_prompts = ["You are helpful."]
 
-        result = await prompt("do it", role=Helper, tools=[extra])
+        result = await prompt("do it", role=Helper, tools=[wrap_function(extra)])
         assert isinstance(result, str)
 
     async def test_role_with_extra_system(self, ctx):

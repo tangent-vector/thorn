@@ -17,6 +17,7 @@ from thorn.gateway._event import EventSource, IncomingEvent
 from thorn.gateway._gateway import Gateway
 from thorn.gateway._routing import NoteableKind
 from thorn.runtime import AgentID, Runtime, SessionKey
+from thorn.runtime._paths import AgencyPaths
 
 
 # ---------------------------------------------------------------------------
@@ -1581,7 +1582,7 @@ class TestSessionStoreSafeDirnames:
     def test_store_save_load_agent_with_special_chars(self, tmp_path: Path):
         from thorn.runtime._store import SessionStore
 
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = Agent(id=AgentID("a:b/c"), name="special")
         store.save_agent(agent)
 
@@ -1592,7 +1593,7 @@ class TestSessionStoreSafeDirnames:
     def test_store_list_agent_ids_decodes(self, tmp_path: Path):
         from thorn.runtime._store import SessionStore
 
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         store.save_agent(Agent(id=AgentID("x:y"), name="xy"))
         store.save_agent(Agent(id=AgentID("simple"), name="simple"))
 
@@ -1603,7 +1604,7 @@ class TestSessionStoreSafeDirnames:
     def test_store_delete_agent_with_special_chars(self, tmp_path: Path):
         from thorn.runtime._store import SessionStore
 
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         store.save_agent(Agent(id=AgentID("del:me/now"), name="del"))
         assert store.agent_exists(AgentID("del:me/now"))
         store.delete_agent(AgentID("del:me/now"))
@@ -1612,16 +1613,20 @@ class TestSessionStoreSafeDirnames:
     def test_clean_agent_ids_unchanged(self, tmp_path: Path):
         from thorn.runtime._store import SessionStore
 
-        store = SessionStore(tmp_path)
+        paths = AgencyPaths(home_root=tmp_path, workspace_root=tmp_path)
+        store = SessionStore(paths)
         store.save_agent(Agent(id=AgentID("gitlab_123_Issue_42"), name="test"))
 
-        file_names = [f.stem for f in tmp_path.iterdir() if f.is_file()]
-        assert "gitlab_123_Issue_42" in file_names
+        # Clean IDs round-trip to unmolested directory names.
+        agent_dir_names = [
+            d.name for d in paths.agents_root.iterdir() if d.is_dir()
+        ]
+        assert "gitlab_123_Issue_42" in agent_dir_names
 
     def test_store_session_with_special_chars(self, tmp_path: Path):
         from thorn.runtime._store import SessionStore
 
-        store = SessionStore(tmp_path)
+        store = SessionStore(AgencyPaths(home_root=tmp_path, workspace_root=tmp_path))
         agent = Agent(id=AgentID("test_agent"), name="test")
         store.save_agent(agent)
 
@@ -1721,9 +1726,11 @@ class TestProjectCoordinator:
         assert "read_file" in tool_names
         assert "edit_file" in tool_names
 
-    def test_serialization_round_trip(self, tmp_path: Path):
+    def test_serialization_round_trip(self, tmp_path: Path, monkeypatch):
         from thorn.gateway._agents import ProjectCoordinator
         from thorn.runtime._serializer import JsonSessionSerializer
+
+        monkeypatch.setenv("GITLAB_TOKEN", "x")
 
         agent = ProjectCoordinator(
             id=AgentID("test-coordinator"),
@@ -1731,10 +1738,11 @@ class TestProjectCoordinator:
             metadata={"project": "my-proj"},
         )
         serializer = JsonSessionSerializer()
-        # Filename stem is the source of truth for AgentID after the
-        # ``id``/``name`` dedup; save under the matching filename so the
-        # round-trip preserves the agent's identity.
-        path = tmp_path / "test-coordinator.json"
+        # Parent directory name is the source of truth for AgentID
+        # under the Phase-A layout; save under ``<id>/agent.json``.
+        agent_dir = tmp_path / "test-coordinator"
+        agent_dir.mkdir()
+        path = agent_dir / "agent.json"
         serializer.save_agent(agent, path)
         loaded = serializer.load_agent(path)
 
@@ -1832,7 +1840,7 @@ class TestEndToEndWiring:
         async with runtime:
             agent = gateway._resolve_agent(event)
 
-        memory_path = agent.workspace / "MEMORY.md"
+        memory_path = agent.home / "MEMORY.md"
         assert memory_path.is_file()
         content = memory_path.read_text(encoding="utf-8")
         assert "test-proj" in content
@@ -2849,7 +2857,9 @@ class TestBootstrapCoordinator:
 
         assert str(aid) == "test-coord"
 
-        identity = tmp_path / ".thorn" / "agents" / "test-coord.json"
+        identity = (
+            tmp_path / ".thorn" / "agents" / "test-coord" / "agent.json"
+        )
         assert identity.is_file()
 
         import json
@@ -2867,7 +2877,9 @@ class TestBootstrapCoordinator:
         assert acct["credentials"]["kind"] == "gitlab-pat"
         assert acct["credentials"]["token"] == "$GITLAB_TOKEN"
 
-        memory = tmp_path / ".thorn" / "agents" / "test-coord" / "MEMORY.md"
+        memory = (
+            tmp_path / ".thorn" / "agents" / "test-coord" / "home" / "MEMORY.md"
+        )
         assert memory.is_file()
         content = memory.read_text(encoding="utf-8")
         assert "my-project" in content
@@ -2951,7 +2963,9 @@ class TestBootstrapCoordinator:
             access_token_env="MY_TOKEN",
         )
 
-        identity = tmp_path / ".thorn" / "agents" / "custom.json"
+        identity = (
+            tmp_path / ".thorn" / "agents" / "custom" / "agent.json"
+        )
         data = json.loads(identity.read_text(encoding="utf-8"))
         acct = data["accounts"][0]
         assert acct["credentials"]["token"] == "$MY_TOKEN"
@@ -2992,7 +3006,10 @@ class TestBootstrapCoordinator:
             project_url="https://gitlab.com/group/proj",
         )
 
-        store = SessionStore(tmp_path / ".thorn" / "agents")
+        from thorn.runtime._paths import AgencyPaths
+        store = SessionStore(
+            AgencyPaths.for_gateway(tmp_path / ".thorn", tmp_path),
+        )
         agent = store.load_agent(AgentID("loadable"))
 
         assert isinstance(agent, ProjectCoordinator)
@@ -3015,7 +3032,9 @@ class TestBootstrapCoordinator:
         ])
         assert result.exit_code == 0, result.output
         assert "cli-test" in result.output
-        assert (tmp_path / ".thorn" / "agents" / "cli-test.json").is_file()
+        assert (
+            tmp_path / ".thorn" / "agents" / "cli-test" / "agent.json"
+        ).is_file()
         assert (tmp_path / ".thorn" / "gateway.json").is_file()
         assert "gateway.json" in result.output
 
@@ -3064,7 +3083,9 @@ class TestBootstrapCoordinator:
         proj = gw_data["projects"][0]
         assert proj["url"] == "https://github.com/owner/repo"
 
-        identity = tmp_path / ".thorn" / "agents" / "gh-coord.json"
+        identity = (
+            tmp_path / ".thorn" / "agents" / "gh-coord" / "agent.json"
+        )
         data = json.loads(identity.read_text(encoding="utf-8"))
         assert data["metadata"]["project"] == "my-repo"
         acct = data["accounts"][0]
@@ -3087,7 +3108,9 @@ class TestBootstrapCoordinator:
             project_url="https://github.com/owner/proj",
         )
 
-        identity = tmp_path / ".thorn" / "agents" / "id-test.json"
+        identity = (
+            tmp_path / ".thorn" / "agents" / "id-test" / "agent.json"
+        )
         data = json.loads(identity.read_text(encoding="utf-8"))
         acct = data["accounts"][0]
         assert acct["git_user_name"] == "id-test"
@@ -3108,7 +3131,9 @@ class TestBootstrapCoordinator:
             git_user_email="bot@example.com",
         )
 
-        identity = tmp_path / ".thorn" / "agents" / "custom-id.json"
+        identity = (
+            tmp_path / ".thorn" / "agents" / "custom-id" / "agent.json"
+        )
         data = json.loads(identity.read_text(encoding="utf-8"))
         acct = data["accounts"][0]
         assert acct["git_user_name"] == "My Bot"
@@ -3237,12 +3262,18 @@ class TestBootstrapHomeWorkspaceSplit:
         assert not (agency_home / ".thorn").exists()
         assert not (agency_workspace / ".thorn").exists()
         assert (agency_home / "gateway.json").is_file()
-        assert (agency_home / "agents" / "no-nest.json").is_file()
+        assert (agency_home / "agents" / "no-nest" / "agent.json").is_file()
 
     def test_bootstrap_creates_per_agent_workspace_prefix(
         self, tmp_path: Path,
     ):
-        """The ``<agency_workspace>/<agent_id>/`` prefix is created eagerly."""
+        """The ``<agency_workspace>/agents/<agent_id>/`` subtree is created eagerly.
+
+        Under the Phase-A layout both the workspace mount and the
+        control dir sibling are created up front so ``thorn serve``
+        can bind the tool-host socket on first use without racing
+        against a missing directory.
+        """
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         agency_home = tmp_path / "agency"
@@ -3256,7 +3287,9 @@ class TestBootstrapHomeWorkspaceSplit:
             project_url="https://github.com/owner/proj",
         )
 
-        assert (agency_workspace / "eager").is_dir()
+        agent_ws = agency_workspace / "agents" / "eager"
+        assert (agent_ws / "workspace").is_dir()
+        assert (agent_ws / "control").is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -4003,8 +4036,10 @@ class TestRouteGitlabTodo:
 
 class TestGatewayWorkspaceRouting:
     """Verify that _handle_event derives the session workspace from
-    ``<runtime_ws>/<agent_id>/<session_key>/`` and pre-creates the
-    directory on disk."""
+    ``AgencyPaths.session_workspace`` and pre-creates the directory on
+    disk.  Under the Phase-A layout this is
+    ``<workspace_root>/agents/<safe-agent-id>/workspace/<safe-session-key>/``.
+    """
 
     def _make_runtime(self, tmp_path: Path) -> Runtime:
         return Runtime(provider=MockProvider(), workspace_root=tmp_path)
@@ -4027,7 +4062,9 @@ class TestGatewayWorkspaceRouting:
             gateway = Gateway(runtime=runtime, sources=[source])
             await gateway.run()
 
-        expected_ws = tmp_path / "default" / "github" / "42" / "issue" / "7"
+        expected_ws = runtime.paths.session_workspace(
+            AgentID("default"), SessionKey("github/42/issue/7"),
+        )
         assert expected_ws.is_dir()
 
         agent_ids = runtime.sessions.list_agent_ids()
@@ -4064,8 +4101,8 @@ class TestGatewayWorkspaceRouting:
             gateway = Gateway(runtime=runtime, sources=[source])
             await gateway.run()
 
-        expected_ws = (
-            tmp_path / "my-coord" / "gitlab" / "10" / "issue" / "5"
+        expected_ws = runtime.paths.session_workspace(
+            AgentID("my-coord"), SessionKey("gitlab/10/issue/5"),
         )
         assert expected_ws.is_dir()
 
@@ -4097,13 +4134,15 @@ class TestGatewayWorkspaceRouting:
         agent = runtime.sessions.load_agent(agent_ids[0])
         loaded = runtime.sessions.load_session(agent, key)
 
-        expected_ws = tmp_path / "default" / "github" / "99" / "issue" / "1"
+        expected_ws = runtime.paths.session_workspace(
+            AgentID("default"), key,
+        )
         assert loaded.workspace_root == expected_ws
 
     @pytest.mark.asyncio
     async def test_flat_session_key_workspace(self, tmp_path: Path):
         """A simple (non-slashed) session key produces a single-level
-        directory under the agent ID."""
+        directory under the agent's workspace mount."""
         event = IncomingEvent(
             source="test",
             session_key=SessionKey("simple_key"),
@@ -4118,8 +4157,14 @@ class TestGatewayWorkspaceRouting:
             gateway = Gateway(runtime=runtime, sources=[source])
             await gateway.run()
 
-        expected_ws = tmp_path / "default" / "simple_key"
+        expected_ws = runtime.paths.session_workspace(
+            AgentID("default"), SessionKey("simple_key"),
+        )
         assert expected_ws.is_dir()
+        # Flat keys remain single-level under the workspace mount.
+        assert expected_ws.parent == runtime.paths.agent_workspace_mount(
+            AgentID("default"),
+        )
 
         agent_ids = runtime.sessions.list_agent_ids()
         agent = runtime.sessions.load_agent(agent_ids[0])

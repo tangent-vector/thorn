@@ -251,7 +251,7 @@ class TestAgentPromptMessages:
 
         class MyRole(Agent):
             system_prompts = ["Role for {module}."]
-            tools = [capture]
+            tools = [wrap_function(capture)]
 
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "capture", "{}"),

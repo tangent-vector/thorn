@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from thorn.core._agent import Agent
 from thorn.runtime._address import ServiceAddress, SessionAddress
 from thorn.runtime._in_flight_index import (
     InFlightIndex,
@@ -37,6 +38,7 @@ from thorn.runtime._paths import (
 )
 from thorn.runtime._queue import DurableQueue
 from thorn.runtime._session import AgentID, SessionKey
+from thorn.runtime._store import SessionStore
 
 
 # ---------------------------------------------------------------------------
@@ -114,13 +116,16 @@ class TestSessionPaths:
         from thorn.runtime._store import SessionStore
 
         paths = _paths(tmp_path)
-        store = SessionStore(paths.agents_root)
+        store = SessionStore(paths)
         agent = AgentID("coord")
         session = SessionKey("proj/mr/42")
-        assert (
-            paths.session_metadata_dir(agent, session)
-            == store._session_dir(agent, session)
-        )
+        # Cross-check: the store's save/load paths land under the same
+        # ``session_metadata_dir`` that ``AgencyPaths`` advertises.
+        store_agent = Agent(id=agent, name="coord")
+        store.save_agent(store_agent)
+        from thorn.core._session import Session as _Session
+        store.save_session(_Session(agent=store_agent, key=session))
+        assert (paths.session_metadata_dir(agent, session) / "session.json").is_file()
 
     def test_session_inbox_dir_is_inside_metadata(self, tmp_path: Path) -> None:
         paths = _paths(tmp_path)

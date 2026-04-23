@@ -18,6 +18,15 @@ import time
 from typing import Any
 
 from thorn.core._context import ExecutionContext, Scope
+from thorn.core._executor import (
+    ExecutorRouter,
+    ToolInvocation,
+    ToolRegistry,
+    ToolVenue,
+    build_default_router,
+    build_registry_from_wrapped_tools,
+    build_split_router,
+)
 from thorn.core._history import (
     DEFAULT_HIGH_WATERMARK,
     DEFAULT_LOW_WATERMARK,
@@ -72,19 +81,27 @@ class _WrappedTool:
     When *call_node_class* is set, ``HistoryTree.append_turn`` will
     construct that ``ToolCallNode`` subclass instead of the base class,
     enabling ``isinstance``-based identification in downstream code.
+
+    ``venue`` names the :class:`~thorn.core._executor.ToolVenue` the
+    tool is meant to run in.  The agent loop uses it only indirectly
+    (via :class:`~thorn.core._executor.ToolRegistry` + router); for
+    non-registry callers (``wrap_function`` etc.) it still defaults to
+    ``IN_PROCESS`` which matches today's behavior.
     """
 
-    __slots__ = ("schema", "execute", "call_node_class")
+    __slots__ = ("schema", "execute", "call_node_class", "venue")
 
     def __init__(
         self,
         schema: dict[str, Any],
         execute: Any,  # async callable(**kwargs) -> str
         call_node_class: type[ToolCallNode] | None = None,
+        venue: ToolVenue = ToolVenue.IN_PROCESS,
     ) -> None:
         self.schema = schema
         self.execute = execute
         self.call_node_class = call_node_class
+        self.venue = venue
 
 
 async def run_agent_loop(
@@ -130,13 +147,15 @@ async def run_agent_loop(
             if _tool_name(t.schema) != "ask_user"
         ]
 
-    # -- build schemas and dispatch table ----------------------------------
+    # -- build schemas and registry ----------------------------------------
     all_tools = list(tools)
-    tool_dispatch: dict[str, _WrappedTool] = {
-        _tool_name(t.schema): t for t in all_tools
-    }
+    registry = build_registry_from_wrapped_tools(all_tools)
+    if context.sandbox_executor is not None:
+        router = build_split_router(all_tools, context.sandbox_executor)
+    else:
+        router = build_default_router(all_tools)
 
-    all_schemas = [t.schema for t in all_tools]
+    all_schemas = registry.schemas()
 
     # raise_error is always available so any agent can signal failure.
     all_schemas.append(RAISE_ERROR_SCHEMA)
@@ -208,7 +227,8 @@ async def run_agent_loop(
         result_msgs, call_node_classes, advisory_nodes, captured = (
             await _execute_tool_calls(
                 tool_calls=tool_calls,
-                tool_dispatch=tool_dispatch,
+                registry=registry,
+                router=router,
                 context=context,
                 result_type=result_type if structured else None,
                 session=session,
@@ -454,12 +474,19 @@ def _normalize_tool_name(name: str) -> str:
 async def _execute_tool_calls(
     *,
     tool_calls: list[ToolCall],
-    tool_dispatch: dict[str, _WrappedTool],
+    registry: ToolRegistry,
+    router: ExecutorRouter,
     context: ExecutionContext,
     result_type: type | None,
     session: Any = None,
 ) -> tuple[list[ToolResultMessage], dict[str, type[ToolCallNode]], list[AdvisoryNode], Any]:
     """Execute tool calls and return (result_messages, call_node_classes, advisory_nodes, captured_value).
+
+    Dispatch walks through the :class:`ToolRegistry` (for name
+    resolution, venue, and history-node class) and the
+    :class:`ExecutorRouter` (for the actual invocation).  The two are
+    split so that Phase A's sandbox work can swap the executor for the
+    ``SANDBOX`` venue without any changes to the loop itself.
 
     *call_node_classes* maps ``call_id`` to the ``ToolCallNode``
     subclass registered on the resolved tool (if any).  Only entries
@@ -508,16 +535,16 @@ async def _execute_tool_calls(
             msg = kwargs.get("message", "unknown error")
             raise SkillError(msg)
 
-        # -- resolve tool --------------------------------------------------
-        tool = tool_dispatch.get(tc.name)
-        if tool is None:
+        # -- resolve registry entry ----------------------------------------
+        entry = registry.get(tc.name)
+        if entry is None:
             normalized = _normalize_tool_name(tc.name)
-            for registered_name, t in tool_dispatch.items():
-                if _normalize_tool_name(registered_name) == normalized:
-                    tool = t
+            for candidate in registry.entries():
+                if _normalize_tool_name(candidate.name) == normalized:
+                    entry = candidate
                     break
 
-        if tool is None:
+        if entry is None:
             results.append(ToolResultMessage(
                 call_id=tc.call_id,
                 content=f"Unknown tool: {tc.name!r}",
@@ -528,22 +555,28 @@ async def _execute_tool_calls(
             )
             continue
 
-        if tool.call_node_class is not None:
-            call_node_classes[tc.call_id] = tool.call_node_class
+        if entry.call_node_class is not None:
+            call_node_classes[tc.call_id] = entry.call_node_class
 
-        # -- execute -------------------------------------------------------
+        invocation = ToolInvocation(
+            call_id=tc.call_id,
+            tool_name=entry.name,
+            arguments=kwargs,
+        )
+
+        # -- execute via the venue's executor ------------------------------
         await context.event_sink.on_tool_start(
             tc.name, kwargs, scope=context.scope,
         )
+        executor = router.for_venue(entry.venue)
         t0 = time.monotonic()
         try:
-            result_str = await tool.execute(**kwargs)
+            outcome = await executor.invoke(invocation)
         except SkillError:
             raise
         except Exception as exc:
             duration_s = time.monotonic() - t0
             logger.exception("error executing tool %s", tc.name)
-            result_str = None
             results.append(ToolResultMessage(
                 call_id=tc.call_id,
                 content=f"Error: {exc}",
@@ -558,10 +591,14 @@ async def _execute_tool_calls(
         duration_s = time.monotonic() - t0
         results.append(ToolResultMessage(
             call_id=tc.call_id,
-            content=result_str if isinstance(result_str, str) else serialize_for_tool_result(result_str),
+            content=outcome.content,
+            is_error=outcome.is_error,
         ))
         await context.event_sink.on_tool_end(
-            tc.name, duration_s=duration_s, scope=context.scope,
+            tc.name,
+            duration_s=duration_s,
+            error=outcome.content if outcome.is_error else None,
+            scope=context.scope,
         )
 
     advisory_nodes: list[AdvisoryNode] = []

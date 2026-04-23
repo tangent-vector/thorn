@@ -387,6 +387,15 @@ class Gateway:
             health_monitor=self._health_monitor,
         )
         self._schedulers[agent.id] = scheduler
+
+        # Eagerly register the per-agent sandbox executor with the
+        # runtime's pool.  The executor itself is lazy (the daemon
+        # subprocess only starts on the first ``invoke``), but doing
+        # the bookkeeping here means a later prompt round on this
+        # agent does not race two threads through
+        # ``get_or_create_sandbox_executor``.  When sandbox execution
+        # is disabled on the runtime this is a no-op.
+        self._runtime.get_or_create_sandbox_executor(agent)
         return scheduler
 
     async def _save_session_async(self, session: Session) -> None:

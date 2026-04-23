@@ -317,13 +317,15 @@ class TestAgentPromptTextMode:
         assert "say hello" in result
 
     async def test_prompt_with_agent_tools(self, ctx):
+        from thorn.core._func import wrap_function
+
         async def helper(x: int) -> int:
             """Double a number."""
             return x * 2
 
         class ToolAgent(Agent):
             system_prompts = ["Use tools."]
-            tools = [helper]
+            tools = [wrap_function(helper)]
 
         agent = ToolAgent()
         result = await agent.prompt("help me")
@@ -337,8 +339,10 @@ class TestAgentPromptTextMode:
         class SimpleAgent(Agent):
             pass
 
+        from thorn.core._func import wrap_function
+
         agent = SimpleAgent()
-        result = await agent.prompt("do it", tools=[extra_tool])
+        result = await agent.prompt("do it", tools=[wrap_function(extra_tool)])
         assert isinstance(result, str)
 
     async def test_prompt_with_extra_system(self, ctx):
@@ -492,9 +496,11 @@ class TestContextAgent:
         ctx = ExecutionContext(provider=provider)
         token = set_context(ctx)
         try:
+            from thorn.core._func import wrap_function
+
             class TestRole(Agent):
                 system_prompts = ["Working on {module}."]
-                tools = [capture_agent]
+                tools = [wrap_function(capture_agent)]
 
             agent = TestRole(module="parser")
             await agent.prompt("do it")
@@ -538,9 +544,11 @@ class TestSkillWithRole:
             captured_agents.append(get_context().agent)
             return "ok"
 
+        from thorn.core._func import wrap_function
+
         class TestRole(Agent):
             system_prompts = ["Working on {module}."]
-            tools = [capture_agent]
+            tools = [wrap_function(capture_agent)]
 
         provider = MockProvider(canned_responses=[
             [
@@ -581,8 +589,10 @@ class TestSkillWithRole:
             calls_seen.append("skill_tool")
             return "from skill"
 
+        from thorn.core._func import wrap_function
+
         class ToolRole(Agent):
-            tools = [role_tool]
+            tools = [wrap_function(role_tool)]
 
         provider = MockProvider(canned_responses=[
             [
@@ -599,7 +609,7 @@ class TestSkillWithRole:
         ctx = ExecutionContext(provider=provider)
         token = set_context(ctx)
         try:
-            @skill(role=ToolRole, tools=[skill_tool])
+            @skill(role=ToolRole, tools=[wrap_function(skill_tool)])
             async def do_work(module: str) -> str:
                 """Work on {module}."""
 
@@ -844,7 +854,9 @@ class TestAgentHome:
         token = set_context(ctx)
         try:
             agent = Agent(id=AgentID("test-agent"))
-            assert agent.home == tmp_path / ".thorn" / "agents" / "test-agent"
+            assert agent.home == (
+                tmp_path / ".thorn" / "agents" / "test-agent" / "home"
+            )
         finally:
             reset_context(token)
 
@@ -859,7 +871,10 @@ class TestAgentHome:
             agent = Agent()
             home = agent.home
             assert home is not None
-            assert home.parent == tmp_path / ".thorn" / "agents"
+            # ``home`` is the mounted ``home/`` subtree under the
+            # agent's framework dir.
+            assert home.name == "home"
+            assert home.parent.parent == tmp_path / ".thorn" / "agents"
             # The agent should now have a derived ID
             assert agent.id is not None
             assert isinstance(agent.id, AgentID)
@@ -875,7 +890,9 @@ class TestAgentHome:
         token = set_context(ctx)
         try:
             agent = Agent(id=AgentID("fallback-agent"))
-            assert agent.home == tmp_path / ".thorn" / "agents" / "fallback-agent"
+            assert agent.home == (
+                tmp_path / ".thorn" / "agents" / "fallback-agent" / "home"
+            )
         finally:
             reset_context(token)
 

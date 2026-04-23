@@ -54,6 +54,7 @@ from thorn.gateway._config import (
     GATEWAY_CONFIG_FILENAME,
     derive_forge_type_from_url,
 )
+from thorn.runtime._paths import AgencyPaths
 from thorn.runtime._session import AgentID
 
 log = logging.getLogger(__name__)
@@ -180,8 +181,8 @@ def bootstrap_coordinator(
     agency_home = agency_home.resolve()
     agency_workspace = agency_workspace.resolve()
 
-    agents_root = agency_home / "agents"
-    agents_root.mkdir(parents=True, exist_ok=True)
+    paths = AgencyPaths.for_gateway(agency_home, agency_workspace)
+    paths.agents_root.mkdir(parents=True, exist_ok=True)
 
     resolved_git_name = git_user_name or agent_id
     resolved_git_email = git_user_email or f"{agent_id}@thorn"
@@ -203,7 +204,8 @@ def bootstrap_coordinator(
 
     # -- Agent identity ------------------------------------------------------
 
-    identity_path = agents_root / f"{agent_id}.json"
+    identity_path = paths.agent_identity_file(aid)
+    identity_path.parent.mkdir(parents=True, exist_ok=True)
     agent_data: dict[str, Any] = {
         "name": agent_id,
         "agent_class": "ProjectCoordinator",
@@ -231,8 +233,12 @@ def bootstrap_coordinator(
     log.info("Wrote agent identity: %s", identity_path)
 
     # -- Agent home (memory) -------------------------------------------------
+    #
+    # The agent's home subtree is the ``home/`` directory inside its
+    # framework dir; this is the part mounted into the tool-executor
+    # sandbox, so MEMORY.md, journal/, etc. all go here.
 
-    agent_home = agents_root / agent_id
+    agent_home = paths.agent_home_mount(aid)
     agent_home.mkdir(parents=True, exist_ok=True)
 
     memory_path = agent_home / "MEMORY.md"
@@ -255,13 +261,17 @@ def bootstrap_coordinator(
 
     # -- Per-agent workspace prefix ------------------------------------------
     #
-    # Sessions create their own ``<agent_workspace>/<session_key>/``
-    # subdirectories lazily, but creating the agent-level prefix here
-    # means any "workspace path is unwritable" error surfaces during
-    # bootstrap rather than the first time a session tries to start.
+    # Sessions create their own
+    # ``<agent_workspace_mount>/<session_key>/`` subdirectories
+    # lazily, but creating the agent-level workspace (and the sibling
+    # control dir the tool-host socket lives in) here means any
+    # "workspace path is unwritable" error surfaces during bootstrap
+    # rather than the first time a session tries to start or the
+    # daemon tries to listen.
 
-    agent_workspace = agency_workspace / agent_id
+    agent_workspace = paths.agent_workspace_mount(aid)
     agent_workspace.mkdir(parents=True, exist_ok=True)
+    paths.agent_control_dir(aid).mkdir(parents=True, exist_ok=True)
     log.info("Created agent workspace: %s", agent_workspace)
 
     # -- Gateway configuration -----------------------------------------------

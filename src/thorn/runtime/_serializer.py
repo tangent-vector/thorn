@@ -417,14 +417,15 @@ class JsonSessionSerializer:
 
         agent_cls = _resolve_agent_class(agent_data.get("agent_class", "Agent"))
 
-        # Derive the AgentID from the file's path stem so that the
-        # store's directory layout is the single source of truth for
-        # agent identity.  When the JSON also carries an explicit
-        # ``name``, prefer that for the human label; otherwise fall
-        # back to the path-derived value so the ``name`` field is
-        # still populated.
-        path_stem_id = AgentID(unsafe_dirname(path.stem))
-        name = agent_data.get("name") or str(path_stem_id)
+        # Derive the AgentID from the parent directory name so that
+        # the store's directory layout is the single source of truth
+        # for agent identity.  Under the Phase-A layout each agent
+        # lives at ``<agents_root>/<safe-agent-id>/agent.json``, so
+        # the containing directory name carries the ID.  When the
+        # JSON also carries an explicit ``name``, prefer that for the
+        # human label; otherwise fall back to the path-derived value.
+        path_id = AgentID(unsafe_dirname(path.parent.name))
+        name = agent_data.get("name") or str(path_id)
 
         metadata = agent_data.get("metadata") or {}
 
@@ -434,7 +435,7 @@ class JsonSessionSerializer:
             kwargs["accounts"] = _deserialize_accounts(raw_accounts)
 
         return agent_cls(
-            id=path_stem_id,
+            id=path_id,
             name=name,
             metadata=metadata,
             **kwargs,
