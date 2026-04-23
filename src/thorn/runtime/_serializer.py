@@ -405,6 +405,17 @@ class JsonSessionSerializer:
         accounts_data = _serialize_accounts(agent)
         if accounts_data is not None:
             agent_data["accounts"] = accounts_data
+        # Sandbox overrides ride alongside accounts as an optional
+        # ``sandbox`` block.  Only written when the agent actually
+        # carries an override; absent block means "use the agency
+        # default".
+        sandbox_override = getattr(agent, "sandbox_override", None)
+        if sandbox_override is not None:
+            sandbox_dict = sandbox_override.model_dump(
+                mode="json", exclude_none=True,
+            )
+            if sandbox_dict:
+                agent_data["sandbox"] = sandbox_dict
         _atomic_write_text(
             path,
             json.dumps(agent_data, indent=2, ensure_ascii=False) + "\n",
@@ -433,6 +444,13 @@ class JsonSessionSerializer:
         raw_accounts = agent_data.get("accounts")
         if raw_accounts is not None:
             kwargs["accounts"] = _deserialize_accounts(raw_accounts)
+
+        raw_sandbox = agent_data.get("sandbox")
+        if raw_sandbox is not None:
+            from thorn.gateway._config import AgentSandboxOverride
+            kwargs["sandbox_override"] = AgentSandboxOverride.model_validate(
+                raw_sandbox,
+            )
 
         return agent_cls(
             id=path_id,

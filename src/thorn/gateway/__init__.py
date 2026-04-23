@@ -7,10 +7,12 @@ TODOs, future webhook endpoints, etc.) into Thorn agents.
 
 from thorn.gateway._agents import ProjectCoordinator
 from thorn.gateway._config import (
+    AgentSandboxOverride,
     ForgeSpec,
     ForkSpec,
     GatewayConfig,
     ProjectSpec,
+    SandboxConfig,
     ServiceTypeRegistry,
     expand_env_vars,
     get_service_type_registry,
@@ -22,6 +24,7 @@ from thorn.gateway._event import EventSource, IncomingEvent
 from thorn.gateway._gateway import Gateway
 
 __all__ = [
+    "AgentSandboxOverride",
     "EventSource",
     "ForgeSpec",
     "ForkSpec",
@@ -30,6 +33,7 @@ __all__ = [
     "IncomingEvent",
     "ProjectCoordinator",
     "ProjectSpec",
+    "SandboxConfig",
     "ServiceTypeRegistry",
     "expand_env_vars",
     "get_service_type_registry",

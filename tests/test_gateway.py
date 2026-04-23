@@ -2085,6 +2085,64 @@ class TestGatewayConfigLoading:
         config = load_gateway_config(thorn_dir)
         assert config.forges == []
         assert config.projects == []
+        # Sandbox is opt-in: omitting the block leaves it None so the
+        # runtime keeps the Phase-A subprocess executor.
+        assert config.sandbox is None
+
+    def test_load_with_sandbox_block(self, tmp_path: Path):
+        import json
+        from thorn.gateway._config import load_gateway_config
+
+        thorn_dir = tmp_path / ".thorn"
+        thorn_dir.mkdir()
+        (thorn_dir / "gateway.json").write_text(
+            json.dumps({
+                "sandbox": {
+                    "oci_runtime": "podman",
+                    "image": "thorn-sandbox:1.2",
+                    "env_passthrough": ["LANG", "TZ"],
+                    "dev_mount_runtime": True,
+                    "container_ready_timeout_s": 45.0,
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        config = load_gateway_config(thorn_dir)
+        assert config.sandbox is not None
+        assert config.sandbox.backend == "container"
+        assert config.sandbox.oci_runtime == "podman"
+        assert config.sandbox.image == "thorn-sandbox:1.2"
+        assert config.sandbox.env_passthrough == ["LANG", "TZ"]
+        assert config.sandbox.dev_mount_runtime is True
+        assert config.sandbox.container_ready_timeout_s == 45.0
+
+    def test_load_sandbox_block_subprocess_backend(self, tmp_path: Path):
+        import json
+        from thorn.gateway._config import load_gateway_config
+
+        thorn_dir = tmp_path / ".thorn"
+        thorn_dir.mkdir()
+        (thorn_dir / "gateway.json").write_text(
+            json.dumps({"sandbox": {"backend": "subprocess"}}),
+            encoding="utf-8",
+        )
+        config = load_gateway_config(thorn_dir)
+        assert config.sandbox is not None
+        assert config.sandbox.backend == "subprocess"
+
+    def test_sandbox_invalid_backend_rejected(self, tmp_path: Path):
+        import json
+        from thorn.gateway._config import load_gateway_config
+
+        thorn_dir = tmp_path / ".thorn"
+        thorn_dir.mkdir()
+        (thorn_dir / "gateway.json").write_text(
+            json.dumps({"sandbox": {"backend": "vm"}}),
+            encoding="utf-8",
+        )
+        with pytest.raises(Exception):
+            load_gateway_config(thorn_dir)
 
 
 # ---------------------------------------------------------------------------

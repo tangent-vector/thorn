@@ -68,7 +68,7 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, model_validator
@@ -482,6 +482,147 @@ class ProjectSpec(BaseModel):
         return [ForkSpec(url=self.url)]
 
 
+class SandboxConfig(BaseModel):
+    """Agency-wide defaults for the per-agent sandbox container.
+
+    Phase B introduces sandboxing in two layers: an agency-wide
+    default (this model, attached to :class:`GatewayConfig`) and an
+    optional per-agent override (``sandbox`` block of ``agent.json``).
+    A field set on the agent wins; otherwise the agency default
+    applies; otherwise the framework default applies.
+
+    Fields are intentionally named after operator concepts rather
+    than implementation details so that diagnosing why a container
+    behaved a certain way amounts to reading this block.
+
+    The ``backend`` knob exists so the existing Phase-A subprocess
+    behavior can be preserved by setting ``backend: "subprocess"``;
+    Phase B's default is ``"container"`` for any agency whose
+    operator opts in by writing this block.  When the block is
+    omitted entirely from ``gateway.json``, the runtime keeps the
+    Phase-A subprocess default so existing agencies see no behavior
+    change until they opt in.
+    """
+
+    backend: Literal["subprocess", "container"] = Field(
+        default="container",
+        description=(
+            "Sandbox executor backend.  'subprocess' keeps the Phase-A "
+            "behavior (toolhost runs as a host subprocess).  'container' "
+            "runs the toolhost inside an OCI container per agent."
+        ),
+    )
+    oci_runtime: Literal["podman", "docker"] | None = Field(
+        default=None,
+        description=(
+            "OCI runtime to use ('podman' or 'docker').  When null, "
+            "auto-detect: prefer podman, fall back to docker.  Has "
+            "no effect when backend is 'subprocess'."
+        ),
+    )
+    image: str = Field(
+        default="",
+        description=(
+            "Default container image tag (e.g. 'thorn-sandbox:0.1.0').  "
+            "When empty, the framework default 'thorn-sandbox:<thorn-version>' "
+            "applies.  Per-agent agent.json sandbox.image overrides this."
+        ),
+    )
+    env_passthrough: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Names of host environment variables forwarded into every "
+            "agent container.  Operator-controlled allow-list; per-agent "
+            "agent.json may *add* to this list, never *remove* from it."
+        ),
+    )
+    dev_mount_runtime: bool = Field(
+        default=False,
+        description=(
+            "If true, bind-mount this checkout's thorn source tree "
+            "read-only into each container at /opt/thorn-runtime and set "
+            "PYTHONPATH so the in-container daemon picks up local edits "
+            "without rebuilding the image.  Off by default; opt-in for "
+            "developer workflows."
+        ),
+    )
+    container_ready_timeout_s: float = Field(
+        default=30.0,
+        gt=0.0,
+        description=(
+            "Stage-one readiness budget: seconds to wait for the "
+            "container to reach 'running' after launch.  Distinct from "
+            "the daemon's socket-bind poll, which is governed by the "
+            "executor."
+        ),
+    )
+
+
+class AgentSandboxOverride(BaseModel):
+    """Per-agent overrides for the agency's :class:`SandboxConfig`.
+
+    Lives in the ``sandbox`` block of an agent's ``agent.json``.
+    Every field is optional; an absent field falls back to the agency
+    default (which itself may fall back to the framework default).
+    Setting a field to its explicit empty form (``[]`` for the list,
+    ``""`` for ``image``) does **not** reset to the agency value --
+    it is a literal override.
+
+    The merge rules differ slightly across fields:
+
+    * ``image`` -- replaces the agency value when set (most common
+      reason to override per-agent: a specialized agent that needs
+      extra system packages baked into its sandbox image).
+    * ``env_passthrough`` -- *added* to the agency list, never
+      replaces it.  Operators can broaden the allow-list per agent
+      but never narrow it without a config change at the agency
+      level.  This avoids the surprise of "I added LANG to the
+      agency-wide list and a particular agent silently lost it".
+    * Other fields -- replace the agency value verbatim when set.
+
+    The merge happens in :func:`thorn.runtime._sandbox.resolve_sandbox_config`
+    (see Phase B plan, "Configuration"), not here -- this class is
+    just the on-disk shape.
+    """
+
+    backend: Literal["subprocess", "container"] | None = Field(
+        default=None,
+        description=(
+            "Per-agent override for the executor backend.  When null, "
+            "use the agency default."
+        ),
+    )
+    image: str | None = Field(
+        default=None,
+        description=(
+            "Per-agent override for the container image.  When null, "
+            "use the agency default; when a non-empty string, replaces "
+            "the agency value."
+        ),
+    )
+    env_passthrough: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Additional env-var names this agent's container should "
+            "see (added to the agency-wide allow-list, not replacing it)."
+        ),
+    )
+    extra_env: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Literal env entries added to this agent's container, "
+            "not read from the host process environment."
+        ),
+    )
+    container_ready_timeout_s: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Per-agent override for the stage-one readiness timeout."
+        ),
+    )
+
+
 class GatewayConfig(BaseModel):
     """Top-level model for an agency's ``gateway.json``.
 
@@ -504,6 +645,15 @@ class GatewayConfig(BaseModel):
     )
     forges: list[ForgeSpec] = Field(default_factory=list)
     projects: list[ProjectSpec] = Field(default_factory=list)
+    sandbox: SandboxConfig | None = Field(
+        default=None,
+        description=(
+            "Agency-wide sandbox defaults.  When omitted, the runtime "
+            "keeps the Phase-A subprocess executor behavior; setting "
+            "this block (even to '{}') opts the agency into the Phase-B "
+            "container backend by default."
+        ),
+    )
 
     def resolve_workspace(self, agency_home: Path) -> Path | None:
         """Resolve the configured workspace path against *agency_home*.
@@ -1131,6 +1281,7 @@ def _create_gitlab_source(
 
 
 __all__ = [
+    "AgentSandboxOverride",
     "ForgeSpec",
     "ForkLocation",
     "ForkSpec",
@@ -1139,6 +1290,7 @@ __all__ = [
     "ProjectSpec",
     "ResolvedFork",
     "ResolvedProject",
+    "SandboxConfig",
     "ServiceTypeRegistry",
     "derive_api_url",
     "derive_forge_name_from_url",

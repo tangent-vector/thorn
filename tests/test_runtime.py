@@ -773,6 +773,58 @@ class TestJsonSessionSerializerAgent:
         assert type(restored) is Agent
         assert restored.name == "fb"
 
+    def test_sandbox_override_roundtrips(self, tmp_path: Path):
+        from thorn.gateway._config import AgentSandboxOverride
+
+        override = AgentSandboxOverride(
+            image="thorn-sandbox-rust:dev",
+            env_passthrough=["RUST_LOG"],
+            extra_env={"CARGO_HOME": "/agent/home/.cargo"},
+            container_ready_timeout_s=60.0,
+        )
+        agent = Agent(
+            id=AgentID("rust-agent"),
+            name="rusty",
+            sandbox_override=override,
+        )
+        serializer = JsonSessionSerializer()
+        agent_dir = tmp_path / "rust-agent"
+        agent_dir.mkdir()
+        agent_path = agent_dir / "agent.json"
+        serializer.save_agent(agent, agent_path)
+
+        on_disk = json.loads(agent_path.read_text(encoding="utf-8"))
+        assert on_disk["sandbox"]["image"] == "thorn-sandbox-rust:dev"
+        assert on_disk["sandbox"]["env_passthrough"] == ["RUST_LOG"]
+        assert on_disk["sandbox"]["extra_env"] == {
+            "CARGO_HOME": "/agent/home/.cargo",
+        }
+        assert on_disk["sandbox"]["container_ready_timeout_s"] == 60.0
+        assert "backend" not in on_disk["sandbox"]
+
+        restored = serializer.load_agent(agent_path)
+        restored_override = getattr(restored, "sandbox_override", None)
+        assert isinstance(restored_override, AgentSandboxOverride)
+        assert restored_override.image == "thorn-sandbox-rust:dev"
+        assert restored_override.env_passthrough == ["RUST_LOG"]
+        assert restored_override.extra_env == {
+            "CARGO_HOME": "/agent/home/.cargo",
+        }
+        assert restored_override.container_ready_timeout_s == 60.0
+        assert restored_override.backend is None
+
+    def test_no_sandbox_override_omits_block(self, tmp_path: Path):
+        agent = Agent(id=AgentID("plain"), name="plain")
+        serializer = JsonSessionSerializer()
+        agent_dir = tmp_path / "plain"
+        agent_dir.mkdir()
+        agent_path = agent_dir / "agent.json"
+        serializer.save_agent(agent, agent_path)
+        on_disk = json.loads(agent_path.read_text(encoding="utf-8"))
+        assert "sandbox" not in on_disk
+        restored = serializer.load_agent(agent_path)
+        assert getattr(restored, "sandbox_override", None) is None
+
     def test_load_derives_id_from_parent_directory(self, tmp_path: Path):
         """``load_agent`` derives the AgentID from the file's parent dir.
 

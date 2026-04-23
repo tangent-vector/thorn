@@ -21,6 +21,11 @@ from thorn.toolhost._executor import (
     DaemonToolExecutor,
     DaemonUnavailableError,
 )
+from thorn.toolhost._host import (
+    DaemonHost,
+    SubprocessDaemonHost,
+    SubprocessDaemonHostConfig,
+)
 from thorn.toolhost._protocol import (
     PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
@@ -45,9 +50,12 @@ __all__ = [
     "PROTOCOL_MINOR",
     "DaemonCrashedError",
     "DaemonExecutorConfig",
+    "DaemonHost",
     "DaemonToolExecutor",
     "DaemonUnavailableError",
     "Frame",
+    "SubprocessDaemonHost",
+    "SubprocessDaemonHostConfig",
     "FrameKind",
     "Heartbeat",
     "Hello",

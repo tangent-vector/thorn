@@ -29,6 +29,15 @@ packages = ["src/thorn"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "requires_podman: smoke test that talks to a real podman; opt-in only",
+    "requires_docker: smoke test that talks to a real docker; opt-in only",
+]
+# Smoke tests against real OCI runtimes are opt-in: developers should not
+# pay 20s of container churn on every ``uv run pytest``.  Run them
+# explicitly via ``pytest -m requires_podman`` (or ``-m requires_docker``,
+# or ``-m 'requires_podman or requires_docker'``).
+addopts = "-m 'not requires_podman and not requires_docker'"
 
 [build-system]
 requires = ["hatchling"]

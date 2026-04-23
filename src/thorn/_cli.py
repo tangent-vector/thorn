@@ -178,6 +178,7 @@ def _build_runtime(
     interactive: bool = True,
     paths: "AgencyPaths | None" = None,
     sandbox_executor_enabled: bool = False,
+    sandbox_config: "SandboxConfig | None" = None,
 ) -> Runtime:
     """Create a ``Runtime`` whose event sink is an :class:`EventBus`.
 
@@ -232,6 +233,7 @@ def _build_runtime(
         ask_user_handler=_rich_ask_user if interactive else None,
         paths=paths,
         sandbox_executor_enabled=sandbox_executor_enabled,
+        sandbox_config=sandbox_config,
     )
 
 
@@ -1038,6 +1040,7 @@ def _serve_gateway(
             trace_file=trace_file, workspace=str(ws_root),
             interactive=False, paths=paths,
             sandbox_executor_enabled=True,
+            sandbox_config=gateway_config.sandbox,
         )
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -1246,6 +1249,187 @@ def serve_mcp(
     except ThornError as exc:
         console.print(f"\n[red]Error:[/red] {exc}")
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# thorn sandbox (group: build, status)
+# ---------------------------------------------------------------------------
+
+@main.group()
+def sandbox() -> None:
+    """Manage Phase-B sandbox container images and runtime status."""
+
+
+@sandbox.command("build")
+@click.option(
+    "--tag",
+    "tag",
+    default=None,
+    help=(
+        "Image tag to build.  Defaults to thorn-sandbox:<thorn-version>; "
+        "match this in gateway.json's sandbox.image to use it."
+    ),
+)
+@click.option(
+    "--dockerfile",
+    "dockerfile_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help=(
+        "Path to the Dockerfile.sandbox to build.  Defaults to the "
+        "Dockerfile.sandbox shipped with the thorn source tree."
+    ),
+)
+@click.option(
+    "--context",
+    "context_path",
+    type=click.Path(exists=True, file_okay=False),
+    default=None,
+    help=(
+        "Build context directory.  Defaults to the directory containing "
+        "the resolved Dockerfile.sandbox."
+    ),
+)
+@click.option(
+    "--runtime",
+    "runtime_choice",
+    type=click.Choice(["podman", "docker"]),
+    default=None,
+    help=(
+        "OCI runtime to use for the build.  Defaults to podman when "
+        "available, then docker.  No gateway.json read here -- the build "
+        "command is independent of any specific agency configuration."
+    ),
+)
+def sandbox_build(
+    tag: str | None,
+    dockerfile_path: str | None,
+    context_path: str | None,
+    runtime_choice: str | None,
+) -> None:
+    """Build the sandbox image from Dockerfile.sandbox.
+
+    Phase B's image policy is hard-fail on missing image; this is the
+    command operators run when the gateway tells them the image is
+    missing.  No auto-build happens elsewhere -- making the build an
+    explicit, named operator action keeps post-hoc diagnosis simple.
+    """
+    from thorn.sandbox import (
+        OCIRuntimeNotFound,
+        build_default_sandbox_image,
+        select_oci_runtime,
+    )
+
+    try:
+        adapter = select_oci_runtime(runtime_choice)  # type: ignore[arg-type]
+    except OCIRuntimeNotFound as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+
+    dockerfile = Path(dockerfile_path) if dockerfile_path else None
+    context = Path(context_path) if context_path else None
+
+    try:
+        resolved_tag = asyncio.run(
+            build_default_sandbox_image(
+                adapter,
+                tag=tag,
+                dockerfile=dockerfile,
+                context=context,
+            ),
+        )
+    except FileNotFoundError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] sandbox image build failed: {exc}")
+        sys.exit(1)
+
+    console.print(
+        f"[green]Built sandbox image:[/green] {resolved_tag} "
+        f"(runtime: {adapter.name})",
+    )
+
+
+@sandbox.command("status")
+@click.option(
+    "--agency",
+    "agency_path",
+    type=click.Path(file_okay=False),
+    default=None,
+    help=(
+        "Agency home directory.  Defaults to ~/.thorn.  The configured "
+        "sandbox runtime and per-agent containers are read from this "
+        "agency's gateway.json + agents/ tree."
+    ),
+)
+def sandbox_status(agency_path: str | None) -> None:
+    """Report sandbox image presence and per-agent container state.
+
+    Reads ``gateway.json`` for the configured runtime + default image,
+    then probes the local OCI cache for image presence and queries
+    ``ps -a`` (filtered by the ``thorn-agent-`` prefix) for the live
+    state of every per-agent container.  Read-only; no containers are
+    started, stopped, or removed.
+    """
+    from thorn.gateway import load_gateway_config
+    from thorn.sandbox import (
+        OCIRuntimeNotFound,
+        default_sandbox_image_tag,
+        select_oci_runtime,
+    )
+
+    agency_home = _resolve_agency_home(agency_path)
+    try:
+        gateway_config = load_gateway_config(agency_home)
+    except FileNotFoundError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+
+    sandbox_cfg = getattr(gateway_config, "sandbox", None)
+    runtime_choice = (
+        sandbox_cfg.oci_runtime if sandbox_cfg is not None else None
+    )
+    default_image = (
+        (sandbox_cfg.image if sandbox_cfg is not None else None)
+        or default_sandbox_image_tag()
+    )
+
+    try:
+        adapter = select_oci_runtime(runtime_choice)
+    except OCIRuntimeNotFound as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+
+    async def _gather() -> dict[str, Any]:
+        present = await adapter.image_exists(default_image)
+        containers = await adapter.list_containers(name_prefix="thorn-agent-")
+        return {"present": present, "containers": containers}
+
+    info = asyncio.run(_gather())
+
+    console.print(f"[bold]Agency:[/bold] {agency_home}")
+    console.print(f"[bold]Runtime:[/bold] {adapter.name}")
+    console.print(
+        f"[bold]Default image:[/bold] {default_image} "
+        f"({'present' if info['present'] else '[red]missing[/red]'})"
+    )
+    if not info["present"]:
+        console.print(
+            "  Run [yellow]thorn sandbox build[/yellow] to build the default image."
+        )
+
+    containers = info["containers"]
+    if not containers:
+        console.print("[bold]Containers:[/bold] (none)")
+        return
+    console.print(f"[bold]Containers:[/bold] {len(containers)}")
+    for state in containers:
+        marker = "[green]running[/green]" if state.running else f"[dim]{state.status}[/dim]"
+        line = f"  {state.name}  {marker}"
+        if state.exit_code is not None and not state.running:
+            line += f"  exit={state.exit_code}"
+        console.print(line)
 
 
 if __name__ == "__main__":

@@ -271,6 +271,16 @@ class Gateway:
             agent = self._runtime.get_or_create_agent(agent_id)
             self._ensure_scheduler_for_agent(agent)
 
+        # Phase B: kick the per-agent sandbox executor's
+        # ``start()`` now (rather than lazily on first ``invoke``)
+        # so any image-missing / image-broken / runtime-misconfigured
+        # failures surface during gateway startup.  The operator
+        # then sees the failure on the same console they ran ``thorn
+        # serve`` from, rather than on the first webhook delivery
+        # minutes later.  Failure is hard: we let the exception
+        # escape so ``thorn serve`` exits with a non-zero status.
+        await self._preload_sandbox_executors()
+
         activated = await self._activate_sessions_with_work()
         if activated:
             log.info(
@@ -279,6 +289,57 @@ class Gateway:
             )
 
         self._started = True
+
+    async def _preload_sandbox_executors(self) -> None:
+        """Start every agent's sandbox executor up-front.
+
+        Runs after schedulers are wired but before sessions are
+        activated.  For the subprocess backend this just spawns the
+        ``thorn-toolhost`` subprocess; for the container backend it
+        provisions the per-agent OCI container, so any
+        ``SandboxImageMissingError`` (or other startup failure) lands
+        on the gateway's console rather than on the first incoming
+        event.
+
+        Failures propagate.  Phase B's stance is hard-fail: if the
+        operator's sandbox is misconfigured we want ``thorn serve``
+        to exit non-zero with the original exception, not run with a
+        partially-degraded agency where some agents work and others
+        don't.
+
+        Starts run in parallel via :func:`asyncio.gather` so a slow
+        cold image extraction does not serialize across agents.
+        """
+        executors = []
+        for agent_id, scheduler in self._schedulers.items():
+            agent = scheduler.agent
+            executor = self._runtime.get_or_create_sandbox_executor(agent)
+            if executor is None:
+                continue
+            executors.append((agent_id, executor))
+        if not executors:
+            return
+        log.info(
+            "Preloading sandbox executors for %d agent(s)", len(executors),
+        )
+        # ``return_exceptions=True`` lets us log every failure even when
+        # multiple agents fail, but we still raise the first one so
+        # ``thorn serve`` exits non-zero.
+        results = await asyncio.gather(
+            *(ex.start() for _aid, ex in executors),
+            return_exceptions=True,
+        )
+        first_exc: BaseException | None = None
+        for (agent_id, _executor), result in zip(executors, results):
+            if isinstance(result, BaseException):
+                log.error(
+                    "Sandbox executor preload failed for agent %s: %s",
+                    agent_id, result,
+                )
+                if first_exc is None:
+                    first_exc = result
+        if first_exc is not None:
+            raise first_exc
 
     async def _activate_sessions_with_work(self) -> int:
         """Submit every session with ``prompt_pending`` work to its scheduler.

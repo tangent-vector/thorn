@@ -9,12 +9,21 @@ defined in :mod:`thorn.toolhost._protocol` to that interface:
   ``call_id``.
 * :meth:`cancel` ships a :class:`ToolCallCancel` and lets the daemon
   decide what cancellation actually means for the in-flight call.
-* :meth:`aclose` shuts the connection (and the subprocess, if we
-  started one) cleanly.
+* :meth:`aclose` shuts the connection (and the daemon, if we started
+  one) cleanly.
 
-The implementation deliberately splits subprocess management from
-stream multiplexing so unit tests can drive the executor over an
-in-memory stream pair without paying for a real ``fork``.
+The implementation deliberately splits *daemon hosting* from *stream
+multiplexing* so unit tests can drive the executor over an in-memory
+stream pair without paying for a real ``fork``, and so that Phase B
+can swap a container-host implementation in without touching the
+protocol layer.
+
+Hosting concerns -- "what brings the daemon process into existence?
+where does the socket live? when is the host considered ready?" --
+live behind the :class:`~thorn.toolhost._host.DaemonHost` protocol.
+The Phase-A path uses the in-package
+:class:`~thorn.toolhost._host.SubprocessDaemonHost`; Phase B's
+container path lives at :class:`thorn.sandbox.ContainerDaemonHost`.
 """
 
 from __future__ import annotations
@@ -22,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import sys
 import time
 from dataclasses import dataclass
@@ -33,6 +41,11 @@ from thorn.core._executor import (
     ToolExecutor,
     ToolInvocation,
     ToolInvocationResult,
+)
+from thorn.toolhost._host import (
+    DaemonHost,
+    SubprocessDaemonHost,
+    SubprocessDaemonHostConfig,
 )
 from thorn.toolhost._protocol import (
     PROTOCOL_MAJOR,
@@ -55,7 +68,7 @@ logger = logging.getLogger(__name__)
 class DaemonUnavailableError(RuntimeError):
     """Raised when the brain cannot reach a working daemon.
 
-    Either the subprocess never started, the socket never bound, the
+    Either the host failed to start, the socket never bound, the
     handshake failed, or the daemon crashed before serving a frame.
     Wraps the underlying error so callers do not have to introspect
     ``__cause__`` to render a useful message.
@@ -66,14 +79,27 @@ class DaemonCrashedError(RuntimeError):
     """Raised inside :meth:`DaemonToolExecutor.invoke` when the daemon dies.
 
     Distinguishes a daemon-side crash (transient, retryable: the next
-    invocation will spin up a fresh subprocess) from a tool-level
-    failure (returned in the response payload).
+    invocation will spin up a fresh host) from a tool-level failure
+    (returned in the response payload).
     """
 
 
 @dataclass
 class DaemonExecutorConfig:
-    """Configuration for spawning and supervising the daemon.
+    """Configuration for the brain-side daemon executor.
+
+    Carries two distinct concerns:
+
+    * *Connection-level* knobs the executor uses directly: socket
+      path, agent identity, timeouts, heartbeat policy, auto-restart
+      flag.
+    * *Subprocess-host fallback* knobs (``home_path``,
+      ``workspace_root``, ``log_path``, ``python_executable``,
+      ``max_concurrency``, ``extra_args``) used when no explicit
+      :class:`~thorn.toolhost._host.DaemonHost` is supplied to
+      :class:`DaemonToolExecutor`.  In that case the executor builds
+      a :class:`~thorn.toolhost._host.SubprocessDaemonHost` from these
+      fields, preserving the Phase-A behavior verbatim.
 
     The defaults are tuned for human interactive latency: a five-second
     connect budget covers cold-cache subprocess startup, and the
@@ -95,14 +121,36 @@ class DaemonExecutorConfig:
     auto_restart: bool = True
     extra_args: tuple[str, ...] = ()
 
+    def to_subprocess_host_config(self) -> SubprocessDaemonHostConfig:
+        """Return a :class:`SubprocessDaemonHostConfig` mirroring this config.
+
+        Used when no explicit ``host=`` is passed to the executor; lets
+        the Phase-A subprocess shape stay a one-line construction
+        instead of leaking the host's keyword arguments back into
+        the executor's call sites.
+        """
+        return SubprocessDaemonHostConfig(
+            socket_path=self.socket_path,
+            agent_id=self.agent_id,
+            home_path=self.home_path,
+            workspace_root=self.workspace_root,
+            log_path=self.log_path,
+            python_executable=self.python_executable,
+            max_concurrency=self.max_concurrency,
+            extra_args=self.extra_args,
+        )
+
 
 class DaemonToolExecutor(ToolExecutor):
-    """``ToolExecutor`` backed by a ``thorn-toolhost`` subprocess.
+    """``ToolExecutor`` backed by a ``thorn-toolhost`` daemon.
 
     Lifecycle::
 
-        executor = DaemonToolExecutor(config)
-        result = await executor.invoke(invocation)   # lazily starts on first call
+        executor = DaemonToolExecutor(config)        # subprocess host (Phase A default)
+        # or
+        executor = DaemonToolExecutor(config, host=ContainerDaemonHost(...))
+
+        result = await executor.invoke(invocation)   # lazily starts the host on first call
         await executor.aclose()                      # shuts everything down
 
     The executor is safe to share across coroutines.  Send frames are
@@ -113,15 +161,33 @@ class DaemonToolExecutor(ToolExecutor):
     failing to receive an echo within ``heartbeat_dead_s`` seconds.
     """
 
-    def __init__(self, config: DaemonExecutorConfig) -> None:
+    def __init__(
+        self,
+        config: DaemonExecutorConfig,
+        *,
+        host: DaemonHost | None = None,
+    ) -> None:
         self._config = config
+        if host is None:
+            host = SubprocessDaemonHost(config.to_subprocess_host_config())
+        self._host = host
+        # The host owns the socket path of record.  Validate that the
+        # executor's connection-level config agrees, so a mismatched
+        # injection (e.g. tests handing in a host whose socket doesn't
+        # match the config) is a loud programming error rather than a
+        # silent connect-to-the-wrong-place bug.
+        if Path(host.socket_path) != Path(config.socket_path):
+            raise ValueError(
+                f"DaemonHost.socket_path ({host.socket_path}) does not "
+                f"match config.socket_path ({config.socket_path})",
+            )
+
         self._lock = asyncio.Lock()
         self._writer: asyncio.StreamWriter | None = None
         self._reader: asyncio.StreamReader | None = None
         self._reader_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
-        self._process: asyncio.subprocess.Process | None = None
-        self._owns_process: bool = False
+        self._host_started: bool = False
         self._in_flight: dict[str, asyncio.Future[ToolCallResponse]] = {}
         self._chunk_callbacks: dict[str, OnChunkCallback] = {}
         self._daemon_hello: Hello | None = None
@@ -132,6 +198,11 @@ class DaemonToolExecutor(ToolExecutor):
     @property
     def config(self) -> DaemonExecutorConfig:
         return self._config
+
+    @property
+    def host(self) -> DaemonHost:
+        """The :class:`DaemonHost` driving this executor's daemon."""
+        return self._host
 
     @property
     def daemon_hello(self) -> Hello | None:
@@ -204,6 +275,22 @@ class DaemonToolExecutor(ToolExecutor):
         self._closed = True
         await self._teardown(reason="aclose")
 
+    async def start(self) -> None:
+        """Eagerly start the host and complete the handshake.
+
+        Equivalent to issuing a no-op :meth:`invoke` to force the lazy
+        path, but without sending a tool-call frame.  Used by the
+        gateway during agent pre-load (Phase B) so containers come up
+        before the first incoming event hits the agent.
+
+        Idempotent: calling ``start`` on an already-running executor
+        is a no-op.  Raises :class:`DaemonUnavailableError` on any
+        startup failure.
+        """
+        if self._closed:
+            raise RuntimeError("DaemonToolExecutor is closed")
+        await self._ensure_running()
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -214,21 +301,26 @@ class DaemonToolExecutor(ToolExecutor):
         async with self._lock:
             if self._writer is not None:
                 return
-            await self._start_subprocess_and_connect()
+            await self._start_host_and_connect()
 
-    async def _start_subprocess_and_connect(self) -> None:
-        """Spawn the daemon and complete the handshake.
+    async def _start_host_and_connect(self) -> None:
+        """Start the host and complete the handshake.
 
         Raises :class:`DaemonUnavailableError` on any startup failure,
         wrapping the underlying cause so callers get a clear message
         without having to introspect chained exceptions.
         """
         try:
-            self._process = await self._spawn_subprocess()
-            self._owns_process = True
+            await self._host.start()
+            self._host_started = True
             reader, writer = await self._connect_socket()
+        except DaemonUnavailableError:
+            # Already a host-aware diagnostic; tear the host down and
+            # let the caller see the original error verbatim.
+            await self._stop_host_quietly()
+            raise
         except Exception as exc:
-            await self._kill_process()
+            await self._stop_host_quietly()
             raise DaemonUnavailableError(
                 f"failed to start toolhost daemon: {exc}"
             ) from exc
@@ -238,33 +330,6 @@ class DaemonToolExecutor(ToolExecutor):
         except Exception:
             await self._teardown(reason="handshake_failed")
             raise
-
-    async def _spawn_subprocess(self) -> asyncio.subprocess.Process:
-        cmd: list[str] = [
-            self._config.python_executable,
-            "-m",
-            "thorn.toolhost",
-            "--socket",
-            str(self._config.socket_path),
-            "--agent-id",
-            self._config.agent_id,
-            "--max-concurrency",
-            str(self._config.max_concurrency),
-        ]
-        if self._config.home_path is not None:
-            cmd.extend(["--home", str(self._config.home_path)])
-        if self._config.workspace_root is not None:
-            cmd.extend(["--workspace-root", str(self._config.workspace_root)])
-        if self._config.log_path is not None:
-            cmd.extend(["--log-file", str(self._config.log_path)])
-        cmd.extend(self._config.extra_args)
-
-        return await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
 
     async def _connect_socket(
         self,
@@ -276,22 +341,28 @@ class DaemonToolExecutor(ToolExecutor):
         ``FileNotFoundError`` on the first try.  The poll interval is
         coarser than necessary (10ms) to keep CPU use trivial; a real
         cold start tops out at a few hundred milliseconds.
+
+        This is the *protocol-level* readiness probe, common across
+        host kinds.  Container hosts run their own *host-level*
+        readiness probe inside ``host.start()`` (e.g. waiting for
+        ``inspect`` to report ``running``); that means cold container
+        start latency is paid in ``host.start()``, not here, and the
+        executor's connect timeout can stay tight even for containers.
         """
+        socket_path = self._host.socket_path
         deadline = time.monotonic() + self._config.connect_timeout_s
         last_exc: Exception | None = None
         while time.monotonic() < deadline:
-            if not self._config.socket_path.exists():
+            if not socket_path.exists():
                 await asyncio.sleep(0.01)
                 continue
             try:
-                return await asyncio.open_unix_connection(
-                    path=str(self._config.socket_path),
-                )
+                return await asyncio.open_unix_connection(path=str(socket_path))
             except (FileNotFoundError, ConnectionRefusedError) as exc:
                 last_exc = exc
                 await asyncio.sleep(0.01)
         raise DaemonUnavailableError(
-            f"daemon socket {self._config.socket_path} did not become "
+            f"daemon socket {socket_path} did not become "
             f"reachable within {self._config.connect_timeout_s}s"
         ) from last_exc
 
@@ -300,12 +371,12 @@ class DaemonToolExecutor(ToolExecutor):
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Adopt caller-provided streams instead of spawning a subprocess.
+        """Adopt caller-provided streams instead of starting the host.
 
         Tests use this entry point to drive the executor over an
         in-memory pipe pair connected to a daemon running in the same
         event loop.  Production code should use :meth:`invoke`, which
-        spawns the subprocess implicitly.
+        starts the host implicitly.
         """
         if self._writer is not None:
             raise RuntimeError("DaemonToolExecutor is already connected")
@@ -484,7 +555,7 @@ class DaemonToolExecutor(ToolExecutor):
         Called when the reader loop notices the daemon died or sent
         garbage.  The futures get the exception so awaiting callers
         unblock immediately; the next :meth:`invoke` triggers a fresh
-        subprocess start when ``auto_restart`` is enabled.
+        host start when ``auto_restart`` is enabled.
         """
         if self._closed:
             return
@@ -518,35 +589,23 @@ class DaemonToolExecutor(ToolExecutor):
         self._daemon_hello = None
         self._last_frame_received_at = 0.0
 
-        if self._owns_process:
-            await self._kill_process()
+        if self._host_started:
+            await self._stop_host_quietly()
 
         if not self._config.auto_restart:
             self._closed = True
 
-    async def _kill_process(self) -> None:
-        proc = self._process
-        if proc is None:
-            return
-        if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await proc.wait()
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(self._config.socket_path)
-        self._process = None
-        self._owns_process = False
+    async def _stop_host_quietly(self) -> None:
+        """Tear the host down, swallowing exceptions for graceful close."""
+        try:
+            await self._host.stop()
+        except Exception:
+            logger.exception(
+                "DaemonHost.stop raised during teardown; ignoring",
+            )
+        self._host_started = False
 
 
-# Re-exported for convenience.  Aliased so the symbol can be imported
-# from the top-level :mod:`thorn.toolhost` package without forcing
-# callers to reach into ``_executor``.
 __all__ = [
     "DaemonExecutorConfig",
     "DaemonToolExecutor",

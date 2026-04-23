@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# Thorn sandbox image (Phase B)
+#
+# Minimal, single-purpose image whose only job is to host a per-agent
+# `thorn-toolhost` daemon for sandboxed tool execution.  Intentionally small
+# so the 90% case is "an agent uses this directly"; the 10% that need extra
+# toolchains (Rust, Node, etc.) compose this in (`FROM thorn-sandbox:<ver>`)
+# and add what they need.  This Dockerfile is *not* a substitute for the
+# heavier gateway image (`Dockerfile`); the two address separate concerns
+# and ship/version independently.
+#
+# Build:   thorn sandbox build              (recommended; tags thorn-sandbox:<thorn-version>)
+#   or:    docker|podman build -f Dockerfile.sandbox -t thorn-sandbox:<tag> .
+#
+# Run:     never directly; the gateway provisions one per agent via
+#          ContainerDaemonHost.  The container is launched detached, with
+#          host bind-mounts at /agent/{home,workspace,control}, and runs
+#          as the host UID/GID by default so bind-mount writes land with
+#          operator ownership.
+# ---------------------------------------------------------------------------
+
+# ---- uv binary (fast Python package installer) ----------------------------
+FROM ghcr.io/astral-sh/uv:0.7 AS uv
+
+# ---- builder: install thorn into a portable venv --------------------------
+FROM python:3.12-slim AS builder
+
+COPY --from=uv /uv /usr/local/bin/uv
+
+WORKDIR /build
+COPY pyproject.toml ./
+COPY src/ src/
+
+# Sandbox image is intentionally minimal -- no [github,gitlab] extras here.
+# Agent-specific toolchains and SDKs belong in derived images that compose
+# `FROM thorn-sandbox:<version>` and add what they need.
+RUN uv venv /opt/thorn-venv \
+ && VIRTUAL_ENV=/opt/thorn-venv uv pip install "."
+
+# ---- runtime: small image hosting a single per-agent toolhost daemon -----
+FROM python:3.12-slim
+
+# `git` is the only baseline tool we expect every agent to want; it is the
+# spine of the journal/workspace tools and is small enough that bundling
+# it here saves every derived image from re-installing it.  Anything
+# heavier (build toolchains, language runtimes) belongs to the operator's
+# derived image.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/thorn-venv /opt/thorn-venv
+ENV PATH="/opt/thorn-venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# The container runs as whatever UID the gateway picks at `run --user ...`
+# time (defaults to the host UID/GID).  No `useradd` here on purpose: with
+# bind-mounted host directories, an in-image `thorn` user would land with
+# a different UID than the bind-mount owner and either need a chown on
+# entry or an explicit `--user` override anyway.  The current approach is
+# simpler: trust the run-time `--user` flag, no in-image user state.
+
+# Rendezvous directory; the gateway bind-mounts `<host control dir>` over
+# this so the in-container daemon can bind its socket here and the brain
+# can read it from the host side.
+WORKDIR /agent
+RUN mkdir -p /agent/home /agent/workspace /agent/control
+
+# Default entrypoint: the daemon, which is given socket / agent-id / mount
+# paths via argv at `run` time (see thorn.sandbox.ContainerDaemonHost).
+ENTRYPOINT ["python", "-m", "thorn.toolhost"]

@@ -285,7 +285,8 @@ class TestSubprocessCrashRecovery:
         )
         try:
             await executor._ensure_running()
-            assert executor._process is not None
+            host_proc = executor.host.process
+            assert host_proc is not None
 
             slow_task = asyncio.create_task(
                 executor.invoke(
@@ -299,8 +300,8 @@ class TestSubprocessCrashRecovery:
             await asyncio.sleep(0.3)
 
             # SIGKILL the daemon out from under the in-flight call.
-            executor._process.kill()
-            await executor._process.wait()
+            host_proc.kill()
+            await host_proc.wait()
 
             with pytest.raises((DaemonCrashedError, asyncio.CancelledError)):
                 await asyncio.wait_for(slow_task, timeout=10.0)
@@ -316,11 +317,12 @@ class TestSubprocessCrashRecovery:
         )
         try:
             await executor._ensure_running()
-            first_pid = executor._process.pid if executor._process else None
-            assert first_pid is not None
+            first_proc = executor.host.process
+            first_pid = first_proc.pid if first_proc is not None else None
+            assert first_pid is not None and first_proc is not None
 
-            executor._process.kill()
-            await executor._process.wait()
+            first_proc.kill()
+            await first_proc.wait()
 
             # Drain the reader-loop's "connection closed" handling
             # so the next invoke spawns a fresh subprocess from a
@@ -343,8 +345,9 @@ class TestSubprocessCrashRecovery:
             )
             assert result.is_error is False
             assert "restarted" in result.content
-            assert executor._process is not None
-            assert executor._process.pid != first_pid
+            second_proc = executor.host.process
+            assert second_proc is not None
+            assert second_proc.pid != first_pid
         finally:
             await _terminate(executor)
 
@@ -459,8 +462,10 @@ class TestMultiAgentDaemons:
         try:
             await a._ensure_running()
             await b._ensure_running()
-            assert a._process is not None and b._process is not None
-            assert a._process.pid != b._process.pid
+            a_proc = a.host.process
+            b_proc = b.host.process
+            assert a_proc is not None and b_proc is not None
+            assert a_proc.pid != b_proc.pid
             assert a.config.socket_path != b.config.socket_path
         finally:
             await _terminate(a)

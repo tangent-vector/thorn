@@ -48,7 +48,10 @@ if TYPE_CHECKING:
     from thorn.core._file_access import FileAccessPolicy
     from thorn.core._executor import ToolExecutor
     from thorn.core._validation_tracker import ValidationTracker
+    from thorn.gateway._config import SandboxConfig
+    from thorn.sandbox._runtime import OCIRuntimeAdapter
     from thorn.toolhost._executor import DaemonExecutorConfig
+    from thorn.toolhost._host import DaemonHost
 
 _S = TypeVar("_S", bound=Service)
 
@@ -85,6 +88,8 @@ class Runtime:
         address_book: AddressBook | None = None,
         in_flight_index: InFlightIndex | None = None,
         sandbox_executor_enabled: bool = False,
+        sandbox_config: SandboxConfig | None = None,
+        oci_runtime_adapter: OCIRuntimeAdapter | None = None,
     ) -> None:
         self.provider = provider
         self.event_sink: EventSink = event_sink or NullEventSink()
@@ -130,6 +135,16 @@ class Runtime:
 
         self._sandbox_executor_enabled = sandbox_executor_enabled
         self._sandbox_executors: dict[AgentID, ToolExecutor] = {}
+        self._sandbox_config: SandboxConfig | None = sandbox_config
+        self._oci_runtime_adapter: OCIRuntimeAdapter | None = oci_runtime_adapter
+        # Lazily-resolved adapter cache so multiple agents on a
+        # container backend share one OCI runtime client (each adapter
+        # only instantiates ``shutil.which`` lookups, but resolving it
+        # once means the agency-wide ``oci_runtime`` decision is made
+        # at most once per process).
+        self._oci_runtime_adapter_resolved: bool = (
+            oci_runtime_adapter is not None
+        )
 
     # -- Service registry ---------------------------------------------------
 
@@ -261,10 +276,16 @@ class Runtime:
     def _build_sandbox_executor(self, agent: Agent) -> ToolExecutor:
         """Construct a :class:`DaemonToolExecutor` for *agent*.
 
+        The agency's ``sandbox.backend`` (with per-agent override) picks
+        between the Phase-A subprocess host and the Phase-B container
+        host; everything downstream of that choice (the executor, the
+        socket protocol, the brain-side tool-call shape) is identical.
+
         Factored out so tests / subclasses can override it with a
         stub executor (e.g. one driven over an in-memory socket pair)
         without having to subclass and override the lookup method too.
         """
+        from thorn.sandbox._resolve import resolve_sandbox_config
         from thorn.toolhost._executor import (
             DaemonExecutorConfig,
             DaemonToolExecutor,
@@ -280,6 +301,11 @@ class Runtime:
         socket_path = self.paths.agent_toolhost_socket(agent.id)
         log_path = control_dir / "toolhost.log"
 
+        resolved = resolve_sandbox_config(
+            self._sandbox_config,
+            getattr(agent, "sandbox_override", None),
+        )
+
         config = DaemonExecutorConfig(
             socket_path=socket_path,
             agent_id=str(agent.id),
@@ -287,7 +313,111 @@ class Runtime:
             workspace_root=self.paths.agent_workspace_mount(agent.id),
             log_path=log_path,
         )
-        return DaemonToolExecutor(config)
+
+        host = self._build_daemon_host(
+            agent=agent, resolved=resolved,
+            socket_path=socket_path, log_path=log_path,
+        )
+        return DaemonToolExecutor(config, host=host)
+
+    def _build_daemon_host(
+        self,
+        *,
+        agent: Agent,
+        resolved: Any,
+        socket_path: Path,
+        log_path: Path,
+    ) -> DaemonHost:
+        """Pick the right :class:`DaemonHost` for *agent*'s resolved config.
+
+        Branches on ``resolved.backend``: ``"subprocess"`` keeps the
+        Phase-A in-process daemon, ``"container"`` provisions a per-agent
+        OCI container.  All path/control-dir wiring is shared so callers
+        do not need to know which branch ran.
+        """
+        from thorn.toolhost._host import (
+            SubprocessDaemonHost,
+            SubprocessDaemonHostConfig,
+        )
+
+        assert agent.id is not None  # validated by caller
+
+        if resolved.backend == "subprocess":
+            host_config = SubprocessDaemonHostConfig(
+                socket_path=socket_path,
+                agent_id=str(agent.id),
+                home_path=self.paths.agent_home_mount(agent.id),
+                workspace_root=self.paths.agent_workspace_mount(agent.id),
+                log_path=log_path,
+            )
+            return SubprocessDaemonHost(host_config)
+
+        # Container backend.
+        from thorn.sandbox._container import (
+            ContainerDaemonHost,
+            ContainerHostConfig,
+            derive_container_name,
+        )
+
+        adapter = self._resolve_oci_runtime_adapter(resolved)
+
+        control_dir = self.paths.agent_control_dir(agent.id)
+        host_home = self.paths.agent_home_mount(agent.id)
+        host_workspace = self.paths.agent_workspace_mount(agent.id)
+        host_home.mkdir(parents=True, exist_ok=True)
+        host_workspace.mkdir(parents=True, exist_ok=True)
+
+        dev_mount = self._dev_mount_runtime_path(resolved)
+
+        container_config = ContainerHostConfig(
+            agent_id=str(agent.id),
+            container_name=derive_container_name(str(agent.id)),
+            image=resolved.image,
+            adapter=adapter,
+            host_home_dir=host_home,
+            host_workspace_dir=host_workspace,
+            host_control_dir=control_dir,
+            env_passthrough=tuple(resolved.env_passthrough),
+            extra_env=tuple(resolved.extra_env),
+            dev_mount_runtime=dev_mount,
+            container_ready_timeout_s=resolved.container_ready_timeout_s,
+        )
+        return ContainerDaemonHost(container_config)
+
+    def _resolve_oci_runtime_adapter(self, resolved: Any) -> OCIRuntimeAdapter:
+        """Lazily resolve and cache the agency's OCI runtime adapter.
+
+        Resolution happens at most once per runtime so per-agent host
+        construction does not pay the ``shutil.which`` cost on every
+        call.  Tests can pre-inject an adapter via ``oci_runtime_adapter``
+        in the ``Runtime`` constructor; that value short-circuits this
+        method entirely.
+        """
+        if self._oci_runtime_adapter_resolved and self._oci_runtime_adapter is not None:
+            return self._oci_runtime_adapter
+        from thorn.sandbox._runtime import select_oci_runtime
+        adapter = select_oci_runtime(resolved.oci_runtime)
+        self._oci_runtime_adapter = adapter
+        self._oci_runtime_adapter_resolved = True
+        return adapter
+
+    def _dev_mount_runtime_path(self, resolved: Any) -> Path | None:
+        """Resolve the source-tree path for the ``dev_mount_runtime`` toggle.
+
+        When the agency opts into ``dev_mount_runtime``, we mount the
+        live ``thorn`` package source tree into the container so the
+        in-container daemon picks up local edits without a rebuild.
+        Returns ``None`` when the package's source path cannot be
+        resolved (e.g. running from a wheel install) so the toggle
+        gracefully degrades to "no-op" rather than failing the start.
+        """
+        if not resolved.dev_mount_runtime:
+            return None
+        try:
+            from thorn import __file__ as thorn_file
+        except Exception:
+            return None
+        return Path(thorn_file).resolve().parent.parent  # .../src/
 
     def get_or_create_sandbox_executor(
         self, agent: Agent,
