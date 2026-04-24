@@ -393,7 +393,11 @@ class Gateway:
             ws = self._runtime.paths.session_workspace(agent_id, session_key)
             ws.mkdir(parents=True, exist_ok=True)
             session = self._runtime.get_or_create_session(
-                agent, session_key, workspace_root=ws,
+                agent, session_key,
+                workspace_root=ws,
+                logical_agent_workspace_path=(
+                    self._runtime.paths.agent_workspace_mount(agent_id)
+                ),
             )
             _, inbox = self._ensure_inbox(agent, session_key)
 
@@ -615,7 +619,11 @@ class Gateway:
         ws.mkdir(parents=True, exist_ok=True)
 
         session = self._runtime.get_or_create_session(
-            agent, event.session_key, workspace_root=ws,
+            agent, event.session_key,
+            workspace_root=ws,
+            logical_agent_workspace_path=(
+                self._runtime.paths.agent_workspace_mount(agent.id)
+            ),
         )
         # Persist session metadata up front so the session directory
         # exists before any prompt round runs.  The scheduler's saver

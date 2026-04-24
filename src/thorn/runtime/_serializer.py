@@ -485,6 +485,10 @@ class JsonSessionSerializer:
         }
         if session.workspace_root is not None:
             session_data["workspace_root"] = str(session.workspace_root)
+        if session.logical_agent_workspace_path is not None:
+            session_data["logical_agent_workspace_path"] = str(
+                session.logical_agent_workspace_path,
+            )
         _atomic_write_text(
             directory / _SESSION_FILE,
             json.dumps(session_data, indent=2, ensure_ascii=False) + "\n",
@@ -512,6 +516,11 @@ class JsonSessionSerializer:
         ws_raw = session_data.get("workspace_root")
         workspace_root = Path(ws_raw) if ws_raw is not None else None
 
+        logical_ws_raw = session_data.get("logical_agent_workspace_path")
+        logical_agent_workspace_path = (
+            Path(logical_ws_raw) if logical_ws_raw is not None else None
+        )
+
         session = Session(
             agent=agent,
             key=key,
@@ -519,6 +528,7 @@ class JsonSessionSerializer:
             last_active=last_active,
             metadata=session_data.get("metadata", {}),
             workspace_root=workspace_root,
+            logical_agent_workspace_path=logical_agent_workspace_path,
         )
 
         history_path = directory / _HISTORY_FILE

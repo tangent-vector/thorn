@@ -50,6 +50,9 @@ from thorn.runtime import (
     SessionKey,
     make_cli_prompt_dispatcher,
 )
+from thorn.runtime._project_detection import (
+    pick_logical_agent_workspace_path_for_cli_session,
+)
 
 console = Console()
 
@@ -474,6 +477,19 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
                         "CLI agent has no id; cannot build a session inbox"
                     )
                 session_key = _generate_cli_session_key(runtime.workspace_root)
+                # Pick the logical agent-workspace upper bound for this
+                # CLI session by scanning ancestors of the session
+                # workspace for a project-root marker.  Persisted on
+                # the Session so the per-prompt context-gathering walk
+                # has a single, well-defined upper bound regardless of
+                # whether the session is later resumed from a different
+                # CWD.  The session's CWD itself is the workspace's
+                # *lower* bound (the inner end of the walk).
+                logical_agent_workspace_path = (
+                    pick_logical_agent_workspace_path_for_cli_session(
+                        runtime.workspace_root,
+                    )
+                )
 
                 # Phase 3: the runtime carries an ``EventBus`` rather
                 # than a single sink; subscribe a console listener
@@ -496,6 +512,9 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
                         agent=agent,
                         key=session_key,
                         workspace_root=runtime.workspace_root,
+                        logical_agent_workspace_path=(
+                            logical_agent_workspace_path
+                        ),
                     )
 
                     session_address = SessionAddress(agent.id, session_key)
@@ -724,9 +743,20 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
                 )
 
             session_key = _generate_cli_session_key(runtime.workspace_root)
+            # Pick the logical agent-workspace upper bound for this
+            # CLI session.  See the matching comment on the ``thorn
+            # run`` path for the rationale.
+            logical_agent_workspace_path = (
+                pick_logical_agent_workspace_path_for_cli_session(
+                    runtime.workspace_root,
+                )
+            )
             session = runtime.get_or_create_session(
                 agent, session_key,
                 workspace_root=runtime.workspace_root,
+                logical_agent_workspace_path=(
+                    logical_agent_workspace_path
+                ),
             )
 
             # Subscribe a per-session console listener (Phase 3

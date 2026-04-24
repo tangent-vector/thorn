@@ -39,6 +39,19 @@ class Session:
             loading, and ``RelativeTo.WORKSPACE`` policy resolution.
             Immutable after the session's first persisted turn —
             subsequent events reuse the stored value.
+        logical_agent_workspace_path: The upper bound of the
+            workspace-side context-gathering walk for this session's
+            prompts.  In gateway mode this is the agent's
+            ``workspace`` mount (one level above every session
+            workspace under that agent); in CLI mode it is the
+            outermost enclosing project directory of the session
+            workspace, picked at startup by
+            :func:`thorn.runtime._project_detection.pick_logical_agent_workspace_path_for_cli_session`.
+            Carried per-session because a single CLI agent identity
+            may serve sessions rooted in different logical projects
+            (the missing ``agency -> agent -> ??? -> session`` rung
+            from the design plan, which is *deferred* — we just
+            smuggle the value through the Session for now).
     """
 
     def __init__(
@@ -50,6 +63,7 @@ class Session:
         last_active: datetime | None = None,
         metadata: dict[str, Any] | None = None,
         workspace_root: Path | None = None,
+        logical_agent_workspace_path: Path | None = None,
     ) -> None:
         from thorn.core._history import HistoryTree
 
@@ -60,6 +74,9 @@ class Session:
         self.last_active: datetime | None = last_active
         self.metadata: dict[str, Any] = metadata if metadata is not None else {}
         self.workspace_root: Path | None = workspace_root
+        self.logical_agent_workspace_path: Path | None = (
+            logical_agent_workspace_path
+        )
 
     def touch(self) -> None:
         """Update ``last_active`` to the current UTC time."""
