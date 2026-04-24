@@ -49,6 +49,43 @@ def _mock_provider_factory(provider: MockProvider):
     return factory
 
 
+def _find_session_state_dirs(
+    sessions_root: Path,
+    *,
+    key_prefix: str | None = None,
+) -> list[Path]:
+    """Return every session ``_state`` directory under *sessions_root*.
+
+    Hierarchical session keys produce nested directories under
+    ``sessions/`` (e.g. ``cli/<workspace-basename>/<8 hex>``), with
+    each session's framework files living one level deeper, in a
+    ``_state`` sentinel subdirectory (see
+    ``AgencyPaths.session_metadata_dir``).  This helper walks that
+    layout, optionally filtering by the leading components of the
+    decoded session key (e.g. ``key_prefix='cli'``).
+    """
+    from thorn.runtime._paths import (
+        SESSION_STATE_DIR,
+        session_key_from_path,
+    )
+    if not sessions_root.is_dir():
+        return []
+    matches: list[Path] = []
+    for state_dir in sessions_root.rglob(SESSION_STATE_DIR):
+        if not state_dir.is_dir() or state_dir.name != SESSION_STATE_DIR:
+            continue
+        rel = state_dir.parent.relative_to(sessions_root)
+        if not rel.parts or SESSION_STATE_DIR in rel.parts:
+            continue
+        if key_prefix is not None:
+            key = session_key_from_path(rel)
+            head = key.components[: len(key_prefix.split("/"))]
+            if "/".join(head) != key_prefix:
+                continue
+        matches.append(state_dir)
+    return matches
+
+
 class TestRunResultFile:
     """``thorn run --result-file`` writes structured JSON."""
 
@@ -222,8 +259,6 @@ class TestAgencyHomeResolution:
         self, tmp_path: Path, monkeypatch,
     ):
         """``--agency`` routes agent state to a caller-chosen directory."""
-        from thorn.runtime._paths import unsafe_dirname
-
         provider = MockProvider(canned_responses=[
             [TextChunk(text="ok"), FinishChunk(reason="stop")],
         ])
@@ -257,10 +292,7 @@ class TestAgencyHomeResolution:
         assert sessions_root.is_dir(), (
             "explicit --agency directory should hold the agent/session tree"
         )
-        cli_dirs = [
-            d for d in sessions_root.iterdir()
-            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
-        ]
+        cli_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
         assert len(cli_dirs) == 1, (
             "one ephemeral cli/... session dir should live under --agency"
         )
@@ -281,8 +313,6 @@ class TestAgencyHomeResolution:
         the full resolution path (resolver consulted ``Path.home()``,
         appended ``.thorn``, and the runtime used the result).
         """
-        from thorn.runtime._paths import unsafe_dirname
-
         provider = MockProvider(canned_responses=[
             [TextChunk(text="ok"), FinishChunk(reason="stop")],
         ])
@@ -316,10 +346,7 @@ class TestAgencyHomeResolution:
         assert sessions_root.is_dir(), (
             "agent/session tree should live under the default ~/.thorn"
         )
-        cli_dirs = [
-            d for d in sessions_root.iterdir()
-            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
-        ]
+        cli_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
         assert len(cli_dirs) == 1
 
         # And we should *not* have written a nested .thorn inside the
@@ -369,27 +396,20 @@ class TestRunPipelineStructure:
         assert result.exit_code == 0
 
         # Per-invocation CLI session keys are
-        # ``cli/<workspace-basename>/<8 hex chars>``; inbox dirs land
-        # at ``<home>/agents/local/sessions/<safe-encoded-key>/inbox/``.
-        # The key's ``/`` separators become ``%2F`` in the flat on-disk
-        # layout (see AgencyPaths.session_metadata_dir), so we decode
-        # the directory name back into the logical key before checking
-        # the prefix.
-        from thorn.runtime._paths import unsafe_dirname
-
+        # ``cli/<workspace-basename>/<8 hex chars>``; framework files
+        # land at ``<home>/agents/local/sessions/<key-as-path>/_state/``
+        # with ``inbox/`` next to ``session.json`` inside the
+        # ``_state/`` sentinel.
         sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
         assert sessions_root.is_dir(), (
             "the runtime should have created an agent sessions root"
         )
-        cli_session_dirs = [
-            d for d in sessions_root.iterdir()
-            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
-        ]
-        assert len(cli_session_dirs) == 1, (
-            f"expected exactly one ephemeral cli/... session dir, "
-            f"found {sorted(d.name for d in sessions_root.iterdir() if d.is_dir())}"
+        cli_state_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
+        assert len(cli_state_dirs) == 1, (
+            f"expected exactly one ephemeral cli/... session, "
+            f"found state dirs: {[str(d) for d in cli_state_dirs]}"
         )
-        inbox_dir = cli_session_dirs[0] / "inbox"
+        inbox_dir = cli_state_dirs[0] / "inbox"
         assert inbox_dir.is_dir(), (
             "the SessionInbox constructor should have mkdir'd the inbox dir"
         )
@@ -659,22 +679,17 @@ class TestChat:
 
         # Phase 5: chat keys are ``cli/<basename>/<uuid8>``; look up
         # whatever single session was created in this invocation.
-        from thorn.runtime._paths import unsafe_dirname
-
         sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
-        cli_session_dirs = [
-            d for d in sessions_root.iterdir()
-            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
-        ]
-        assert len(cli_session_dirs) == 1, (
-            f"expected exactly one chat session dir, got "
-            f"{sorted(d.name for d in cli_session_dirs)}"
+        cli_state_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
+        assert len(cli_state_dirs) == 1, (
+            f"expected exactly one chat session, got "
+            f"{[str(d) for d in cli_state_dirs]}"
         )
-        sessions_dir = cli_session_dirs[0]
         # History file contents are an implementation detail of the
-        # serializer; just confirm something was written.
-        assert any(sessions_dir.iterdir()), (
-            "session directory should not be empty after a turn"
+        # serializer; just confirm something was written into the
+        # session's framework dir.
+        assert any(cli_state_dirs[0].iterdir()), (
+            "session _state directory should not be empty after a turn"
         )
 
     def test_multiple_turns_share_session_history(
@@ -729,8 +744,6 @@ class TestChat:
         regression in which the key-generation helper is bypassed and
         a stable ``default`` key sneaks back in.
         """
-        from thorn.runtime._paths import unsafe_dirname
-
         def _one_turn(text: str) -> str:
             provider = MockProvider(canned_responses=[
                 [TextChunk(text=text), FinishChunk(reason="stop")],
@@ -763,13 +776,10 @@ class TestChat:
         _one_turn("answer beta")
 
         sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
-        cli_dirs = [
-            d for d in sessions_root.iterdir()
-            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
-        ]
-        assert len(cli_dirs) == 2, (
+        cli_state_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
+        assert len(cli_state_dirs) == 2, (
             f"expected two distinct ephemeral chat sessions on disk, "
-            f"got {sorted(d.name for d in cli_dirs)}"
+            f"got {[str(d) for d in cli_state_dirs]}"
         )
 
     def test_session_inbox_dir_created_and_drained(
@@ -808,19 +818,14 @@ class TestChat:
         assert result.exit_code == 0
 
         # Phase 5: chat keys are ``cli/<basename>/<uuid8>``; find the
-        # one session dir created this invocation.
-        from thorn.runtime._paths import unsafe_dirname
-
+        # one session created this invocation.
         sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
-        cli_dirs = [
-            d for d in sessions_root.iterdir()
-            if d.is_dir() and unsafe_dirname(d.name).startswith("cli/")
-        ]
-        assert len(cli_dirs) == 1, (
-            f"expected exactly one chat session dir, got "
-            f"{sorted(d.name for d in cli_dirs)}"
+        cli_state_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
+        assert len(cli_state_dirs) == 1, (
+            f"expected exactly one chat session, got "
+            f"{[str(d) for d in cli_state_dirs]}"
         )
-        inbox_dir = cli_dirs[0] / "inbox"
+        inbox_dir = cli_state_dirs[0] / "inbox"
         assert inbox_dir.is_dir(), (
             "the SessionInbox constructor should have mkdir'd "
             "the per-session inbox dir"

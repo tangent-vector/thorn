@@ -32,7 +32,13 @@ from pathlib import Path
 
 from thorn.core._agent import Agent
 from thorn.core._session import Session
-from thorn.runtime._paths import AgencyPaths, safe_dirname, unsafe_dirname
+from thorn.runtime._paths import (
+    SESSION_STATE_DIR,
+    AgencyPaths,
+    safe_dirname,
+    session_key_from_path,
+    unsafe_dirname,
+)
 from thorn.runtime._serializer import (
     JsonSessionSerializer,
     SessionSerializer,
@@ -214,24 +220,41 @@ class SessionStore:
     def list_session_keys(self, agent_id: AgentID | str) -> list[SessionKey]:
         """Return all persisted session keys for the given agent, sorted.
 
-        Mirrors :meth:`session_exists`: a directory is only counted if
-        its ``session.json`` is present.  Lock-only or otherwise empty
-        session directories are skipped.  See :meth:`session_exists` for
-        the same caveat about custom serializer layouts.
+        Mirrors :meth:`session_exists`: a session is only counted if
+        its ``session.json`` is present in its ``_state/`` directory.
+        Lock-only or otherwise empty session directories are skipped.
+        See :meth:`session_exists` for the same caveat about custom
+        serializer layouts.
+
+        Walks the ``sessions/`` tree recursively to find every
+        ``_state/`` marker, since session keys can be hierarchical
+        (e.g. ``proj/issues/42``) and produce nested directories.
         """
         if not isinstance(agent_id, AgentID):
             agent_id = AgentID(agent_id)
         sessions_dir = self._paths.agent_sessions_dir(agent_id)
         if not sessions_dir.exists():
             return []
-        return sorted(
-            SessionKey(unsafe_dirname(d.name))
-            for d in sessions_dir.iterdir()
-            if d.is_dir() and (d / _SESSION_FILE).is_file()
-        )
+        keys: list[SessionKey] = []
+        for state_dir in sessions_dir.rglob(SESSION_STATE_DIR):
+            if not state_dir.is_dir() or state_dir.name != SESSION_STATE_DIR:
+                continue
+            if not (state_dir / _SESSION_FILE).is_file():
+                continue
+            rel = state_dir.parent.relative_to(sessions_dir)
+            if not rel.parts or SESSION_STATE_DIR in rel.parts:
+                continue
+            keys.append(session_key_from_path(rel))
+        return sorted(keys, key=str)
 
     def delete_session(self, agent_id: AgentID | str, key: SessionKey | str) -> None:
         """Remove a persisted session.
+
+        Removes only the session's ``_state/`` directory, *not* the
+        enclosing key-as-path subtree.  Hierarchical session keys
+        (e.g. ``proj/issue/42``) share directories with sibling and
+        child sessions; tearing down the parent path would obliterate
+        unrelated sessions.
 
         No-op if the session does not exist.
         """

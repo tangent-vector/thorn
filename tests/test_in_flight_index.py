@@ -95,8 +95,13 @@ class TestSessionPaths:
     """New per-session paths under ``AgencyPaths``."""
 
     def test_session_metadata_dir_matches_store_layout(self, tmp_path: Path) -> None:
-        # Matches SessionStore._session_dir so the inbox lives next
-        # to session.json/history.json for the same session.
+        # Matches SessionStore.save_session: framework files live under
+        # ``<sessions>/<key-as-path>/_state/`` so the inbox sits
+        # alongside session.json/history.json for the same session.
+        from thorn.runtime._paths import (
+            SESSION_STATE_DIR,
+            session_key_path,
+        )
         paths = _paths(tmp_path)
         agent = AgentID("coord")
         session = SessionKey("proj/mr/42")
@@ -106,7 +111,8 @@ class TestSessionPaths:
             / "agents"
             / safe_dirname(agent)
             / "sessions"
-            / safe_dirname(session)
+            / session_key_path(session)
+            / SESSION_STATE_DIR
         )
         assert paths.session_metadata_dir(agent, session) == expected
 

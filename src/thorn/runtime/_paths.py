@@ -89,6 +89,62 @@ def unsafe_dirname(dirname: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Session-key path encoding
+# ---------------------------------------------------------------------------
+
+SESSION_STATE_DIR = "_state"
+"""Sentinel subdirectory wrapping a session's framework-owned files.
+
+Per-session metadata (``session.json``, ``history.json``, ``inbox/``,
+``errored/``) lives under ``<sessions>/<key-as-path>/_state/`` rather
+than directly under ``<sessions>/<key-as-path>/``.  This guarantees
+that hierarchical session keys cannot collide on disk with the
+framework files of an enclosing session: e.g. session keys ``a/b`` and
+``a/b/inbox`` both work because the former's framework files live
+under ``a/b/_state/inbox/`` while the latter's live under
+``a/b/inbox/_state/``.
+
+Workspace and (future) session-key-home paths use the bare
+``<key-as-path>`` with no sentinel, so the agent sees clean
+unadorned directory names from inside its sandbox.
+"""
+
+
+def session_key_path(session_key: SessionKey) -> Path:
+    """Render a :class:`SessionKey` as a relative on-disk path.
+
+    Each component is passed through :func:`safe_dirname` to keep
+    individual segments filesystem-safe, but the slashes *between*
+    components are preserved as real directory separators.  So a
+    session key with components ``('cli', 'foo', 'abc123')`` becomes
+    the path ``cli/foo/abc123`` -- three real directory segments,
+    not ``cli%2Ffoo%2Fabc123`` (one URL-quoted segment).
+
+    This is deliberately a module-level function and not a method on
+    :class:`AgencyPaths`: the encoding is a property of the session
+    key alone, not of any particular agency layout.
+    """
+    return Path(*(safe_dirname(component) for component in session_key.components))
+
+
+def session_key_from_path(rel_path: Path) -> SessionKey:
+    """Recover a :class:`SessionKey` from the path produced by
+    :func:`session_key_path`.
+
+    *rel_path* must be relative; passing an absolute path is an error
+    because the session-key-to-path mapping has no concept of an
+    anchor.  Each path part is decoded via :func:`unsafe_dirname` and
+    fed back into the :class:`SessionKey` constructor.
+    """
+    if rel_path.is_absolute():
+        raise ValueError(
+            f"session_key_from_path expects a relative path, got: {rel_path!r}"
+        )
+    parts = tuple(unsafe_dirname(part) for part in rel_path.parts)
+    return SessionKey(parts)
+
+
+# ---------------------------------------------------------------------------
 # Legacy-layout detection
 # ---------------------------------------------------------------------------
 
@@ -234,9 +290,12 @@ class AgencyPaths:
     ) -> Path:
         """Working directory for a specific agent session.
 
-        Returns ``<agent_workspace_mount>/<safe-session-key>``.
+        Returns ``<agent_workspace_mount>/<key-as-path>``, where
+        ``<key-as-path>`` is :func:`session_key_path` applied to the
+        session key.  ``/`` in the key becomes a real directory
+        separator; only individual segments are filesystem-quoted.
         """
-        return self.agent_workspace_mount(agent_id) / safe_dirname(session_key)
+        return self.agent_workspace_mount(agent_id) / session_key_path(session_key)
 
     # ------------------------------------------------------------------
     # Session persistent state (metadata + inbox)
@@ -252,17 +311,44 @@ class AgencyPaths:
         """
         return self.agent_framework_dir(agent_id) / "sessions"
 
+    def session_state_root(
+        self,
+        agent_id: AgentID,
+        session_key: SessionKey,
+    ) -> Path:
+        """The session's bare on-disk root, *without* the ``_state``
+        sentinel.
+
+        Returns ``<agent_sessions_dir>/<key-as-path>``.  This is the
+        subtree the framework owns for a particular session; framework
+        files themselves live one level deeper, under
+        :meth:`session_metadata_dir`.
+
+        Useful for callers that need to clean up an entire session's
+        on-disk footprint at once (delete this and everything below).
+        """
+        return self.agent_sessions_dir(agent_id) / session_key_path(session_key)
+
     def session_metadata_dir(
         self,
         agent_id: AgentID,
         session_key: SessionKey,
     ) -> Path:
-        """Directory holding a session's ``session.json`` and ``history.json``.
+        """Directory holding a session's framework-owned files.
 
-        The inbox and any other per-session persistent state live
-        under this directory as subdirectories.
+        Returns ``<session_state_root>/_state``.  ``session.json``,
+        ``history.json``, and ``inbox/`` all live directly inside this
+        directory.
+
+        The ``_state`` sentinel exists so that hierarchical session
+        keys cannot collide on disk: e.g. session ``a/b`` keeps its
+        framework files at ``a/b/_state/`` while session ``a/b/inbox``
+        keeps its at ``a/b/inbox/_state/``.  Without the sentinel,
+        the second session's root would collide with the first
+        session's inbox subdirectory.  See :data:`SESSION_STATE_DIR`
+        for the rationale.
         """
-        return self.agent_sessions_dir(agent_id) / safe_dirname(session_key)
+        return self.session_state_root(agent_id, session_key) / SESSION_STATE_DIR
 
     def session_inbox_dir(
         self,
@@ -347,28 +433,62 @@ class AgencyPaths:
                 continue
             yield entry
 
-    def iter_session_inbox_dirs(self) -> Iterator[Path]:
-        """Yield every session inbox directory that currently exists on disk.
+    def _iter_session_state_dirs(
+        self,
+    ) -> Iterator[tuple[AgentID, SessionKey, Path]]:
+        """Yield every session's ``_state`` directory currently on disk.
 
-        Walks ``<agent_framework_dir>/sessions/<session-key>/inbox``
-        for every agent and session directory found.  Yields the main
-        inbox directory; the caller is expected to look for the
-        ``errored/`` subdirectory separately (via rglob or by probing
-        :meth:`session_inbox_errored_dir`) as appropriate.
+        Walks ``<agent_framework_dir>/sessions/`` recursively to find
+        any subdirectory whose final component is :data:`SESSION_STATE_DIR`.
+        Each such hit identifies one session: the session-key path is
+        the rel-path from ``sessions/`` up to (but not including) the
+        ``_state`` segment.
 
-        Non-existent agents, non-existent ``sessions/`` dirs, and
-        missing ``inbox/`` dirs are silently skipped.
+        Yields ``(agent_id, session_key, state_dir)`` triples with
+        identifiers decoded from their on-disk form.  Sessions whose
+        ``_state`` directory is missing or whose path includes the
+        sentinel name as a non-terminal segment are silently skipped.
         """
         for agent_dir in self._iter_agent_dirs():
             sessions_dir = agent_dir / "sessions"
             if not sessions_dir.is_dir():
                 continue
-            for session_dir in sessions_dir.iterdir():
-                if not session_dir.is_dir():
+            agent_id = AgentID(unsafe_dirname(agent_dir.name))
+            for state_dir in sessions_dir.rglob(SESSION_STATE_DIR):
+                if not state_dir.is_dir():
                     continue
-                inbox_dir = session_dir / "inbox"
-                if inbox_dir.is_dir():
-                    yield inbox_dir
+                if state_dir.name != SESSION_STATE_DIR:
+                    continue
+                rel = state_dir.parent.relative_to(sessions_dir)
+                if not rel.parts:
+                    # Defensive: a `_state` directory directly under
+                    # `sessions/` has no enclosing key.
+                    continue
+                if SESSION_STATE_DIR in rel.parts:
+                    # Defensive: a session-key segment that happens to
+                    # be literally `_state` would round-trip
+                    # ambiguously; refuse to decode such on-disk shapes
+                    # rather than emit a wrong key.
+                    continue
+                session_key = session_key_from_path(rel)
+                yield (agent_id, session_key, state_dir)
+
+    def iter_session_inbox_dirs(self) -> Iterator[Path]:
+        """Yield every session inbox directory that currently exists on disk.
+
+        Yields ``<session_metadata_dir>/inbox`` for every session that
+        carries an ``inbox/`` subdirectory.  See
+        :meth:`iter_session_inbox_locations` for a richer variant that
+        also yields the decoded ``(agent_id, session_key)`` pair.
+
+        Non-existent agents, non-existent ``sessions/`` dirs, and
+        sessions without an ``inbox/`` subdirectory are silently
+        skipped.
+        """
+        for _agent_id, _session_key, state_dir in self._iter_session_state_dirs():
+            inbox_dir = state_dir / "inbox"
+            if inbox_dir.is_dir():
+                yield inbox_dir
 
     def iter_service_queue_dirs(self) -> Iterator[Path]:
         """Yield every service notification queue directory on disk.
@@ -392,24 +512,16 @@ class AgencyPaths:
     ) -> Iterator[tuple[AgentID, SessionKey, Path]]:
         """Yield ``(agent_id, session_key, inbox_dir)`` for every inbox on disk.
 
-        Decodes the directory names via :func:`unsafe_dirname` so the
-        returned identifiers are the original application-level values
-        (with ``/`` and other special characters restored).  Useful for
-        sweep and address-aware enumeration paths that need more than
-        just the raw directory.
+        Decodes both the agent-id and the session-key from their
+        on-disk path representation so that the returned identifiers
+        are the original application-level values (with ``/`` between
+        session-key components restored).  Useful for sweep and
+        address-aware enumeration paths that need more than just the
+        raw directory.
         """
-        for agent_dir in self._iter_agent_dirs():
-            sessions_dir = agent_dir / "sessions"
-            if not sessions_dir.is_dir():
-                continue
-            agent_id = AgentID(unsafe_dirname(agent_dir.name))
-            for session_dir in sessions_dir.iterdir():
-                if not session_dir.is_dir():
-                    continue
-                inbox_dir = session_dir / "inbox"
-                if not inbox_dir.is_dir():
-                    continue
-                session_key = SessionKey(unsafe_dirname(session_dir.name))
+        for agent_id, session_key, state_dir in self._iter_session_state_dirs():
+            inbox_dir = state_dir / "inbox"
+            if inbox_dir.is_dir():
                 yield (agent_id, session_key, inbox_dir)
 
     def iter_service_queue_locations(self) -> Iterator[tuple[str, Path]]:
@@ -544,6 +656,9 @@ class AgencyPaths:
 __all__ = [
     "AgencyPaths",
     "LegacyLayoutError",
+    "SESSION_STATE_DIR",
     "safe_dirname",
+    "session_key_from_path",
+    "session_key_path",
     "unsafe_dirname",
 ]

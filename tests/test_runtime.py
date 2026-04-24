@@ -215,24 +215,61 @@ class TestSessionFields:
 
 
 class TestSessionKey:
-    def test_is_str_subclass(self):
+    def test_is_not_str_subclass(self):
+        # SessionKey deliberately stopped deriving from `str` so that
+        # callers must commit to either a structured (component-based)
+        # view or a string-formatted view, never both.  See
+        # `src/thorn/runtime/_session.py` for the rationale.
         key = SessionKey("my-session")
-        assert isinstance(key, str)
         assert isinstance(key, SessionKey)
+        assert not isinstance(key, str)
 
-    def test_str_operations(self):
-        key = SessionKey("gitlab:issue:42")
-        assert key.startswith("gitlab:")
-        assert "issue" in key
+    def test_str_form_joins_components(self):
+        key = SessionKey("gitlab/issue/42")
+        assert str(key) == "gitlab/issue/42"
+        assert key.components == ("gitlab", "issue", "42")
 
-    def test_equality_with_str(self):
+    def test_components_form_round_trips(self):
+        key = SessionKey(("gitlab", "issue", "42"))
+        assert str(key) == "gitlab/issue/42"
+        assert SessionKey(str(key)) == key
+
+    def test_repr_is_unambiguous(self):
+        assert repr(SessionKey("abc")) == "SessionKey('abc')"
+        assert repr(SessionKey("a/b")) == "SessionKey('a/b')"
+
+    def test_equality_to_other_session_key_only(self):
         key = SessionKey("abc")
-        assert key == "abc"
+        assert key == SessionKey("abc")
+        # Plain strings are no longer equal to a SessionKey (the
+        # whole point of dropping the str-subclass shape).
+        assert key != "abc"
 
     def test_as_dict_key(self):
         key = SessionKey("k1")
         d: dict[SessionKey, int] = {key: 1}
         assert d[SessionKey("k1")] == 1
+
+    def test_iter_and_len(self):
+        key = SessionKey("a/b/c")
+        assert list(key) == ["a", "b", "c"]
+        assert len(key) == 3
+
+    def test_construction_validation(self):
+        # Empty string -> error (no components).
+        with pytest.raises(ValueError):
+            SessionKey("")
+        # Empty iterable -> error.
+        with pytest.raises(ValueError):
+            SessionKey(())
+        # Empty component (e.g. trailing or doubled slash) -> error.
+        with pytest.raises(ValueError):
+            SessionKey("a//b")
+        with pytest.raises(ValueError):
+            SessionKey(("a", "", "b"))
+        # `/` inside a literal component (iterable form) -> error.
+        with pytest.raises(ValueError):
+            SessionKey(("a/b", "c"))
 
 
 # ---------------------------------------------------------------------------
