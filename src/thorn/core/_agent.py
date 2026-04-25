@@ -465,31 +465,59 @@ async def _run_session_prompt(
             child.sandbox_executor = runtime_executor
 
     # Override workspace_root when the agent has its own workspace,
-    # so file tools, AGENTS.md loading, and policies operate within
-    # the agent's scope rather than the parent context's.
+    # so file tools and policies operate within the agent's scope
+    # rather than the parent context's.  The system-prompt blocks
+    # (AGENTS.md, MEMORY.md, journal, environment) are no longer
+    # injected here -- they are produced by the unified
+    # context-gathering pipeline a few lines below.
     if workspace is not None:
         child.workspace_root = workspace
 
-    # When the agent's effective workspace differs from the parent
-    # context, reload AGENTS.md so sub-agents get project-specific
-    # instructions rather than inheriting the parent's.
-    if workspace is not None and workspace != ctx.workspace_root:
-        from thorn.core._discovery import load_workspace_instructions
-        child.workspace_instructions = load_workspace_instructions(workspace)
+    # The legacy per-context ``workspace_instructions`` slot (populated
+    # upstream by ``Runtime.create_context``) is now a vestige: the
+    # unified pipeline below loads AGENTS.md from every relevant
+    # directory itself.  Clear it on the child so the run loop's
+    # legacy ``context.workspace_instructions`` injection point does
+    # not double-emit the workspace AGENTS.md content.  The
+    # ``rewire_runtime_create_context`` plan item retires the slot
+    # entirely; this clear is the minimum surgery to make the new
+    # pipeline end-to-end-correct in the meantime.
+    child.workspace_instructions = None
 
-    # Inject MEMORY.md from the agent's home directory (personal state),
-    # NOT the workspace.  AGENTS.md comes from workspace (project-level);
-    # MEMORY.md comes from home (agent-level personal knowledge).
     agent_home = agent.home
-    if agent_home is not None:
-        from thorn.core._discovery import load_agent_memory
-        memory = load_agent_memory(agent_home)
-        if memory:
-            sys_prompts.append(memory)
 
-    # Inject recent journal entries from other sessions so the agent
-    # has cross-session continuity.  Entries from the current session
-    # are excluded (they're already visible in the history).
+    # ----------------------------------------------------------------
+    # Unified context-gathering pipeline (per-prompt)
+    #
+    # Phase 1: identify the outer-to-inner directory chain.
+    # Phase 2: load each directory's per-category contributions.
+    # Phase 3: assemble the system-prompt blocks, MCP configs, and
+    #          skill list ready for the agent loop.
+    #
+    # This replaces the legacy ``load_workspace_instructions`` /
+    # ``load_agent_memory`` / hand-rolled environment block paths
+    # that used to live inline above.  Journal loading still happens
+    # here (caller-side) but block placement is owned by phase 3.
+    # ----------------------------------------------------------------
+    from thorn.runtime._context_layers import load_context_layers
+    from thorn.runtime._context_paths import gather_context_directories
+    from thorn.runtime._paths import session_key_path
+    from thorn.runtime._prompt_assembly import assemble_prompt_context
+
+    session_key_home_path = (
+        agent_home / session_key_path(session.key)
+        if (agent_home is not None and session.key is not None)
+        else None
+    )
+    context_directories = gather_context_directories(
+        agent_home_path=agent_home,
+        session_key_home_path=session_key_home_path,
+        logical_agent_workspace_path=session.logical_agent_workspace_path,
+        session_workspace_path=workspace,
+    )
+    collected_layers = load_context_layers(context_directories)
+
+    journal_text: str | None = None
     if agent_home is not None:
         journal_dir = agent_home / "journal"
         if journal_dir.is_dir():
@@ -497,26 +525,22 @@ async def _run_session_prompt(
             session_key_str = (
                 str(session.key) if session.key is not None else None
             )
-            journal_content = read_recent_journal(
+            journal_text = read_recent_journal(
                 journal_dir,
                 exclude_session_key=session_key_str,
             )
-            if journal_content:
-                sys_prompts.append(
-                    "Your recent activity log"
-                    " (shared across all sessions):\n\n"
-                    + journal_content
-                )
 
-    env_lines: list[str] = []
-    if workspace is not None:
-        env_lines.append(f"- Working directory (`.`): {workspace}")
-    if agent_home is not None:
-        env_lines.append(f"- Home directory (`~`): {agent_home}")
-    if env_lines:
-        sys_prompts.append(
-            "## Your environment\n\n" + "\n".join(env_lines)
-        )
+    assembled = assemble_prompt_context(
+        collected_layers,
+        workspace_path=workspace,
+        agent_home_path=agent_home,
+        journal_text=journal_text,
+    )
+    sys_prompts.extend(assembled.system_prompt_blocks)
+    # ``assembled.mcp_configs`` and ``assembled.skills`` are
+    # collected here for shape but not yet wired through to tool
+    # registration; that is the next step in the plan
+    # (delete_workspace_config / skill_md_loader).
 
     await child.event_sink.on_scope_enter(child.scope)
     t0 = time.monotonic()
