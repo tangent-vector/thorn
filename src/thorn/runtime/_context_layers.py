@@ -286,7 +286,7 @@ def _expand_env_vars(data: Any) -> Any:
 
     A leading ``$`` on a string indicates an env-var reference; the
     rest of the string is the variable name (no braces, no defaults
-    -- the convention matches the existing :mod:`_workspace_config`
+    -- the convention matches the historical workspace-config
     behavior so .agents/mcp.json files keep working).  Raises
     :exc:`_MissingEnvVarSkip` when the reference cannot be resolved.
     """

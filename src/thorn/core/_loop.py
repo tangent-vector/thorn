@@ -167,9 +167,12 @@ async def run_agent_loop(
         all_schemas.append(rr_schema)
 
     # -- assemble system prompts -------------------------------------------
+    # ``context.system_prompts`` carries the runtime's universal prompts;
+    # the per-call ``system_prompts`` argument carries the role-level
+    # prompts plus the assembled per-prompt context blocks (AGENTS.md,
+    # MEMORY.md, environment, journal, skill index) produced by the
+    # unified context-gathering pipeline in ``_run_session_prompt``.
     prompts = list(context.system_prompts)
-    if context.workspace_instructions:
-        prompts.append(context.workspace_instructions)
     if system_prompts:
         prompts.extend(system_prompts)
 

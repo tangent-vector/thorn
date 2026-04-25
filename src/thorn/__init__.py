@@ -266,7 +266,6 @@ def run(
     """
     from pathlib import Path
 
-    from thorn.core._discovery import load_workspace_instructions
     from thorn.core._file_access import load_global_ignores
     from thorn.core._context import reset_context
 
@@ -291,7 +290,6 @@ def run(
         event_sink=event_sink,
         system_prompts=system_prompts,
         workspace_root=ws_root,
-        workspace_instructions=load_workspace_instructions(ws_root),
         global_ignores=global_ignores,
         context_window=effective_cw,
         agency_root_directory=ws_root,

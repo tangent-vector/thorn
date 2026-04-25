@@ -7,7 +7,6 @@ import json
 import sys
 import time
 import uuid
-from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
@@ -211,7 +210,6 @@ def _build_runtime(
     from pathlib import Path
 
     from thorn import infer_workspace_root
-    from thorn.core._discovery import load_workspace_instructions
     from thorn.core._file_access import load_global_ignores
     from thorn.runtime._paths import AgencyPaths
 
@@ -231,7 +229,6 @@ def _build_runtime(
         provider=provider,
         event_sink=bus,
         workspace_root=ws_root,
-        workspace_instructions=load_workspace_instructions(ws_root),
         global_ignores=load_global_ignores(ws_root),
         ask_user_handler=_rich_ask_user if interactive else None,
         paths=paths,
@@ -258,22 +255,21 @@ def _runtime_event_bus(runtime: Runtime) -> EventBus:
     return sink
 
 
-async def _collect_all_tools(
-    exit_stack: AsyncExitStack,
+def _collect_cli_tools(
     *,
     no_tools: bool,
-    no_discover: bool,
-    no_mcp: bool,
     interactive: bool = True,
 ) -> list[_WrappedTool]:
-    """Assemble tools from all sources: builtins, discovery, and MCP servers.
+    """Return the per-CLI-invocation static tool list (builtins +
+    optional ``ask_user``).
 
-    Tool discovery scans ``.agents/thorn/`` directories for ``@tool`` /
-    ``@skill`` Python functions.  MCP configs are loaded from
-    ``.agents/mcp.json`` (future) or ``.thorn/mcp.json`` (legacy).
-
-    MCP sessions are registered on *exit_stack* so they stay alive for
-    the duration of the caller's async block.
+    Everything that varies with workspace context -- MCP servers,
+    discovered ``.agents/thorn/`` Python tools, skills -- now flows
+    through the unified context-gathering pipeline that runs inside
+    ``_run_session_prompt`` for every prompt round.  The CLI's job is
+    only to seed the dispatcher with the static "always present"
+    tools that every CLI session expects regardless of where it is
+    being run.
     """
     from thorn.core._tools import ask_user
 
@@ -284,46 +280,7 @@ async def _collect_all_tools(
         if interactive:
             raw.append(ask_user)
 
-    if not no_discover:
-        # Phase A retired the .agents/thorn/@tool discovery path; the
-        # flag is preserved as a no-op so older invocations still parse.
-        pass
-
-    tools = _prepare_tools(raw)
-
-    if not no_mcp:
-        try:
-            from thorn.core._mcp import MCPToolSource
-            from thorn.core._workspace_config import load_workspace_config
-
-            ws_config = load_workspace_config(Path.cwd())
-            configs = list(ws_config.mcp_configs)
-
-            if not configs:
-                from thorn.core._discovery import find_thorn_dirs
-                from thorn.core._mcp import load_mcp_configs
-
-                configs = load_mcp_configs(find_thorn_dirs())
-
-            if configs:
-                mcp_source: MCPToolSource = await exit_stack.enter_async_context(
-                    MCPToolSource(configs)
-                )
-                mcp_tools = mcp_source.tools
-                if mcp_tools:
-                    names = [
-                        t.schema.get("function", {}).get("name", "?")
-                        for t in mcp_tools
-                    ]
-                    console.print(
-                        f"[dim]MCP tools:[/dim] {', '.join(names)}",
-                        highlight=False,
-                    )
-                tools.extend(mcp_tools)
-        except ImportError:
-            pass
-
-    return tools
+    return _prepare_tools(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -382,18 +339,6 @@ def _write_result_file(
     default=False,
     help="Disable built-in tools (file I/O, etc.).",
 )
-@click.option(
-    "--no-discover",
-    is_flag=True,
-    default=False,
-    help="Skip .agents/thorn/ tool discovery.",
-)
-@click.option(
-    "--no-mcp",
-    is_flag=True,
-    default=False,
-    help="Skip MCP server tool sources.",
-)
 @click.option("-v", "--verbose", count=True, help="Increase output detail (-v, -vv).")
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
@@ -409,7 +354,7 @@ def _write_result_file(
     ),
 )
 @click.option("--result-file", "result_file_path", type=click.Path(), default=None, help="Write a JSON result summary (outcome, duration, token usage).")
-def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, result_file_path: str | None) -> None:
+def run(prompt_text: str, no_tools: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, result_file_path: str | None) -> None:
     """Execute a single prompt and print the result."""
     from thorn import infer_workspace_root
     from thorn.runtime._paths import AgencyPaths
@@ -456,114 +401,111 @@ def run(prompt_text: str, no_tools: bool, no_discover: bool, no_mcp: bool, verbo
         async with runtime:
             ctx_holder.append(runtime.context)
             agent = _ensure_cli_agent(runtime)
-            async with AsyncExitStack() as stack:
-                tools = await _collect_all_tools(
-                    stack,
-                    no_tools=no_tools,
-                    no_discover=no_discover,
-                    no_mcp=no_mcp,
+            tools = _collect_cli_tools(
+                no_tools=no_tools,
+                interactive=False,
+            )
+
+            # Phase 5: every CLI invocation gets a fresh session
+            # under a unique key (``cli/<workspace-basename>/<uuid>``).
+            # The in-memory session is never persisted
+            # (``save_session=None`` below) so the only on-disk
+            # artefacts are the session's inbox directory (empty
+            # after the dispatcher deletes the one notification it
+            # processes) and, in future, shutdown-housekeeping
+            # journal entries that the agent may choose to write.
+            if agent.id is None:
+                raise RuntimeError(
+                    "CLI agent has no id; cannot build a session inbox"
+                )
+            session_key = _generate_cli_session_key(runtime.workspace_root)
+            # Pick the logical agent-workspace upper bound for this
+            # CLI session by scanning ancestors of the session
+            # workspace for a project-root marker.  Persisted on
+            # the Session so the per-prompt context-gathering walk
+            # has a single, well-defined upper bound regardless of
+            # whether the session is later resumed from a different
+            # CWD.  The session's CWD itself is the workspace's
+            # *lower* bound (the inner end of the walk).
+            logical_agent_workspace_path = (
+                pick_logical_agent_workspace_path_for_cli_session(
+                    runtime.workspace_root,
+                )
+            )
+
+            # Phase 3: the runtime carries an ``EventBus`` rather
+            # than a single sink; subscribe a console listener
+            # that only fires for *this* session's events so
+            # background activity in other sessions (none today
+            # under ``thorn run``, but plausible once the local
+            # agency lands in Phase 5) won't bleed into our
+            # console output.  Subscribing here -- *before* the
+            # session is submitted -- ensures we don't miss the
+            # initial agent scope-enter event.
+            bus = _runtime_event_bus(runtime)
+            console_listener: EventSink = ConsoleEventSink(
+                verbosity=verbosity,
+            )
+            with bus.subscribe(
+                console_listener,
+                scope_filter=in_session(session_key),
+            ):
+                session = Session(
+                    agent=agent,
+                    key=session_key,
+                    workspace_root=runtime.workspace_root,
+                    logical_agent_workspace_path=(
+                        logical_agent_workspace_path
+                    ),
                 )
 
-                # Phase 5: every CLI invocation gets a fresh session
-                # under a unique key (``cli/<workspace-basename>/<uuid>``).
-                # The in-memory session is never persisted
-                # (``save_session=None`` below) so the only on-disk
-                # artefacts are the session's inbox directory (empty
-                # after the dispatcher deletes the one notification it
-                # processes) and, in future, shutdown-housekeeping
-                # journal entries that the agent may choose to write.
-                if agent.id is None:
-                    raise RuntimeError(
-                        "CLI agent has no id; cannot build a session inbox"
-                    )
-                session_key = _generate_cli_session_key(runtime.workspace_root)
-                # Pick the logical agent-workspace upper bound for this
-                # CLI session by scanning ancestors of the session
-                # workspace for a project-root marker.  Persisted on
-                # the Session so the per-prompt context-gathering walk
-                # has a single, well-defined upper bound regardless of
-                # whether the session is later resumed from a different
-                # CWD.  The session's CWD itself is the workspace's
-                # *lower* bound (the inner end of the walk).
-                logical_agent_workspace_path = (
-                    pick_logical_agent_workspace_path_for_cli_session(
-                        runtime.workspace_root,
-                    )
+                session_address = SessionAddress(agent.id, session_key)
+                inbox = SessionInbox(
+                    runtime.paths.session_inbox_dir(
+                        agent.id, session_key,
+                    ),
+                    session_address,
+                    in_flight_index=runtime.in_flight_index,
                 )
+                runtime.address_book.register(session_address, inbox)
 
-                # Phase 3: the runtime carries an ``EventBus`` rather
-                # than a single sink; subscribe a console listener
-                # that only fires for *this* session's events so
-                # background activity in other sessions (none today
-                # under ``thorn run``, but plausible once the local
-                # agency lands in Phase 5) won't bleed into our
-                # console output.  Subscribing here -- *before* the
-                # session is submitted -- ensures we don't miss the
-                # initial agent scope-enter event.
-                bus = _runtime_event_bus(runtime)
-                console_listener: EventSink = ConsoleEventSink(
-                    verbosity=verbosity,
+                loop = asyncio.get_running_loop()
+                result_future: asyncio.Future[str] = loop.create_future()
+                dispatcher = make_cli_prompt_dispatcher(
+                    result_future=result_future,
+                    extra_tools=tools,
+                    extra_system=(
+                        "You are executing a single non-interactive "
+                        "request. Complete the task and report results "
+                        "concisely. Do not offer follow-up actions or "
+                        "ask questions."
+                    ),
                 )
-                with bus.subscribe(
-                    console_listener,
-                    scope_filter=in_session(session_key),
-                ):
-                    session = Session(
-                        agent=agent,
-                        key=session_key,
-                        workspace_root=runtime.workspace_root,
-                        logical_agent_workspace_path=(
-                            logical_agent_workspace_path
-                        ),
-                    )
-
-                    session_address = SessionAddress(agent.id, session_key)
-                    inbox = SessionInbox(
-                        runtime.paths.session_inbox_dir(
-                            agent.id, session_key,
-                        ),
-                        session_address,
-                        in_flight_index=runtime.in_flight_index,
-                    )
-                    runtime.address_book.register(session_address, inbox)
-
-                    loop = asyncio.get_running_loop()
-                    result_future: asyncio.Future[str] = loop.create_future()
-                    dispatcher = make_cli_prompt_dispatcher(
-                        result_future=result_future,
-                        extra_tools=tools,
-                        extra_system=(
-                            "You are executing a single non-interactive "
-                            "request. Complete the task and report results "
-                            "concisely. Do not offer follow-up actions or "
-                            "ask questions."
-                        ),
-                    )
-                    # ``save_session=None``: ``thorn run`` is ephemeral.
-                    # Phase 5 will revisit when the local-agency defaults
-                    # land and persistence semantics get redesigned.
-                    scheduler = AgentScheduler(
-                        agent=agent,
-                        prompt_dispatcher=dispatcher,
-                        save_session=None,
-                    )
-                    try:
-                        inbox.post(NotificationSpec(
-                            source="user",
-                            content=prompt_text,
-                            target=session_address,
-                        ))
-                        await scheduler.submit(session, inbox)
-                        return await result_future
-                    finally:
-                        # Bounded grace period so a misbehaving
-                        # dispatcher cannot wedge process exit
-                        # indefinitely.  By the time we get here the
-                        # future has resolved, the dispatcher has
-                        # returned, and the driver has parked on its
-                        # idle wait, so shutdown is essentially
-                        # instantaneous in the success case.
-                        await scheduler.shutdown(timeout=5.0)
+                # ``save_session=None``: ``thorn run`` is ephemeral.
+                # Phase 5 will revisit when the local-agency defaults
+                # land and persistence semantics get redesigned.
+                scheduler = AgentScheduler(
+                    agent=agent,
+                    prompt_dispatcher=dispatcher,
+                    save_session=None,
+                )
+                try:
+                    inbox.post(NotificationSpec(
+                        source="user",
+                        content=prompt_text,
+                        target=session_address,
+                    ))
+                    await scheduler.submit(session, inbox)
+                    return await result_future
+                finally:
+                    # Bounded grace period so a misbehaving
+                    # dispatcher cannot wedge process exit
+                    # indefinitely.  By the time we get here the
+                    # future has resolved, the dispatcher has
+                    # returned, and the driver has parked on its
+                    # idle wait, so shutdown is essentially
+                    # instantaneous in the success case.
+                    await scheduler.shutdown(timeout=5.0)
 
     outcome = "success"
     error_msg: str | None = None
@@ -657,18 +599,6 @@ async def _chat_loop(
     default=False,
     help="Disable built-in tools.",
 )
-@click.option(
-    "--no-discover",
-    is_flag=True,
-    default=False,
-    help="Skip .agents/thorn/ tool discovery.",
-)
-@click.option(
-    "--no-mcp",
-    is_flag=True,
-    default=False,
-    help="Skip MCP server tool sources.",
-)
 @click.option("-v", "--verbose", count=True, help="Increase output detail (-v, -vv).")
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
@@ -693,7 +623,7 @@ async def _chat_loop(
         "remembering from this session)."
     ),
 )
-def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, no_housekeeping: bool) -> None:
+def chat(no_tools: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, no_housekeeping: bool) -> None:
     """Start an interactive chat session."""
     from thorn import infer_workspace_root
     from thorn.runtime._paths import AgencyPaths
@@ -772,106 +702,103 @@ def chat(no_tools: bool, no_discover: bool, no_mcp: bool, verbose: int, quiet: b
                 console_listener,
                 scope_filter=in_session(session_key),
             ):
-                async with AsyncExitStack() as stack:
-                    tools = await _collect_all_tools(
-                        stack,
-                        no_tools=no_tools,
-                        no_discover=no_discover,
-                        no_mcp=no_mcp,
-                    )
+                tools = _collect_cli_tools(
+                    no_tools=no_tools,
+                    interactive=True,
+                )
 
-                    # Per-session inbox + scheduler wiring.  The
-                    # inbox lives under the agent's data root so a
-                    # crash leaves the in-flight notification on
-                    # disk for the startup sweep to reconcile -- a
-                    # property that becomes load-bearing once Phase
-                    # 6 introduces the local-agency daemon.
-                    session_address = SessionAddress(
+                # Per-session inbox + scheduler wiring.  The
+                # inbox lives under the agent's data root so a
+                # crash leaves the in-flight notification on
+                # disk for the startup sweep to reconcile -- a
+                # property that becomes load-bearing once Phase
+                # 6 introduces the local-agency daemon.
+                session_address = SessionAddress(
+                    agent.id, session_key,
+                )
+                inbox = SessionInbox(
+                    runtime.paths.session_inbox_dir(
                         agent.id, session_key,
-                    )
-                    inbox = SessionInbox(
-                        runtime.paths.session_inbox_dir(
-                            agent.id, session_key,
-                        ),
-                        session_address,
-                        in_flight_index=runtime.in_flight_index,
-                    )
-                    runtime.address_book.register(
-                        session_address, inbox,
-                    )
+                    ),
+                    session_address,
+                    in_flight_index=runtime.in_flight_index,
+                )
+                runtime.address_book.register(
+                    session_address, inbox,
+                )
 
-                    router = ChatPromptRouter(
-                        target=session_address,
-                        extra_tools=tools,
-                        extra_system=CHAT_SYSTEM_PROMPT,
+                router = ChatPromptRouter(
+                    target=session_address,
+                    extra_tools=tools,
+                    extra_system=CHAT_SYSTEM_PROMPT,
+                )
+
+                async def _save_session_async(
+                    sess: Session,
+                ) -> None:
+                    """Async adapter around the sync save.
+
+                    Mirrors the gateway's pattern (named so
+                    scheduler exception logs point at a real
+                    qualified name).  The save is small;
+                    running it on the loop thread is fine
+                    because the scheduler already serialises
+                    per-session, so there is no contention to
+                    offload.
+                    """
+                    runtime.save_session(sess)
+
+                scheduler = AgentScheduler(
+                    agent=agent,
+                    prompt_dispatcher=router.dispatcher,
+                    save_session=_save_session_async,
+                )
+
+                try:
+                    await _chat_loop(
+                        router=router,
+                        scheduler=scheduler,
+                        session=session,
+                        inbox=inbox,
                     )
-
-                    async def _save_session_async(
-                        sess: Session,
-                    ) -> None:
-                        """Async adapter around the sync save.
-
-                        Mirrors the gateway's pattern (named so
-                        scheduler exception logs point at a real
-                        qualified name).  The save is small;
-                        running it on the loop thread is fine
-                        because the scheduler already serialises
-                        per-session, so there is no contention to
-                        offload.
-                        """
-                        runtime.save_session(sess)
-
-                    scheduler = AgentScheduler(
-                        agent=agent,
-                        prompt_dispatcher=router.dispatcher,
-                        save_session=_save_session_async,
-                    )
-
-                    try:
-                        await _chat_loop(
-                            router=router,
-                            scheduler=scheduler,
-                            session=session,
-                            inbox=inbox,
+                    # Shutdown housekeeping (Phase 5): gives the
+                    # agent one last turn to journal anything
+                    # worth remembering before the session is
+                    # discarded.  Bypasses the scheduler/router
+                    # -- this is a framework-driven action, not a
+                    # user turn, and the scheduler's drain task
+                    # is about to be torn down.  ``--no-
+                    # housekeeping`` skips the turn entirely for
+                    # scripted / test use.  We run housekeeping
+                    # *only after a clean REPL exit*; if
+                    # ``_chat_loop`` raised (``KeyboardInterrupt``,
+                    # unexpected error) we skip, because the
+                    # agent is unlikely to produce a useful final
+                    # turn mid-panic and the user wants their
+                    # shell prompt back.
+                    if not no_housekeeping:
+                        from thorn.core._housekeeping import (
+                            perform_shutdown_housekeeping,
                         )
-                        # Shutdown housekeeping (Phase 5): gives the
-                        # agent one last turn to journal anything
-                        # worth remembering before the session is
-                        # discarded.  Bypasses the scheduler/router
-                        # -- this is a framework-driven action, not a
-                        # user turn, and the scheduler's drain task
-                        # is about to be torn down.  ``--no-
-                        # housekeeping`` skips the turn entirely for
-                        # scripted / test use.  We run housekeeping
-                        # *only after a clean REPL exit*; if
-                        # ``_chat_loop`` raised (``KeyboardInterrupt``,
-                        # unexpected error) we skip, because the
-                        # agent is unlikely to produce a useful final
-                        # turn mid-panic and the user wants their
-                        # shell prompt back.
-                        if not no_housekeeping:
-                            from thorn.core._housekeeping import (
-                                perform_shutdown_housekeeping,
+                        try:
+                            await perform_shutdown_housekeeping(session)
+                            runtime.save_session(session)
+                        except ThornError as exc:
+                            # Shutdown housekeeping swallows
+                            # Thorn-level errors internally, but
+                            # save_session could still raise
+                            # (disk full, etc.); log and move on
+                            # rather than block exit.
+                            console.print(
+                                f"[yellow]Shutdown housekeeping "
+                                f"failed to save:[/yellow] {exc}"
                             )
-                            try:
-                                await perform_shutdown_housekeeping(session)
-                                runtime.save_session(session)
-                            except ThornError as exc:
-                                # Shutdown housekeeping swallows
-                                # Thorn-level errors internally, but
-                                # save_session could still raise
-                                # (disk full, etc.); log and move on
-                                # rather than block exit.
-                                console.print(
-                                    f"[yellow]Shutdown housekeeping "
-                                    f"failed to save:[/yellow] {exc}"
-                                )
-                    finally:
-                        # Bounded grace period mirrors ``thorn
-                        # run``: in the success case the driver is
-                        # parked on its idle wait, so shutdown is
-                        # essentially instantaneous.
-                        await scheduler.shutdown(timeout=5.0)
+                finally:
+                    # Bounded grace period mirrors ``thorn
+                    # run``: in the success case the driver is
+                    # parked on its idle wait, so shutdown is
+                    # essentially instantaneous.
+                    await scheduler.shutdown(timeout=5.0)
 
     try:
         asyncio.run(_chat())
@@ -1229,19 +1156,12 @@ def serve_bootstrap(
     default=False,
     help="Disable built-in tools.",
 )
-@click.option(
-    "--no-discover",
-    is_flag=True,
-    default=False,
-    help="Skip .agents/thorn/ tool discovery.",
-)
 @click.option("--name", default="thorn", help="Server name reported to MCP clients.")
 def serve_mcp(
     transport: str,
     host: str,
     port: int,
     no_tools: bool,
-    no_discover: bool,
     name: str,
 ) -> None:
     """Start an MCP server exposing thorn tools and skills."""
@@ -1257,10 +1177,6 @@ def serve_mcp(
     raw: list[Any] = []
     if not no_tools:
         raw.extend(ALL_BUILTIN_TOOLS)
-    if not no_discover:
-        # Phase A retired the .agents/thorn/@tool discovery path; the
-        # flag is preserved as a no-op so older invocations still parse.
-        pass
 
     tools = _prepare_tools(raw)
     if not tools:

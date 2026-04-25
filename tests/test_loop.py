@@ -414,14 +414,16 @@ class TestValidationFooter:
 
 
 # ---------------------------------------------------------------------------
-# Workspace instructions ordering
+# System-prompt ordering: context.system_prompts then per-call system_prompts
 # ---------------------------------------------------------------------------
 
-class TestWorkspaceInstructionsOrdering:
-    """Verify that workspace_instructions appear between context prompts
-    and agent-level prompts in the assembled system prompt list."""
+class TestSystemPromptOrdering:
+    """``run_agent_loop`` concatenates ``context.system_prompts`` first
+    (the runtime's universal prompts) and then the per-call
+    ``system_prompts`` argument (role-level prompts plus the
+    context-gathering pipeline's assembled blocks)."""
 
-    async def test_workspace_instructions_between_context_and_agent_prompts(self):
+    async def test_context_prompts_precede_per_call_prompts(self):
         captured: list[list[str]] = []
 
         class CapturingProvider(MockProvider):
@@ -436,7 +438,6 @@ class TestWorkspaceInstructionsOrdering:
         ctx = ExecutionContext(
             provider=provider,
             system_prompts=["universal"],
-            workspace_instructions="workspace rules",
         )
         await run_agent_loop(
             context=ctx,
@@ -445,15 +446,9 @@ class TestWorkspaceInstructionsOrdering:
             system_prompts=["agent-class", "agent-instance"],
         )
         assert len(captured) == 1
-        prompts = captured[0]
-        assert prompts == [
-            "universal",
-            "workspace rules",
-            "agent-class",
-            "agent-instance",
-        ]
+        assert captured[0] == ["universal", "agent-class", "agent-instance"]
 
-    async def test_no_workspace_instructions_when_none(self):
+    async def test_no_per_call_prompts(self):
         captured: list[list[str]] = []
 
         class CapturingProvider(MockProvider):
@@ -473,10 +468,10 @@ class TestWorkspaceInstructionsOrdering:
             context=ctx,
             user_prompt="hi",
             tools=[],
-            system_prompts=["agent-level"],
+            system_prompts=[],
         )
         assert len(captured) == 1
-        assert captured[0] == ["universal", "agent-level"]
+        assert captured[0] == ["universal"]
 
 
 # ---------------------------------------------------------------------------

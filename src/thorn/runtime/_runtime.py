@@ -77,7 +77,6 @@ class Runtime:
         provider: LLMProvider,
         event_sink: EventSink | None = None,
         workspace_root: Path,
-        workspace_instructions: str | None = None,
         global_ignores: FileAccessPolicy | None = None,
         ask_user_handler: AskUserHandler | None = None,
         context_window: int | None = None,
@@ -94,7 +93,6 @@ class Runtime:
         self.provider = provider
         self.event_sink: EventSink = event_sink or NullEventSink()
         self.workspace_root = workspace_root
-        self.workspace_instructions = workspace_instructions
         self.global_ignores = global_ignores
         self.ask_user_handler = ask_user_handler
         self.context_window = context_window
@@ -210,7 +208,6 @@ class Runtime:
             provider=self.provider,
             event_sink=self.event_sink,
             workspace_root=self.workspace_root,
-            workspace_instructions=self.workspace_instructions,
             global_ignores=self.global_ignores,
             ask_user_handler=self.ask_user_handler,
             context_window=self.context_window,

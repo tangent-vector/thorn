@@ -1780,16 +1780,12 @@ class TestRuntime:
         assert rt.sessions is custom_store
 
     def test_create_context(self, tmp_path: Path):
-        rt = self._make_runtime(
-            tmp_path,
-            workspace_instructions="Be helpful.",
-        )
+        rt = self._make_runtime(tmp_path)
         ctx = rt.create_context(system_prompts=["Extra prompt."])
 
         assert isinstance(ctx, ExecutionContext)
         assert ctx.provider is rt.provider
         assert ctx.workspace_root == tmp_path
-        assert ctx.workspace_instructions == "Be helpful."
         assert "Extra prompt." in ctx.system_prompts
 
     def test_create_context_inherits_ask_user_handler(self, tmp_path: Path):
