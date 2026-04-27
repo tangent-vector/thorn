@@ -444,7 +444,7 @@ class TestSummarizeToolArgs:
 
     def test_unknown_tool_returns_none(self):
         result = ConsoleEventSink._summarize_tool_args(
-            "ask_user", {"question": "hello?"},
+            "some_unknown_tool", {"question": "hello?"},
         )
         assert result is None
 

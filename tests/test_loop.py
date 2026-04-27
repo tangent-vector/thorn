@@ -7,7 +7,7 @@ import pytest
 from thorn.core._context import ExecutionContext, StatusProvider, scoped_status_provider, set_context
 from thorn.core._func import wrap_function
 from thorn.core._history import AdvisoryNode, CollapseState, HistoryTree, TurnNode
-from thorn.core._loop import _WrappedTool, _normalize_tool_name, _tool_name, run_agent_loop
+from thorn.core._loop import _WrappedTool, _normalize_tool_name, run_agent_loop
 from thorn.core._provider import (
     FinishChunk,
     LLMProvider,
@@ -820,76 +820,6 @@ class TestScopedStatusProvider:
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# ask_user filtering
-# ---------------------------------------------------------------------------
-
-class TestAskUserFiltering:
-    """Verify that ask_user is excluded from tool schemas when no handler is
-    configured, and included when a handler is present."""
-
-    async def test_ask_user_excluded_without_handler(self):
-        """ask_user is NOT sent to the provider when ask_user_handler is None."""
-        from thorn.core._func import wrap_function
-        from thorn.core._tools import ask_user as _ask_user_fn
-
-        captured_schemas: list[list[dict]] = []
-
-        class CapturingProvider(MockProvider):
-            async def complete(self, system_prompts, tools, messages):
-                captured_schemas.append(list(tools))
-                async for chunk in super().complete(system_prompts, tools, messages):
-                    yield chunk
-
-        provider = CapturingProvider(
-            canned_responses=[_text_response("ok")],
-        )
-        ctx = ExecutionContext(provider=provider, ask_user_handler=None)
-
-        ask_tool = wrap_function(_ask_user_fn)
-        await run_agent_loop(
-            context=ctx, user_prompt="hi", tools=[ask_tool],
-        )
-
-        assert len(captured_schemas) == 1
-        tool_names = {
-            _tool_name(s) for s in captured_schemas[0]
-        }
-        assert "ask_user" not in tool_names
-
-    async def test_ask_user_included_with_handler(self):
-        """ask_user IS sent to the provider when ask_user_handler is set."""
-        from thorn.core._func import wrap_function
-        from thorn.core._tools import ask_user as _ask_user_fn
-
-        captured_schemas: list[list[dict]] = []
-
-        class CapturingProvider(MockProvider):
-            async def complete(self, system_prompts, tools, messages):
-                captured_schemas.append(list(tools))
-                async for chunk in super().complete(system_prompts, tools, messages):
-                    yield chunk
-
-        async def fake_handler(q: str) -> str:
-            return "answer"
-
-        provider = CapturingProvider(
-            canned_responses=[_text_response("ok")],
-        )
-        ctx = ExecutionContext(provider=provider, ask_user_handler=fake_handler)
-
-        ask_tool = wrap_function(_ask_user_fn)
-        await run_agent_loop(
-            context=ctx, user_prompt="hi", tools=[ask_tool],
-        )
-
-        assert len(captured_schemas) == 1
-        tool_names = {
-            _tool_name(s) for s in captured_schemas[0]
-        }
-        assert "ask_user" in tool_names
-
 
 # ---------------------------------------------------------------------------
 # Test helpers

@@ -13,8 +13,6 @@
 
 - Consider splitting `@skill` so that there's a distinction between "a function whose implementation is a prompt" and the exposure of such a function to the rest of the system
 
-- The `ask_user` tool should fail gracefully (or be unavailable) when stdin is not a tty, so that non-interactive `thorn run` sessions don't hang waiting for input that will never come.
-
 - Some sort of POR around how to fit approval into all this, by having a notion of tools that should require approval (or maybe have filters/predicates to decide when they need approval)
 
 - Consume typical definitions of skills, slash commands and personas (e.g., like in `.claude/`)

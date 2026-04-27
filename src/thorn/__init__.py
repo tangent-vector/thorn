@@ -29,7 +29,6 @@ from typing import Any, Callable, Coroutine, TypeVar
 
 from thorn.core import (
     AdvisoryNode,
-    AskUserHandler,
     ConsoleEventSink,
     EventSink,
     ExecutionContext,
@@ -85,7 +84,6 @@ from thorn.core import (
     FILE_READING,
     FILE_WRITING,
     FileEdit,
-    ask_user,
     create_file,
     delete_file,
     edit_file,
@@ -155,7 +153,6 @@ __all__ = [
     "discover_tools",
     "bound_retries",
     # Context
-    "AskUserHandler",
     "ExecutionContext",
     "EventSink",
     "NullEventSink",
@@ -202,7 +199,6 @@ __all__ = [
     "list_directory",
     "find_files",
     "search_files",
-    "ask_user",
     "ALL_BUILTIN_TOOLS",
     "FILE_READING",
     "FILE_WRITING",

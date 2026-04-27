@@ -36,8 +36,8 @@ class ToolVenue(str, Enum):
     """Where a tool runs relative to the brain.
 
     ``IN_PROCESS`` tools execute in the same Python process as the
-    agent loop and can touch brain-owned state (session inbox,
-    ``ask_user`` handler, etc.).  ``SANDBOX`` tools are ultimately
+    agent loop and can touch brain-owned state (e.g. the session
+    inbox).  ``SANDBOX`` tools are ultimately
     intended to run inside the per-agent ``thorn-toolhost`` daemon; in
     Phase A they still run in-process but are tracked separately so
     that later wiring the daemon does not require touching the loop.
@@ -332,8 +332,8 @@ def build_split_router(
 
     Used by the gateway and CLI when a real daemon-backed executor is
     available.  The returned router still owns an
-    :class:`InProcessToolExecutor` for the in-process tools (``ask_user``
-    and the inbox tools) -- those need brain-side state and never go
+    :class:`InProcessToolExecutor` for the in-process tools (e.g. the
+    inbox tools) -- those need brain-side state and never go
     through the daemon.  The supplied *sandbox_executor* is *not*
     closed by :meth:`ExecutorRouter.aclose`'s normal dedup logic when
     it is shared across calls; callers manage its lifecycle directly.

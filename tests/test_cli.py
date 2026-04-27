@@ -109,7 +109,6 @@ class TestRunResultFile:
             cli_main,
             [
                 "run", "say hello",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--result-file", str(result_file),
                 "--quiet",
@@ -149,7 +148,6 @@ class TestRunResultFile:
             cli_main,
             [
                 "run", "do something",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--result-file", str(result_file),
                 "--quiet",
@@ -183,7 +181,6 @@ class TestRunResultFile:
             cli_main,
             [
                 "run", "hello",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--result-file", str(result_file),
                 "--trace", str(trace_file),
@@ -232,7 +229,6 @@ class TestRunResultFile:
             cli_main,
             [
                 "run", "hello",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--quiet",
             ],
@@ -277,7 +273,6 @@ class TestAgencyHomeResolution:
             cli_main,
             [
                 "run", "hello",
-                "--no-tools",
                 "--workspace", str(workspace_dir),
                 "--agency", str(agency_dir),
                 "--quiet",
@@ -329,7 +324,6 @@ class TestAgencyHomeResolution:
             cli_main,
             [
                 "run", "hello",
-                "--no-tools",
                 "--workspace", str(workspace_dir),
                 "--quiet",
             ],
@@ -387,7 +381,6 @@ class TestRunPipelineStructure:
             cli_main,
             [
                 "run", "hello",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--quiet",
             ],
@@ -520,7 +513,6 @@ class TestRunEventBusWiring:
             cli_main,
             [
                 "run", "hello",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--quiet",
             ],
@@ -594,7 +586,6 @@ class TestRunEventBusWiring:
             cli_main,
             [
                 "run", "hello",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--quiet",
             ],
@@ -635,7 +626,6 @@ class TestChat:
             cli_main,
             [
                 "chat",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--quiet",
             ],
@@ -668,7 +658,6 @@ class TestChat:
             cli_main,
             [
                 "chat",
-                "--no-tools",
                 "--workspace", str(tmp_path),
             ],
             input="hi there\n",
@@ -717,7 +706,6 @@ class TestChat:
             cli_main,
             [
                 "chat",
-                "--no-tools",
                 "--workspace", str(tmp_path),
             ],
             input="first question\nsecond question\n",
@@ -757,7 +745,6 @@ class TestChat:
                 cli_main,
                 [
                     "chat",
-                    "--no-tools",
                     "--workspace", str(tmp_path),
                 ],
                 input="hi\n",
@@ -808,7 +795,6 @@ class TestChat:
             cli_main,
             [
                 "chat",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--quiet",
             ],
@@ -869,7 +855,6 @@ class TestChat:
             cli_main,
             [
                 "chat",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--quiet",
             ],
@@ -909,7 +894,6 @@ class TestChat:
             cli_main,
             [
                 "chat",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--no-housekeeping",
                 "--quiet",
@@ -949,7 +933,6 @@ class TestChat:
             cli_main,
             [
                 "chat",
-                "--no-tools",
                 "--workspace", str(tmp_path),
                 "--quiet",
             ],
@@ -991,7 +974,6 @@ class TestChat:
             cli_main,
             [
                 "chat",
-                "--no-tools",
                 "--workspace", str(tmp_path),
             ],
             input="please fail\nplease succeed\n",

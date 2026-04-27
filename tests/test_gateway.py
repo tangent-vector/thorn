@@ -171,7 +171,7 @@ class TestGateway:
             content="Do something",
         )
 
-        gateway = Gateway(runtime=runtime, sources=[], tools=[])
+        gateway = Gateway(runtime=runtime, sources=[])
 
         async with runtime:
             agent = runtime.get_or_create_agent(AgentID("default"))
@@ -218,7 +218,7 @@ class TestGateway:
         )
         source = StubSource([event])
         runtime = self._make_runtime(tmp_path)
-        gateway = Gateway(runtime=runtime, sources=[source], tools=[])
+        gateway = Gateway(runtime=runtime, sources=[source])
 
         with patch.object(
             _SessionPromptAccessor, "__call__",
@@ -287,7 +287,7 @@ class TestGateway:
         )
         source = StubSource([event])
         runtime = self._make_runtime(tmp_path)
-        gateway = Gateway(runtime=runtime, sources=[source], tools=[])
+        gateway = Gateway(runtime=runtime, sources=[source])
 
         with patch.object(
             _SessionPromptAccessor, "__call__",
@@ -430,7 +430,7 @@ class TestGateway:
         source = StubSource([event_a, event_b])
 
         runtime = self._make_runtime(tmp_path)
-        gateway = Gateway(runtime=runtime, sources=[source], tools=[])
+        gateway = Gateway(runtime=runtime, sources=[source])
 
         from thorn.runtime._address import SessionAddress
         from thorn.runtime._dispatch import apply_handling_transition
@@ -625,7 +625,6 @@ class TestGatewayInboxIntegration:
         return Gateway(
             runtime=runtime,
             sources=sources,
-            tools=[],
             agent_concurrency=agent_concurrency,
             prompt_dispatcher=prompt_dispatcher,
             shutdown_timeout=(

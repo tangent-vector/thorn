@@ -882,28 +882,6 @@ async def run_shell(
     return output
 
 
-async def ask_user(question: str) -> str:
-    """Ask the human user a question and return their response.
-
-    Requires an ``AskUserHandler`` to be configured on the active
-    ``ExecutionContext``.  The CLI commands (``thorn run``,
-    ``thorn chat``) provide a rich-console handler automatically.
-    Raises ``RuntimeError`` if no handler is available.
-
-    Args:
-        question: The question to present to the user.
-    """
-    from thorn.core._context import get_context
-
-    ctx = get_context()
-    if ctx.ask_user_handler is None:
-        raise RuntimeError(
-            "ask_user is not available in this context. "
-            "No user-interaction handler has been configured."
-        )
-    return await ctx.ask_user_handler(question)
-
-
 # Register ToolCallNode subclasses on built-in tools so that
 # HistoryTree records typed nodes, enabling isinstance-based
 # identification (e.g. in context injection).
@@ -914,8 +892,7 @@ list_directory._thorn_call_node_class = DirectoryListCallNode  # type: ignore[at
 
 
 # Phase A venue classification.  Most file / shell tools run inside the
-# sandbox-venue daemon; ``ask_user`` stays in-process because it needs
-# the brain's ``AskUserHandler``.  See
+# sandbox-venue daemon.  See
 # docs/plans/sandbox_tool_execution_*.plan.md for the full rationale.
 from thorn.core._executor import ToolVenue as _ToolVenue
 
@@ -929,7 +906,6 @@ find_files._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
 search_files._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
 write_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
 run_shell._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
-ask_user._thorn_venue = _ToolVenue.IN_PROCESS  # type: ignore[attr-defined]
 
 
 ALL_BUILTIN_TOOLS = [
@@ -941,7 +917,6 @@ ALL_BUILTIN_TOOLS = [
     list_directory,
     find_files,
     search_files,
-    ask_user,
 ]
 
 # Pre-packaged toolsets for common capabilities.  These are plain lists

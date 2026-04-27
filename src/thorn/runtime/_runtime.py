@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from thorn.core._agent import Agent
 from thorn.core._context import (
-    AskUserHandler,
     EventSink,
     ExecutionContext,
     NullEventSink,
@@ -78,7 +77,6 @@ class Runtime:
         event_sink: EventSink | None = None,
         workspace_root: Path,
         global_ignores: FileAccessPolicy | None = None,
-        ask_user_handler: AskUserHandler | None = None,
         context_window: int | None = None,
         session_store: SessionStore | None = None,
         validation_tracker: ValidationTracker | None = None,
@@ -94,7 +92,6 @@ class Runtime:
         self.event_sink: EventSink = event_sink or NullEventSink()
         self.workspace_root = workspace_root
         self.global_ignores = global_ignores
-        self.ask_user_handler = ask_user_handler
         self.context_window = context_window
         self.status_providers: list[StatusProvider] = list(status_providers or [])
         if validation_tracker is not None:
@@ -209,7 +206,6 @@ class Runtime:
             event_sink=self.event_sink,
             workspace_root=self.workspace_root,
             global_ignores=self.global_ignores,
-            ask_user_handler=self.ask_user_handler,
             context_window=self.context_window,
             system_prompts=list(system_prompts or []),
             status_providers=self.status_providers,

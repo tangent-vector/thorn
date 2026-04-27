@@ -152,8 +152,7 @@ class TestSingleItem:
             "does not loop on it"
         )
 
-    async def test_forwards_extra_tools_and_system(self, tmp_path: Path):
-        sentinel_tools = [object(), object()]
+    async def test_forwards_extra_system(self, tmp_path: Path):
         sentinel_system = "you are a strict pirate"
 
         async def prompt_impl(text, **kwargs):
@@ -167,15 +166,14 @@ class TestSingleItem:
         future: asyncio.Future = loop.create_future()
         dispatcher = make_cli_prompt_dispatcher(
             result_future=future,
-            extra_tools=sentinel_tools,
             extra_system=sentinel_system,
         )
 
         await dispatcher(session, inbox)
 
         text, kwargs = session.prompt_calls[0]
-        assert kwargs["tools"] is sentinel_tools
         assert kwargs["system"] == sentinel_system
+        assert "tools" not in kwargs
 
 
 class TestErrors:

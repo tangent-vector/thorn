@@ -99,9 +99,13 @@ class ChatPromptRouter:
     *target* is the :class:`SessionAddress` notifications will be
     posted to; typically the address of the chat session's own inbox.
 
-    *extra_tools* and *extra_system* are forwarded to
-    ``session.prompt(...)`` on every turn, mirroring
+    *extra_system* is forwarded to ``session.prompt(system=...)`` on
+    every turn, mirroring
     :func:`~thorn.runtime._cli_dispatcher.make_cli_prompt_dispatcher`.
+    Tool registration is *not* a router concern -- the agent's role
+    declares its tool set via :meth:`Agent._collect_tools` and the
+    per-prompt context-gathering pipeline contributes any additional
+    MCP / skill tools.
 
     *source* is the notification ``source`` field, defaulting to
     ``"user"`` since the REPL turn is the human's input.  Exposed as
@@ -112,12 +116,10 @@ class ChatPromptRouter:
         self,
         *,
         target: "SessionAddress",
-        extra_tools: list[Any] | None = None,
         extra_system: str | None = None,
         source: str = "user",
     ) -> None:
         self._target = target
-        self._extra_tools = extra_tools
         self._extra_system = extra_system
         self._source = source
         # Producers (``turn``) append to the right; the dispatcher
@@ -207,7 +209,6 @@ class ChatPromptRouter:
         try:
             result = await session.prompt(
                 item.content,
-                tools=self._extra_tools,
                 system=self._extra_system,
             )
         except (SkillError, ThornError) as exc:

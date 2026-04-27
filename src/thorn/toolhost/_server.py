@@ -128,16 +128,16 @@ def build_default_registry() -> tuple[ToolRegistry, dict[str, _WrappedTool]]:
     """Build the static daemon tool registry plus its execute table.
 
     Loads every built-in tool that is *not* on the in-process
-    allow-list (``ask_user``, the inbox tools).  Returns the registry
-    used to schema-validate incoming requests and the parallel dict
-    of executable callables consumed by
+    allow-list (currently empty -- the inbox tools live elsewhere).
+    Returns the registry used to schema-validate incoming requests
+    and the parallel dict of executable callables consumed by
     :class:`InProcessToolExecutor`.
     """
     from thorn.core._func import wrap_function
     from thorn.core._journal import JOURNAL_TOOLS
     from thorn.core._tools import ALL_BUILTIN_TOOLS, run_shell
 
-    in_process_allowlist = {"ask_user"}
+    in_process_allowlist: set[str] = set()
 
     callables: list[Callable[..., Any]] = []
     for fn in ALL_BUILTIN_TOOLS:

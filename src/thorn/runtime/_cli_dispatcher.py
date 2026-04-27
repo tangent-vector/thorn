@@ -55,7 +55,6 @@ log = logging.getLogger(__name__)
 def make_cli_prompt_dispatcher(
     *,
     result_future: "asyncio.Future[Any]",
-    extra_tools: list[Any] | None = None,
     extra_system: str | None = None,
 ) -> PromptDispatcher:
     """Build a :data:`PromptDispatcher` that reports its result via *result_future*.
@@ -65,10 +64,14 @@ def make_cli_prompt_dispatcher(
     text result returned synchronously.  *result_future* must be a
     fresh future the caller will ``await`` exactly once.
 
-    *extra_tools* and *extra_system* are forwarded to
-    ``session.prompt(tools=..., system=...)`` on every invocation, so
-    a long-lived dispatcher (multi-turn chat in Phase 4) can carry a
-    fixed tool set and system prompt for the whole REPL.
+    *extra_system* is forwarded to ``session.prompt(system=...)`` on
+    every invocation, so the caller can carry a fixed
+    invocation-mode steering prompt (e.g. "you are executing a
+    single non-interactive request") for the dispatcher's lifetime.
+    Tool registration is *not* a dispatcher concern -- the agent's
+    role declares its tool set via :meth:`Agent._collect_tools` and
+    the per-prompt context-gathering pipeline contributes any
+    additional MCP / skill tools.
 
     Behaviour per invocation:
 
@@ -76,8 +79,8 @@ def make_cli_prompt_dispatcher(
       :func:`~thorn.runtime._prompt_format.inbox_prompt_dispatcher`
       no-op convention so the scheduler can re-poll without surprise.
     - Otherwise takes the oldest pending item, calls
-      ``await session.prompt(item.content, tools=..., system=...)``,
-      and removes the item from the inbox so the driver's
+      ``await session.prompt(item.content, system=...)``, and
+      removes the item from the inbox so the driver's
       ``_run_one_round`` accounting records the round as making
       progress (``closed_out`` includes the item's id).
     - Resolves *result_future* with the prompt's return value, or
@@ -102,7 +105,6 @@ def make_cli_prompt_dispatcher(
         try:
             result = await session.prompt(
                 item.content,
-                tools=extra_tools,
                 system=extra_system,
             )
         except BaseException as exc:

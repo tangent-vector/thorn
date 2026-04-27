@@ -1788,14 +1788,6 @@ class TestRuntime:
         assert ctx.workspace_root == tmp_path
         assert "Extra prompt." in ctx.system_prompts
 
-    def test_create_context_inherits_ask_user_handler(self, tmp_path: Path):
-        async def handler(q: str) -> str:
-            return "answer"
-
-        rt = self._make_runtime(tmp_path, ask_user_handler=handler)
-        ctx = rt.create_context()
-        assert ctx.ask_user_handler is handler
-
     def test_create_agent_with_auto_id(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
         agent = rt.create_agent()

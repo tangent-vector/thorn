@@ -364,11 +364,6 @@ class TestProtocolViolations:
 
 
 class TestDefaultRegistry:
-    def test_registry_excludes_in_process_allowlist(self):
-        registry, table = build_default_registry()
-        assert "ask_user" not in registry
-        assert "ask_user" not in table
-
     def test_registry_includes_core_file_tools(self):
         registry, _table = build_default_registry()
         for name in ["read_file", "edit_file", "list_directory", "run_shell"]:

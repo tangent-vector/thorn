@@ -532,21 +532,6 @@ class ConsoleEventSink(EventSink):
 
 
 # ---------------------------------------------------------------------------
-# User-interaction callback
-# ---------------------------------------------------------------------------
-
-class AskUserHandler(Protocol):
-    """Async callback for the ``ask_user`` tool.
-
-    Implementations receive the agent's question and return the human's
-    answer.  The CLI commands supply a ``rich``-based console handler;
-    library users can provide their own.
-    """
-
-    async def __call__(self, question: str) -> str: ...
-
-
-# ---------------------------------------------------------------------------
 # Usage tracking
 # ---------------------------------------------------------------------------
 
@@ -622,7 +607,6 @@ class ExecutionContext:
     file_access_policy: FileAccessPolicy | None = None
     global_ignores: FileAccessPolicy | None = None
     usage: UsageTracker = field(default_factory=UsageTracker)
-    ask_user_handler: AskUserHandler | None = None
     context_window: int | None = None
     status_providers: list[StatusProvider] = field(default_factory=list)
     agency_root_directory: Path | None = None
@@ -636,7 +620,7 @@ class ExecutionContext:
     When set, the loop builds a split router whose ``SANDBOX`` venue
     dispatches through this executor (typically a per-agent
     :class:`~thorn.toolhost.DaemonToolExecutor`) while ``IN_PROCESS``
-    tools (``ask_user``, the inbox tools) still execute inline.
+    tools (e.g. the inbox tools) still execute inline.
     """
 
     def add_status_provider(self, provider: StatusProvider) -> None:
@@ -702,7 +686,6 @@ class ExecutionContext:
             file_access_policy=resolved_policy,
             global_ignores=self.global_ignores,
             usage=self.usage,
-            ask_user_handler=self.ask_user_handler,
             context_window=self.context_window,
             status_providers=self.status_providers,
             agency_root_directory=self.agency_root_directory,

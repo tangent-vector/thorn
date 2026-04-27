@@ -98,11 +98,6 @@ class Gateway:
             shares its :class:`InFlightIndex` with every queue it
             creates.
         sources: Event sources to poll / listen on.
-        tools: Tools passed to ``session.prompt(..., tools=...)``
-            for every event.  Retained for backward compatibility with
-            callers that wired tools through the gateway; the scheduler
-            now delegates prompt construction to the injected
-            :data:`~thorn.runtime.PromptDispatcher`.
         agent_concurrency: Per-agent concurrency cap for the
             :class:`~thorn.runtime.AgentScheduler` of each agent.
             Defaults to :data:`~thorn.runtime.DEFAULT_AGENT_CONCURRENCY`.
@@ -133,7 +128,6 @@ class Gateway:
         *,
         runtime: Runtime,
         sources: list[EventSource],
-        tools: list[Any] | None = None,
         agent_concurrency: int = DEFAULT_AGENT_CONCURRENCY,
         prompt_dispatcher: PromptDispatcher | None = None,
         shutdown_timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
@@ -141,7 +135,6 @@ class Gateway:
     ) -> None:
         self._runtime = runtime
         self._sources = sources
-        self._tools = list(tools or [])
         self._agent_concurrency = agent_concurrency
         self._prompt_dispatcher: PromptDispatcher = (
             prompt_dispatcher or inbox_prompt_dispatcher

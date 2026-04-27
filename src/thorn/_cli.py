@@ -13,6 +13,7 @@ from typing import Any
 import click
 from rich.console import Console
 
+from thorn.agents import LocalCodingAgent
 from thorn.core._context import (
     ConsoleEventSink,
     EventSink,
@@ -20,23 +21,10 @@ from thorn.core._context import (
     Verbosity,
 )
 from thorn.core._event_bus import EventBus, in_session
-from thorn.core._func import _prepare_tools, prompt
-from thorn.core._loop import run_agent_loop, _WrappedTool
+from thorn.core._func import _prepare_tools
 from thorn.core._provider import load_provider_from_env
 from thorn.core._session import Session
-from thorn.core._tools import ALL_BUILTIN_TOOLS, FILE_WRITING, run_shell
-from thorn.tools.git import GIT_TOOLS
-
-CLI_DEFAULT_TOOLS: list[object] = [
-    FILE_WRITING,
-    run_shell,
-    GIT_TOOLS,
-]
-"""Default tool set for ``thorn run`` / ``thorn chat`` CLI commands.
-
-Includes file operations (read + write), shell access, and git tools.
-The ``ask_user`` tool is added separately depending on interactivity.
-"""
+from thorn.core._tools import ALL_BUILTIN_TOOLS
 from thorn.core.errors import SkillError, ThornError
 from thorn.runtime import (
     AgentID,
@@ -107,34 +95,19 @@ CHAT_SYSTEM_PROMPT = (
 of the conversation and that asking back is welcome."""
 
 
-def _ensure_cli_agent(runtime: Runtime) -> "Agent":
+def _ensure_cli_agent(runtime: Runtime) -> LocalCodingAgent:
     """Get or create the CLI local agent, persisting identity to disk.
 
-    Returns the agent instance.  On first use, creates the agent
-    directory and identity file under ``.thorn/``.
+    The agent is constructed as a :class:`LocalCodingAgent` so that
+    its standard tool kit (file I/O, shell, git) flows through the
+    ordinary :meth:`Agent._collect_tools` MRO walk -- the dispatcher
+    no longer needs to smuggle tools in via ``extra_tools``.
     """
-    from thorn.core._agent import Agent
-
-    agent = runtime.get_or_create_agent(CLI_AGENT_ID, name="local")
+    agent = runtime.get_or_create_agent(
+        CLI_AGENT_ID, LocalCodingAgent, name="local",
+    )
     runtime.save_agent(agent)
     return agent
-
-
-async def _rich_ask_user(question: str) -> str:
-    """Prompt the user via the rich console, suitable for interactive CLI use.
-
-    Refuses to block on a non-TTY stdin (e.g. piped input) where
-    ``console.input()`` would read EOF or garbage.
-    """
-    if not sys.stdin.isatty():
-        raise RuntimeError(
-            "ask_user is not available: stdin is not a TTY. "
-            "Cannot prompt for user input in a non-interactive context."
-        )
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, lambda: console.input(f"\n[yellow]? {question}[/yellow]\n> "),
-    )
 
 
 def _resolve_verbosity(verbose: int, quiet: bool) -> Verbosity:
@@ -177,7 +150,6 @@ def _build_runtime(
     trace_file: Any | None = None,
     workspace: str | None = None,
     *,
-    interactive: bool = True,
     paths: "AgencyPaths | None" = None,
     sandbox_executor_enabled: bool = False,
     sandbox_config: "SandboxConfig | None" = None,
@@ -230,7 +202,6 @@ def _build_runtime(
         event_sink=bus,
         workspace_root=ws_root,
         global_ignores=load_global_ignores(ws_root),
-        ask_user_handler=_rich_ask_user if interactive else None,
         paths=paths,
         sandbox_executor_enabled=sandbox_executor_enabled,
         sandbox_config=sandbox_config,
@@ -253,34 +224,6 @@ def _runtime_event_bus(runtime: Runtime) -> EventBus:
             f"got {type(sink).__name__}"
         )
     return sink
-
-
-def _collect_cli_tools(
-    *,
-    no_tools: bool,
-    interactive: bool = True,
-) -> list[_WrappedTool]:
-    """Return the per-CLI-invocation static tool list (builtins +
-    optional ``ask_user``).
-
-    Everything that varies with workspace context -- MCP servers,
-    discovered ``.agents/thorn/`` Python tools, skills -- now flows
-    through the unified context-gathering pipeline that runs inside
-    ``_run_session_prompt`` for every prompt round.  The CLI's job is
-    only to seed the dispatcher with the static "always present"
-    tools that every CLI session expects regardless of where it is
-    being run.
-    """
-    from thorn.core._tools import ask_user
-
-    raw: list[Any] = []
-
-    if not no_tools:
-        raw.extend(CLI_DEFAULT_TOOLS)
-        if interactive:
-            raw.append(ask_user)
-
-    return _prepare_tools(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -333,12 +276,6 @@ def _write_result_file(
 
 @main.command()
 @click.argument("prompt_text")
-@click.option(
-    "--no-tools",
-    is_flag=True,
-    default=False,
-    help="Disable built-in tools (file I/O, etc.).",
-)
 @click.option("-v", "--verbose", count=True, help="Increase output detail (-v, -vv).")
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
@@ -354,7 +291,7 @@ def _write_result_file(
     ),
 )
 @click.option("--result-file", "result_file_path", type=click.Path(), default=None, help="Write a JSON result summary (outcome, duration, token usage).")
-def run(prompt_text: str, no_tools: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, result_file_path: str | None) -> None:
+def run(prompt_text: str, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, result_file_path: str | None) -> None:
     """Execute a single prompt and print the result."""
     from thorn import infer_workspace_root
     from thorn.runtime._paths import AgencyPaths
@@ -401,10 +338,6 @@ def run(prompt_text: str, no_tools: bool, verbose: int, quiet: bool, trace_path:
         async with runtime:
             ctx_holder.append(runtime.context)
             agent = _ensure_cli_agent(runtime)
-            tools = _collect_cli_tools(
-                no_tools=no_tools,
-                interactive=False,
-            )
 
             # Phase 5: every CLI invocation gets a fresh session
             # under a unique key (``cli/<workspace-basename>/<uuid>``).
@@ -473,7 +406,6 @@ def run(prompt_text: str, no_tools: bool, verbose: int, quiet: bool, trace_path:
                 result_future: asyncio.Future[str] = loop.create_future()
                 dispatcher = make_cli_prompt_dispatcher(
                     result_future=result_future,
-                    extra_tools=tools,
                     extra_system=(
                         "You are executing a single non-interactive "
                         "request. Complete the task and report results "
@@ -593,12 +525,6 @@ async def _chat_loop(
 
 
 @main.command()
-@click.option(
-    "--no-tools",
-    is_flag=True,
-    default=False,
-    help="Disable built-in tools.",
-)
 @click.option("-v", "--verbose", count=True, help="Increase output detail (-v, -vv).")
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
@@ -623,7 +549,7 @@ async def _chat_loop(
         "remembering from this session)."
     ),
 )
-def chat(no_tools: bool, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, no_housekeeping: bool) -> None:
+def chat(verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, no_housekeeping: bool) -> None:
     """Start an interactive chat session."""
     from thorn import infer_workspace_root
     from thorn.runtime._paths import AgencyPaths
@@ -702,11 +628,6 @@ def chat(no_tools: bool, verbose: int, quiet: bool, trace_path: str | None, work
                 console_listener,
                 scope_filter=in_session(session_key),
             ):
-                tools = _collect_cli_tools(
-                    no_tools=no_tools,
-                    interactive=True,
-                )
-
                 # Per-session inbox + scheduler wiring.  The
                 # inbox lives under the agent's data root so a
                 # crash leaves the in-flight notification on
@@ -729,7 +650,6 @@ def chat(no_tools: bool, verbose: int, quiet: bool, trace_path: str | None, work
 
                 router = ChatPromptRouter(
                     target=session_address,
-                    extra_tools=tools,
                     extra_system=CHAT_SYSTEM_PROMPT,
                 )
 
@@ -995,7 +915,7 @@ def _serve_gateway(
     try:
         runtime = _build_runtime(
             trace_file=trace_file, workspace=str(ws_root),
-            interactive=False, paths=paths,
+            paths=paths,
             sandbox_executor_enabled=True,
             sandbox_config=gateway_config.sandbox,
         )
@@ -1150,18 +1070,11 @@ def serve_bootstrap(
 )
 @click.option("--host", default="0.0.0.0", help="Bind host (HTTP transport).")
 @click.option("--port", default=8080, type=int, help="Bind port (HTTP transport).")
-@click.option(
-    "--no-tools",
-    is_flag=True,
-    default=False,
-    help="Disable built-in tools.",
-)
 @click.option("--name", default="thorn", help="Server name reported to MCP clients.")
 def serve_mcp(
     transport: str,
     host: str,
     port: int,
-    no_tools: bool,
     name: str,
 ) -> None:
     """Start an MCP server exposing thorn tools and skills."""
@@ -1174,11 +1087,7 @@ def serve_mcp(
         )
         sys.exit(1)
 
-    raw: list[Any] = []
-    if not no_tools:
-        raw.extend(ALL_BUILTIN_TOOLS)
-
-    tools = _prepare_tools(raw)
+    tools = _prepare_tools(list(ALL_BUILTIN_TOOLS))
     if not tools:
         console.print("[yellow]Warning:[/yellow] no tools to serve.")
 

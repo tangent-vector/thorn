@@ -3,8 +3,8 @@
 Locks in two contracts:
 
 * Built-in tools carry a ``_thorn_venue`` attribute that drives where
-  the brain dispatches them; ``ask_user`` and the inbox tools stay
-  in-process, everything else flips to ``SANDBOX``.
+  the brain dispatches them; the inbox tools stay in-process,
+  everything else flips to ``SANDBOX``.
 * :func:`_prepare_tools` rejects bare callables that aren't on the
   known-built-in list, while still accepting them when wrapped via
   :func:`wrap_function` (the explicit opt-in route).
@@ -19,7 +19,6 @@ from thorn.core._func import _prepare_tools, wrap_function
 from thorn.core._journal import read_journal, write_journal
 from thorn.core._tools import (
     ALL_BUILTIN_TOOLS,
-    ask_user,
     create_file,
     delete_file,
     edit_file,
@@ -55,7 +54,6 @@ SANDBOX_TOOLS = [
 
 
 IN_PROCESS_TOOLS = [
-    ask_user,
     list_inbox_items,
     read_inbox_item,
     update_inbox_item,

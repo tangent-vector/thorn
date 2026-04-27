@@ -14,7 +14,7 @@ Tests fall into three buckets:
 
 - **Plumbing** (``TestDispatcherPlumbing``, ``TestTurnFlow``):
   the dispatcher wakes up correctly on a posted turn, forwards
-  ``extra_tools`` / ``extra_system``, deletes the item, and resolves
+  ``extra_system``, deletes the item, and resolves
   the matching future.
 - **Error policy** (``TestErrorRouting``): recoverable Thorn
   exceptions are caught so the scheduler still saves the session;
@@ -108,8 +108,8 @@ class TestDispatcherPlumbing:
     """Calls into ``router.dispatcher`` directly (no scheduler).
 
     Verifies the dispatcher's local contract -- empty-inbox no-op,
-    extra_tools/extra_system propagation, item deletion -- without
-    the additional moving parts a real scheduler brings.
+    extra_system propagation, item deletion -- without the additional
+    moving parts a real scheduler brings.
     """
 
     async def test_empty_inbox_returns_without_calling_prompt(
@@ -127,8 +127,7 @@ class TestDispatcherPlumbing:
         assert session.prompt_calls == []
         assert router.pending_count == 0
 
-    async def test_forwards_extra_tools_and_system(self, tmp_path: Path):
-        sentinel_tools = [object(), object()]
+    async def test_forwards_extra_system(self, tmp_path: Path):
         sentinel_system = "you are a helpful assistant"
 
         async def prompt_impl(text, **kwargs):
@@ -138,7 +137,6 @@ class TestDispatcherPlumbing:
         inbox, address = _make_inbox(tmp_path)
         router = ChatPromptRouter(
             target=address,
-            extra_tools=sentinel_tools,
             extra_system=sentinel_system,
         )
 
@@ -151,8 +149,8 @@ class TestDispatcherPlumbing:
         await router.dispatcher(session, inbox)
 
         text, kwargs = session.prompt_calls[0]
-        assert kwargs["tools"] is sentinel_tools
         assert kwargs["system"] == sentinel_system
+        assert "tools" not in kwargs
         assert fut.result() == "ok"
 
     async def test_deletes_item_after_success(self, tmp_path: Path):

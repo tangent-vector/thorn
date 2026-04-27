@@ -12,7 +12,6 @@ for backward compatibility, so ``from thorn import Agent`` and
 from __future__ import annotations
 
 from thorn.core._context import (
-    AskUserHandler,
     ConsoleEventSink,
     EventSink,
     ExecutionContext,
@@ -79,7 +78,6 @@ from thorn.core._tools import (
     FILE_READING,
     FILE_WRITING,
     FileEdit,
-    ask_user,
     create_file,
     delete_file,
     edit_file,
@@ -119,7 +117,6 @@ __all__ = [
     "Agent",
     "Session",
     # Context
-    "AskUserHandler",
     "ConsoleEventSink",
     "EventSink",
     "ExecutionContext",
@@ -203,7 +200,6 @@ __all__ = [
     "FILE_READING",
     "FILE_WRITING",
     "FileEdit",
-    "ask_user",
     "create_file",
     "delete_file",
     "edit_file",

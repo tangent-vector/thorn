@@ -140,13 +140,6 @@ async def run_agent_loop(
     """
     structured = result_type is not None and result_type is not str
 
-    # -- filter out ask_user when no handler is available ------------------
-    if context.ask_user_handler is None:
-        tools = [
-            t for t in tools
-            if _tool_name(t.schema) != "ask_user"
-        ]
-
     # -- build schemas and registry ----------------------------------------
     all_tools = list(tools)
     registry = build_registry_from_wrapped_tools(all_tools)
@@ -464,10 +457,6 @@ async def _request_completion(
 # ---------------------------------------------------------------------------
 # Tool dispatch
 # ---------------------------------------------------------------------------
-
-def _tool_name(schema: dict[str, Any]) -> str:
-    return schema.get("function", {}).get("name", "")
-
 
 def _normalize_tool_name(name: str) -> str:
     """Forgive minor naming mismatches (hyphens vs underscores, casing)."""
