@@ -1,9 +1,16 @@
-"""Tests for thorn.core._mcp (MCP integration)."""
+"""Tests for thorn.core._mcp (MCP integration).
+
+Per-directory MCP discovery (``mcp.json`` walking, dedup, env
+expansion) lives in the unified context-gathering pipeline -- see
+``tests/test_context_layers.py`` and ``tests/test_prompt_assembly.py``
+for that coverage.  This module focuses on the bits of ``_mcp`` that
+remain after the refactor: ``MCPServerConfig`` validation, schema
+conversion helpers, and the ``MCPToolSource`` / ``serve_tools``
+client/server seams.
+"""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,7 +21,6 @@ from thorn.core._mcp import (
     _mcp_result_to_string,
     _mcp_tool_to_openai_schema,
     _openai_schema_to_mcp_tool,
-    load_mcp_configs,
 )
 
 
@@ -36,103 +42,6 @@ class TestMCPServerConfig:
     def test_requires_command_or_url(self):
         with pytest.raises(ValueError, match="must specify either"):
             MCPServerConfig(name="bad")
-
-
-# ---------------------------------------------------------------------------
-# load_mcp_configs
-# ---------------------------------------------------------------------------
-
-class TestLoadMcpConfigs:
-    def test_loads_stdio_config(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
-        (thorn_dir / "mcp.json").write_text(json.dumps({
-            "mcpServers": {
-                "github": {
-                    "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-github"],
-                    "env": {"GITHUB_TOKEN": "tok_123"},
-                }
-            }
-        }))
-
-        configs = load_mcp_configs([thorn_dir])
-        assert len(configs) == 1
-        assert configs[0].name == "github"
-        assert configs[0].command == "npx"
-        assert configs[0].args == ["-y", "@modelcontextprotocol/server-github"]
-        assert configs[0].env == {"GITHUB_TOKEN": "tok_123"}
-
-    def test_loads_http_config(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
-        (thorn_dir / "mcp.json").write_text(json.dumps({
-            "mcpServers": {
-                "remote": {"url": "http://localhost:9090/mcp"}
-            }
-        }))
-
-        configs = load_mcp_configs([thorn_dir])
-        assert len(configs) == 1
-        assert configs[0].name == "remote"
-        assert configs[0].url == "http://localhost:9090/mcp"
-
-    def test_multiple_servers(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
-        (thorn_dir / "mcp.json").write_text(json.dumps({
-            "mcpServers": {
-                "a": {"command": "a-cmd"},
-                "b": {"url": "http://b"},
-            }
-        }))
-
-        configs = load_mcp_configs([thorn_dir])
-        assert len(configs) == 2
-        names = {c.name for c in configs}
-        assert names == {"a", "b"}
-
-    def test_deduplicates_across_dirs(self, tmp_path: Path):
-        d1 = tmp_path / "d1"
-        d1.mkdir()
-        d2 = tmp_path / "d2"
-        d2.mkdir()
-
-        for d in [d1, d2]:
-            (d / "mcp.json").write_text(json.dumps({
-                "mcpServers": {"dup": {"command": "test"}}
-            }))
-
-        configs = load_mcp_configs([d1, d2])
-        assert len(configs) == 1
-
-    def test_no_mcp_json(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
-        configs = load_mcp_configs([thorn_dir])
-        assert configs == []
-
-    def test_invalid_json(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
-        (thorn_dir / "mcp.json").write_text("NOT JSON {{{")
-
-        configs = load_mcp_configs([thorn_dir])
-        assert configs == []
-
-    def test_invalid_server_entry(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
-        (thorn_dir / "mcp.json").write_text(json.dumps({
-            "mcpServers": {
-                "bad": {},
-                "good": {"command": "ok"},
-            }
-        }))
-
-        configs = load_mcp_configs([thorn_dir])
-        assert len(configs) == 1
-        assert configs[0].name == "good"
 
 
 # ---------------------------------------------------------------------------

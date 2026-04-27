@@ -108,7 +108,7 @@ from thorn.core._event_bus import (
 )
 
 try:
-    from thorn.core._mcp import MCPServerConfig, MCPToolSource, load_mcp_configs, serve_tools
+    from thorn.core._mcp import MCPServerConfig, MCPToolSource, serve_tools
 except ImportError:
     pass
 

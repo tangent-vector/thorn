@@ -114,7 +114,7 @@ from thorn import tools
 from thorn.runtime import AgentID, Runtime, SessionKey
 
 try:
-    from thorn.core import MCPServerConfig, MCPToolSource, load_mcp_configs, serve_tools
+    from thorn.core import MCPServerConfig, MCPToolSource, serve_tools
 except ImportError:
     pass
 
@@ -234,7 +234,6 @@ __all__ = [
     # MCP (available when thorn[mcp] is installed)
     "MCPServerConfig",
     "MCPToolSource",
-    "load_mcp_configs",
     "serve_tools",
 ]
 

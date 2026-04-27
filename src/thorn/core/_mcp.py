@@ -4,7 +4,10 @@ Client side
 -----------
 ``MCPToolSource`` connects to one or more MCP servers (stdio or HTTP),
 discovers their tools, and wraps each one as a ``_WrappedTool`` that
-the agent loop can dispatch like any other tool.
+the agent loop can dispatch like any other tool.  Configurations are
+sourced from the unified context-gathering pipeline; see
+:func:`thorn.runtime._context_layers.collect_mcp_configs_for_directory`
+and :class:`~thorn.runtime._prompt_assembly.AssembledPromptContext`.
 
 Server side
 -----------
@@ -14,11 +17,9 @@ discovery or manual wrapping) and exposes them as an MCP server.
 
 from __future__ import annotations
 
-import json
 import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from thorn.core._loop import _WrappedTool
@@ -62,67 +63,6 @@ class MCPServerConfig:
                 f"MCPServerConfig {self.name!r}: "
                 "must specify either 'command' (stdio) or 'url' (HTTP)"
             )
-
-
-def load_mcp_configs(thorn_dirs: list[Path]) -> list[MCPServerConfig]:
-    """Load MCP server definitions from ``mcp.json`` files in *.thorn/* dirs.
-
-    The file format follows the convention used by Claude Desktop and
-    Cursor::
-
-        {
-          "mcpServers": {
-            "github": {
-              "command": "npx",
-              "args": ["-y", "@modelcontextprotocol/server-github"],
-              "env": {"GITHUB_TOKEN": "..."}
-            },
-            "remote": {
-              "url": "http://localhost:8080/mcp"
-            }
-          }
-        }
-    """
-    configs: list[MCPServerConfig] = []
-    seen_names: set[str] = set()
-
-    for thorn_dir in thorn_dirs:
-        cfg_path = thorn_dir / "mcp.json"
-        if not cfg_path.is_file():
-            continue
-
-        try:
-            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
-        except Exception:
-            logger.warning("failed to parse %s", cfg_path, exc_info=True)
-            continue
-
-        servers = raw.get("mcpServers", {})
-        if not isinstance(servers, dict):
-            logger.warning("'mcpServers' in %s is not a mapping", cfg_path)
-            continue
-
-        for name, spec in servers.items():
-            if name in seen_names:
-                logger.debug("skipping duplicate MCP server %r from %s", name, cfg_path)
-                continue
-            seen_names.add(name)
-
-            try:
-                configs.append(MCPServerConfig(
-                    name=name,
-                    command=spec.get("command"),
-                    args=spec.get("args", []),
-                    env=spec.get("env"),
-                    url=spec.get("url"),
-                ))
-            except (ValueError, TypeError) as exc:
-                logger.warning(
-                    "invalid MCP server config %r in %s: %s",
-                    name, cfg_path, exc,
-                )
-
-    return configs
 
 
 # ---------------------------------------------------------------------------
