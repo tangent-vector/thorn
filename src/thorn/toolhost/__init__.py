@@ -20,19 +20,24 @@ from thorn.toolhost._executor import (
     DaemonExecutorConfig,
     DaemonToolExecutor,
     DaemonUnavailableError,
+    MCPServerUnavailableError,
 )
+from thorn.toolhost._mcp_host import MCPHost, MCPUnavailableError
 from thorn.toolhost._host import (
     DaemonHost,
     SubprocessDaemonHost,
     SubprocessDaemonHostConfig,
 )
 from thorn.toolhost._protocol import (
+    MCP_FEATURE,
     PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
     Frame,
     FrameKind,
     Heartbeat,
     Hello,
+    ListMCPServerToolsRequest,
+    ListMCPServerToolsResponse,
     ProtocolError,
     ToolCallCancel,
     ToolCallChunk,
@@ -46,6 +51,7 @@ from thorn.toolhost._protocol import (
 )
 
 __all__ = [
+    "MCP_FEATURE",
     "PROTOCOL_MAJOR",
     "PROTOCOL_MINOR",
     "DaemonCrashedError",
@@ -54,11 +60,16 @@ __all__ = [
     "DaemonToolExecutor",
     "DaemonUnavailableError",
     "Frame",
+    "MCPHost",
+    "MCPServerUnavailableError",
+    "MCPUnavailableError",
     "SubprocessDaemonHost",
     "SubprocessDaemonHostConfig",
     "FrameKind",
     "Heartbeat",
     "Hello",
+    "ListMCPServerToolsRequest",
+    "ListMCPServerToolsResponse",
     "ProtocolError",
     "ToolCallCancel",
     "ToolCallChunk",

@@ -41,12 +41,16 @@ from thorn.core._executor import (
     ToolVenue,
 )
 from thorn.core._loop import _WrappedTool
+from thorn.toolhost._mcp_host import MCPHost, MCPUnavailableError
 from thorn.toolhost._protocol import (
+    MCP_FEATURE,
     PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
     Frame,
     Heartbeat,
     Hello,
+    ListMCPServerToolsRequest,
+    ListMCPServerToolsResponse,
     ProtocolError,
     ToolCallCancel,
     ToolCallError,
@@ -201,6 +205,8 @@ class ToolhostServer:
         config: ToolhostConfig,
         registry: ToolRegistry | None = None,
         executor: InProcessToolExecutor | None = None,
+        *,
+        mcp_host: MCPHost | None = None,
     ) -> None:
         if registry is None or executor is None:
             built_registry, table = build_default_registry()
@@ -219,6 +225,14 @@ class ToolhostServer:
         )
         self._provider = _NullProvider()
         self._connection_count = 0
+        # MCPHost is cheap to construct and probes the ``mcp`` package
+        # at __init__ time so the handshake feature-flag decision is
+        # synchronous.  Tests pass an explicit instance to inject a
+        # mock; production constructs the default.
+        self._mcp_host = mcp_host or MCPHost()
+        # Strong refs for fire-and-forget tasks (e.g. MCP-list
+        # responses) that have no cancellation channel of their own.
+        self._background_tasks: set[asyncio.Task] = set()
 
     @property
     def config(self) -> ToolhostConfig:
@@ -227,6 +241,11 @@ class ToolhostServer:
     @property
     def registry(self) -> ToolRegistry:
         return self._registry
+
+    @property
+    def mcp_host(self) -> MCPHost:
+        """The :class:`MCPHost` owned by this server."""
+        return self._mcp_host
 
     async def serve_forever(self) -> None:
         """Bind the socket, handle one connection, then return."""
@@ -304,6 +323,14 @@ class ToolhostServer:
                 with suppress(asyncio.CancelledError, Exception):
                     await task
             connection.in_flight.clear()
+            for task in list(self._background_tasks):
+                task.cancel()
+            for task in list(self._background_tasks):
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+            self._background_tasks.clear()
+            with suppress(Exception):
+                await self._mcp_host.aclose()
             with suppress(Exception):
                 writer.close()
             with suppress(Exception):
@@ -341,13 +368,22 @@ class ToolhostServer:
                 PROTOCOL_MINOR,
             )
 
+        features = list(self._config.features)
+        # Advertise "mcp" only when the daemon can actually serve MCP
+        # traffic.  Brains use the absence of this flag as the signal
+        # to error out on any attempt to use ``ListMCPServerTools`` or
+        # MCP-routed tool calls; that produces a clear "rebuild the
+        # sandbox image with [mcp] installed" message instead of a
+        # cryptic protocol error mid-call.
+        if self._mcp_host.mcp_available and MCP_FEATURE not in features:
+            features.append(MCP_FEATURE)
         await self._send(
             connection,
             Hello(
                 protocol_major=PROTOCOL_MAJOR,
                 protocol_minor=PROTOCOL_MINOR,
                 thorn_version=self._config.thorn_version,
-                features=list(self._config.features),
+                features=features,
                 per_agent_state={
                     "agent_id": self._config.agent_id,
                     "home": str(self._config.home_path) if self._config.home_path else None,
@@ -381,6 +417,8 @@ class ToolhostServer:
 
             if isinstance(frame, ToolCallRequest):
                 self._spawn_request(connection, frame)
+            elif isinstance(frame, ListMCPServerToolsRequest):
+                self._spawn_list_mcp_tools(connection, frame)
             elif isinstance(frame, ToolCallCancel):
                 self._handle_cancel(connection, frame)
             elif isinstance(frame, Heartbeat):
@@ -454,6 +492,9 @@ class ToolhostServer:
 
     async def _dispatch(self, request: ToolCallRequest) -> ToolCallResponse:
         """Look up *request* in the registry and run it via the executor."""
+        if request.mcp_server_config is not None:
+            return await self._dispatch_mcp_call(request)
+
         entry = self._registry.get(request.tool_name)
         if entry is None:
             return ToolCallResponse(
@@ -514,6 +555,123 @@ class ToolhostServer:
         return ToolCallResponse(
             call_id=request.call_id,
             result=result.content,
+        )
+
+    async def _dispatch_mcp_call(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        """Route an MCP-flavored tool call through :class:`MCPHost`.
+
+        The tool name is the MCP server's own tool name (the brain has
+        already stripped any ``__`` collision prefix it added during
+        name resolution).  Any failure -- the ``mcp`` package missing,
+        the server failing to start, the tool raising -- is returned
+        as a structured :class:`ToolCallResponse` rather than letting
+        the connection loop see the raw exception.
+        """
+        assert request.mcp_server_config is not None  # guard at caller
+        try:
+            text = await self._mcp_host.call_tool(
+                request.mcp_server_config,
+                request.tool_name,
+                dict(request.arguments),
+            )
+        except asyncio.CancelledError:
+            logger.info(
+                "toolhost: mcp call %r cancelled mid-flight",
+                request.call_id,
+            )
+            return ToolCallResponse(
+                call_id=request.call_id,
+                error=ToolCallError(
+                    kind="cancelled",
+                    message="tool call was cancelled",
+                ),
+            )
+        except MCPUnavailableError as exc:
+            return ToolCallResponse(
+                call_id=request.call_id,
+                error=ToolCallError(kind="mcp_unavailable", message=str(exc)),
+            )
+        except Exception as exc:
+            logger.exception(
+                "toolhost: mcp call %r on server %r raised",
+                request.tool_name,
+                request.mcp_server_config.name,
+            )
+            message = (
+                f"MCP error: {exc!r}" if self._config.debug else f"MCP error: {exc}"
+            )
+            return ToolCallResponse(
+                call_id=request.call_id,
+                error=ToolCallError(kind="mcp_error", message=message),
+            )
+        return ToolCallResponse(call_id=request.call_id, result=text)
+
+    def _spawn_list_mcp_tools(
+        self,
+        connection: _Connection,
+        request: ListMCPServerToolsRequest,
+    ) -> None:
+        """Launch a per-request task to fulfill a tool-list inquiry.
+
+        The connection's ``in_flight`` map is keyed by tool-call IDs
+        and is intentionally not reused for list requests; a list
+        request has no cancellation surface, so we just fire and
+        forget.  The task exits as soon as the response goes out.
+        """
+        task = asyncio.create_task(
+            self._run_list_mcp_tools(connection, request),
+            name=f"toolhost:mcp-list:{request.request_id}",
+        )
+        # Hold a reference until completion so the task does not get
+        # garbage collected mid-flight.  asyncio's docs strongly
+        # recommend this idiom for fire-and-forget tasks.
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _run_list_mcp_tools(
+        self,
+        connection: _Connection,
+        request: ListMCPServerToolsRequest,
+    ) -> None:
+        async with self._semaphore:
+            response = await self._serve_list_mcp_tools(request)
+            await self._send(connection, response)
+
+    async def _serve_list_mcp_tools(
+        self,
+        request: ListMCPServerToolsRequest,
+    ) -> ListMCPServerToolsResponse:
+        """Resolve a list request through :class:`MCPHost`.
+
+        Like :meth:`_dispatch_mcp_call`, every failure mode is
+        normalized to a structured error so the brain never has to
+        deal with a half-finished frame.
+        """
+        try:
+            tools = await self._mcp_host.list_tools(request.server_config)
+        except MCPUnavailableError as exc:
+            return ListMCPServerToolsResponse(
+                request_id=request.request_id,
+                error=ToolCallError(kind="mcp_unavailable", message=str(exc)),
+            )
+        except Exception as exc:
+            logger.exception(
+                "toolhost: list_tools for server %r raised",
+                request.server_config.name,
+            )
+            message = (
+                f"MCP error: {exc!r}" if self._config.debug else f"MCP error: {exc}"
+            )
+            return ListMCPServerToolsResponse(
+                request_id=request.request_id,
+                error=ToolCallError(kind="mcp_error", message=message),
+            )
+        return ListMCPServerToolsResponse(
+            request_id=request.request_id,
+            tools=tools,
         )
 
     def _build_context(self, request: ToolCallRequest) -> ExecutionContext:

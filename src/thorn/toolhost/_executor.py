@@ -33,8 +33,10 @@ import contextlib
 import logging
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from thorn.core._executor import (
     OnChunkCallback,
@@ -42,17 +44,21 @@ from thorn.core._executor import (
     ToolInvocation,
     ToolInvocationResult,
 )
+from thorn.core._mcp_config import MCPServerConfig
 from thorn.toolhost._host import (
     DaemonHost,
     SubprocessDaemonHost,
     SubprocessDaemonHostConfig,
 )
 from thorn.toolhost._protocol import (
+    MCP_FEATURE,
     PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
     Frame,
     Heartbeat,
     Hello,
+    ListMCPServerToolsRequest,
+    ListMCPServerToolsResponse,
     ProtocolError,
     ToolCallCancel,
     ToolCallChunk,
@@ -82,6 +88,24 @@ class DaemonCrashedError(RuntimeError):
     invocation will spin up a fresh host) from a tool-level failure
     (returned in the response payload).
     """
+
+
+class MCPServerUnavailableError(RuntimeError):
+    """Raised when an MCP-list request fails on the daemon side.
+
+    Surfaces from :meth:`DaemonToolExecutor.list_mcp_server_tools`
+    when the daemon either does not advertise the ``"mcp"`` feature
+    flag or returned a structured error for the requested server.
+    The brain treats this as warn-and-skip during per-prompt context
+    rebuild: the offending server contributes no tools to the current
+    prompt and is re-attempted on the next one.
+    """
+
+    def __init__(self, server_name: str, *, error_kind: str, message: str) -> None:
+        super().__init__(f"MCP server {server_name!r}: {message}")
+        self.server_name = server_name
+        self.error_kind = error_kind
+        self.message = message
 
 
 @dataclass
@@ -189,6 +213,9 @@ class DaemonToolExecutor(ToolExecutor):
         self._heartbeat_task: asyncio.Task | None = None
         self._host_started: bool = False
         self._in_flight: dict[str, asyncio.Future[ToolCallResponse]] = {}
+        self._in_flight_lists: dict[
+            str, asyncio.Future[ListMCPServerToolsResponse]
+        ] = {}
         self._chunk_callbacks: dict[str, OnChunkCallback] = {}
         self._daemon_hello: Hello | None = None
         self._closed: bool = False
@@ -240,6 +267,7 @@ class DaemonToolExecutor(ToolExecutor):
                     call_id=invocation.call_id,
                     tool_name=invocation.tool_name,
                     arguments=dict(invocation.arguments),
+                    mcp_server_config=invocation.mcp_server_config,
                 )
             )
         except Exception:
@@ -290,6 +318,83 @@ class DaemonToolExecutor(ToolExecutor):
         if self._closed:
             raise RuntimeError("DaemonToolExecutor is closed")
         await self._ensure_running()
+
+    async def list_mcp_server_tools(
+        self,
+        server_config: MCPServerConfig,
+    ) -> list[dict[str, Any]]:
+        """Ask the daemon to enumerate the tools served by *server_config*.
+
+        Sends a :class:`ListMCPServerToolsRequest` and returns the
+        OpenAI-style tool schemas in the matching response.  Lazily
+        starts the daemon on first call (same lifecycle as
+        :meth:`invoke`).
+
+        Pre-flight checks:
+
+        * The executor must not be closed.
+        * The daemon must advertise the ``"mcp"`` feature flag in its
+          handshake.  An old daemon (or a daemon built without the
+          ``mcp`` package) will not, in which case this raises
+          :class:`MCPServerUnavailableError` *before* any frame goes
+          out: that gives callers a clear "rebuild the sandbox image"
+          message rather than a wire-level surprise.
+
+        Failures from the daemon (server failed to start, ``mcp`` not
+        installed, etc.) are surfaced as
+        :class:`MCPServerUnavailableError` so the brain's per-prompt
+        rebuild can warn-and-skip cleanly.
+        """
+        if self._closed:
+            raise RuntimeError("DaemonToolExecutor is closed")
+        await self._ensure_running()
+        self._require_mcp_feature(server_config.name)
+
+        request_id = uuid.uuid4().hex
+        future: asyncio.Future[ListMCPServerToolsResponse] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._in_flight_lists[request_id] = future
+        try:
+            await self._send(
+                ListMCPServerToolsRequest(
+                    request_id=request_id,
+                    server_config=server_config,
+                )
+            )
+            response = await future
+        finally:
+            self._in_flight_lists.pop(request_id, None)
+
+        if response.error is not None:
+            raise MCPServerUnavailableError(
+                server_config.name,
+                error_kind=response.error.kind,
+                message=response.error.message,
+            )
+        return list(response.tools or [])
+
+    def _require_mcp_feature(self, server_name: str) -> None:
+        """Verify the daemon advertised ``"mcp"`` in its :class:`Hello`.
+
+        Raises :class:`MCPServerUnavailableError` (with no frame sent)
+        when the daemon predates the ``mcp`` feature flag or was built
+        without the ``mcp`` package.  Centralized so future entry
+        points (e.g. an MCP-aware health check) reuse the same gate.
+        """
+        hello = self._daemon_hello
+        if hello is None:
+            return
+        if MCP_FEATURE in hello.features:
+            return
+        raise MCPServerUnavailableError(
+            server_name,
+            error_kind="mcp_unavailable",
+            message=(
+                "daemon does not advertise the 'mcp' feature; rebuild "
+                "the sandbox image with thorn[mcp] installed."
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -400,7 +505,11 @@ class DaemonToolExecutor(ToolExecutor):
                 protocol_major=PROTOCOL_MAJOR,
                 protocol_minor=PROTOCOL_MINOR,
                 thorn_version="phase-a-brain",
-                features=[],
+                # The brain advertises ``"mcp"`` unconditionally: it
+                # always knows how to *speak* the MCP frames.  Whether
+                # they are actually used is gated on the daemon's own
+                # feature advertisement (see ``_require_mcp_feature``).
+                features=[MCP_FEATURE],
                 per_agent_state={
                     "agent_id": self._config.agent_id,
                     "home": (
@@ -515,6 +624,15 @@ class DaemonToolExecutor(ToolExecutor):
                 )
                 return
             future.set_result(frame)
+        elif isinstance(frame, ListMCPServerToolsResponse):
+            list_future = self._in_flight_lists.get(frame.request_id)
+            if list_future is None or list_future.done():
+                logger.debug(
+                    "daemon: ignoring list response for unknown request_id %r",
+                    frame.request_id,
+                )
+                return
+            list_future.set_result(frame)
         elif isinstance(frame, ToolCallChunk):
             callback = self._chunk_callbacks.get(frame.call_id)
             if callback is not None:
@@ -564,6 +682,10 @@ class DaemonToolExecutor(ToolExecutor):
                 future.set_exception(exc)
             self._in_flight.pop(call_id, None)
             self._chunk_callbacks.pop(call_id, None)
+        for request_id, list_future in list(self._in_flight_lists.items()):
+            if not list_future.done():
+                list_future.set_exception(exc)
+            self._in_flight_lists.pop(request_id, None)
         await self._teardown(reason=reason)
 
     async def _teardown(self, *, reason: str) -> None:

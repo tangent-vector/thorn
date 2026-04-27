@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from thorn.core._history import ToolCallNode
     from thorn.core._loop import _WrappedTool
+    from thorn.core._mcp_config import MCPServerConfig
 
 
 class ToolVenue(str, Enum):
@@ -55,11 +56,19 @@ class ToolInvocation:
     only for cancellation bookkeeping.  ``tool_name`` is the registered
     name (post-normalization) and ``arguments`` is the pre-parsed
     keyword payload.
+
+    ``mcp_server_config`` carries an MCP server's connection
+    parameters when the call should be routed through the daemon's
+    :class:`~thorn.toolhost._mcp_host.MCPHost` rather than the static
+    built-in registry.  ``None`` (the default) means "this is a
+    built-in tool, dispatch normally"; brain-side tool resolution
+    populates the field for tools that came from an MCP server.
     """
 
     call_id: str
     tool_name: str
     arguments: dict[str, Any] = field(default_factory=dict)
+    mcp_server_config: "MCPServerConfig | None" = None
 
 
 @dataclass(frozen=True)

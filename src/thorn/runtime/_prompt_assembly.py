@@ -206,28 +206,17 @@ def _format_journal_block(journal_text: str) -> str:
 def _mcp_config_dedup_key(config: MCPServerConfig) -> tuple[Any, ...]:
     """Return a hashable key that identifies *config* by full content.
 
-    Two configs with the same key are considered semantically
-    identical and collapse to one entry in the assembled output.
-    Differences in any field -- including ``name`` -- produce
-    distinct keys, so two ``github`` servers with different commands
-    still both appear in the output.
-
-    The ``env`` dict, if present, is normalised to a sorted tuple of
-    ``(key, value)`` pairs so dict iteration order is irrelevant to
-    the dedup decision.
+    Thin alias around
+    :func:`thorn.core._mcp_config.mcp_server_config_identity` so the
+    brain (per-prompt dedup) and the daemon (per-process MCP cache)
+    agree byte-for-byte on what counts as "the same" server.  Kept as
+    a local name to preserve the existing call sites and to document
+    that the dedup decision is intentionally identity-driven (every
+    field, ``env`` included, contributes to the key).
     """
-    env_key: tuple[tuple[str, str], ...] | None
-    env_key = (
-        tuple(sorted(config.env.items()))
-        if config.env is not None else None
-    )
-    return (
-        config.name,
-        config.command,
-        tuple(config.args),
-        env_key,
-        config.url,
-    )
+    from thorn.core._mcp_config import mcp_server_config_identity
+
+    return mcp_server_config_identity(config)
 
 
 def _dedup_mcp_configs_outer_first(

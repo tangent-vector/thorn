@@ -32,8 +32,8 @@ class MCPServerConfig:
 
     Equality and hashing follow the standard ``@dataclass`` rules and
     are stable across processes for byte-identical fields, which is
-    what the brain's per-prompt deduplication and (eventually) the
-    daemon's hash-keyed ``MCPHost`` rely on.
+    what the brain's per-prompt deduplication and the daemon's
+    identity-keyed ``MCPHost`` rely on.
     """
 
     name: str
@@ -50,4 +50,41 @@ class MCPServerConfig:
             )
 
 
-__all__ = ["MCPServerConfig"]
+def mcp_server_config_identity(
+    config: MCPServerConfig,
+) -> tuple[str, str | None, tuple[str, ...], tuple[tuple[str, str], ...] | None, str | None]:
+    """Return a stable, hashable identity tuple for *config*.
+
+    Two configs that produce equal identity tuples are treated as the
+    same MCP server by every Thorn component that needs an
+    "is this server already loaded?" answer:
+
+    * The brain's per-prompt context-gathering pipeline uses it to
+      dedupe configs harvested from overlapping ``mcp.json`` files.
+    * The toolhost daemon's ``MCPHost`` uses it as the cache key for
+      at-most-one-process-per-unique-config.
+
+    Every field that influences the running server is part of the
+    identity, ``env`` included: rotating a credential by editing the
+    ``env`` block in ``mcp.json`` produces a new identity, so the
+    daemon spins up a fresh process and the stale one drains and
+    exits.  ``args`` is normalised to a tuple and ``env`` to a sorted
+    tuple of pairs so dict / list iteration order does not perturb
+    the result.
+    """
+    env_key: tuple[tuple[str, str], ...] | None
+    env_key = (
+        tuple(sorted(config.env.items()))
+        if config.env is not None
+        else None
+    )
+    return (
+        config.name,
+        config.command,
+        tuple(config.args),
+        env_key,
+        config.url,
+    )
+
+
+__all__ = ["MCPServerConfig", "mcp_server_config_identity"]

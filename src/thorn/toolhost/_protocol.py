@@ -31,8 +31,19 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Union
 
+from thorn.core._mcp_config import MCPServerConfig
+
 PROTOCOL_MAJOR: int = 1
-PROTOCOL_MINOR: int = 0
+PROTOCOL_MINOR: int = 1
+
+# Feature flag advertised in :class:`Hello.features` by both sides when
+# they understand the MCP frames (``ListMCPServerToolsRequest`` /
+# ``ListMCPServerToolsResponse``) and the optional ``mcp_server_config``
+# field on :class:`ToolCallRequest`.  The brain advertises it
+# unconditionally; the daemon advertises it only when the ``mcp``
+# Python package is importable.  Brains that wish to issue MCP traffic
+# must verify the daemon advertises it before using those frames.
+MCP_FEATURE: str = "mcp"
 
 LENGTH_PREFIX_FORMAT: str = "!I"
 LENGTH_PREFIX_SIZE: int = struct.calcsize(LENGTH_PREFIX_FORMAT)
@@ -57,6 +68,8 @@ class FrameKind(str, Enum):
     TOOL_CALL_CHUNK = "tool_call_chunk"
     TOOL_CALL_CANCEL = "tool_call_cancel"
     HEARTBEAT = "heartbeat"
+    LIST_MCP_SERVER_TOOLS_REQUEST = "list_mcp_server_tools_request"
+    LIST_MCP_SERVER_TOOLS_RESPONSE = "list_mcp_server_tools_response"
 
 
 @dataclass(frozen=True)
@@ -97,12 +110,21 @@ class ToolCallRequest:
     ``per_call_context`` carries only what genuinely varies per call
     (session key, workspace subdirectory, scope metadata) -- the stable
     per-agent state lives in the connection-level :class:`Hello`.
+
+    ``mcp_server_config`` routes the call through the daemon's
+    :class:`~thorn.toolhost._mcp_host.MCPHost` instead of the static
+    built-in registry.  The full server config is sent on every MCP
+    call so the daemon does not have to track brain-side server names
+    (the brain owns name resolution); the daemon caches connections
+    keyed by config identity and serializes calls per-server.  Leave
+    ``None`` for built-in tools.
     """
 
     call_id: str
     tool_name: str
     arguments: dict[str, Any] = field(default_factory=dict)
     per_call_context: dict[str, Any] = field(default_factory=dict)
+    mcp_server_config: MCPServerConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +194,49 @@ class Heartbeat:
     """
 
 
+@dataclass(frozen=True)
+class ListMCPServerToolsRequest:
+    """Brain -> daemon: enumerate the tools served by *server_config*.
+
+    The daemon spawns / connects to the matching MCP server on first
+    reference and returns its tool list as OpenAI-style schema dicts
+    (``{"type": "function", "function": {...}}``).  The full
+    :class:`~thorn.core._mcp_config.MCPServerConfig` is shipped on every
+    request so the daemon does not need any prior knowledge of brain-
+    side server names; identity-keyed caching inside the daemon
+    deduplicates concurrent requests for the same config.
+
+    ``request_id`` is the brain-generated correlation key for the
+    matching :class:`ListMCPServerToolsResponse`.
+    """
+
+    request_id: str
+    server_config: MCPServerConfig
+
+
+@dataclass(frozen=True)
+class ListMCPServerToolsResponse:
+    """Daemon -> brain: tool list (or error) for a prior list request.
+
+    Exactly one of ``tools`` or ``error`` is populated; this is
+    enforced at construction time.  On error the brain logs and omits
+    the offending server's tools from this prompt; the next prompt
+    re-attempts naturally because the per-prompt context-gathering
+    pipeline does not cache across prompts.
+    """
+
+    request_id: str
+    tools: list[dict[str, Any]] | None = None
+    error: ToolCallError | None = None
+
+    def __post_init__(self) -> None:
+        if (self.tools is None) == (self.error is None):
+            raise ProtocolError(
+                "ListMCPServerToolsResponse must carry exactly one of "
+                "tools/error",
+            )
+
+
 Frame = Union[
     Hello,
     ToolCallRequest,
@@ -179,6 +244,8 @@ Frame = Union[
     ToolCallChunk,
     ToolCallCancel,
     Heartbeat,
+    ListMCPServerToolsRequest,
+    ListMCPServerToolsResponse,
 ]
 
 
@@ -189,9 +256,65 @@ _KIND_TO_CLASS: dict[FrameKind, type] = {
     FrameKind.TOOL_CALL_CHUNK: ToolCallChunk,
     FrameKind.TOOL_CALL_CANCEL: ToolCallCancel,
     FrameKind.HEARTBEAT: Heartbeat,
+    FrameKind.LIST_MCP_SERVER_TOOLS_REQUEST: ListMCPServerToolsRequest,
+    FrameKind.LIST_MCP_SERVER_TOOLS_RESPONSE: ListMCPServerToolsResponse,
 }
 
 _CLASS_TO_KIND: dict[type, FrameKind] = {cls: kind for kind, cls in _KIND_TO_CLASS.items()}
+
+
+def _mcp_server_config_to_payload(config: MCPServerConfig) -> dict[str, Any]:
+    """Encode *config* into a JSON-friendly object for the wire.
+
+    Mirrors the dataclass fields one-to-one; ``env`` is preserved as a
+    plain dict because callers (e.g. the daemon's identity hash and
+    the brain's dedup key) sort it themselves where order matters.
+    """
+    return {
+        "name": config.name,
+        "command": config.command,
+        "args": list(config.args),
+        "env": dict(config.env) if config.env is not None else None,
+        "url": config.url,
+    }
+
+
+def _payload_to_mcp_server_config(payload: Any) -> MCPServerConfig:
+    """Decode an MCP server config payload into an :class:`MCPServerConfig`.
+
+    Raises :class:`ProtocolError` for any structural problem (missing
+    ``name``, non-object ``env``, etc.).  Field-level invariants
+    enforced by ``MCPServerConfig.__post_init__`` (e.g. "must specify
+    command or url") propagate as :class:`ProtocolError` too so the
+    caller does not have to distinguish wire bugs from semantic ones.
+    """
+    if not isinstance(payload, dict):
+        raise ProtocolError(
+            f"mcp_server_config must be an object, got "
+            f"{type(payload).__name__}",
+        )
+    try:
+        name = str(payload["name"])
+    except KeyError as exc:
+        raise ProtocolError("mcp_server_config missing 'name'") from exc
+    args_payload = payload.get("args") or []
+    if not isinstance(args_payload, list):
+        raise ProtocolError("mcp_server_config 'args' must be a list")
+    env_payload = payload.get("env")
+    if env_payload is not None and not isinstance(env_payload, dict):
+        raise ProtocolError("mcp_server_config 'env' must be an object or null")
+    try:
+        return MCPServerConfig(
+            name=name,
+            command=payload.get("command"),
+            args=[str(arg) for arg in args_payload],
+            env={str(k): str(v) for k, v in env_payload.items()}
+            if env_payload is not None
+            else None,
+            url=payload.get("url"),
+        )
+    except ValueError as exc:
+        raise ProtocolError(f"invalid mcp_server_config: {exc}") from exc
 
 
 def _frame_to_payload(frame: Frame) -> dict[str, Any]:
@@ -211,6 +334,30 @@ def _frame_to_payload(frame: Frame) -> dict[str, Any]:
             body["error"] = asdict(frame.error)
         else:
             body["result"] = frame.result
+        return body
+
+    if isinstance(frame, ToolCallRequest):
+        body["call_id"] = frame.call_id
+        body["tool_name"] = frame.tool_name
+        body["arguments"] = dict(frame.arguments)
+        body["per_call_context"] = dict(frame.per_call_context)
+        if frame.mcp_server_config is not None:
+            body["mcp_server_config"] = _mcp_server_config_to_payload(
+                frame.mcp_server_config,
+            )
+        return body
+
+    if isinstance(frame, ListMCPServerToolsRequest):
+        body["request_id"] = frame.request_id
+        body["server_config"] = _mcp_server_config_to_payload(frame.server_config)
+        return body
+
+    if isinstance(frame, ListMCPServerToolsResponse):
+        body["request_id"] = frame.request_id
+        if frame.error is not None:
+            body["error"] = asdict(frame.error)
+        else:
+            body["tools"] = list(frame.tools or [])
         return body
 
     payload = asdict(frame)
@@ -250,12 +397,19 @@ def _payload_to_frame(payload: dict[str, Any]) -> Frame:
             raise ProtocolError(f"hello frame missing field {exc.args[0]!r}") from exc
 
     if kind is FrameKind.TOOL_CALL_REQUEST:
+        mcp_config_payload = payload.get("mcp_server_config")
+        mcp_config = (
+            _payload_to_mcp_server_config(mcp_config_payload)
+            if mcp_config_payload is not None
+            else None
+        )
         try:
             return ToolCallRequest(
                 call_id=str(payload["call_id"]),
                 tool_name=str(payload["tool_name"]),
                 arguments=dict(payload.get("arguments") or {}),
                 per_call_context=dict(payload.get("per_call_context") or {}),
+                mcp_server_config=mcp_config,
             )
         except KeyError as exc:
             raise ProtocolError(
@@ -310,6 +464,70 @@ def _payload_to_frame(payload: dict[str, Any]) -> Frame:
             raise ProtocolError(
                 f"tool_call_cancel frame missing field {exc.args[0]!r}",
             ) from exc
+
+    if kind is FrameKind.LIST_MCP_SERVER_TOOLS_REQUEST:
+        try:
+            request_id = str(payload["request_id"])
+        except KeyError as exc:
+            raise ProtocolError(
+                "list_mcp_server_tools_request frame missing 'request_id'",
+            ) from exc
+        try:
+            server_payload = payload["server_config"]
+        except KeyError as exc:
+            raise ProtocolError(
+                "list_mcp_server_tools_request frame missing 'server_config'",
+            ) from exc
+        return ListMCPServerToolsRequest(
+            request_id=request_id,
+            server_config=_payload_to_mcp_server_config(server_payload),
+        )
+
+    if kind is FrameKind.LIST_MCP_SERVER_TOOLS_RESPONSE:
+        try:
+            request_id = str(payload["request_id"])
+        except KeyError as exc:
+            raise ProtocolError(
+                "list_mcp_server_tools_response frame missing 'request_id'",
+            ) from exc
+
+        error_payload = payload.get("error")
+        if error_payload is not None:
+            if not isinstance(error_payload, dict):
+                raise ProtocolError(
+                    "list_mcp_server_tools_response 'error' must be an object",
+                )
+            try:
+                error = ToolCallError(
+                    kind=str(error_payload["kind"]),
+                    message=str(error_payload["message"]),
+                )
+            except KeyError as exc:
+                raise ProtocolError(
+                    "list_mcp_server_tools_response error missing field "
+                    f"{exc.args[0]!r}",
+                ) from exc
+            return ListMCPServerToolsResponse(request_id=request_id, error=error)
+
+        if "tools" not in payload:
+            raise ProtocolError(
+                "list_mcp_server_tools_response must carry either 'tools' "
+                "or 'error'",
+            )
+        tools_payload = payload["tools"]
+        if not isinstance(tools_payload, list):
+            raise ProtocolError(
+                "list_mcp_server_tools_response 'tools' must be a list",
+            )
+        tools: list[dict[str, Any]] = []
+        for tool in tools_payload:
+            if not isinstance(tool, dict):
+                raise ProtocolError(
+                    "list_mcp_server_tools_response 'tools' entries must be "
+                    "objects",
+                )
+            tools.append(dict(tool))
+        return ListMCPServerToolsResponse(request_id=request_id, tools=tools)
 
     raise ProtocolError(f"no decoder for known frame kind {kind!r}")  # pragma: no cover
 
