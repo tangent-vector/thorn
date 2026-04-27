@@ -87,9 +87,27 @@ class _WrappedTool:
     (via :class:`~thorn.core._executor.ToolRegistry` + router); for
     non-registry callers (``wrap_function`` etc.) it still defaults to
     ``IN_PROCESS`` which matches today's behavior.
+
+    ``mcp_server_config`` and ``mcp_tool_name`` are populated only for
+    tools sourced from an MCP server.  The brain owns name resolution
+    (a tool may be exposed to the model under a server-prefixed name to
+    avoid collisions); ``mcp_tool_name`` is the *unprefixed* name the
+    server itself knows the tool by, which is what the daemon must
+    forward to ``ClientSession.call_tool``.  Both are ``None`` for
+    built-in tools and are propagated into
+    :class:`~thorn.core._executor.ToolRegistryEntry` and onward into
+    :class:`~thorn.core._executor.ToolInvocation` so the daemon
+    executor can recognise an MCP-routed call.
     """
 
-    __slots__ = ("schema", "execute", "call_node_class", "venue")
+    __slots__ = (
+        "schema",
+        "execute",
+        "call_node_class",
+        "venue",
+        "mcp_server_config",
+        "mcp_tool_name",
+    )
 
     def __init__(
         self,
@@ -97,11 +115,15 @@ class _WrappedTool:
         execute: Any,  # async callable(**kwargs) -> str
         call_node_class: type[ToolCallNode] | None = None,
         venue: ToolVenue = ToolVenue.IN_PROCESS,
+        mcp_server_config: Any = None,  # MCPServerConfig | None; Any avoids cyclic import
+        mcp_tool_name: str | None = None,
     ) -> None:
         self.schema = schema
         self.execute = execute
         self.call_node_class = call_node_class
         self.venue = venue
+        self.mcp_server_config = mcp_server_config
+        self.mcp_tool_name = mcp_tool_name
 
 
 async def run_agent_loop(
@@ -550,10 +572,22 @@ async def _execute_tool_calls(
         if entry.call_node_class is not None:
             call_node_classes[tc.call_id] = entry.call_node_class
 
+        # MCP-sourced tools may have been exposed to the model under a
+        # collision-disambiguating prefix (``<server>__<tool>``); the
+        # daemon's ``ClientSession.call_tool`` needs the unprefixed
+        # name the server itself knows.  ``entry.mcp_tool_name`` is
+        # always set when ``entry.mcp_server_config`` is, so the
+        # daemon receives the right name even on collision-prefixed
+        # registry names.
+        if entry.mcp_server_config is not None:
+            wire_tool_name = entry.mcp_tool_name or entry.name
+        else:
+            wire_tool_name = entry.name
         invocation = ToolInvocation(
             call_id=tc.call_id,
-            tool_name=entry.name,
+            tool_name=wire_tool_name,
             arguments=kwargs,
+            mcp_server_config=entry.mcp_server_config,
         )
 
         # -- execute via the venue's executor ------------------------------

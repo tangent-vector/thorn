@@ -138,12 +138,25 @@ class ToolRegistryEntry:
     runs: the loop reads ``venue``, the router maps ``venue`` to an
     executor, and nothing else in the loop needs to know which
     implementation services the call.
+
+    ``mcp_server_config`` and ``mcp_tool_name`` are non-``None`` only
+    for tools sourced from an MCP server.  They flow from the brain's
+    per-prompt MCP discovery (see
+    :mod:`thorn.runtime._mcp_tools`) through to the
+    :class:`ToolInvocation` the loop hands to the daemon executor: the
+    daemon needs the ``MCPServerConfig`` to identify which server to
+    route through and the ``mcp_tool_name`` (the unprefixed name the
+    server itself exposes) so it can call ``ClientSession.call_tool``
+    correctly even when the brain has prefixed the schema name to
+    avoid a collision.
     """
 
     name: str
     schema: dict[str, Any]
     venue: ToolVenue
     call_node_class: type[ToolCallNode] | None = None
+    mcp_server_config: "MCPServerConfig | None" = None
+    mcp_tool_name: str | None = None
 
 
 class ToolRegistry:
@@ -302,6 +315,8 @@ def build_registry_from_wrapped_tools(
                 schema=tool.schema,
                 venue=getattr(tool, "venue", ToolVenue.IN_PROCESS),
                 call_node_class=tool.call_node_class,
+                mcp_server_config=getattr(tool, "mcp_server_config", None),
+                mcp_tool_name=getattr(tool, "mcp_tool_name", None),
             )
         )
     return ToolRegistry(entries)

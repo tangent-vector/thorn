@@ -535,67 +535,78 @@ async def _run_session_prompt(
     # ----------------------------------------------------------------
     # MCP servers for this prompt round
     #
-    # Wrap the agent loop in an AsyncExitStack so any MCP sessions we
-    # open are torn down even if the loop raises.  When there are no
-    # MCP configs (the common case for tests / library use), the
-    # stack is a no-op.  The ``mcp`` package is an optional extra; if
-    # it is missing we log a warning and proceed without MCP tools
-    # rather than crashing the prompt -- the same behaviour the
-    # legacy ``_collect_all_tools`` had.
+    # All MCP execution lives in the per-agent ``thorn-toolhost``
+    # daemon: we ask the daemon (via the agent's sandbox executor)
+    # to enumerate each server's tools, apply brain-side name
+    # resolution, and produce ``_WrappedTool`` instances that the
+    # split router will route back through that same daemon at call
+    # time.  The brain itself never opens an MCP ``ClientSession``
+    # (the legacy ``MCPToolSource`` path) -- this keeps MCP traffic
+    # inside the sandbox boundary.
+    #
+    # When the agent has no sandbox executor (e.g. bare
+    # ``agent.prompt(...)`` calls in unit tests with no Runtime),
+    # MCP discovery is skipped with a warning rather than falling
+    # back to in-process: there is intentionally no in-process MCP
+    # path in the brain anymore.
     # ----------------------------------------------------------------
-    from contextlib import AsyncExitStack
-    mcp_stack = AsyncExitStack()
-    async with mcp_stack:
-        if assembled.mcp_configs:
-            try:
-                from thorn.core._mcp import MCPToolSource
-            except ImportError:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "MCP configs found but the 'mcp' package is not "
-                    "installed; skipping MCP tool registration",
-                )
-            else:
-                mcp_source = await mcp_stack.enter_async_context(
-                    MCPToolSource(assembled.mcp_configs),
-                )
-                prepared.extend(mcp_source.tools)
-
-        await child.event_sink.on_scope_enter(child.scope)
-        t0 = time.monotonic()
-        token = set_context(child)
-        try:
-            # Context injection: pre-populate the session's history with
-            # relevant content so it doesn't waste turns re-discovering
-            # project structure.  This MUST run after set_context(child)
-            # because the tool functions we call (read_file, etc.) use
-            # get_context() internally to enforce the agent's file-access
-            # policy.  The user prompt is appended first so the injected
-            # assistant turn follows it naturally; run_agent_loop is then
-            # called with user_prompt=None to avoid a duplicate.
-            user_prompt_for_loop: str | None = text
-            if not session._history.nodes:
-                injected = await _inject_context(
-                    session, text, child, recommended_context,
-                )
-                if injected:
-                    user_prompt_for_loop = None
-
-            return await run_agent_loop(
-                context=child,
-                user_prompt=user_prompt_for_loop,
-                tools=prepared,
-                system_prompts=sys_prompts,
-                result_type=result_type,
-                history=session._history,
-                session=session,
+    if assembled.mcp_configs:
+        if child.sandbox_executor is None:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "MCP configs found (%d) but the agent has no sandbox "
+                "executor; skipping MCP tool registration. Configure a "
+                "Runtime with a sandbox executor to enable MCP.",
+                len(assembled.mcp_configs),
             )
-        finally:
-            duration_s = time.monotonic() - t0
-            await child.event_sink.on_scope_exit(
-                child.scope, duration_s=duration_s,
+        else:
+            from thorn.runtime._mcp_tools import discover_mcp_tools
+            builtin_tool_names = {
+                t.schema.get("function", {}).get("name", "") for t in prepared
+            }
+            builtin_tool_names.discard("")
+            mcp_wrapped = await discover_mcp_tools(
+                sandbox_executor=child.sandbox_executor,
+                mcp_configs=assembled.mcp_configs,
+                builtin_tool_names=builtin_tool_names,
             )
-            reset_context(token)
+            prepared.extend(mcp_wrapped)
+
+    await child.event_sink.on_scope_enter(child.scope)
+    t0 = time.monotonic()
+    token = set_context(child)
+    try:
+        # Context injection: pre-populate the session's history with
+        # relevant content so it doesn't waste turns re-discovering
+        # project structure.  This MUST run after set_context(child)
+        # because the tool functions we call (read_file, etc.) use
+        # get_context() internally to enforce the agent's file-access
+        # policy.  The user prompt is appended first so the injected
+        # assistant turn follows it naturally; run_agent_loop is then
+        # called with user_prompt=None to avoid a duplicate.
+        user_prompt_for_loop: str | None = text
+        if not session._history.nodes:
+            injected = await _inject_context(
+                session, text, child, recommended_context,
+            )
+            if injected:
+                user_prompt_for_loop = None
+
+        return await run_agent_loop(
+            context=child,
+            user_prompt=user_prompt_for_loop,
+            tools=prepared,
+            system_prompts=sys_prompts,
+            result_type=result_type,
+            history=session._history,
+            session=session,
+        )
+    finally:
+        duration_s = time.monotonic() - t0
+        await child.event_sink.on_scope_exit(
+            child.scope, duration_s=duration_s,
+        )
+        reset_context(token)
 
 
 async def _inject_context(
