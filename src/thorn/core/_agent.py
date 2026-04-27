@@ -526,9 +526,11 @@ async def _run_session_prompt(
         journal_text=journal_text,
     )
     sys_prompts.extend(assembled.system_prompt_blocks)
-    # ``assembled.skills`` is produced here but not yet projected into
-    # the tool list; that arrives with the ``skill_md_loader`` plan
-    # item, alongside actual SKILL.md discovery.
+    # ``assembled.skills`` is *not* exposed as tools by design: skills
+    # are a prompt-side concept, advertised via the skill-index block
+    # already included in ``assembled.system_prompt_blocks`` above.
+    # The agent reads a SKILL.md body via the ordinary file-read tool
+    # if and when the indexed description suggests it is relevant.
 
     # ----------------------------------------------------------------
     # MCP servers for this prompt round

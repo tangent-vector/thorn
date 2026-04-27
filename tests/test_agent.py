@@ -673,6 +673,132 @@ class TestSkillWithRole:
 
 
 # ---------------------------------------------------------------------------
+# AGENTS.md injection into system prompts
+# ---------------------------------------------------------------------------
+
+
+class TestAgentsMdInjection:
+    """End-to-end coverage for the AGENTS.md side of the unified
+    context-gathering pipeline.
+
+    The unit tests in ``tests/test_context_layers.py`` and
+    ``tests/test_prompt_assembly.py`` already exercise per-directory
+    AGENTS.md loading and outer-to-inner block ordering against
+    in-memory fixtures.  The tests here close the loop: they put real
+    files on disk under realistic ``home`` / ``workspace`` directories,
+    drive a full ``Session.prompt`` round, and assert that what the
+    LLM provider actually receives in ``system_prompts`` matches what
+    the pipeline is supposed to produce.
+
+    The headline regression target is the historical "silent-drop"
+    bug, where an AGENTS.md placed in the agent workspace would be
+    silently overridden (and lost) when the agent home also had one.
+    Under the unified pipeline both files must reach the provider, in
+    outer-to-inner order: agent_home first, then agent_workspace.
+    """
+
+    @pytest.mark.asyncio
+    async def test_home_and_workspace_agents_md_both_reach_provider(
+        self, tmp_path: Path,
+    ):
+        home_dir = tmp_path / "home"
+        workspace_dir = tmp_path / "ws"
+        home_dir.mkdir()
+        workspace_dir.mkdir()
+
+        (home_dir / "AGENTS.md").write_text(
+            "HOME-POLICY-MARKER: project-wide invariants\n",
+            encoding="utf-8",
+        )
+        (workspace_dir / "AGENTS.md").write_text(
+            "WORKSPACE-POLICY-MARKER: per-checkout overrides\n",
+            encoding="utf-8",
+        )
+
+        provider = MockProvider()
+        captured_prompts: list[list[str]] = []
+        original_complete = provider.complete
+
+        async def tracking_complete(
+            system_prompts: list[str],
+            tools: list[dict],
+            messages: list[Any],
+        ):
+            captured_prompts.append(list(system_prompts))
+            async for chunk in original_complete(system_prompts, tools, messages):
+                yield chunk
+
+        provider.complete = tracking_complete  # type: ignore[assignment]
+
+        context = ExecutionContext(provider=provider, workspace_root=workspace_dir)
+        token = set_context(context)
+        try:
+            agent = Agent(workspace=workspace_dir, home=home_dir)
+            session = Session(agent=agent)
+            await session.prompt("hello")
+
+            assert len(captured_prompts) == 1
+            joined = "\n".join(captured_prompts[0])
+            # Both files reach the provider -- this is the silent-drop
+            # regression assertion.
+            assert "HOME-POLICY-MARKER" in joined
+            assert "WORKSPACE-POLICY-MARKER" in joined
+            # And the home (outer) block precedes the workspace (inner)
+            # block, matching the documented outer-to-inner ordering.
+            assert (
+                joined.index("HOME-POLICY-MARKER")
+                < joined.index("WORKSPACE-POLICY-MARKER")
+            )
+        finally:
+            reset_context(token)
+
+    @pytest.mark.asyncio
+    async def test_workspace_agents_md_reaches_provider_when_home_has_none(
+        self, tmp_path: Path,
+    ):
+        # Companion to the silent-drop regression: in the *absence* of a
+        # home AGENTS.md, the workspace one must still flow through.
+        # Guards against the inverse bug -- workspace content being
+        # gated on the presence of home content.
+        home_dir = tmp_path / "home"
+        workspace_dir = tmp_path / "ws"
+        home_dir.mkdir()
+        workspace_dir.mkdir()
+
+        (workspace_dir / "AGENTS.md").write_text(
+            "WORKSPACE-ONLY-MARKER\n", encoding="utf-8",
+        )
+
+        provider = MockProvider()
+        captured_prompts: list[list[str]] = []
+        original_complete = provider.complete
+
+        async def tracking_complete(
+            system_prompts: list[str],
+            tools: list[dict],
+            messages: list[Any],
+        ):
+            captured_prompts.append(list(system_prompts))
+            async for chunk in original_complete(system_prompts, tools, messages):
+                yield chunk
+
+        provider.complete = tracking_complete  # type: ignore[assignment]
+
+        context = ExecutionContext(provider=provider, workspace_root=workspace_dir)
+        token = set_context(context)
+        try:
+            agent = Agent(workspace=workspace_dir, home=home_dir)
+            session = Session(agent=agent)
+            await session.prompt("hello")
+
+            assert len(captured_prompts) == 1
+            joined = "\n".join(captured_prompts[0])
+            assert "WORKSPACE-ONLY-MARKER" in joined
+        finally:
+            reset_context(token)
+
+
+# ---------------------------------------------------------------------------
 # MEMORY.md injection into system prompts
 # ---------------------------------------------------------------------------
 
