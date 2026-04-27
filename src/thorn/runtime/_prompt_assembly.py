@@ -14,12 +14,11 @@ into the final shape the agent loop wants:
 
 Block ordering
 --------------
-The aspirational design (``docs/aspirational/context-gathering.md``)
-prescribes the following outer-to-inner order for the assembled
-prompt.  Block kinds that have no contributions are simply omitted;
-every block that is emitted carries its own provenance header so the
-agent (and a human reading the prompt) can see where each contribution
-came from.
+The shipped pipeline (see ``docs/context-gathering.md``) emits the
+following outer-to-inner block order.  Block kinds that have no
+contributions are simply omitted; every block that is emitted carries
+its own provenance header so the agent (and a human reading the
+prompt) can see where each contribution came from.
 
 1. Environment block (Thorn-runtime-injected facts about the session's
    filesystem layout: working directory, agent home).  Optional --

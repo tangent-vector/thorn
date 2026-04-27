@@ -8,8 +8,8 @@ missing-on-disk directories.  Whether any given path actually exists
 is the per-directory loaders' problem (phase 2,
 :mod:`thorn.runtime._context_layers`).
 
-The aspirational design (see ``docs/aspirational/context-gathering.md``)
-identifies three layers, in outer-to-inner order:
+The shipped pipeline (see ``docs/context-gathering.md``) identifies
+three layers, in outer-to-inner order:
 
 1. **operator** -- ``<agency-home>/agents/<agent-id>/``: a single
    directory, outside the agent's sandbox, where human operators

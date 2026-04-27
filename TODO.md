@@ -19,17 +19,17 @@
 
 - Some sort of POR around how to fit approval into all this, by having a notion of tools that should require approval (or maybe have filters/predicates to decide when they need approval)
 
-- Consume typical definitions of skills, slash commands and personas (e.g., like in `.claude/`)
+- Introduce the missing ontological rung between Agent and Session.  Today the agency/agent/session hierarchy has a gap where one logical container/workspace/MCP-connection-set ought to live: gateway agents have exactly one such rung (the agent itself) while CLI agents may have many (one per project the user runs Thorn from).  The unified context-gathering pipeline papers over this by smuggling a `logical_agent_workspace_path` field onto `Session`, which is fine for prompt assembly but won't cut it once container isolation is in play -- container boundaries naturally fall on this missing rung, not on Agent or Session.  Designing the rung and migrating gateway/CLI agent provisioning onto it is its own piece of work, deliberately scoped out of the context-gathering refactor.  See the "A 'logical agent workspace' rung in the runtime ontology" subsection of `docs/context-gathering.md`.
 
-- Consider scraping MCP servers, skills, etc. from `.cursor/`, `.claude`, etc. rather than just from `.thorn/`... or at least allowing configuration in `.thorn/` to specify that additional configuration stuff should be loaded from such a directory
+- Operator-policy population in the gateway.  The unified context-gathering pipeline already considers `<agency-home>/agents/<agent-id>/AGENTS.md` (the `OPERATOR`-kind contribution) when assembling a session's system prompt, but the gateway-side agent provisioning does not yet *write* anything into that file by default.  When we have a use case (e.g. mandatory forge-credential warnings, an agency-wide code-of-conduct, or a shared safety boilerplate), teach `Gateway`/`Runtime` agent creation to materialise a default operator `AGENTS.md` at the right time.  See the "Operator-policy population" subsection of `docs/context-gathering.md`.
+
+- Cross-tool aliasing for context sources.  The unified context-gathering pipeline already consumes `AGENTS.md` (with `CLAUDE.md` as a same-directory fallback), `.agents/skills/<name>/SKILL.md`, and `.agents/mcp.json`.  Other tools in the ecosystem ship parallel conventions: `.cursor/rules/*.mdc`, `.claude/agents/*.md`, `.claude/skills/`, `.claude/mcp.json`, slash-command definitions, etc.  A future iteration should fold these in as additional sources of the same conceptual contributions, plumbed through the same per-category collectors in `thorn.runtime._context_layers` rather than a parallel set of walkers.  See the "Cross-tool aliasing for context sources" subsection of `docs/context-gathering.md`.
 
 - Make it easier for code under `.thorn/` to reference text/markdown documents in the same directory as part of their prompts, etc. (or just document the conventions for getting at resources).
 
 - Make it easier to expose tools that don't require writing Python (e.g., stuff that should just amount to running a command line or shell script)
 
 - Expose additional predefined tool sets beyond the existing `FILE_READING` and `FILE_WRITING`: a `file_manipulation` set (reading plus writing/creating directories), and a `web_research` set (web searches via something like duckduckgo, plus beautifulsoup or similar for extracting content).
-
-- Thorn should probably read and respect any `AGENTS.md` file(s) that are set up in a project, using the conventions established by other tools. The content of those files should be piped into `thorn`s agents as additional system-prompt content.
 
 - We have a potential gotcha lurking, in that `@skill` functions use the docstring to represent the prompt, which leaves them without a way to convey all the things that a `@tool` function uses its docstring to set up. It may be that `@skill` is too 'clever" for its own good, and we should instead just tell people to write an ordinary function that calls `prompt()` instead.
 
