@@ -314,9 +314,10 @@ def collect_mcp_configs_for_directory(
 ) -> list[Any]:
     """Load MCP server configs from ``<dir>/.agents/mcp.json``.
 
-    Returns a list of :class:`thorn.core._mcp.MCPServerConfig`
-    instances (typed loosely as ``list[Any]`` so this module does
-    not import the MCP package eagerly; see imports at top of file).
+    Returns a list of :class:`thorn.core._mcp_config.MCPServerConfig`
+    instances (typed loosely as ``list[Any]`` because the dataclass
+    lives in a sibling module that this one does not import at
+    module scope; see the lazy import in the body).
 
     Per-server behaviour:
 
@@ -350,11 +351,12 @@ def collect_mcp_configs_for_directory(
         logger.warning("'mcpServers' in %s is missing or not a mapping", mcp_json)
         return []
 
-    # Lazy import: many code paths never look at MCP at all (CLI runs
-    # without MCP, tests that don't exercise MCP, etc.).  Keep the
-    # ``mcp`` extra optional by deferring the import to the moment
-    # we actually have an MCP config to construct.
-    from thorn.core._mcp import MCPServerConfig
+    # Lazy import keeps this module's import graph small for callers
+    # that walk directories without ever finding an ``mcp.json`` to
+    # parse.  ``_mcp_config`` itself has no MCP-package dependency,
+    # so the laziness is a cosmetic preference, not a correctness
+    # requirement.
+    from thorn.core._mcp_config import MCPServerConfig
 
     configs: list[MCPServerConfig] = []
     for name, spec in servers.items():

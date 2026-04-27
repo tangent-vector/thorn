@@ -32,10 +32,14 @@ COPY pyproject.toml ./
 COPY src/ src/
 
 # Sandbox image is intentionally minimal -- no [github,gitlab] extras here.
-# Agent-specific toolchains and SDKs belong in derived images that compose
-# `FROM thorn-sandbox:<version>` and add what they need.
+# `[mcp]` is bundled because Phase C.1 hosts MCP servers inside this
+# container as subprocesses of the toolhost daemon; the `mcp` Python
+# package is the daemon's MCP client and is a baseline requirement of
+# the sandbox image rather than an agent-specific toolchain.
+# Agent-specific toolchains and SDKs belong in derived images that
+# compose `FROM thorn-sandbox:<version>` and add what they need.
 RUN uv venv /opt/thorn-venv \
- && VIRTUAL_ENV=/opt/thorn-venv uv pip install "."
+ && VIRTUAL_ENV=/opt/thorn-venv uv pip install ".[mcp]"
 
 # ---- runtime: small image hosting a single per-agent toolhost daemon -----
 FROM python:3.12-slim
@@ -50,6 +54,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/thorn-venv /opt/thorn-venv
+
+# `uv` is bundled in the runtime stage so command-style MCP server
+# entries can use `uvx <pkg>` (the dominant invocation pattern in
+# the MCP ecosystem) without each agent re-installing uv.  The
+# binary is a single static blob; cost is negligible.
+COPY --from=uv /uv /usr/local/bin/uv
+
 ENV PATH="/opt/thorn-venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

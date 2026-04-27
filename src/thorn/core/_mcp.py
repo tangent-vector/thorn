@@ -19,10 +19,10 @@ from __future__ import annotations
 
 import logging
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
 from typing import Any
 
 from thorn.core._loop import _WrappedTool
+from thorn.core._mcp_config import MCPServerConfig
 from thorn.core._schema import serialize_for_tool_result
 
 logger = logging.getLogger(__name__)
@@ -42,27 +42,12 @@ def _require_mcp(feature: str = "MCP support") -> None:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
-@dataclass
-class MCPServerConfig:
-    """Connection parameters for a single MCP server.
-
-    For stdio transport, set *command* (and optionally *args* / *env*).
-    For HTTP transport, set *url*.
-    """
-
-    name: str
-    command: str | None = None
-    args: list[str] = field(default_factory=list)
-    env: dict[str, str] | None = None
-    url: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.command and not self.url:
-            raise ValueError(
-                f"MCPServerConfig {self.name!r}: "
-                "must specify either 'command' (stdio) or 'url' (HTTP)"
-            )
+#
+# ``MCPServerConfig`` lives in :mod:`thorn.core._mcp_config` so it can be
+# imported by callers (the runtime context-gathering pipeline today, the
+# toolhost daemon's MCP client tomorrow) without dragging in this module's
+# brain-side ``MCPToolSource`` / ``serve_tools`` surface.  Re-exported here
+# for the existing ``from thorn.core._mcp import MCPServerConfig`` callers.
 
 
 # ---------------------------------------------------------------------------

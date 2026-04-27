@@ -77,7 +77,7 @@ from thorn.runtime._context_layers import (
 )
 
 if TYPE_CHECKING:
-    from thorn.core._mcp import MCPServerConfig
+    from thorn.core._mcp_config import MCPServerConfig
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import PurePosixPath
 
-from thorn.core._mcp import MCPServerConfig
+from thorn.core._mcp_config import MCPServerConfig
 from thorn.runtime._context_layers import (
     CollectedContext,
     SkillEntry,
