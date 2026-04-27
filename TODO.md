@@ -13,6 +13,8 @@
 
 - Consider splitting `@skill` so that there's a distinction between "a function whose implementation is a prompt" and the exposure of such a function to the rest of the system
 
+- Unify the two skill/tool-discovery pipelines.  Today there are two parallel paths: (a) `discover_tools` in `thorn.core._discovery` walks ancestor `.agents/thorn/*.py` files, imports them, and collects `@tool` / `@skill`-decorated Python callables, and (b) the unified per-prompt context-gathering pipeline (`thorn.runtime._context_layers`) walks `.agents/skills/<name>/SKILL.md` files and produces `SkillEntry`s consumed by phase-3 prompt assembly.  The two systems answer different questions today (Python-callable vs. Markdown-prompt skill) but they both descend from the same ancestor walk and both register against the same agent.  A future iteration should rationalise them — most likely by routing `discover_tools` through the new per-prompt pipeline rather than running its own walker, so directory selection (operator/agent-home/agent-workspace, kind-filtering, dedup) only has one home.
+
 - Some sort of POR around how to fit approval into all this, by having a notion of tools that should require approval (or maybe have filters/predicates to decide when they need approval)
 
 - Consume typical definitions of skills, slash commands and personas (e.g., like in `.claude/`)

@@ -1,16 +1,27 @@
-"""Workspace discovery: agent instructions, memory, and tool loading.
+"""Project-level Python tool discovery from ``.agents/thorn/``.
 
-Locates ``.thorn/`` directories (used for agency state such as agent
-identities, session history, and journals) and ``.agents/thorn/``
-directories (used for project-level Python tool definitions).
+This module's sole remaining responsibility is the
+``@tool`` / ``@skill`` Python-decorator-based tool discovery that
+:func:`discover_tools` performs against ``.agents/thorn/*.py`` files.
+Everything else that used to live here -- ``.thorn/`` directory
+walking, ``AGENTS.md`` and ``MEMORY.md`` loading -- has been
+absorbed into the unified per-prompt context-gathering pipeline
+(``thorn.runtime._context_paths`` /
+``thorn.runtime._context_layers``).
 
-Python files in an ``.agents/thorn/`` directory are imported, and any
-functions decorated with ``@tool`` or ``@skill`` are collected for use
-as agent tools.  Each such directory is registered as a synthetic Python
-package so that files within it can use relative imports::
+Files in an ``.agents/thorn/`` directory are imported, and any
+functions decorated with ``@tool`` or ``@skill`` are collected for
+use as agent tools.  Each such directory is registered as a
+synthetic Python package so that files within it can use relative
+imports::
 
     # In .agents/thorn/dev_tools.py
     from .build_tools import build, run_calc
+
+This is the *Python-callable* tool entry point.  Markdown-based
+agent skills (``.agents/skills/<name>/SKILL.md``) live in the new
+context-gathering pipeline; the plan calls out unifying these two
+under one umbrella as a follow-up (see ``TODO.md``).
 """
 
 from __future__ import annotations
@@ -27,55 +38,19 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# .thorn/ directory location (agency state)
+# .agents/thorn/ directory location (project tool definitions)
 # ---------------------------------------------------------------------------
 
-def find_thorn_dirs(start: Path | None = None) -> list[Path]:
-    """Locate ``.thorn/`` directories by walking up from *start*.
-
-    Returns directories ordered deepest-first (most specific first).
-    The user home directory (``~/.thorn``) is appended last, if it
-    exists and wasn't already found during the walk.
-
-    These directories are used for **agency state** (agent identities,
-    session history, journals, memory) -- not for tool definitions.
-    """
-    if start is None:
-        start = Path.cwd()
-    start = start.resolve()
-
-    found: list[Path] = []
-    seen: set[Path] = set()
-
-    current = start
-    while True:
-        candidate = current / ".thorn"
-        if candidate.is_dir() and candidate not in seen:
-            found.append(candidate)
-            seen.add(candidate)
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
-
-    home_thorn = Path.home() / ".thorn"
-    if home_thorn.is_dir() and home_thorn.resolve() not in seen:
-        found.append(home_thorn)
-
-    return found
-
-
-# ---------------------------------------------------------------------------
-# .agents/thorn/ directory location (project-level tool definitions)
-# ---------------------------------------------------------------------------
-
-def find_agents_thorn_dirs(start: Path | None = None) -> list[Path]:
+def _find_agents_thorn_dirs(start: Path | None = None) -> list[Path]:
     """Locate ``.agents/thorn/`` directories by walking up from *start*.
 
     Returns directories ordered deepest-first (most specific first).
     Only directories that actually contain at least one ``.py`` file
-    are returned.  A bare ``.agents/thorn.py`` file (without a sibling
-    directory) is treated as if it were a single-file directory.
+    are returned.
+
+    Internal helper for :func:`discover_tools`; not part of the
+    public surface (the previous public name was retired alongside
+    its cousins as part of the unified-context-gathering refactor).
     """
     if start is None:
         start = Path.cwd()
@@ -99,47 +74,6 @@ def find_agents_thorn_dirs(start: Path | None = None) -> list[Path]:
         current = parent
 
     return found
-
-
-# ---------------------------------------------------------------------------
-# Workspace instructions and agent memory
-# ---------------------------------------------------------------------------
-
-def load_workspace_instructions(workspace_root: Path) -> str | None:
-    """Read ``AGENTS.md`` from *workspace_root*, if it exists.
-
-    Returns the file contents as a string, or ``None`` when the file is
-    absent or unreadable.
-    """
-    agents_md = workspace_root / "AGENTS.md"
-    if not agents_md.is_file():
-        return None
-    try:
-        return agents_md.read_text(encoding="utf-8")
-    except OSError:
-        logger.warning("failed to read %s", agents_md, exc_info=True)
-        return None
-
-
-def load_agent_memory(workspace: Path) -> str | None:
-    """Read ``MEMORY.md`` from *workspace*, if it exists.
-
-    ``MEMORY.md`` holds instance-specific knowledge for an agent (e.g.
-    "the repository URL is X", "the default branch is Y").  It belongs
-    to the agent *instance* (not the role/class) and is auto-injected
-    into the system prompt when present.
-
-    Returns the file contents as a string, or ``None`` when the file is
-    absent or unreadable.
-    """
-    memory_md = workspace / "MEMORY.md"
-    if not memory_md.is_file():
-        return None
-    try:
-        return memory_md.read_text(encoding="utf-8")
-    except OSError:
-        logger.warning("failed to read %s", memory_md, exc_info=True)
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +167,7 @@ def discover_tools(start: Path | None = None) -> list[Callable[..., Any]]:
     result: list[Callable[..., Any]] = []
     seen_names: set[str] = set()
 
-    for tool_dir in find_agents_thorn_dirs(start):
+    for tool_dir in _find_agents_thorn_dirs(start):
         modules: list[types.ModuleType] = []
         for py_file in sorted(tool_dir.glob("*.py")):
             module = _load_module(tool_dir, py_file)
@@ -252,3 +186,6 @@ def discover_tools(start: Path | None = None) -> list[Callable[..., Any]]:
                         name, getattr(module, "__file__", "?"),
                     )
     return result
+
+
+__all__ = ["discover_tools"]

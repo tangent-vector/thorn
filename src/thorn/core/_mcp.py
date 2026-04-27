@@ -172,10 +172,14 @@ class MCPToolSource:
 
     Usage::
 
-        configs = load_mcp_configs(find_thorn_dirs())
         async with MCPToolSource(configs) as src:
             all_tools = local_tools + src.tools
             await run_agent_loop(..., tools=all_tools)
+
+    *configs* is typically the ``mcp_configs`` field of an
+    :class:`~thorn.runtime._prompt_assembly.AssembledPromptContext`,
+    i.e. the deduplicated list produced by the per-prompt
+    context-gathering pipeline.
     """
 
     def __init__(self, configs: list[MCPServerConfig]) -> None:

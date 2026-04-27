@@ -169,8 +169,8 @@ def _build_runtime(
     is an operator-audit channel; per-session filtering would defeat
     its purpose.
 
-    *workspace* overrides the workspace root.  When ``None``, the
-    heuristic in :func:`thorn.infer_workspace_root` is used.
+    *workspace* overrides the workspace root.  When ``None``, falls
+    back to the resolved current working directory.
 
     *paths* sets the agency directory layout explicitly.  When
     ``None``, falls back to the legacy CLI-nested layout
@@ -181,7 +181,6 @@ def _build_runtime(
     """
     from pathlib import Path
 
-    from thorn import infer_workspace_root
     from thorn.core._file_access import load_global_ignores
     from thorn.runtime._paths import AgencyPaths
 
@@ -192,7 +191,7 @@ def _build_runtime(
         from thorn.core._trace import JsonLinesSink
         bus.subscribe(JsonLinesSink(trace_file))
 
-    ws_root = Path(workspace).resolve() if workspace else infer_workspace_root()
+    ws_root = Path(workspace).resolve() if workspace else Path.cwd().resolve()
 
     if paths is None:
         paths = AgencyPaths.for_cli(ws_root)
@@ -293,7 +292,6 @@ def _write_result_file(
 @click.option("--result-file", "result_file_path", type=click.Path(), default=None, help="Write a JSON result summary (outcome, duration, token usage).")
 def run(prompt_text: str, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, result_file_path: str | None) -> None:
     """Execute a single prompt and print the result."""
-    from thorn import infer_workspace_root
     from thorn.runtime._paths import AgencyPaths
 
     verbosity = _resolve_verbosity(verbose, quiet)
@@ -302,7 +300,7 @@ def run(prompt_text: str, verbose: int, quiet: bool, trace_path: str | None, wor
         agency_home = _resolve_cli_agency_home(agency_path)
         ws_root = (
             Path(workspace_path).resolve() if workspace_path
-            else infer_workspace_root()
+            else Path.cwd().resolve()
         )
         paths = AgencyPaths(home_root=agency_home, workspace_root=ws_root)
         runtime = _build_runtime(
@@ -551,7 +549,6 @@ async def _chat_loop(
 )
 def chat(verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, no_housekeeping: bool) -> None:
     """Start an interactive chat session."""
-    from thorn import infer_workspace_root
     from thorn.runtime._paths import AgencyPaths
 
     verbosity = _resolve_verbosity(verbose, quiet)
@@ -560,7 +557,7 @@ def chat(verbose: int, quiet: bool, trace_path: str | None, workspace_path: str 
         agency_home = _resolve_cli_agency_home(agency_path)
         ws_root = (
             Path(workspace_path).resolve() if workspace_path
-            else infer_workspace_root()
+            else Path.cwd().resolve()
         )
         paths = AgencyPaths(home_root=agency_home, workspace_root=ws_root)
         runtime = _build_runtime(

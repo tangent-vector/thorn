@@ -50,10 +50,12 @@ Dedup policy
   differ in any other field are *both* kept; resolving that conflict
   is left to the MCP layer (which today just registers both, and the
   consequences are the user's problem).
-- **Skills**: no dedup at this iteration.  Skill discovery is still a
-  stub (see ``skill_md_loader`` in the unified-context-gathering
-  plan); when it lands, the dedup policy will be revisited alongside
-  the discovery code so the two designs align.
+- **Skills**: no dedup at this iteration.  Skill discovery accumulates
+  every :class:`SkillEntry` produced by phase 2 in walk order; when
+  two layers happen to advertise a same-named skill, both currently
+  appear in the index block.  Revisit if/when the index becomes
+  large enough that duplicate entries are confusing -- the cheapest
+  policy is "outermost wins by ``name``", matching MCP.
 
 This module is **pure** in the sense that it does not touch the
 filesystem.  All I/O (loading ``AGENTS.md``, reading the journal,
@@ -91,9 +93,10 @@ class AssembledPromptContext:
     *system_prompt_blocks* into the system-prompt list they hand to
     :func:`thorn.core._loop.run_agent_loop`, register *mcp_configs*
     against the per-prompt :class:`MCPToolSource` (or equivalent),
-    and (eventually) emit *skills* as tools.  Today the skill list is
-    only used to render the skill-index block in the prompt; the
-    "skills as tools" plumbing arrives with the SKILL.md loader.
+    and use *skills* to render the skill-index block.  Skills are
+    advertised, not auto-invoked: the agent reads the ``SKILL.md``
+    body (via its own file-read tool) when it decides a skill is
+    relevant.  No per-skill tool wrapper is generated.
 
     Each entry of *system_prompt_blocks* is a single fully-formatted
     string ready to ship -- no further wrapping or header insertion

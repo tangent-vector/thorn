@@ -7,11 +7,11 @@ tests.  The composition (``collect_context_for_directory``) and
 the map (``load_context_layers``) get their own coverage at the
 end, focused on shape rather than on individual files.
 
-The skill collector intentionally has minimal coverage here: full
-SKILL.md discovery / YAML parsing tests land with the
-``skill_md_loader`` plan item.  We just verify the kind-filter
-behaviour so the existing plumbing won't regress when that work
-arrives.
+The skill collector exercises the directory walk plus the
+SkillEntry assembly; the deeper SKILL.md frontmatter behaviour
+(well-formed / missing / malformed cases) is covered against the
+parser directly in ``tests/test_skill_md.py`` so we don't double up
+on those exhaustive case tables here.
 """
 
 from __future__ import annotations
@@ -306,23 +306,133 @@ class TestCollectMcpConfigs:
 # Skills collector
 # ---------------------------------------------------------------------------
 
+def _write_skill(
+    root: Path, name: str, frontmatter_body: str, body: str = "Body.\n",
+) -> Path:
+    """Write a ``<root>/.agents/skills/<name>/SKILL.md`` and return its path.
+
+    The SKILL.md content is assembled as ``---\\n<frontmatter_body>---\\n<body>``
+    so callers only have to specify the YAML chunk between the fences.
+    """
+    skill_dir = root / ".agents" / "skills" / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(f"---\n{frontmatter_body}---\n{body}")
+    return skill_md
+
+
 class TestCollectSkills:
-    def test_returns_empty_for_now(self, tmp_path: Path) -> None:
-        # The discovery+parse implementation lands with the
-        # ``skill_md_loader`` plan item.  Until then the collector
-        # is a deliberate stub; this test is a placeholder that the
-        # later work will replace.
-        skills = tmp_path / ".agents" / "skills" / "babysit"
-        skills.mkdir(parents=True)
-        (skills / "SKILL.md").write_text(
-            "---\ndescription: keep PRs merge-ready\n---\nbody\n",
+    def test_loads_one_skill_with_description(self, tmp_path: Path) -> None:
+        skill_md = _write_skill(
+            tmp_path, "babysit",
+            "description: Keep PRs merge-ready.\n",
         )
+        result = collect_skills_for_directory(
+            _ctx(tmp_path, ContextDirectoryKind.AGENT_WORKSPACE),
+        )
+        assert result == [
+            SkillEntry(
+                name="babysit",
+                description="Keep PRs merge-ready.",
+                skill_md_path=skill_md,
+            ),
+        ]
+
+    def test_loads_multiple_skills_sorted_by_name(
+        self, tmp_path: Path,
+    ) -> None:
+        # File-order (creation order) is intentionally non-alpha so
+        # the test exercises the sort instead of accidentally relying
+        # on iteration order of the underlying filesystem.
+        _write_skill(tmp_path, "zeta", "description: last alphabetically\n")
+        _write_skill(tmp_path, "alpha", "description: first alphabetically\n")
+        _write_skill(tmp_path, "mid", "description: middle\n")
+        result = collect_skills_for_directory(
+            _ctx(tmp_path, ContextDirectoryKind.AGENT_HOME),
+        )
+        assert [entry.name for entry in result] == ["alpha", "mid", "zeta"]
+
+    def test_skill_dir_without_skill_md_is_skipped(
+        self, tmp_path: Path,
+    ) -> None:
+        empty = tmp_path / ".agents" / "skills" / "no-md"
+        empty.mkdir(parents=True)
+        (empty / "README.md").write_text("not the right file\n")
+        _write_skill(tmp_path, "good", "description: Good skill.\n")
+        result = collect_skills_for_directory(
+            _ctx(tmp_path, ContextDirectoryKind.AGENT_WORKSPACE),
+        )
+        assert [entry.name for entry in result] == ["good"]
+
+    def test_malformed_skill_md_does_not_break_walk(
+        self, tmp_path: Path,
+    ) -> None:
+        # First skill: completely missing frontmatter.  Second skill:
+        # well-formed.  The malformed one must be skipped without
+        # affecting the well-formed one.
+        bad_dir = tmp_path / ".agents" / "skills" / "bad"
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "SKILL.md").write_text("# Just markdown, no frontmatter\n")
+        _write_skill(tmp_path, "good", "description: Good.\n")
+        result = collect_skills_for_directory(
+            _ctx(tmp_path, ContextDirectoryKind.AGENT_WORKSPACE),
+        )
+        assert [entry.name for entry in result] == ["good"]
+
+    def test_skill_with_missing_description_is_skipped(
+        self, tmp_path: Path,
+    ) -> None:
+        _write_skill(tmp_path, "no-desc", "name: foo\n")
+        _write_skill(tmp_path, "ok", "description: present\n")
+        result = collect_skills_for_directory(
+            _ctx(tmp_path, ContextDirectoryKind.AGENT_HOME),
+        )
+        assert [entry.name for entry in result] == ["ok"]
+
+    def test_no_skills_dir_returns_empty(self, tmp_path: Path) -> None:
+        # Workspace exists but has no `.agents/skills/`.
         result = collect_skills_for_directory(
             _ctx(tmp_path, ContextDirectoryKind.AGENT_WORKSPACE),
         )
         assert result == []
 
+    def test_empty_skills_dir_returns_empty(self, tmp_path: Path) -> None:
+        (tmp_path / ".agents" / "skills").mkdir(parents=True)
+        result = collect_skills_for_directory(
+            _ctx(tmp_path, ContextDirectoryKind.AGENT_WORKSPACE),
+        )
+        assert result == []
+
+    def test_files_in_skills_dir_are_ignored(
+        self, tmp_path: Path,
+    ) -> None:
+        # ``.agents/skills/README.md`` is a plain file, not a skill
+        # directory; it must not be treated as a skill.
+        skills_root = tmp_path / ".agents" / "skills"
+        skills_root.mkdir(parents=True)
+        (skills_root / "README.md").write_text("notes about skills\n")
+        _write_skill(tmp_path, "real", "description: Real skill.\n")
+        result = collect_skills_for_directory(
+            _ctx(tmp_path, ContextDirectoryKind.AGENT_WORKSPACE),
+        )
+        assert [entry.name for entry in result] == ["real"]
+
+    def test_skill_md_path_points_at_the_md_file(
+        self, tmp_path: Path,
+    ) -> None:
+        skill_md = _write_skill(
+            tmp_path, "name-here", "description: x\n",
+        )
+        result = collect_skills_for_directory(
+            _ctx(tmp_path, ContextDirectoryKind.AGENT_WORKSPACE),
+        )
+        assert len(result) == 1
+        assert result[0].skill_md_path == skill_md
+
     def test_excluded_from_operator(self, tmp_path: Path) -> None:
+        # Even with a perfectly valid skill on disk, OPERATOR
+        # directories must contribute zero skills (per kind-filter).
+        _write_skill(tmp_path, "any", "description: irrelevant\n")
         result = collect_skills_for_directory(
             _ctx(tmp_path, ContextDirectoryKind.OPERATOR),
         )

@@ -13,6 +13,7 @@ dependencies = [
     "pathspec>=0.12",
     "psutil>=5.9",
     "mistletoe>=1.4",
+    "PyYAML>=6.0",
 ]
 
 [project.scripts]

@@ -1,19 +1,21 @@
-"""Tests for thorn.core._discovery and the @tool decorator."""
+"""Tests for thorn.core._discovery and the @tool decorator.
+
+Coverage is limited to the ``@tool`` marker decorator and to
+``discover_tools`` (the project-level ``.agents/thorn/*.py`` Python
+tool collector).  The rest of the module's previous surface
+(``find_thorn_dirs``, ``load_workspace_instructions``,
+``load_agent_memory``) was retired alongside the unified
+context-gathering refactor; equivalent behavior now lives in
+``thorn.runtime._context_layers`` and is exercised by
+``tests/test_context_layers.py``.
+"""
 
 from __future__ import annotations
 
 import textwrap
 from pathlib import Path
 
-import pytest
-
-from thorn.core._discovery import (
-    discover_tools,
-    find_agents_thorn_dirs,
-    find_thorn_dirs,
-    load_agent_memory,
-    load_workspace_instructions,
-)
+from thorn.core._discovery import discover_tools
 from thorn.core._func import tool
 
 
@@ -58,155 +60,15 @@ class TestToolDecorator:
 
 
 # ---------------------------------------------------------------------------
-# find_thorn_dirs (agency state)
-# ---------------------------------------------------------------------------
-
-class TestFindThornDirs:
-    def test_finds_thorn_dir_in_start(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
-        result = find_thorn_dirs(start=tmp_path)
-        assert thorn_dir in result
-
-    def test_finds_thorn_dir_in_ancestor(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
-        child = tmp_path / "a" / "b" / "c"
-        child.mkdir(parents=True)
-
-        result = find_thorn_dirs(start=child)
-        assert thorn_dir in result
-
-    def test_deepest_first_ordering(self, tmp_path: Path):
-        parent_thorn = tmp_path / ".thorn"
-        parent_thorn.mkdir()
-        child = tmp_path / "project"
-        child.mkdir()
-        child_thorn = child / ".thorn"
-        child_thorn.mkdir()
-
-        result = find_thorn_dirs(start=child)
-        parent_idx = result.index(parent_thorn)
-        child_idx = result.index(child_thorn)
-        assert child_idx < parent_idx
-
-    def test_no_thorn_dirs(self, tmp_path: Path):
-        deep = tmp_path / "a" / "b"
-        deep.mkdir(parents=True)
-        result = find_thorn_dirs(start=deep)
-        for d in result:
-            assert not str(d).startswith(str(tmp_path))
-
-    def test_ignores_thorn_file_not_dir(self, tmp_path: Path):
-        (tmp_path / ".thorn").write_text("not a dir")
-        result = find_thorn_dirs(start=tmp_path)
-        for d in result:
-            assert not str(d).startswith(str(tmp_path))
-
-
-# ---------------------------------------------------------------------------
-# find_agents_thorn_dirs (project tool definitions)
-# ---------------------------------------------------------------------------
-
-class TestFindAgentsThornDirs:
-    def test_finds_agents_thorn_dir(self, tmp_path: Path):
-        agents_thorn = tmp_path / ".agents" / "thorn"
-        agents_thorn.mkdir(parents=True)
-        (agents_thorn / "tools.py").write_text("x = 1\n")
-
-        result = find_agents_thorn_dirs(start=tmp_path)
-        assert agents_thorn in result
-
-    def test_ignores_empty_thorn_dir(self, tmp_path: Path):
-        agents_thorn = tmp_path / ".agents" / "thorn"
-        agents_thorn.mkdir(parents=True)
-
-        result = find_agents_thorn_dirs(start=tmp_path)
-        assert agents_thorn not in result
-
-    def test_finds_in_ancestor(self, tmp_path: Path):
-        agents_thorn = tmp_path / ".agents" / "thorn"
-        agents_thorn.mkdir(parents=True)
-        (agents_thorn / "tools.py").write_text("x = 1\n")
-        child = tmp_path / "a" / "b" / "c"
-        child.mkdir(parents=True)
-
-        result = find_agents_thorn_dirs(start=child)
-        assert agents_thorn in result
-
-    def test_deepest_first_ordering(self, tmp_path: Path):
-        parent_agents = tmp_path / ".agents" / "thorn"
-        parent_agents.mkdir(parents=True)
-        (parent_agents / "a.py").write_text("x = 1\n")
-
-        child = tmp_path / "project"
-        child.mkdir()
-        child_agents = child / ".agents" / "thorn"
-        child_agents.mkdir(parents=True)
-        (child_agents / "b.py").write_text("x = 2\n")
-
-        result = find_agents_thorn_dirs(start=child)
-        parent_idx = result.index(parent_agents)
-        child_idx = result.index(child_agents)
-        assert child_idx < parent_idx
-
-    def test_ignores_non_directory(self, tmp_path: Path):
-        agents_dir = tmp_path / ".agents"
-        agents_dir.mkdir()
-        (agents_dir / "thorn").write_text("not a directory")
-
-        result = find_agents_thorn_dirs(start=tmp_path)
-        assert len(result) == 0
-
-
-# ---------------------------------------------------------------------------
-# load_workspace_instructions
-# ---------------------------------------------------------------------------
-
-class TestLoadWorkspaceInstructions:
-    def test_returns_content_when_file_exists(self, tmp_path: Path):
-        agents_md = tmp_path / "AGENTS.md"
-        agents_md.write_text("Follow these rules.", encoding="utf-8")
-        assert load_workspace_instructions(tmp_path) == "Follow these rules."
-
-    def test_returns_none_when_absent(self, tmp_path: Path):
-        assert load_workspace_instructions(tmp_path) is None
-
-    def test_returns_none_when_agents_md_is_directory(self, tmp_path: Path):
-        (tmp_path / "AGENTS.md").mkdir()
-        assert load_workspace_instructions(tmp_path) is None
-
-    def test_preserves_multiline_content(self, tmp_path: Path):
-        content = "# Rules\n\n- Be concise\n- Use types\n"
-        (tmp_path / "AGENTS.md").write_text(content, encoding="utf-8")
-        assert load_workspace_instructions(tmp_path) == content
-
-
-# ---------------------------------------------------------------------------
-# load_agent_memory
-# ---------------------------------------------------------------------------
-
-class TestLoadAgentMemory:
-    def test_returns_content_when_file_exists(self, tmp_path: Path):
-        memory_md = tmp_path / "MEMORY.md"
-        memory_md.write_text("The repository URL is https://example.com/repo.git", encoding="utf-8")
-        assert load_agent_memory(tmp_path) == "The repository URL is https://example.com/repo.git"
-
-    def test_returns_none_when_absent(self, tmp_path: Path):
-        assert load_agent_memory(tmp_path) is None
-
-    def test_returns_none_when_memory_md_is_directory(self, tmp_path: Path):
-        (tmp_path / "MEMORY.md").mkdir()
-        assert load_agent_memory(tmp_path) is None
-
-    def test_preserves_multiline_content(self, tmp_path: Path):
-        content = "# Agent Memory\n\n- Project URL: https://example.com\n- Default branch: main\n"
-        (tmp_path / "MEMORY.md").write_text(content, encoding="utf-8")
-        assert load_agent_memory(tmp_path) == content
-
-
-# ---------------------------------------------------------------------------
 # discover_tools (integration, from .agents/thorn/)
+#
+# This is the only `_discovery` surface that survived the
+# unified-context-gathering refactor: ``find_thorn_dirs``,
+# ``load_workspace_instructions``, and ``load_agent_memory`` were
+# retired in favor of the per-prompt context-gathering pipeline.  The
+# bulk of the previous test coverage moved with them; what remains
+# here exercises the deepest-first walker indirectly via the public
+# ``discover_tools`` entry point.
 # ---------------------------------------------------------------------------
 
 class TestDiscoverTools:

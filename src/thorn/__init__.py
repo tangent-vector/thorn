@@ -258,7 +258,7 @@ def run(
     via ``load_provider_from_env()``.
 
     *workspace* sets the workspace root for file-access rules.  When
-    ``None``, the heuristic in :func:`infer_workspace_root` is used.
+    ``None``, falls back to the resolved current working directory.
     """
     from pathlib import Path
 
@@ -270,7 +270,7 @@ def run(
     if event_sink is None:
         event_sink = NullEventSink()
 
-    ws_root = Path(workspace).resolve() if workspace else infer_workspace_root()
+    ws_root = Path(workspace).resolve() if workspace else Path.cwd().resolve()
     global_ignores = load_global_ignores(ws_root)
 
     system_prompts: list[str] = []
@@ -299,20 +299,3 @@ def run(
             reset_context(token)
 
     return asyncio.run(_run_with_context())
-
-
-def infer_workspace_root() -> "Path":
-    """Determine the workspace root using the .thorn/ heuristic.
-
-    Precedence:
-    1. Deepest ancestor of CWD that contains a ``.thorn/`` directory.
-    2. CWD, if no ``.thorn/`` directory is found.
-    """
-    from pathlib import Path
-
-    from thorn.core._discovery import find_thorn_dirs
-
-    thorn_dirs = find_thorn_dirs()
-    if thorn_dirs:
-        return thorn_dirs[0].parent.resolve()
-    return Path.cwd().resolve()

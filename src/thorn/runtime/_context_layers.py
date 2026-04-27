@@ -73,6 +73,10 @@ from thorn.runtime._context_paths import (
     ContextDirectory,
     ContextDirectoryKind,
 )
+from thorn.runtime._skill_md import (
+    SkillMdError,
+    parse_skill_md,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +107,8 @@ class SkillEntry:
 
     The *name* is the immediate skill directory's basename (the
     "babysit" in ``.agents/skills/babysit/``).  *description* is
-    populated from the SKILL.md YAML frontmatter (see the
-    ``skill_md_loader`` plan item for the parsing implementation).
+    the one-line summary lifted from the SKILL.md YAML frontmatter
+    (see :mod:`thorn.runtime._skill_md` for the parser contract).
     *skill_md_path* is the absolute path the agent uses to actually
     read the skill body via the ``Read`` tool.
 
@@ -407,32 +411,65 @@ def collect_skills_for_directory(
 ) -> list[SkillEntry]:
     """Discover agent skills under ``<dir>/.agents/skills/``.
 
-    Each immediate subdirectory containing a ``SKILL.md`` is one
-    skill; the entry's *name* is the subdirectory basename, the
-    *description* is sourced from the SKILL.md YAML frontmatter,
+    Each immediate subdirectory containing a ``SKILL.md`` file is
+    one skill; the entry's *name* is the subdirectory basename, the
+    *description* is sourced from the SKILL.md YAML frontmatter
+    (see :mod:`thorn.runtime._skill_md` for the parser contract),
     and *skill_md_path* points at the SKILL.md file itself.
 
     Excludes ``OPERATOR`` directories.
 
-    .. note::
+    Per-skill failure modes (no SKILL.md, parse error, missing
+    description) all log a warning and skip the offending skill;
+    they never tank the rest of the walk.  This matches the broader
+    "best-effort context loading" policy of the pipeline -- a typo
+    in one SKILL.md should not erase every skill the agent has.
 
-        YAML frontmatter parsing has not yet landed -- it is the
-        ``skill_md_loader`` item in the unified-context-gathering
-        plan.  For now this collector returns an empty list even
-        when SKILL.md files exist, so the pipeline shape is
-        deliberate but the skill block in the assembled prompt is
-        empty.  Implementing the parser is a one-place change here:
-        replace the early ``return []`` with the directory walk and
-        per-skill YAML parse.  Tests for the discovery and parsing
-        will land alongside that change.
+    Returned entries are ordered by skill name (ASCII-sort) so the
+    skill-index block in the assembled prompt is stable across runs
+    and across filesystems with different ``readdir`` ordering.
     """
     if directory.kind not in _SKILLS_ALLOWED_KINDS:
         return []
-    # TODO(skill_md_loader): implement SKILL.md discovery + YAML
-    # frontmatter parsing.  Tracked as a separate plan item to keep
-    # the dependency story (pyyaml vs. mistletoe vs. an alternative
-    # markdown parser) on its own beat.
-    return []
+
+    skills_root = directory.path / _SKILLS_REL_PATH
+    if not skills_root.is_dir():
+        return []
+
+    entries: list[SkillEntry] = []
+    for skill_dir in sorted(
+        skills_root.iterdir(), key=lambda p: p.name,
+    ):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.is_file():
+            logger.warning(
+                "skill directory %s has no SKILL.md; skipping",
+                skill_dir,
+            )
+            continue
+
+        text = _read_text_or_warn(skill_md)
+        if text is None:
+            continue
+
+        try:
+            parsed = parse_skill_md(skill_md, text)
+        except SkillMdError as exc:
+            logger.warning(
+                "failed to parse %s as a SKILL.md: %s",
+                skill_md, exc.message,
+            )
+            continue
+
+        entries.append(SkillEntry(
+            name=skill_dir.name,
+            description=parsed.description,
+            skill_md_path=skill_md,
+        ))
+
+    return entries
 
 
 # ---------------------------------------------------------------------------
