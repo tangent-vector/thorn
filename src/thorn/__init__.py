@@ -113,8 +113,10 @@ from thorn.core import (
 from thorn import tools
 from thorn.runtime import AgentID, Runtime, SessionKey
 
+from thorn.core import MCPServerConfig
+
 try:
-    from thorn.core import MCPServerConfig, MCPToolSource, serve_tools
+    from thorn.core import serve_tools
 except ImportError:
     pass
 
@@ -231,9 +233,9 @@ __all__ = [
     "TransientProviderError",
     "LoopLimitError",
     "AgentFailureError",
-    # MCP (available when thorn[mcp] is installed)
+    # MCP (``MCPServerConfig`` is always importable; ``serve_tools``
+    # requires the ``thorn[mcp]`` optional extra).
     "MCPServerConfig",
-    "MCPToolSource",
     "serve_tools",
 ]
 

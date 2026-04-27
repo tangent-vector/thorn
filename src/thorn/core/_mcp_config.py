@@ -9,9 +9,14 @@ that:
 
 * The runtime context-gathering pipeline can construct instances
   without pulling in the optional ``mcp`` package.
-* The toolhost daemon (Phase C.1's eventual MCP client) can import
-  the type without going through ``thorn.core._mcp`` and the
-  brain-side ``MCPToolSource`` plumbing that lives there today.
+* The toolhost daemon's :class:`thorn.toolhost._mcp_host.MCPHost`
+  (the canonical MCP client since Phase C.1) imports the type
+  directly without going through :mod:`thorn.core._mcp`, which now
+  carries only the Thorn-as-MCP-server (``serve_tools``) surface.
+* The wire protocol in :mod:`thorn.toolhost._protocol` carries
+  ``MCPServerConfig`` payloads on both ``ToolCallRequest`` and
+  ``ListMCPServerToolsRequest`` frames; serialisation goes through
+  this same dataclass.
 
 The dataclass itself does not depend on the ``mcp`` package; that
 dependency only enters the picture when something actually tries to

@@ -1,31 +1,30 @@
-"""Tests for thorn.core._mcp (MCP integration).
+"""Tests for ``thorn.core._mcp`` (Thorn-as-MCP-server side).
 
-Per-directory MCP discovery (``mcp.json`` walking, dedup, env
-expansion) lives in the unified context-gathering pipeline -- see
-``tests/test_context_layers.py`` and ``tests/test_prompt_assembly.py``
-for that coverage.  This module focuses on the bits of ``_mcp`` that
-remain after the refactor: ``MCPServerConfig`` validation, schema
-conversion helpers, and the ``MCPToolSource`` / ``serve_tools``
-client/server seams.
+After Phase C.1 the brain-side MCP *client* (``MCPToolSource``) is
+retired; the daemon's ``MCPHost`` is the only Thorn component that
+opens an MCP ``ClientSession``.  What remains in ``thorn.core._mcp``
+is the *server* side: the ``serve_tools`` entry point that backs
+``thorn serve``, plus the OpenAI-schema -> MCP-tool helper it uses.
+
+Direct ``MCPServerConfig`` validation also lives here for historical
+reasons -- the dataclass is re-exported from
+``thorn.core._mcp`` for back-compat with pre-C.1 callers and that
+re-export is the public seam these tests exercise.
+
+Daemon-side conversion helpers (``_mcp_tool_to_openai_schema``,
+``_mcp_result_to_string``) moved to ``thorn.toolhost._mcp_host``;
+their tests now live in ``tests/test_mcp_host.py``.
 """
 
 from __future__ import annotations
 
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
-
 import pytest
 
-from thorn.core._mcp import (
-    MCPServerConfig,
-    _mcp_result_to_string,
-    _mcp_tool_to_openai_schema,
-    _openai_schema_to_mcp_tool,
-)
+from thorn.core._mcp import MCPServerConfig, _openai_schema_to_mcp_tool
 
 
 # ---------------------------------------------------------------------------
-# MCPServerConfig
+# MCPServerConfig (re-exported from thorn.core._mcp_config)
 # ---------------------------------------------------------------------------
 
 class TestMCPServerConfig:
@@ -45,37 +44,11 @@ class TestMCPServerConfig:
 
 
 # ---------------------------------------------------------------------------
-# Schema conversion
+# OpenAI schema -> MCP tool dict (still consumed by ``serve_tools``)
 # ---------------------------------------------------------------------------
 
-class TestSchemaConversion:
-    def test_mcp_to_openai(self):
-        mcp_tool = MagicMock()
-        mcp_tool.name = "search"
-        mcp_tool.description = "Search for things."
-        mcp_tool.inputSchema = {
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": ["query"],
-        }
-
-        schema = _mcp_tool_to_openai_schema(mcp_tool)
-
-        assert schema["type"] == "function"
-        assert schema["function"]["name"] == "search"
-        assert schema["function"]["description"] == "Search for things."
-        assert schema["function"]["parameters"] == mcp_tool.inputSchema
-
-    def test_mcp_to_openai_no_description(self):
-        mcp_tool = MagicMock()
-        mcp_tool.name = "noop"
-        mcp_tool.description = None
-        mcp_tool.inputSchema = {"type": "object", "properties": {}}
-
-        schema = _mcp_tool_to_openai_schema(mcp_tool)
-        assert schema["function"]["description"] == ""
-
-    def test_openai_to_mcp(self):
+class TestOpenAISchemaToMcpTool:
+    def test_translates_function_block(self):
         openai_schema = {
             "type": "function",
             "function": {
@@ -95,67 +68,44 @@ class TestSchemaConversion:
         assert mcp_info["description"] == "Read a file."
         assert mcp_info["inputSchema"] == openai_schema["function"]["parameters"]
 
-    def test_round_trip(self):
-        """OpenAI -> MCP -> OpenAI should preserve the important fields."""
-        original = {
-            "type": "function",
-            "function": {
-                "name": "greet",
-                "description": "Say hello.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"name": {"type": "string"}},
-                    "required": ["name"],
-                },
-            },
-        }
-
-        mcp_info = _openai_schema_to_mcp_tool(original)
-
-        # Simulate an MCP Tool object from the mcp_info dict
-        mock_tool = MagicMock()
-        mock_tool.name = mcp_info["name"]
-        mock_tool.description = mcp_info["description"]
-        mock_tool.inputSchema = mcp_info["inputSchema"]
-
-        restored = _mcp_tool_to_openai_schema(mock_tool)
-
-        assert restored == original
+    def test_missing_function_block_yields_empty_strings(self):
+        # Defensive: a malformed schema must not blow up; ``serve_tools``
+        # iterates this output and skips entries with empty names.
+        mcp_info = _openai_schema_to_mcp_tool({})
+        assert mcp_info == {"name": "", "description": "", "inputSchema": {}}
 
 
 # ---------------------------------------------------------------------------
-# Result extraction
+# Regression guard: MCPToolSource is gone for good
 # ---------------------------------------------------------------------------
 
-class TestMcpResultToString:
-    def test_single_text_block(self):
-        result = MagicMock()
-        block = MagicMock()
-        block.text = "hello world"
-        result.content = [block]
+class TestMCPToolSourceRetired:
+    """``MCPToolSource`` was retired in Phase C.1.
 
-        assert _mcp_result_to_string(result) == "hello world"
+    All brain-side MCP discovery now goes through
+    :func:`thorn.runtime._mcp_tools.discover_mcp_tools`, which routes
+    list/call traffic through the per-agent toolhost daemon.  Anything
+    importing ``MCPToolSource`` is reaching for code that no longer
+    exists; making that an import error here keeps a future
+    well-meaning revert from silently re-introducing the brain-side
+    client.
+    """
 
-    def test_multiple_text_blocks(self):
-        result = MagicMock()
-        b1, b2 = MagicMock(), MagicMock()
-        b1.text = "line 1"
-        b2.text = "line 2"
-        result.content = [b1, b2]
+    def test_not_importable_from_thorn_core_mcp(self):
+        import thorn.core._mcp as mcp_module
 
-        assert _mcp_result_to_string(result) == "line 1\nline 2"
+        assert not hasattr(mcp_module, "MCPToolSource"), (
+            "MCPToolSource was retired in Phase C.1; reintroducing it "
+            "would re-create a brain-side MCP client outside the "
+            "sandbox boundary."
+        )
 
-    def test_non_text_blocks_skipped(self):
-        result = MagicMock()
-        text_block = MagicMock()
-        text_block.text = "good"
-        image_block = MagicMock(spec=[])  # no .text attribute
-        result.content = [image_block, text_block]
+    def test_not_importable_from_thorn_top_level(self):
+        import thorn
 
-        assert _mcp_result_to_string(result) == "good"
+        assert not hasattr(thorn, "MCPToolSource")
 
-    def test_empty_content(self):
-        result = MagicMock()
-        result.content = []
+    def test_not_importable_from_thorn_core(self):
+        import thorn.core as core
 
-        assert _mcp_result_to_string(result) == ""
+        assert not hasattr(core, "MCPToolSource")

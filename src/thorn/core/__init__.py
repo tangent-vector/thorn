@@ -107,8 +107,15 @@ from thorn.core._event_bus import (
     in_session,
 )
 
+from thorn.core._mcp_config import MCPServerConfig
+
 try:
-    from thorn.core._mcp import MCPServerConfig, MCPToolSource, serve_tools
+    # ``serve_tools`` lives behind the optional ``mcp`` extra
+    # because it imports ``mcp.server.fastmcp`` lazily; an
+    # operator that does not install ``thorn[mcp]`` simply does
+    # not get the symbol.  ``MCPServerConfig`` itself has no
+    # optional dependency and is always importable.
+    from thorn.core._mcp import serve_tools
 except ImportError:
     pass
 

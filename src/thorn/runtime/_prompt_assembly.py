@@ -90,8 +90,9 @@ class AssembledPromptContext:
 
     Consumers (today: ``_run_session_prompt``) splice
     *system_prompt_blocks* into the system-prompt list they hand to
-    :func:`thorn.core._loop.run_agent_loop`, register *mcp_configs*
-    against the per-prompt :class:`MCPToolSource` (or equivalent),
+    :func:`thorn.core._loop.run_agent_loop`, hand *mcp_configs* to
+    :func:`thorn.runtime._mcp_tools.discover_mcp_tools` (which routes
+    every list/call through the per-agent ``thorn-toolhost`` daemon),
     and use *skills* to render the skill-index block.  Skills are
     advertised, not auto-invoked: the agent reads the ``SKILL.md``
     body (via its own file-read tool) when it decides a skill is

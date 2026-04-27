@@ -270,11 +270,10 @@ class MCPHost:
 def _mcp_tool_to_openai_schema(tool: Any) -> dict[str, Any]:
     """Convert an MCP ``Tool`` object to an OpenAI-style tool schema.
 
-    Kept duplicated from :mod:`thorn.core._mcp` (rather than imported)
-    so the daemon does not pull in the brain-side ``MCPToolSource`` /
-    ``serve_tools`` plumbing that lives there.  The brain-side copy
-    will go away with :class:`MCPToolSource` retirement (Phase C.1
-    item 7); until then both paths happen to agree on the conversion.
+    Canonical home as of Phase C.1: the brain-side
+    :class:`thorn.core._mcp.MCPToolSource` that previously owned a copy
+    of this helper has been retired, and the daemon's ``MCPHost`` is
+    now the only consumer of MCP tools across the project.
     """
     return {
         "type": "function",
@@ -289,8 +288,10 @@ def _mcp_tool_to_openai_schema(tool: Any) -> dict[str, Any]:
 def _mcp_result_to_string(result: Any) -> str:
     """Extract text from an MCP ``CallToolResult``.
 
-    See :func:`_mcp_tool_to_openai_schema` for why this is duplicated
-    rather than imported.
+    Concatenates every text-bearing content block with newlines and
+    drops anything else (e.g. image blocks); callers that want
+    structured access to non-text content should reach into
+    ``result.content`` directly instead of using this helper.
     """
     parts: list[str] = []
     for block in getattr(result, "content", []):
