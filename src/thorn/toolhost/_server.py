@@ -29,6 +29,7 @@ import os
 import platform
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -42,6 +43,11 @@ from thorn.core._executor import (
 )
 from thorn.core._loop import _WrappedTool
 from thorn.toolhost._mcp_host import MCPHost, MCPUnavailableError
+from thorn.toolhost._mcp_state import (
+    MCP_STATE_FILE_NAME,
+    MCPStateSnapshot,
+    write_atomic_snapshot,
+)
 from thorn.toolhost._protocol import (
     MCP_FEATURE,
     PROTOCOL_MAJOR,
@@ -233,6 +239,16 @@ class ToolhostServer:
         # Strong refs for fire-and-forget tasks (e.g. MCP-list
         # responses) that have no cancellation channel of their own.
         self._background_tasks: set[asyncio.Task] = set()
+        # Path of the daemon's MCP state snapshot file.  Co-located
+        # with the log so a single bind-mount (the per-agent control
+        # dir) carries everything ``thorn sandbox status`` needs to
+        # render live state.  Disabled when the daemon was started
+        # without a log file (typically tests with in-memory streams).
+        self._mcp_state_path: Path | None = (
+            (config.log_path.parent / MCP_STATE_FILE_NAME)
+            if config.log_path is not None
+            else None
+        )
 
     @property
     def config(self) -> ToolhostConfig:
@@ -557,6 +573,31 @@ class ToolhostServer:
             result=result.content,
         )
 
+    def _persist_mcp_state(self) -> None:
+        """Write a fresh :class:`MCPStateSnapshot` to the control dir.
+
+        Called after every MCP-flavored op (list or call) so the
+        snapshot the ``thorn sandbox status`` CLI reads tracks the
+        daemon's view in near-real-time.  Best-effort: any I/O failure
+        is logged and swallowed -- the user's tool call must not be
+        impacted by a transient disk hiccup, and the next op will
+        write again anyway.
+        """
+        if self._mcp_state_path is None:
+            return
+        try:
+            snapshot = MCPStateSnapshot(
+                updated_at=datetime.now(timezone.utc).isoformat(),
+                servers=self._mcp_host.snapshot(),
+            )
+            write_atomic_snapshot(self._mcp_state_path, snapshot)
+        except Exception as exc:
+            logger.warning(
+                "toolhost: failed to write mcp_state snapshot to %s: %s",
+                self._mcp_state_path,
+                exc,
+            )
+
     async def _dispatch_mcp_call(
         self,
         request: ToolCallRequest,
@@ -572,11 +613,18 @@ class ToolhostServer:
         """
         assert request.mcp_server_config is not None  # guard at caller
         try:
-            text = await self._mcp_host.call_tool(
-                request.mcp_server_config,
-                request.tool_name,
-                dict(request.arguments),
-            )
+            try:
+                text = await self._mcp_host.call_tool(
+                    request.mcp_server_config,
+                    request.tool_name,
+                    dict(request.arguments),
+                )
+            finally:
+                # Persist regardless of success/failure so the snapshot
+                # reflects the post-call state of the entry (e.g.
+                # "alive=True, last_used_at=just now" after the very
+                # first call).
+                self._persist_mcp_state()
         except asyncio.CancelledError:
             logger.info(
                 "toolhost: mcp call %r cancelled mid-flight",
@@ -651,7 +699,14 @@ class ToolhostServer:
         deal with a half-finished frame.
         """
         try:
-            tools = await self._mcp_host.list_tools(request.server_config)
+            try:
+                tools = await self._mcp_host.list_tools(request.server_config)
+            finally:
+                # Persist after every list attempt so an early failure
+                # still surfaces "the daemon tried this server" via the
+                # snapshot file (the entry is registered before the
+                # session opens).
+                self._persist_mcp_state()
         except MCPUnavailableError as exc:
             return ListMCPServerToolsResponse(
                 request_id=request.request_id,

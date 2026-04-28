@@ -338,3 +338,98 @@ async def test_use_after_close_raises():
     cfg = MCPServerConfig(name="srv", command="srv")
     with pytest.raises(RuntimeError, match="MCPHost is closed"):
         await host.list_tools(cfg)
+
+
+# ---------------------------------------------------------------------------
+# snapshot()
+# ---------------------------------------------------------------------------
+
+class TestMCPHostSnapshot:
+    @pytest.mark.asyncio
+    async def test_empty_host_snapshots_empty(self):
+        host = MCPHost()
+        try:
+            assert host.snapshot() == []
+        finally:
+            await host.aclose()
+
+    @pytest.mark.asyncio
+    async def test_snapshot_after_list_reports_alive_and_tool_count(self):
+        cfg = MCPServerConfig(name="srv", command="srv-mcp")
+        fake = _FakeSession(tools=[_FakeTool("a"), _FakeTool("b")])
+
+        from thorn.core._mcp_config import mcp_server_config_identity
+        host = _make_host_with_fake_sessions(
+            {mcp_server_config_identity(cfg): fake},
+        )
+        try:
+            await host.list_tools(cfg)
+            snap = host.snapshot()
+            assert len(snap) == 1
+            entry = snap[0]
+            assert entry.name == "srv"
+            assert entry.kind == "stdio"
+            assert entry.identifier == "srv-mcp"
+            assert entry.alive is True
+            assert entry.tool_count == 2
+            assert entry.last_used_at is not None
+            # ISO-8601 with offset; cheap structural check.
+            assert "T" in entry.last_used_at
+            # Identity hash is short hex (12 chars in production).
+            assert len(entry.config_identity) == 12
+            int(entry.config_identity, 16)  # parses as hex
+        finally:
+            await host.aclose()
+
+    @pytest.mark.asyncio
+    async def test_snapshot_call_tool_advances_last_used(self):
+        cfg = MCPServerConfig(name="srv", command="srv-mcp")
+        fake = _FakeSession(tools=[_FakeTool("t")])
+
+        from thorn.core._mcp_config import mcp_server_config_identity
+        host = _make_host_with_fake_sessions(
+            {mcp_server_config_identity(cfg): fake},
+        )
+        try:
+            await host.list_tools(cfg)
+            first = host.snapshot()[0].last_used_at
+            assert first is not None
+
+            # Force monotonic clock advancement (real wall-clock can
+            # tick at the same microsecond on fast machines).  We
+            # patch the module-level _utcnow seam with a fixed later
+            # timestamp.
+            from datetime import datetime, timezone
+            import thorn.toolhost._mcp_host as mcp_host_mod
+
+            later = datetime(2099, 1, 1, tzinfo=timezone.utc)
+            original = mcp_host_mod._utcnow
+            mcp_host_mod._utcnow = lambda: later  # type: ignore[assignment]
+            try:
+                await host.call_tool(cfg, "t", {})
+            finally:
+                mcp_host_mod._utcnow = original  # type: ignore[assignment]
+
+            second = host.snapshot()[0].last_used_at
+            assert second == later.isoformat()
+            assert second != first
+        finally:
+            await host.aclose()
+
+    @pytest.mark.asyncio
+    async def test_snapshot_distinguishes_kind_for_url_config(self):
+        cfg = MCPServerConfig(name="docs", url="https://example.com/mcp")
+        host = MCPHost()
+        host._mcp_available = True
+        try:
+            entry = await host._get_or_create_entry(cfg)
+            assert entry is not None
+            snap = host.snapshot()
+            assert len(snap) == 1
+            assert snap[0].kind == "http"
+            assert snap[0].identifier == "https://example.com/mcp"
+            assert snap[0].alive is False
+            assert snap[0].tool_count is None
+            assert snap[0].last_used_at is None
+        finally:
+            await host.aclose()

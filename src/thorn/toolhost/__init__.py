@@ -23,6 +23,13 @@ from thorn.toolhost._executor import (
     MCPServerUnavailableError,
 )
 from thorn.toolhost._mcp_host import MCPHost, MCPUnavailableError
+from thorn.toolhost._mcp_state import (
+    MCP_STATE_FILE_NAME,
+    MCPServerState,
+    MCPStateSnapshot,
+    read_snapshot,
+    write_atomic_snapshot,
+)
 from thorn.toolhost._host import (
     DaemonHost,
     SubprocessDaemonHost,
@@ -52,6 +59,7 @@ from thorn.toolhost._protocol import (
 
 __all__ = [
     "MCP_FEATURE",
+    "MCP_STATE_FILE_NAME",
     "PROTOCOL_MAJOR",
     "PROTOCOL_MINOR",
     "DaemonCrashedError",
@@ -61,7 +69,9 @@ __all__ = [
     "DaemonUnavailableError",
     "Frame",
     "MCPHost",
+    "MCPServerState",
     "MCPServerUnavailableError",
+    "MCPStateSnapshot",
     "MCPUnavailableError",
     "SubprocessDaemonHost",
     "SubprocessDaemonHostConfig",
@@ -79,5 +89,7 @@ __all__ = [
     "decode_frame",
     "encode_frame",
     "read_frame",
+    "read_snapshot",
+    "write_atomic_snapshot",
     "write_frame",
 ]

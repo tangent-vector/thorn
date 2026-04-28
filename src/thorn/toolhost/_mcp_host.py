@@ -30,15 +30,18 @@ the ``"mcp"`` feature flag in its :class:`~thorn.toolhost._protocol.Hello`.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from thorn.core._mcp_config import (
     MCPServerConfig,
     mcp_server_config_identity,
 )
+from thorn.toolhost._mcp_state import MCPServerState
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +66,17 @@ class _MCPEntry:
     first :meth:`MCPHost.list_tools` call for this entry and reused
     thereafter; the cache lives only as long as the daemon process,
     which is short enough that staleness is not a concern in v1.
+
+    ``last_used_at`` is updated on every successful ``list_tools`` /
+    ``call_tool`` so the daemon can include a "freshness" timestamp
+    in the snapshot file the ``thorn sandbox status`` CLI reads.
     """
 
     config: MCPServerConfig
     call_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     session: Any | None = None
     tools_cache: list[dict[str, Any]] | None = None
+    last_used_at: datetime | None = None
 
 
 class MCPHost:
@@ -145,12 +153,14 @@ class MCPHost:
         async with entry.call_lock:
             await self._ensure_connected(entry)
             if entry.tools_cache is not None:
+                entry.last_used_at = _utcnow()
                 return list(entry.tools_cache)
             tools_result = await entry.session.list_tools()
             schemas = [
                 _mcp_tool_to_openai_schema(tool) for tool in tools_result.tools
             ]
             entry.tools_cache = schemas
+            entry.last_used_at = _utcnow()
             logger.info(
                 "MCPHost: server %r exposes %d tools (%s)",
                 config.name,
@@ -182,6 +192,7 @@ class MCPHost:
         async with entry.call_lock:
             await self._ensure_connected(entry)
             result = await entry.session.call_tool(tool_name, arguments)
+            entry.last_used_at = _utcnow()
             return _mcp_result_to_string(result)
 
     async def aclose(self) -> None:
@@ -205,6 +216,23 @@ class MCPHost:
         except Exception:
             logger.exception("MCPHost: error during exit-stack teardown")
         self._entries.clear()
+
+    def snapshot(self) -> list[MCPServerState]:
+        """Return a point-in-time view of every registered server.
+
+        Synchronous and lock-free: reads each entry's already-set
+        attributes without taking the per-entry ``call_lock``, so it
+        cannot wedge a status read on a slow tool call.  The returned
+        list is a fresh snapshot; mutating it has no effect on the
+        host.
+
+        ``alive`` reports whether the daemon currently holds a
+        connected ``ClientSession`` for the entry; ``tool_count`` is
+        ``None`` until the first :meth:`list_tools`.  All timestamps
+        are ISO-8601 in UTC for cross-tool comparability.
+        """
+        entries = list(self._entries.values())
+        return [_entry_to_state(entry) for entry in entries]
 
     def _require_open(self) -> None:
         if self._closed:
@@ -265,6 +293,67 @@ class MCPHost:
         )
         await session.initialize()
         entry.session = session
+
+
+def _utcnow() -> datetime:
+    """Return the current UTC time.
+
+    Wrapped in a helper so tests can monkeypatch this single seam
+    instead of stubbing ``datetime`` globally.
+    """
+    return datetime.now(timezone.utc)
+
+
+def _describe_kind(config: MCPServerConfig) -> str:
+    """Classify a config as ``"stdio"`` or ``"http"`` for diagnostics."""
+    return "http" if config.url else "stdio"
+
+
+def _describe_identifier(config: MCPServerConfig) -> str:
+    """Render a short human-readable transport hint.
+
+    For stdio configs we include the first arg (if any) because the
+    command alone (``uvx``, ``npx``) carries little information; for
+    HTTP configs the URL is already meaningful on its own.  This
+    string is for operator eyeballs only -- it is *not* a stable
+    identity.
+    """
+    if config.url:
+        return config.url
+    cmd = config.command or "?"
+    if config.args:
+        return f"{cmd} {config.args[0]}"
+    return cmd
+
+
+def _short_identity_hash(config: MCPServerConfig) -> str:
+    """SHA-256 of the canonical identity tuple, truncated for display.
+
+    Twelve hex chars is plenty to disambiguate a small handful of
+    co-running MCP servers without dominating the snapshot file.
+    Operators who need byte-exact comparisons can recompute the full
+    digest from ``mcp_server_config_identity`` themselves.
+    """
+    identity = mcp_server_config_identity(config)
+    digest = hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
+def _entry_to_state(entry: _MCPEntry) -> MCPServerState:
+    """Project a live ``_MCPEntry`` into the on-disk snapshot dataclass."""
+    return MCPServerState(
+        name=entry.config.name,
+        kind=_describe_kind(entry.config),
+        identifier=_describe_identifier(entry.config),
+        config_identity=_short_identity_hash(entry.config),
+        alive=entry.session is not None,
+        tool_count=(
+            len(entry.tools_cache) if entry.tools_cache is not None else None
+        ),
+        last_used_at=(
+            entry.last_used_at.isoformat() if entry.last_used_at else None
+        ),
+    )
 
 
 def _mcp_tool_to_openai_schema(tool: Any) -> dict[str, Any]:

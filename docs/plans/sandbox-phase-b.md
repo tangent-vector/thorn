@@ -32,10 +32,9 @@ behavioral changes to tools.
 **Explicit non-goals (handed to later phases):**
 
 * MCP server lifecycle *inside* the container — Phase C.
-* Credential broker / removing service credentials from the brain
-  — Phase D.
-* Capability drops, userns remapping, resource limits, network
-  egress policy — Phase F.
+* Credential broker (OneCLI integration) and the matching network
+  egress policy that bounds the container to the broker — Phase D.
+* Capability drops, userns remapping, resource limits — Phase E.
 * Production network-restricted defaults.  Phase B uses default
   OCI networking so existing env-injected credentials continue to
   reach upstream APIs through the container.
@@ -241,7 +240,7 @@ would require either a pre-built image or a 3-minute build
 on every smoke run.  The deeper integration is covered by the
 fake-adapter tests, which exercise the same control-flow.
 
-## Deferred items (handed to Phases C/D/F)
+## Deferred items (handed to Phases C/D/E)
 
 These were either out of scope for Phase B or revealed during
 implementation as worth a dedicated follow-up.
@@ -253,28 +252,36 @@ Phase A left it).  Phase C will move the lifecycle inside the
 container, so an MCP-using tool's network reach is bounded by the
 container's network policy rather than the host's.
 
-### Phase D — Credential broker
+### Phase D — Credential broker (OneCLI)
 
 Phase B punts on credential isolation: env-passthrough is opt-in
 and `extra_env` is supported as a literal-value mechanism, but
 both are honest about the fact that anything passed in is visible
-to the daemon and to all tools running under it.  Phase D will
-add a credential broker on the host and remove credentials from
-the daemon's environment entirely.
+to the daemon and to all tools running under it.  Phase D
+integrates [OneCLI](https://github.com/onecli/onecli) as the
+credential broker -- placeholder strings live in the container's
+env, real credentials live in OneCLI, container HTTPS traffic
+flows through OneCLI for substitution -- and pairs that with an
+egress policy that bounds the container's outbound to the broker.
+Per the roadmap's *Resolved opens*, we deliberately do not ship a
+Thorn-internal alternative broker; OneCLI is the chosen solution.
 
 Until Phase D lands, the env-passthrough mechanism remains useful
 for non-credential values (locale, timezone, dev-mode toggles).
 Even after, the *mechanism* will stay; the *guidance* will shift
 from "don't pass credentials" to "you can't pass credentials".
 
-### Phase F — Hardening
+### Phase E — Hardening
 
 Phase B uses default OCI networking and does not drop capabilities,
-remap user namespaces, set memory/CPU limits, or restrict egress.
-Phase F is the dedicated hardening phase; the seams are already in
+remap user namespaces, or set memory/CPU limits.  Phase E is the
+dedicated hardening phase (capability drops, userns remap, resource
+limits, formal threat-model review); the seams are already in
 place (`ContainerSpec.extra_run_args`, the per-agent override
-block, the resolver) so Phase F mostly adds new fields rather than
-restructuring anything.
+block, the resolver) so Phase E mostly adds new fields rather than
+restructuring anything.  Egress restriction is *not* a Phase E
+deliverable -- it lands with the broker in Phase D, and Phase E
+revisits it as part of the threat-model review.
 
 ### Smoke-test image build
 

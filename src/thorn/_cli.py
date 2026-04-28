@@ -1223,12 +1223,27 @@ def sandbox_status(agency_path: str | None) -> None:
     ``ps -a`` (filtered by the ``thorn-agent-`` prefix) for the live
     state of every per-agent container.  Read-only; no containers are
     started, stopped, or removed.
+
+    Live MCP-server state is read from each agent's
+    ``<workspace_root>/agents/<id>/control/mcp_state.json`` (written
+    by the daemon via :class:`thorn.toolhost.MCPStateSnapshot`) and
+    rendered alongside each container.  Missing or unreadable state
+    files are silently skipped -- diagnostic commands never crash on
+    half-written files.
     """
     from thorn.gateway import load_gateway_config
+    from thorn.runtime._paths import AgencyPaths
+    from thorn.runtime._store import AgentStore
     from thorn.sandbox import (
         OCIRuntimeNotFound,
         default_sandbox_image_tag,
         select_oci_runtime,
+    )
+    from thorn.sandbox._container import derive_container_name
+    from thorn.toolhost import (
+        MCP_STATE_FILE_NAME,
+        MCPStateSnapshot,
+        read_snapshot,
     )
 
     agency_home = _resolve_agency_home(agency_path)
@@ -1260,6 +1275,33 @@ def sandbox_status(agency_path: str | None) -> None:
 
     info = asyncio.run(_gather())
 
+    # Build a {container_name -> MCPStateSnapshot} map by enumerating
+    # the agents this agency knows about (their canonical IDs live in
+    # <home_root>/agents/<safe-id>/agent.json).  We deliberately do
+    # *not* try to invert the container name back to an agent ID --
+    # derive_container_name's ``[^a-zA-Z0-9_.-] -> _`` substitution is
+    # not generally invertible -- so the forward map keeps the lookup
+    # honest.  Containers with no matching agent.json get rendered
+    # without MCP state, which is the right behavior for orphaned
+    # containers and old test debris.
+    snapshots_by_container: dict[str, MCPStateSnapshot] = {}
+    workspace_root = gateway_config.resolve_workspace(agency_home)
+    if workspace_root is not None:
+        paths = AgencyPaths(home_root=agency_home, workspace_root=workspace_root)
+        try:
+            agent_ids = AgentStore(paths).list_agent_ids()
+        except Exception as exc:
+            console.print(
+                f"[yellow]Warning:[/yellow] could not enumerate agents: {exc}"
+            )
+            agent_ids = []
+        for agent_id in agent_ids:
+            container_name = derive_container_name(str(agent_id))
+            snapshot_path = paths.agent_control_dir(agent_id) / MCP_STATE_FILE_NAME
+            snapshot = read_snapshot(snapshot_path)
+            if snapshot is not None:
+                snapshots_by_container[container_name] = snapshot
+
     console.print(f"[bold]Agency:[/bold] {agency_home}")
     console.print(f"[bold]Runtime:[/bold] {adapter.name}")
     console.print(
@@ -1282,6 +1324,32 @@ def sandbox_status(agency_path: str | None) -> None:
         if state.exit_code is not None and not state.running:
             line += f"  exit={state.exit_code}"
         console.print(line)
+        snapshot = snapshots_by_container.get(state.name)
+        if snapshot is None or not snapshot.servers:
+            continue
+        console.print(
+            f"    [bold]MCP servers ({len(snapshot.servers)}):[/bold] "
+            f"[dim](as of {snapshot.updated_at})[/dim]"
+        )
+        for server in snapshot.servers:
+            alive = (
+                "[green]alive[/green]" if server.alive else "[dim]idle[/dim]"
+            )
+            tool_count = (
+                f"tools={server.tool_count}"
+                if server.tool_count is not None
+                else "tools=?"
+            )
+            last_used = (
+                f"last_used={server.last_used_at}"
+                if server.last_used_at
+                else "last_used=never"
+            )
+            console.print(
+                f"      {server.name}  ({server.kind})  {alive}  "
+                f"{tool_count}  identity={server.config_identity}  "
+                f"{last_used}  [dim]{server.identifier}[/dim]"
+            )
 
 
 if __name__ == "__main__":
