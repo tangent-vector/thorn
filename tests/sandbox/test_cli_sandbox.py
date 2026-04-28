@@ -122,6 +122,136 @@ class TestSandboxStatus:
         assert "running" in result.output
         assert "exit=0" in result.output
 
+    def test_status_renders_mcp_state_per_container(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+        fake_adapter: FakeOCIRuntimeAdapter,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When a per-agent ``mcp_state.json`` file is present alongside
+        a known container, the status output renders the live MCP-server
+        state inline.  This verifies the CLI reads the daemon-written
+        snapshot via :class:`thorn.toolhost.MCPStateSnapshot` and not
+        some out-of-band mechanism.
+        """
+        from thorn.toolhost import (
+            MCPServerState,
+            MCPStateSnapshot,
+            write_atomic_snapshot,
+        )
+
+        async def _list(name_prefix: str | None = None):
+            return [
+                ContainerState(
+                    name="thorn-agent-alpha",
+                    status="running",
+                    running=True,
+                    exit_code=None,
+                ),
+            ]
+
+        monkeypatch.setattr(fake_adapter, "list_containers", _list)
+
+        agency = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        agency.mkdir()
+        workspace.mkdir()
+
+        # gateway.json with an explicit workspace pointing at our
+        # workspace tmpdir; without this the CLI cannot map agents to
+        # control-dir paths and won't render any MCP state.
+        _write_gateway_config(
+            agency, {"image": "thorn-sandbox:test"},
+        )
+        cfg_path = agency / "gateway.json"
+        import json as _json
+        body = _json.loads(cfg_path.read_text())
+        body["workspace"] = str(workspace)
+        cfg_path.write_text(_json.dumps(body))
+
+        # Pretend the agent "alpha" was previously persisted: an
+        # ``agent.json`` under <home>/agents/<safe-id>/ is all
+        # AgentStore.list_agent_ids needs.
+        agent_framework = agency / "agents" / "alpha"
+        agent_framework.mkdir(parents=True)
+        (agent_framework / "agent.json").write_text("{}")
+
+        # Drop a snapshot the CLI should pick up via the per-agent
+        # control directory.
+        control = workspace / "agents" / "alpha" / "control"
+        control.mkdir(parents=True)
+        write_atomic_snapshot(
+            control / "mcp_state.json",
+            MCPStateSnapshot(
+                updated_at="2026-04-27T22:39:55+00:00",
+                servers=[
+                    MCPServerState(
+                        name="github",
+                        kind="stdio",
+                        identifier="uvx mcp-server-github",
+                        config_identity="ab12cd34ef01",
+                        alive=True,
+                        tool_count=17,
+                        last_used_at="2026-04-27T22:39:50+00:00",
+                    ),
+                ],
+            ),
+        )
+
+        result = runner.invoke(
+            main, ["sandbox", "status", "--agency", str(agency)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "MCP servers (1)" in result.output
+        assert "github" in result.output
+        assert "stdio" in result.output
+        assert "alive" in result.output
+        assert "tools=17" in result.output
+        assert "ab12cd34ef01" in result.output
+        assert "uvx mcp-server-github" in result.output
+
+    def test_status_silent_when_no_mcp_state(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+        fake_adapter: FakeOCIRuntimeAdapter,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A container without a snapshot file must not print an MCP
+        sub-section.  Regression guard for the "diagnostic commands
+        never crash on missing files" contract.
+        """
+        async def _list(name_prefix: str | None = None):
+            return [
+                ContainerState(
+                    name="thorn-agent-alpha",
+                    status="running",
+                    running=True,
+                    exit_code=None,
+                ),
+            ]
+
+        monkeypatch.setattr(fake_adapter, "list_containers", _list)
+
+        agency = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        agency.mkdir()
+        workspace.mkdir()
+        _write_gateway_config(agency, {"image": "thorn-sandbox:test"})
+        cfg_path = agency / "gateway.json"
+        import json as _json
+        body = _json.loads(cfg_path.read_text())
+        body["workspace"] = str(workspace)
+        cfg_path.write_text(_json.dumps(body))
+
+        result = runner.invoke(
+            main, ["sandbox", "status", "--agency", str(agency)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "thorn-agent-alpha" in result.output
+        assert "MCP servers" not in result.output
+
 
 class TestSandboxBuild:
     def test_build_invokes_adapter(

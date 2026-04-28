@@ -20,6 +20,7 @@ import struct
 
 import pytest
 
+from thorn.core._mcp_config import MCPServerConfig
 from thorn.toolhost._protocol import (
     LENGTH_PREFIX_FORMAT,
     LENGTH_PREFIX_SIZE,
@@ -29,6 +30,8 @@ from thorn.toolhost._protocol import (
     FrameKind,
     Heartbeat,
     Hello,
+    ListMCPServerToolsRequest,
+    ListMCPServerToolsResponse,
     ProtocolError,
     ToolCallCancel,
     ToolCallChunk,
@@ -133,6 +136,98 @@ class TestFrameRoundTrip:
         round_tripped = decode_frame(_strip_prefix(encode_frame(frame)))
         assert round_tripped == frame
 
+    def test_tool_call_request_with_mcp_server_config_round_trip(self):
+        """``ToolCallRequest.mcp_server_config`` must survive the wire.
+
+        This is the field the brain stamps onto MCP-routed tool calls
+        so the daemon knows which MCP server to dispatch through; if
+        encode/decode dropped it, MCP calls would silently fall back
+        to the in-process built-in path on the daemon side.
+        """
+        cfg = MCPServerConfig(
+            name="github",
+            command="uvx",
+            args=["mcp-server-github"],
+            env={"GITHUB_TOKEN": "redacted"},
+        )
+        frame = ToolCallRequest(
+            call_id="c1",
+            tool_name="search_issues",
+            arguments={"q": "label:bug"},
+            mcp_server_config=cfg,
+        )
+        body = _decode_body(encode_frame(frame))
+        assert body["mcp_server_config"]["name"] == "github"
+        assert body["mcp_server_config"]["command"] == "uvx"
+        assert body["mcp_server_config"]["args"] == ["mcp-server-github"]
+        assert body["mcp_server_config"]["env"] == {"GITHUB_TOKEN": "redacted"}
+
+        round_tripped = decode_frame(_strip_prefix(encode_frame(frame)))
+        assert round_tripped == frame
+
+    def test_tool_call_request_without_mcp_config_omits_field(self):
+        """A non-MCP request must not emit ``mcp_server_config: null``.
+
+        Older daemons reject unknown keys on a few legacy paths; we
+        keep the wire form lean for the common (built-in) case.
+        """
+        frame = ToolCallRequest(call_id="c1", tool_name="echo")
+        body = _decode_body(encode_frame(frame))
+        assert "mcp_server_config" not in body
+        round_tripped = decode_frame(_strip_prefix(encode_frame(frame)))
+        assert round_tripped == frame
+        assert round_tripped.mcp_server_config is None  # type: ignore[union-attr]
+
+    def test_list_mcp_server_tools_request_round_trip(self):
+        cfg = MCPServerConfig(name="docs", url="https://example.com/mcp")
+        frame = ListMCPServerToolsRequest(request_id="r1", server_config=cfg)
+        body = _decode_body(encode_frame(frame))
+        assert body["kind"] == FrameKind.LIST_MCP_SERVER_TOOLS_REQUEST.value
+        assert body["request_id"] == "r1"
+        assert body["server_config"]["url"] == "https://example.com/mcp"
+
+        round_tripped = decode_frame(_strip_prefix(encode_frame(frame)))
+        assert round_tripped == frame
+
+    def test_list_mcp_server_tools_response_with_tools_round_trip(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search docs",
+                    "parameters": {"type": "object"},
+                },
+            },
+        ]
+        frame = ListMCPServerToolsResponse(request_id="r1", tools=tools)
+        body = _decode_body(encode_frame(frame))
+        assert body["tools"] == tools
+        assert "error" not in body
+
+        round_tripped = decode_frame(_strip_prefix(encode_frame(frame)))
+        assert round_tripped == frame
+
+    def test_list_mcp_server_tools_response_with_error_round_trip(self):
+        err = ToolCallError(kind="mcp_unavailable", message="mcp not installed")
+        frame = ListMCPServerToolsResponse(request_id="r1", error=err)
+        body = _decode_body(encode_frame(frame))
+        assert body["error"]["kind"] == "mcp_unavailable"
+        assert "tools" not in body
+
+        round_tripped = decode_frame(_strip_prefix(encode_frame(frame)))
+        assert round_tripped == frame
+
+    def test_list_mcp_server_tools_response_requires_exactly_one_payload(self):
+        with pytest.raises(ProtocolError):
+            ListMCPServerToolsResponse(request_id="r1")
+        with pytest.raises(ProtocolError):
+            ListMCPServerToolsResponse(
+                request_id="r1",
+                tools=[],
+                error=ToolCallError(kind="x", message="m"),
+            )
+
 
 class TestDecodeFailures:
     def test_unknown_kind_raises(self):
@@ -181,6 +276,26 @@ class TestDecodeFailures:
             }
         ).encode("utf-8")
         with pytest.raises(ProtocolError, match="error' must be an object"):
+            decode_frame(body)
+
+    def test_list_mcp_server_tools_response_without_payload_raises(self):
+        body = json.dumps(
+            {
+                "kind": FrameKind.LIST_MCP_SERVER_TOOLS_RESPONSE.value,
+                "request_id": "r1",
+            }
+        ).encode("utf-8")
+        with pytest.raises(ProtocolError, match="must carry either 'tools' or 'error'"):
+            decode_frame(body)
+
+    def test_list_mcp_server_tools_request_missing_server_config_raises(self):
+        body = json.dumps(
+            {
+                "kind": FrameKind.LIST_MCP_SERVER_TOOLS_REQUEST.value,
+                "request_id": "r1",
+            }
+        ).encode("utf-8")
+        with pytest.raises(ProtocolError):
             decode_frame(body)
 
     def test_unknown_extra_fields_are_tolerated(self):

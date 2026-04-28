@@ -1233,7 +1233,7 @@ def sandbox_status(agency_path: str | None) -> None:
     """
     from thorn.gateway import load_gateway_config
     from thorn.runtime._paths import AgencyPaths
-    from thorn.runtime._store import AgentStore
+    from thorn.runtime._store import SessionStore
     from thorn.sandbox import (
         OCIRuntimeNotFound,
         default_sandbox_image_tag,
@@ -1289,7 +1289,7 @@ def sandbox_status(agency_path: str | None) -> None:
     if workspace_root is not None:
         paths = AgencyPaths(home_root=agency_home, workspace_root=workspace_root)
         try:
-            agent_ids = AgentStore(paths).list_agent_ids()
+            agent_ids = SessionStore(paths).list_agent_ids()
         except Exception as exc:
             console.print(
                 f"[yellow]Warning:[/yellow] could not enumerate agents: {exc}"

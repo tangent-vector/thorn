@@ -409,6 +409,75 @@ class TestMcpConfigDedup:
         result = assemble_prompt_context(layers)
         assert len(result.mcp_configs) == 1
 
+    def test_brain_dedup_key_matches_daemon_identity(self) -> None:
+        """Brain-side dedup and daemon-side ``MCPHost`` cache must agree.
+
+        The contract: any two configs the brain collapses to one
+        entry must hash to the same key the daemon uses for its
+        per-process MCP cache, otherwise the daemon would spin up
+        two processes for what the brain treats as the same server.
+        Both sides go through
+        :func:`thorn.core._mcp_config.mcp_server_config_identity`,
+        so this test is a regression guard against either side
+        diverging.
+        """
+        from thorn.core._mcp_config import mcp_server_config_identity
+        from thorn.runtime._prompt_assembly import _mcp_config_dedup_key
+
+        equal_pairs = [
+            (
+                MCPServerConfig(name="x", command="cmd"),
+                MCPServerConfig(name="x", command="cmd"),
+            ),
+            (
+                MCPServerConfig(
+                    name="x", command="cmd",
+                    args=["a", "b"],
+                    env={"A": "1", "B": "2"},
+                ),
+                MCPServerConfig(
+                    name="x", command="cmd",
+                    args=["a", "b"],
+                    env={"B": "2", "A": "1"},  # different dict order
+                ),
+            ),
+            (
+                MCPServerConfig(name="docs", url="https://x/mcp"),
+                MCPServerConfig(name="docs", url="https://x/mcp"),
+            ),
+        ]
+        for left, right in equal_pairs:
+            assert _mcp_config_dedup_key(left) == _mcp_config_dedup_key(right)
+            assert (
+                _mcp_config_dedup_key(left)
+                == mcp_server_config_identity(right)
+            )
+
+        distinct_pairs = [
+            # Different env value -> different identity.
+            (
+                MCPServerConfig(name="x", command="cmd", env={"K": "1"}),
+                MCPServerConfig(name="x", command="cmd", env={"K": "2"}),
+            ),
+            # Different args -> different identity.
+            (
+                MCPServerConfig(name="x", command="cmd", args=["a"]),
+                MCPServerConfig(name="x", command="cmd", args=["a", "b"]),
+            ),
+            # env=None vs env={} are different identities (the dedup
+            # key reflects whether env was specified at all).
+            (
+                MCPServerConfig(name="x", command="cmd"),
+                MCPServerConfig(name="x", command="cmd", env={}),
+            ),
+        ]
+        for left, right in distinct_pairs:
+            assert _mcp_config_dedup_key(left) != _mcp_config_dedup_key(right)
+            assert (
+                _mcp_config_dedup_key(left)
+                != mcp_server_config_identity(right)
+            )
+
 
 # ---------------------------------------------------------------------------
 # Skill accumulation surface

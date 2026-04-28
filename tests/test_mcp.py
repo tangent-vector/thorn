@@ -109,3 +109,90 @@ class TestMCPToolSourceRetired:
         import thorn.core as core
 
         assert not hasattr(core, "MCPToolSource")
+
+    def test_run_session_prompt_does_not_instantiate_mcptoolsource(self):
+        """Source-level guard against accidentally bringing the brain-side
+        MCP client back into the per-prompt path.
+
+        The contract Phase C.1 introduced is that all MCP discovery
+        and execution flows through ``discover_mcp_tools`` (which
+        delegates to the daemon-hosted :class:`MCPHost`); seeing an
+        ``MCPToolSource(`` constructor call in ``_agent.py`` would
+        mean someone reverted that.  Cheap to assert and catches the
+        most likely regression vector.
+        """
+        from pathlib import Path
+
+        import thorn.core._agent as agent_mod
+
+        source = Path(agent_mod.__file__).read_text(encoding="utf-8")
+        assert "MCPToolSource(" not in source, (
+            "thorn.core._agent must not instantiate MCPToolSource; "
+            "MCP discovery goes through discover_mcp_tools instead."
+        )
+
+    def test_run_session_prompt_uses_discover_mcp_tools(self):
+        """Positive flip side: the documented Phase-C.1 entry point is
+        present in ``_agent.py``.  This catches a refactor that
+        renamed or moved ``discover_mcp_tools`` without updating its
+        sole brain-side call site.
+        """
+        from pathlib import Path
+
+        import thorn.core._agent as agent_mod
+
+        source = Path(agent_mod.__file__).read_text(encoding="utf-8")
+        assert "discover_mcp_tools" in source, (
+            "thorn.core._agent must call discover_mcp_tools to load MCP "
+            "servers per prompt round."
+        )
+
+    def test_discover_mcp_tools_produces_sandbox_venue_only(self):
+        """Belt-and-suspenders for the never-IN_PROCESS contract.
+
+        Phase C.1 stipulates that MCP-sourced tools always run in
+        the daemon (``ToolVenue.SANDBOX``), never in-process; if
+        someone added a fallback path, the wrapped tools would
+        suddenly carry ``IN_PROCESS``.  ``test_mcp_tools.py``
+        already covers a single-config case; this one fans out to
+        a mix of stdio and HTTP configs to widen the coverage.
+        """
+        import asyncio
+        from typing import Any
+
+        from thorn.core._executor import ToolVenue
+        from thorn.core._mcp_config import MCPServerConfig
+        from thorn.runtime._mcp_tools import discover_mcp_tools
+
+        class _StubExecutor:
+            async def list_mcp_server_tools(
+                self, server_config: MCPServerConfig,
+            ) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": f"{server_config.name}_tool",
+                            "description": "",
+                            "parameters": {"type": "object"},
+                        },
+                    },
+                ]
+
+        wrapped = asyncio.run(
+            discover_mcp_tools(
+                sandbox_executor=_StubExecutor(),
+                mcp_configs=[
+                    MCPServerConfig(name="alpha", command="alpha-mcp"),
+                    MCPServerConfig(name="beta", url="https://beta/mcp"),
+                ],
+                builtin_tool_names=set(),
+            )
+        )
+        assert len(wrapped) == 2
+        for tool in wrapped:
+            assert tool.venue is ToolVenue.SANDBOX, (
+                f"MCP-sourced tool {tool.schema['function']['name']!r} "
+                "must be SANDBOX-venue; IN_PROCESS would route through "
+                "the brain instead of the per-agent toolhost daemon."
+            )

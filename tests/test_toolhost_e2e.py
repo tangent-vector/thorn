@@ -23,12 +23,16 @@ from pathlib import Path
 import pytest
 
 from thorn.core._executor import ToolInvocation
+from thorn.core._mcp_config import MCPServerConfig
 from thorn.toolhost._executor import (
     DaemonCrashedError,
     DaemonExecutorConfig,
     DaemonToolExecutor,
     DaemonUnavailableError,
 )
+
+
+_STUB_MCP_SERVER_PATH = Path(__file__).parent / "fixtures" / "mcp_stub_server.py"
 
 
 pytestmark = [
@@ -498,5 +502,169 @@ class TestUnreachableDaemon:
                         arguments={"path": "/etc/hostname"},
                     ),
                 )
+        finally:
+            await _terminate(executor)
+
+
+# ---------------------------------------------------------------------------
+# Real-subprocess MCP roundtrip (Phase C.1)
+# ---------------------------------------------------------------------------
+
+_mcp_pkg_available = True
+try:  # pragma: no cover - import probe
+    import mcp  # noqa: F401
+    import mcp.server.fastmcp  # noqa: F401
+except Exception:  # pragma: no cover
+    _mcp_pkg_available = False
+
+
+@pytest.mark.skipif(
+    not _mcp_pkg_available,
+    reason="mcp package not installed; install thorn[mcp] to enable",
+)
+class TestSubprocessMCP:
+    """End-to-end MCP path through a real ``thorn-toolhost`` subprocess.
+
+    Spawns the daemon as ``python -m thorn.toolhost``, then has the
+    daemon spawn the bundled stub MCP server (``tests/fixtures/
+    mcp_stub_server.py``) on demand.  Exercises the full Phase-C.1
+    chain:
+
+        DaemonToolExecutor (brain) <-> toolhost daemon
+            <-> MCPHost (in daemon) <-> mcp.ClientSession
+            <-> stub MCP server subprocess
+
+    The slow-path tests are budgeted generously: cold-cache MCP
+    server startup pays import time on first call, and CI machines
+    occasionally pause for several seconds under load.
+    """
+
+    @staticmethod
+    def _stub_config(name: str = "stub") -> MCPServerConfig:
+        return MCPServerConfig(
+            name=name,
+            command=sys.executable,
+            args=[str(_STUB_MCP_SERVER_PATH)],
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_returns_stub_tools(self, tmp_path: Path):
+        executor = DaemonToolExecutor(_make_config(tmp_path))
+        try:
+            tools = await asyncio.wait_for(
+                executor.list_mcp_server_tools(self._stub_config()),
+                timeout=30.0,
+            )
+            names = {t["function"]["name"] for t in tools}
+            assert {"echo", "slow_sleep", "add"}.issubset(names), names
+        finally:
+            await _terminate(executor)
+
+    @pytest.mark.asyncio
+    async def test_call_returns_tool_output(self, tmp_path: Path):
+        executor = DaemonToolExecutor(_make_config(tmp_path))
+        cfg = self._stub_config()
+        try:
+            # First touch loads the server.
+            await asyncio.wait_for(
+                executor.list_mcp_server_tools(cfg), timeout=30.0,
+            )
+            result = await asyncio.wait_for(
+                executor.invoke(
+                    ToolInvocation(
+                        call_id="c1",
+                        tool_name="echo",
+                        arguments={"message": "phase-c"},
+                        mcp_server_config=cfg,
+                    ),
+                ),
+                timeout=15.0,
+            )
+            assert result.is_error is False, result.content
+            assert "echoed: phase-c" in result.content
+        finally:
+            await _terminate(executor)
+
+    @pytest.mark.asyncio
+    async def test_second_call_reuses_server(self, tmp_path: Path):
+        """Second call must not re-spawn the MCP server.
+
+        The daemon's :class:`MCPHost` caches one process per unique
+        config; we cannot directly observe the cache from the brain,
+        but the second call's latency is dramatically lower than the
+        first when the cache is honored (no fresh ``python`` import
+        time).  Asserting "second call < first call" is too noisy on
+        loaded CI; instead we just assert *both* calls succeed and
+        return the expected answers, which is enough to prove the
+        second one didn't crash on a re-spawn race.
+        """
+        executor = DaemonToolExecutor(_make_config(tmp_path))
+        cfg = self._stub_config()
+        try:
+            r1 = await asyncio.wait_for(
+                executor.invoke(
+                    ToolInvocation(
+                        call_id="c1",
+                        tool_name="add",
+                        arguments={"a": 2, "b": 3},
+                        mcp_server_config=cfg,
+                    ),
+                ),
+                timeout=30.0,
+            )
+            r2 = await asyncio.wait_for(
+                executor.invoke(
+                    ToolInvocation(
+                        call_id="c2",
+                        tool_name="add",
+                        arguments={"a": 10, "b": 32},
+                        mcp_server_config=cfg,
+                    ),
+                ),
+                timeout=15.0,
+            )
+            assert r1.is_error is False, r1.content
+            assert r2.is_error is False, r2.content
+            assert "5" in r1.content
+            assert "42" in r2.content
+        finally:
+            await _terminate(executor)
+
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates_to_brain(self, tmp_path: Path):
+        """Cancelling the brain task aborts the in-flight MCP call.
+
+        ``slow_sleep`` blocks the stub server for 30 s; we cancel a
+        few hundred ms in and assert the brain's awaiter raises
+        ``CancelledError`` quickly.  The stub server itself may
+        keep running until its blocking sleep completes -- the
+        contract here is purely the brain-side cancellation, since
+        v1's MCP layer doesn't propagate cancel signals through the
+        SDK.
+        """
+        executor = DaemonToolExecutor(_make_config(tmp_path))
+        cfg = self._stub_config()
+        try:
+            # Prime the cache so the cancel test starts from a hot
+            # MCP server (eliminates flaky variance from cold-start
+            # import time).
+            await asyncio.wait_for(
+                executor.list_mcp_server_tools(cfg), timeout=30.0,
+            )
+
+            task = asyncio.create_task(
+                executor.invoke(
+                    ToolInvocation(
+                        call_id="slow-1",
+                        tool_name="slow_sleep",
+                        arguments={"seconds": 30.0},
+                        mcp_server_config=cfg,
+                    ),
+                ),
+            )
+            await asyncio.sleep(0.3)  # let the call get into flight
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5.0)
         finally:
             await _terminate(executor)
