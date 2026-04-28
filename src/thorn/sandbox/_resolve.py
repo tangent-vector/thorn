@@ -19,7 +19,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from thorn.gateway._config import AgentSandboxOverride, SandboxConfig
+from thorn.gateway._config import (
+    AgentSandboxOverride,
+    EgressAllowlistEntry,
+    SandboxConfig,
+)
 from thorn.sandbox._image import default_sandbox_image_tag
 
 
@@ -39,6 +43,8 @@ class ResolvedSandboxConfig:
     extra_env: tuple[tuple[str, str], ...]
     dev_mount_runtime: bool
     container_ready_timeout_s: float
+    egress_network: str | None
+    egress_allowlist: tuple[EgressAllowlistEntry, ...]
 
 
 _DEFAULT_AGENCY_SANDBOX = SandboxConfig(backend="subprocess")
@@ -122,6 +128,15 @@ def resolve_sandbox_config(
         extra_env=extra_env,
         dev_mount_runtime=a.dev_mount_runtime,
         container_ready_timeout_s=timeout,
+        # Phase D: egress fields are agency-only.  No per-agent
+        # override surface today: the network and allow-list are
+        # operator-controlled because letting an agent narrow or
+        # widen them would defeat the broker-only invariant.  If a
+        # specialised agent ever needs different egress, the right
+        # mechanism is a separate agency, not a per-agent escape
+        # hatch.
+        egress_network=a.egress_network,
+        egress_allowlist=tuple(a.egress_allowlist),
     )
 
 

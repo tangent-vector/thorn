@@ -73,6 +73,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, model_validator
 
+from thorn.core._credentials import ServiceCredential
 from thorn.core._service import Service
 from thorn.gateway._event import EventSource
 
@@ -482,6 +483,45 @@ class ProjectSpec(BaseModel):
         return [ForkSpec(url=self.url)]
 
 
+class EgressAllowlistEntry(BaseModel):
+    """A single ``(host, port)`` pair the sandbox may reach directly.
+
+    Phase D's egress policy is "broker-only by default": the
+    container's network is restricted so the only reachable
+    destination is the broker (per :attr:`SandboxConfig.egress_network`).
+    The allow-list is the operator's escape hatch for genuinely
+    direct upstreams that should *not* go through the broker -- for
+    example, an internal observability endpoint with no auth that
+    publishing through the broker would only complicate.
+
+    Both fields are explicit:
+
+    * ``host`` -- DNS name or IP literal.  No wildcard / pattern
+      support: each upstream that needs direct access gets its own
+      entry, so an audit of the allow-list is a literal enumeration
+      rather than a regex review.
+    * ``port`` -- TCP port.  Always required; we deliberately do
+      not default to 443 because "an exception to the broker-only
+      policy" warrants explicit attention to the port the
+      operator is opening up.
+
+    This file is the on-disk shape; enforcement (the firewall /
+    network mechanism) is the responsibility of the OCI-runtime
+    integration and is documented as an open question in the Phase D
+    plan (``R3``).  Schema is in place so operators can declare their
+    intended allow-list ahead of enforcement landing.
+    """
+
+    host: str = Field(
+        min_length=1,
+        description="DNS hostname or IP literal of the upstream.",
+    )
+    port: int = Field(
+        ge=1, le=65535,
+        description="TCP port the sandbox may connect to on this host.",
+    )
+
+
 class SandboxConfig(BaseModel):
     """Agency-wide defaults for the per-agent sandbox container.
 
@@ -556,6 +596,34 @@ class SandboxConfig(BaseModel):
             "executor."
         ),
     )
+    egress_network: str | None = Field(
+        default=None,
+        description=(
+            "Phase D: name of the OCI network the sandbox container "
+            "joins.  When set, ``--network <name>`` is passed at "
+            "container launch and the agent's outbound is bounded by "
+            "what that network can reach.  Operators creating the "
+            "network with ``--internal`` (so it has no NAT to the "
+            "host) and connecting only the broker to it implements "
+            "the 'broker-only' egress policy; the bundled "
+            "docker-compose deploys exactly this shape under the "
+            "name 'thorn-broker'.  Default null keeps the Phase-B "
+            "behavior (default OCI bridge, full host network access)."
+        ),
+    )
+    egress_allowlist: list[EgressAllowlistEntry] = Field(
+        default_factory=list,
+        description=(
+            "Phase D: ``(host, port)`` pairs the sandbox container "
+            "is permitted to reach directly, *in addition to* the "
+            "broker on :attr:`egress_network`.  Schema parses today; "
+            "enforcement (the firewall / OCI-runtime mechanism) is "
+            "tracked as Phase D open question R3 and not yet wired "
+            "in.  When the gateway sees a non-empty list it logs a "
+            "warning at startup so operators are not surprised by "
+            "the enforcement gap."
+        ),
+    )
 
 
 class AgentSandboxOverride(BaseModel):
@@ -623,6 +691,87 @@ class AgentSandboxOverride(BaseModel):
     )
 
 
+class BrokerConfig(BaseModel):
+    """Agency-wide configuration for the OneCLI credential broker.
+
+    Phase D introduces the broker as the substitution proxy that the
+    per-agent sandbox container's outbound HTTPS funnels through.
+    When this block is absent from ``gateway.json`` (or when present
+    with ``enabled: false``), the broker is disabled and credentials
+    continue to flow via the Phase-B env-injection path
+    (``env_passthrough`` / ``extra_env``); the audit invariant is not
+    enforced.  When present and enabled, the gateway registers each
+    agent's credentials with the broker at agent-load and the
+    container env carries only placeholder values.
+
+    The broker process can be either bundled (the default deploy
+    compose runs an OneCLI sidecar) or standalone (an existing OneCLI
+    deployment the operator already runs).  Both shapes share this
+    config; only the URLs differ.
+
+    See [docs/aspirational/architecture.md] and the Phase D plan
+    (``~/.cursor/plans/sandbox_phase_d_plan_*.plan.md``) for the
+    integration shape.  R1/R2 confirm: the proxy accepts ``Basic``
+    auth via embedded ``HTTPS_PROXY`` URL credentials (no per-tool
+    bearer wiring needed); the admin surface is OneCLI's Next.js
+    ``/api/agents``, ``/api/secrets``, and friends authenticated with
+    ``Authorization: Bearer oc_<hex>``.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "When false, the broker is treated as not configured even "
+            "if other fields are set; agent-load uses Phase-B env "
+            "injection and the audit invariant is not enforced.  "
+            "Useful for temporarily disabling the broker without "
+            "removing the configuration."
+        ),
+    )
+    admin_url: str = Field(
+        description=(
+            "Base URL of OneCLI's admin/management API (the Next.js "
+            "service, default port 10254 in OneCLI's bundled compose).  "
+            "The gateway calls this to create agent identities, "
+            "register secrets, and mint per-agent proxy tokens.  "
+            "Example: 'http://onecli-web:10254'."
+        ),
+    )
+    admin_api_key: ServiceCredential = Field(
+        description=(
+            "OneCLI admin API key (Bearer token, prefix 'oc_'), used "
+            "by the gateway as ``Authorization`` when driving the "
+            "admin API.  This is a META-credential: it grants the "
+            "gateway the ability to manage agents and secrets within "
+            "our broker, NOT the ability to call any upstream service "
+            "directly.  The Phase D audit invariant tolerates this "
+            "credential by design (see "
+            ":func:`thorn.core._credentials.assert_no_literal_credentials`)."
+        ),
+    )
+    proxy_url: str = Field(
+        description=(
+            "URL of OneCLI's HTTP/HTTPS substitution proxy (the Rust "
+            "gateway, default port 10255).  Each per-agent sandbox "
+            "container's ``HTTPS_PROXY`` env var points at this URL "
+            "with the per-agent proxy token embedded as Basic-auth "
+            "credentials in the URL.  Example: "
+            "'http://onecli-gateway:10255'."
+        ),
+    )
+    ca_certificate_path: str = Field(
+        description=(
+            "Host filesystem path to OneCLI's gateway CA certificate "
+            "(PEM).  The gateway bind-mounts this file read-only into "
+            "every agent container so the in-container TLS clients "
+            "trust the broker's MITM certificates.  Obtain via "
+            "OneCLI's ``GET /api/gateway/ca`` endpoint and persist to "
+            "this path at deploy time, or point at a volume that "
+            "OneCLI's compose service writes."
+        ),
+    )
+
+
 class GatewayConfig(BaseModel):
     """Top-level model for an agency's ``gateway.json``.
 
@@ -652,6 +801,17 @@ class GatewayConfig(BaseModel):
             "keeps the Phase-A subprocess executor behavior; setting "
             "this block (even to '{}') opts the agency into the Phase-B "
             "container backend by default."
+        ),
+    )
+    broker: BrokerConfig | None = Field(
+        default=None,
+        description=(
+            "Agency-wide credential-broker configuration.  When "
+            "omitted (or set with ``enabled: false``), the gateway "
+            "uses Phase-B env injection for credentials and does not "
+            "enforce the Phase-D audit invariant.  Setting this block "
+            "opts the agency into broker-routed credentials; see "
+            ":class:`BrokerConfig` for the deployment topology."
         ),
     )
 
@@ -1002,6 +1162,16 @@ def load_gateway_config(agency_home: Path) -> GatewayConfig:
     *agency_home* is the directory containing ``gateway.json`` (the
     agency's home root).  Raises :class:`FileNotFoundError` if the
     config file does not exist.
+
+    The ``broker`` block (when present) has its string values expanded
+    through :func:`expand_env_vars` before validation so that the
+    admin API key can be sourced from an environment variable
+    (``"admin_api_key": "$ONECLI_ADMIN_KEY"``) instead of being
+    written literally to disk.  Other top-level fields are NOT
+    expanded -- they are structural (URLs, paths, names) and the
+    framework deliberately keeps the env-var convention scoped to
+    credential-bearing blocks to avoid surprise for operators with
+    literal ``$``-prefixed strings elsewhere.
     """
     config_path = agency_home / GATEWAY_CONFIG_FILENAME
     if not config_path.is_file():
@@ -1010,6 +1180,8 @@ def load_gateway_config(agency_home: Path) -> GatewayConfig:
             "Run 'thorn serve bootstrap' to create one, or write it manually."
         )
     raw = json.loads(config_path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and "broker" in raw and raw["broker"] is not None:
+        raw["broker"] = expand_env_vars(raw["broker"])
     return GatewayConfig.model_validate(raw)
 
 
@@ -1282,6 +1454,8 @@ def _create_gitlab_source(
 
 __all__ = [
     "AgentSandboxOverride",
+    "BrokerConfig",
+    "EgressAllowlistEntry",
     "ForgeSpec",
     "ForkLocation",
     "ForkSpec",

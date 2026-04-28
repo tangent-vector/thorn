@@ -150,6 +150,142 @@ class TestContainerBackend:
         assert isinstance(executor.host, SubprocessDaemonHost)
 
 
+class TestBrokerBindingLookup:
+    """Phase D: the runtime threads the gateway-installed binding
+    lookup into ``ContainerHostConfig`` at executor-construction
+    time.
+
+    The lookup is *only* consulted on the container backend.  The
+    subprocess backend does not get broker wiring because the
+    in-process daemon shares the host's network and credentials, so
+    proxy interception has nothing to attach to.
+    """
+
+    def _make_binding(
+        self,
+        *,
+        proxy_url: str = "http://x:tok@broker:8443/",
+        ca_path: str = "/host/path/to/ca.pem",
+        placeholder_env: tuple[tuple[str, str], ...] = (
+            ("GITHUB_TOKEN", "thorn-broker-placeholder-1"),
+        ),
+    ) -> Any:
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Binding:
+            proxy_url: str
+            ca_certificate_path: str
+            placeholder_env: tuple[tuple[str, str], ...]
+
+        return _Binding(
+            proxy_url=proxy_url,
+            ca_certificate_path=ca_path,
+            placeholder_env=placeholder_env,
+        )
+
+    def test_container_backend_consults_lookup(self, tmp_path: Path) -> None:
+        adapter = FakeOCIRuntimeAdapter(present_images=["t:1"])
+        runtime = _make_runtime(
+            tmp_path,
+            sandbox_config=SandboxConfig(image="t:1"),
+            oci_adapter=adapter,
+        )
+        agent = _make_agent(aid="agent-bound")
+        binding = self._make_binding(proxy_url="http://x:abc@broker:9999/")
+        runtime.set_sandbox_broker_binding_lookup(
+            lambda agent_id: binding if str(agent_id) == "agent-bound" else None,
+        )
+
+        executor = runtime.get_or_create_sandbox_executor(agent)
+        assert isinstance(executor.host, ContainerDaemonHost)
+        cfg = executor.host._config  # type: ignore[attr-defined]
+        assert cfg.broker_proxy_url == "http://x:abc@broker:9999/"
+        assert cfg.broker_ca_host_path == Path("/host/path/to/ca.pem")
+        assert cfg.broker_placeholder_env == (
+            ("GITHUB_TOKEN", "thorn-broker-placeholder-1"),
+        )
+
+    def test_container_backend_no_lookup_means_no_broker(
+        self, tmp_path: Path,
+    ) -> None:
+        adapter = FakeOCIRuntimeAdapter(present_images=["t:1"])
+        runtime = _make_runtime(
+            tmp_path,
+            sandbox_config=SandboxConfig(image="t:1"),
+            oci_adapter=adapter,
+        )
+        agent = _make_agent()
+        executor = runtime.get_or_create_sandbox_executor(agent)
+        assert isinstance(executor.host, ContainerDaemonHost)
+        cfg = executor.host._config  # type: ignore[attr-defined]
+        assert cfg.broker_proxy_url is None
+        assert cfg.broker_ca_host_path is None
+        assert cfg.broker_placeholder_env == ()
+
+    def test_lookup_returning_none_yields_no_broker_wiring(
+        self, tmp_path: Path,
+    ) -> None:
+        adapter = FakeOCIRuntimeAdapter(present_images=["t:1"])
+        runtime = _make_runtime(
+            tmp_path,
+            sandbox_config=SandboxConfig(image="t:1"),
+            oci_adapter=adapter,
+        )
+        agent = _make_agent()
+        runtime.set_sandbox_broker_binding_lookup(lambda agent_id: None)
+
+        executor = runtime.get_or_create_sandbox_executor(agent)
+        assert isinstance(executor.host, ContainerDaemonHost)
+        cfg = executor.host._config  # type: ignore[attr-defined]
+        assert cfg.broker_proxy_url is None
+        assert cfg.broker_placeholder_env == ()
+
+    def test_subprocess_backend_ignores_lookup(self, tmp_path: Path) -> None:
+        runtime = _make_runtime(
+            tmp_path,
+            sandbox_config=SandboxConfig(backend="subprocess"),
+        )
+        agent = _make_agent()
+        called: list[AgentID] = []
+
+        def lookup(agent_id: AgentID):
+            called.append(agent_id)
+            return self._make_binding()
+
+        runtime.set_sandbox_broker_binding_lookup(lookup)
+
+        executor = runtime.get_or_create_sandbox_executor(agent)
+        assert isinstance(executor.host, SubprocessDaemonHost)
+        assert called == [], (
+            "Subprocess backend must not consult the broker binding "
+            "lookup -- broker integration is conditional on the "
+            "container backend"
+        )
+
+
+class TestEgressNetworkPlumbing:
+    """Phase D: the resolved ``egress_network`` reaches the
+    per-agent ``ContainerHostConfig`` via ``_build_daemon_host``."""
+
+    def test_egress_network_propagates_from_sandbox_config(
+        self, tmp_path: Path,
+    ) -> None:
+        adapter = FakeOCIRuntimeAdapter(present_images=["t:1"])
+        runtime = _make_runtime(
+            tmp_path,
+            sandbox_config=SandboxConfig(
+                image="t:1", egress_network="thorn-broker",
+            ),
+            oci_adapter=adapter,
+        )
+        agent = _make_agent()
+        executor = runtime.get_or_create_sandbox_executor(agent)
+        assert isinstance(executor.host, ContainerDaemonHost)
+        cfg = executor.host._config  # type: ignore[attr-defined]
+        assert cfg.egress_network == "thorn-broker"
+
+
 class TestNoAgentId:
     def test_no_id_means_no_executor(self, tmp_path: Path) -> None:
         runtime = _make_runtime(tmp_path)

@@ -946,7 +946,11 @@ def _serve_gateway(
             "The gateway will start but will not receive any events."
         )
 
-    gateway = Gateway(runtime=runtime, sources=sources)
+    gateway = Gateway(
+        runtime=runtime,
+        sources=sources,
+        gateway_config=gateway_config,
+    )
 
     service_names = [s.name for s in all_services]
     console.print(

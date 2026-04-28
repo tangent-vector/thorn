@@ -53,10 +53,18 @@ import contextlib
 import logging
 import signal
 import sys
+from collections.abc import Callable
 from typing import Any
 
 from thorn.core._agent import Agent
 from thorn.core._session import Session
+from thorn.gateway._broker import (
+    BrokerBinding,
+    BrokerClient,
+    BrokerError,
+    register_agent_with_broker,
+)
+from thorn.gateway._config import GatewayConfig
 from thorn.gateway._event import EventSource, IncomingEvent
 from thorn.runtime import (
     DEFAULT_AGENT_CONCURRENCY,
@@ -132,6 +140,10 @@ class Gateway:
         prompt_dispatcher: PromptDispatcher | None = None,
         shutdown_timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
         health_monitor: ProviderHealthMonitor | None = None,
+        gateway_config: GatewayConfig | None = None,
+        broker_client_factory: (
+            "Callable[[GatewayConfig], BrokerClient] | None"
+        ) = None,
     ) -> None:
         self._runtime = runtime
         self._sources = sources
@@ -148,6 +160,24 @@ class Gateway:
         self._health_monitor: ProviderHealthMonitor = (
             health_monitor or ProviderHealthMonitor.from_env()
         )
+
+        # Phase D: optional broker integration.  When *gateway_config*
+        # carries a ``broker`` block (and ``broker.enabled``), startup
+        # registers each loaded agent with the broker, swaps the
+        # in-memory credentials for placeholders, and stashes the
+        # resulting :class:`BrokerBinding` for the per-agent sandbox
+        # executor to consume.  When the broker is disabled (or
+        # *gateway_config* is None, the test-only path), the gateway
+        # behaves exactly as in Phase B (env injection + audit not
+        # enforced).  *broker_client_factory* is an injection seam
+        # for tests; production callers leave it None.
+        self._gateway_config = gateway_config
+        self._broker_client_factory = (
+            broker_client_factory
+            or (lambda cfg: BrokerClient(cfg.broker))  # type: ignore[arg-type]
+        )
+        self._broker_client: BrokerClient | None = None
+        self._broker_bindings: dict[AgentID, BrokerBinding] = {}
 
         self._stop_event: asyncio.Event | None = None
         self._source_tasks: list[asyncio.Task[None]] = []
@@ -263,6 +293,26 @@ class Gateway:
         for agent_id in self._runtime.sessions.list_agent_ids():
             agent = self._runtime.get_or_create_agent(agent_id)
             self._ensure_scheduler_for_agent(agent)
+
+        self._warn_if_egress_allowlist_unenforced()
+
+        # Phase D: register every loaded agent with the broker before
+        # the sandbox executor preload runs, so the per-agent
+        # container can be built with broker bindings from the start
+        # (no later mutation of HTTPS_PROXY / placeholders).  No-op
+        # when the broker block is absent or disabled.
+        await self._register_broker_bindings()
+
+        # Install the binding lookup *after* the registration loop
+        # has populated ``self._broker_bindings``.  Doing it here
+        # (rather than in ``__init__``) means the runtime sees a
+        # stable dict for the rest of the gateway's lifetime;
+        # ``_preload_sandbox_executors`` below is the first call site
+        # that materialises sandbox executors, and it consults the
+        # lookup once per agent at construction time.
+        self._runtime.set_sandbox_broker_binding_lookup(
+            self.broker_binding_for,
+        )
 
         # Phase B: kick the per-agent sandbox executor's
         # ``start()`` now (rather than lazily on first ``invoke``)
@@ -446,14 +496,19 @@ class Gateway:
         )
         self._schedulers[agent.id] = scheduler
 
-        # Eagerly register the per-agent sandbox executor with the
-        # runtime's pool.  The executor itself is lazy (the daemon
-        # subprocess only starts on the first ``invoke``), but doing
-        # the bookkeeping here means a later prompt round on this
-        # agent does not race two threads through
-        # ``get_or_create_sandbox_executor``.  When sandbox execution
-        # is disabled on the runtime this is a no-op.
-        self._runtime.get_or_create_sandbox_executor(agent)
+        # Sandbox-executor materialisation is deferred to
+        # ``_preload_sandbox_executors`` (during startup) or to the
+        # first ``ToolExecutor`` lookup on demand.  The previous
+        # implementation eagerly cached the executor here as
+        # defensive bookkeeping against a "race" between concurrent
+        # prompt rounds, but the dict-based cache in
+        # :meth:`Runtime.get_or_create_sandbox_executor` runs on a
+        # single asyncio thread without ``await`` points, so there
+        # is no actual race to defend against.  Skipping the eager
+        # call here is what allows Phase D's broker-binding lookup
+        # to be consulted at construction time -- if we cached the
+        # executor before ``_register_broker_bindings`` had run,
+        # the binding would be lost on the cache hit at preload.
         return scheduler
 
     async def _save_session_async(self, session: Session) -> None:
@@ -691,8 +746,177 @@ class Gateway:
                 ),
                 return_exceptions=True,
             )
+        # Clear the binding lookup before broker teardown so any
+        # late callers (e.g. a sandbox executor that survives
+        # scheduler shutdown) see ``None`` rather than dangling
+        # references to deleted bindings.
+        self._runtime.set_sandbox_broker_binding_lookup(None)
+
+        # Phase D: tear down broker registrations after schedulers
+        # have drained so any in-flight tool calls had their proxy
+        # routing intact for the duration.  Best-effort -- a broker
+        # outage at shutdown should not prevent the gateway from
+        # exiting cleanly.
+        await self._teardown_broker_bindings()
+
         self._inboxes.clear()
         log.info("Gateway stopped.")
+
+    # ------------------------------------------------------------------
+    # Phase D: broker registration / teardown
+    # ------------------------------------------------------------------
+
+    def _warn_if_egress_allowlist_unenforced(self) -> None:
+        """Log a warning when ``sandbox.egress_allowlist`` is non-empty.
+
+        Phase D ships the schema for the operator-configurable
+        allow-list (``EgressAllowlistEntry`` list under
+        ``gateway.json`` ``sandbox.egress_allowlist``) so deployments
+        can declare their intended exceptions ahead of enforcement
+        landing.  The actual firewall mechanism is the open question
+        ``R3`` in the Phase D plan -- per-agent network with iptables
+        rules vs. separate netns vs. OCI-runtime hooks.  We surface
+        the gap loudly at startup so an operator who declares
+        ``[{host: foo, port: 443}]`` and expects direct access to
+        work does not silently observe broker-only egress.
+        """
+        config = self._runtime.sandbox_config
+        if config is None:
+            return
+        if not config.egress_allowlist:
+            return
+        rendered = ", ".join(
+            f"{e.host}:{e.port}" for e in config.egress_allowlist
+        )
+        log.warning(
+            "sandbox.egress_allowlist is configured (%s) but enforcement "
+            "is not yet implemented (Phase D plan, open question R3); "
+            "the entries are parsed and visible in config but the "
+            "container's outbound is restricted only by "
+            "sandbox.egress_network membership.  "
+            "Operators relying on the allow-list should treat this "
+            "release as broker-only egress until R3 is resolved.",
+            rendered,
+        )
+
+    def broker_binding_for(
+        self,
+        agent_id: AgentID,
+    ) -> BrokerBinding | None:
+        """Return the broker binding for *agent_id*, if any.
+
+        Public read-only accessor consumed by the per-agent sandbox
+        executor (Phase D work item 6) so it can inject the proxy
+        URL, CA mount, and placeholder env entries when building the
+        container.  ``None`` when the broker is disabled, *agent_id*
+        is unknown, or the agent's registration was skipped.
+        """
+        return self._broker_bindings.get(agent_id)
+
+    async def _register_broker_bindings(self) -> None:
+        """Register every loaded agent with the broker.
+
+        No-op when:
+
+        * *gateway_config* is missing the broker block, or it has
+          ``enabled: false`` -- the operator has not opted in to
+          broker integration.
+        * The agency's sandbox backend resolves to ``subprocess``
+          -- the in-process daemon shares the host's network stack
+          and credentials, so there is no container to inject
+          ``HTTPS_PROXY`` / placeholder env vars into.  Registering
+          would swap real credentials for placeholders in memory
+          but the subprocess daemon would still be the one making
+          HTTPS calls, hitting auth failures everywhere.  We log a
+          warning so an operator who configured both broker and
+          subprocess backend at once notices the mismatch.
+
+        Hard-fails (raises) when any agent's registration fails: a
+        partial broker enrolment is worse than not enrolling at all
+        because the audit invariant would be violated and the
+        operator might not notice.
+        """
+        config = self._gateway_config
+        if config is None or config.broker is None or not config.broker.enabled:
+            return
+
+        sandbox_config = self._runtime.sandbox_config
+        sandbox_backend = (
+            sandbox_config.backend if sandbox_config is not None else None
+        )
+        if sandbox_backend != "container":
+            log.warning(
+                "Broker is enabled in gateway.json but the sandbox "
+                "backend resolves to %r; skipping broker registration "
+                "because subprocess-mode tools share the host network "
+                "and would not pick up the proxy / CA / placeholder "
+                "env injection.  Set sandbox.backend to 'container' "
+                "(or remove the broker block) to make this "
+                "consistent.",
+                sandbox_backend or "subprocess (no sandbox block)",
+            )
+            return
+
+        if not self._schedulers:
+            return
+
+        client = self._broker_client_factory(config)
+        try:
+            for agent_id, scheduler in self._schedulers.items():
+                agent = scheduler.agent
+                # Registration is sync (a small handful of HTTP calls
+                # over a single connection) -- run in a worker thread
+                # so it does not block the event loop, but keep the
+                # logic itself synchronous since it is much easier to
+                # reason about in that form.
+                binding = await asyncio.to_thread(
+                    register_agent_with_broker,
+                    client=client, agent=agent, config=config,
+                )
+                self._broker_bindings[agent_id] = binding
+                log.info(
+                    "Broker: registered agent %s as %s with %d secret(s)",
+                    agent_id, binding.agent_id, len(binding.secret_ids),
+                )
+        except Exception:
+            # A registration failure mid-loop leaves us with some
+            # agents registered with the broker.  Best-effort cleanup
+            # on the way out so the next startup attempt is on a
+            # clean slate.
+            await self._teardown_broker_bindings(client_override=client)
+            raise
+        self._broker_client = client
+
+    async def _teardown_broker_bindings(
+        self,
+        *,
+        client_override: BrokerClient | None = None,
+    ) -> None:
+        """Best-effort delete of every registered agent + its secrets."""
+        client = client_override if client_override is not None else self._broker_client
+        if client is None:
+            return
+
+        bindings = list(self._broker_bindings.items())
+        self._broker_bindings.clear()
+
+        for agent_id, binding in bindings:
+            try:
+                await asyncio.to_thread(client.delete_agent, binding.agent_id)
+                for secret_id in binding.secret_ids:
+                    await asyncio.to_thread(client.delete_secret, secret_id)
+            except BrokerError as exc:
+                log.warning(
+                    "Broker: teardown failed for agent %s: %s",
+                    agent_id, exc,
+                )
+
+        try:
+            await asyncio.to_thread(client.close)
+        except Exception:
+            log.exception("Broker: error closing client during teardown")
+        if client_override is None:
+            self._broker_client = None
 
     def _install_signal_handlers(self) -> None:
         """Register SIGINT/SIGTERM to trigger a clean shutdown on POSIX."""

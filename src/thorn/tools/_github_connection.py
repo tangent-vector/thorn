@@ -16,6 +16,8 @@ from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, Field, field_validator
 
+from thorn.core._credentials import ServiceCredential
+
 _DEFAULT_API_BASE = "https://api.github.com"
 
 
@@ -23,7 +25,9 @@ class GitHubPatAuth(BaseModel):
     """Authenticate with a personal access token or other static bearer token."""
 
     kind: Literal["pat"] = "pat"
-    token: str = Field(description="PAT or OAuth access token string")
+    token: ServiceCredential = Field(
+        description="PAT or OAuth access token string",
+    )
 
 
 class GitHubAppAuth(BaseModel):
@@ -39,7 +43,7 @@ class GitHubAppAuth(BaseModel):
     installation_id: int = Field(
         description="Installation ID for the org or user account",
     )
-    private_key_pem: str = Field(
+    private_key_pem: ServiceCredential = Field(
         description="PEM-encoded RSA private key for the GitHub App",
     )
 

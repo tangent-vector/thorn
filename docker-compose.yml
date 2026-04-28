@@ -1,9 +1,37 @@
-# docker compose up --build
+# docker compose up --build              # gateway only (Phase B baseline)
+# docker compose --profile broker up      # gateway + bundled OneCLI broker
 #
 # Expects:
 #   - .env at the repo root with LLM + forge credentials (see deploy/brev/env.template)
 #   - .thorn/ directory with gateway.json and agent identity
 #     (create via: docker compose run --rm gateway thorn serve bootstrap ...)
+#
+# When ``--profile broker`` is active:
+#   - The OneCLI broker (Rust gateway + Next.js dashboard, port 10254 dashboard,
+#     port 10255 substitution proxy) and its Postgres run as siblings on a
+#     shared internal bridge network (``thorn-broker``, ``internal: true``).
+#   - The Thorn gateway service joins that network so it can reach the broker
+#     by service name (``onecli:10254`` for admin, ``onecli:10255`` for proxy)
+#     and *also* joins ``thorn-default`` so it can reach the LLM provider and
+#     forge upstreams over the internet.
+#   - The OneCLI broker also joins ``thorn-default`` so its substitution proxy
+#     can reach upstream HTTPS endpoints on behalf of sandbox containers.
+#   - The per-agent sandbox containers (created by the Thorn gateway at
+#     runtime via the OCI runtime, not by compose) join only
+#     ``thorn-broker``; because that network is ``internal: true`` they have
+#     no NAT to the host network and cannot reach the internet directly --
+#     the only reachable destination is the broker.  This implements the
+#     Phase D "broker-only" egress policy without any iptables work in Thorn.
+#   - A named volume (``onecli-ca``) holds the broker's MITM CA certificate
+#     once OneCLI generates it; the brain pulls it via GET /api/gateway/ca at
+#     agent-load time and bind-mounts it read-only into per-agent sandbox
+#     containers (Phase D).  See ``BrokerConfig.ca_certificate_path`` in
+#     ``src/thorn/gateway/_config.py``.
+#
+# Standalone OneCLI deployments (operator already runs an OneCLI elsewhere)
+# do not need ``--profile broker``: leave the broker profile dormant and
+# point ``broker.{admin_url,proxy_url,ca_certificate_path}`` in
+# ``gateway.json`` at the existing deployment.
 
 services:
   gateway:
@@ -16,4 +44,101 @@ services:
       GIT_COMMITTER_EMAIL: thorn-bot@users.noreply.github.com
     volumes:
       - ./.thorn:/workspace/.thorn
+      # Read-only mount of the broker CA: present whenever the broker
+      # profile is up, no-op otherwise (compose creates the volume on
+      # demand).  Path matches the default ``BrokerConfig.ca_certificate_path``
+      # used in the bundled gateway.json template.
+      - onecli-ca:/var/lib/onecli/ca:ro
+    networks:
+      # Two networks: ``thorn-default`` for the LLM/forge upstream
+      # traffic (the gateway needs to reach the internet); ``thorn-broker``
+      # so it can reach OneCLI by service name when the broker profile is
+      # up.  ``thorn-broker`` being ``internal: true`` does not affect the
+      # gateway because it falls back to ``thorn-default`` for any host
+      # outside the broker network.
+      - thorn-default
+      - thorn-broker
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # Bundled OneCLI broker -- opt-in via ``--profile broker``.
+  #
+  # This stack mirrors OneCLI's published ``docker/docker-compose.yml``
+  # (https://github.com/onecli/onecli) so that operators can step out
+  # of the bundle to a standalone OneCLI without re-learning the shape.
+  # The single ``onecli`` image hosts both the Rust gateway (port 10255,
+  # the substitution proxy) and the Next.js admin/dashboard (port 10254,
+  # the API the brain drives).
+  # ---------------------------------------------------------------------
+
+  postgres:
+    profiles: ["broker"]
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${ONECLI_POSTGRES_USER:-onecli}
+      POSTGRES_PASSWORD: ${ONECLI_POSTGRES_PASSWORD:-onecli}
+      POSTGRES_DB: ${ONECLI_POSTGRES_DB:-onecli}
+    volumes:
+      - onecli-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ONECLI_POSTGRES_USER:-onecli}"]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 10
+    networks:
+      # Postgres serves only the OneCLI app, which is on the broker
+      # network.  Keeping it off ``thorn-default`` reduces the broker
+      # database's external exposure to zero.
+      - thorn-broker
+    restart: unless-stopped
+
+  onecli:
+    profiles: ["broker"]
+    image: ghcr.io/onecli/onecli:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Bind to localhost only by default so the dashboard isn't
+      # accidentally exposed to the host network.  Operators that want
+      # remote access to the dashboard can override.
+      - "${ONECLI_BIND_HOST:-127.0.0.1}:10254:10254"
+      - "${ONECLI_BIND_HOST:-127.0.0.1}:10255:10255"
+    environment:
+      DATABASE_URL: postgresql://${ONECLI_POSTGRES_USER:-onecli}:${ONECLI_POSTGRES_PASSWORD:-onecli}@postgres:5432/${ONECLI_POSTGRES_DB:-onecli}
+      NEXTAUTH_SECRET: ${ONECLI_NEXTAUTH_SECRET:-}
+      NEXT_PUBLIC_APP_URL: http://${ONECLI_BIND_HOST:-127.0.0.1}:10254
+      APP_URL: http://${ONECLI_BIND_HOST:-127.0.0.1}:10254
+    volumes:
+      # The broker writes its generated MITM CA into ``/app/data/ca``;
+      # we share the same volume into the gateway container (read-only)
+      # so the brain can pick the cert up.  This is the one piece of
+      # OneCLI app state that the gateway needs visibility into.
+      - onecli-app-data:/app/data
+      - onecli-ca:/app/data/ca
+    networks:
+      # OneCLI serves the broker network (so sandbox containers can
+      # reach it) *and* needs ``thorn-default`` for outbound HTTPS to
+      # the upstream APIs after credential substitution.  Without
+      # ``thorn-default`` the broker would be unable to forward
+      # requests anywhere.
+      - thorn-default
+      - thorn-broker
+    restart: unless-stopped
+
+volumes:
+  onecli-pgdata:
+  onecli-app-data:
+  onecli-ca:
+
+networks:
+  # Default outbound bridge: the gateway and broker reach the
+  # internet through this network.  Sandbox containers do *not*
+  # join it; they are pinned to ``thorn-broker``, which is
+  # ``internal: true`` and therefore has no NAT route to the host.
+  thorn-default:
+    driver: bridge
+  thorn-broker:
+    driver: bridge
+    internal: true

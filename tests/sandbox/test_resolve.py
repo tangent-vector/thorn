@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from thorn.gateway._config import AgentSandboxOverride, SandboxConfig
+from thorn.gateway._config import (
+    AgentSandboxOverride,
+    EgressAllowlistEntry,
+    SandboxConfig,
+)
 from thorn.sandbox import default_sandbox_image_tag, resolve_sandbox_config
 
 
@@ -79,3 +83,41 @@ class TestOverride:
         agency = SandboxConfig(oci_runtime="docker")
         override = AgentSandboxOverride()
         assert resolve_sandbox_config(agency, override).oci_runtime == "docker"
+
+
+class TestEgressFields:
+    """Phase D: ``egress_network`` and ``egress_allowlist`` are
+    agency-only.  The resolver carries them through verbatim and
+    the per-agent override surface deliberately does not include
+    them (operator-controlled invariant -- a per-agent escape hatch
+    would defeat the broker-only egress policy)."""
+
+    def test_egress_defaults_are_unset(self) -> None:
+        resolved = resolve_sandbox_config(None, None)
+        assert resolved.egress_network is None
+        assert resolved.egress_allowlist == ()
+
+    def test_egress_network_propagates_from_agency(self) -> None:
+        agency = SandboxConfig(egress_network="thorn-broker")
+        resolved = resolve_sandbox_config(agency, None)
+        assert resolved.egress_network == "thorn-broker"
+
+    def test_egress_allowlist_propagates_as_tuple(self) -> None:
+        agency = SandboxConfig(
+            egress_allowlist=[
+                EgressAllowlistEntry(host="status.internal", port=8080),
+                EgressAllowlistEntry(host="metrics.internal", port=443),
+            ],
+        )
+        resolved = resolve_sandbox_config(agency, None)
+        assert isinstance(resolved.egress_allowlist, tuple)
+        assert [(e.host, e.port) for e in resolved.egress_allowlist] == [
+            ("status.internal", 8080),
+            ("metrics.internal", 443),
+        ]
+
+    def test_egress_fields_unaffected_by_override(self) -> None:
+        agency = SandboxConfig(egress_network="thorn-broker")
+        override = AgentSandboxOverride()
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.egress_network == "thorn-broker"

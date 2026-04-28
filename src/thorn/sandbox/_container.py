@@ -109,6 +109,34 @@ CONTAINER_RUNTIME_DIR = "/opt/thorn-runtime"
 CONTAINER_SOCKET_PATH = f"{CONTAINER_CONTROL_DIR}/toolhost.sock"
 CONTAINER_LOG_PATH = f"{CONTAINER_CONTROL_DIR}/toolhost.log"
 
+CONTAINER_BROKER_CA_PATH = "/etc/thorn/onecli-ca.pem"
+"""Container-side path where the broker's CA certificate is mounted.
+
+Phase D: when the gateway is configured with a broker block and an
+agent has registered with the broker, every outbound HTTPS request
+from the sandbox container goes through the broker's HTTPS-MITM
+proxy.  The container needs the broker's CA cert installed so the
+TLS handshake succeeds; we mount the host-side cert read-only at
+this fixed location and point the standard CA-bundle env vars
+(``SSL_CERT_FILE``, ``REQUESTS_CA_BUNDLE``, ``NODE_EXTRA_CA_CERTS``,
+``GIT_SSL_CAINFO``) at it.
+
+The path is hard-coded rather than configurable for the same reason
+as the other container-side paths above: the daemon's environment
+inside the sandbox is uniform across agents, and operators never
+have to think about it.
+"""
+
+NO_PROXY_DEFAULT = "localhost,127.0.0.1,::1,/agent/control"
+"""Default ``NO_PROXY`` list for sandbox containers.
+
+Loopback addresses plus the toolhost control directory (the
+control-plane unix socket lives here, not over TCP, but defending
+against well-meaning HTTP clients that mistakenly resolve
+``localhost`` through the proxy is cheap).  Exposed as a constant
+so tests can assert the precise value without duplicating it.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -156,6 +184,42 @@ class ContainerHostConfig:
     extra_env: tuple[tuple[str, str], ...] = ()
     """Literal env entries to add (not from the host process)."""
 
+    broker_proxy_url: str | None = None
+    """Phase D: HTTPS proxy URL of the OneCLI broker.
+
+    When set, the sandbox container is configured (env vars +
+    CA mount) so all outbound HTTPS traffic flows through this
+    proxy.  The URL embeds Basic auth (``http://x:<token>@host:port/``)
+    so OneCLI's ``Proxy-Authorization`` extractor identifies the
+    agent without any per-tool customization.  ``None`` means the
+    broker is disabled / not bound for this agent and the sandbox
+    runs with no proxy interception.
+    """
+
+    broker_ca_host_path: Path | None = None
+    """Host-side path to the broker's CA certificate (PEM).
+
+    Required when ``broker_proxy_url`` is set; mounted read-only
+    into the container at :data:`CONTAINER_BROKER_CA_PATH`.  The
+    gateway populates this from the file the
+    :class:`~thorn.gateway.BrokerClient` cached on disk after
+    fetching ``/api/gateway/ca`` at startup.
+    """
+
+    broker_placeholder_env: tuple[tuple[str, str], ...] = ()
+    """Phase D: env entries that replace literal credentials.
+
+    Each entry is a ``(name, placeholder_value)`` pair.  The
+    placeholder is the same nonsensical string the brain-side
+    audit invariant verified is in ``ServiceCredential`` placeholder
+    state -- it satisfies tools that require a non-empty token
+    while carrying no real auth material; the broker injects the
+    real credential into the upstream request based on
+    host/path matching.  Independent of ``extra_env`` so the
+    placeholder set is auditable and clearly distinguishable from
+    operator-supplied env in logs and tests.
+    """
+
     dev_mount_runtime: Path | None = None
     """Source path for a R/O bind-mount of the framework's source tree.
 
@@ -181,6 +245,20 @@ class ContainerHostConfig:
     standard mount/env/user flags, before the image).  Use cases:
     ``--userns=keep-id`` for rootless podman, future Phase-F
     ``--cap-drop`` flags."""
+
+    egress_network: str | None = None
+    """Phase D: name of the OCI network the container joins.
+
+    When set, ``--network <name>`` is prepended to ``extra_run_args``
+    so the runtime (podman or docker) connects the container to
+    *only* that network rather than the default bridge.  The
+    operator is expected to have created the network with whatever
+    isolation properties they want (typically ``--internal`` so
+    there is no NAT to the host) and to have connected the broker
+    to it; the resulting topology is "broker reachable, nothing
+    else" without Thorn touching iptables itself.  ``None`` keeps
+    the Phase-B default (whatever the runtime's default network is).
+    """
 
     container_ready_timeout_s: float = 30.0
     """Stage-one budget: how long to wait for the container to reach
@@ -410,6 +488,29 @@ class ContainerDaemonHost:
                 ),
             )
 
+        # Broker integration is opt-in: the gateway only populates
+        # the ``broker_*`` fields after a successful per-agent
+        # registration with OneCLI.  When set, the container gets a
+        # R/O bind-mount of the broker CA at the well-known path so
+        # the in-container TLS stack trusts the broker's MITM cert,
+        # and a curated env block that wires every common HTTP
+        # client through the proxy.
+        if cfg.broker_proxy_url is not None:
+            if cfg.broker_ca_host_path is None:
+                raise ValueError(
+                    "ContainerHostConfig: broker_proxy_url is set but "
+                    "broker_ca_host_path is None; both must be supplied "
+                    "together so the in-container TLS stack trusts the "
+                    "broker's MITM CA",
+                )
+            mounts.append(
+                Mount(
+                    source=cfg.broker_ca_host_path,
+                    target=Path(CONTAINER_BROKER_CA_PATH),
+                    read_only=True,
+                ),
+            )
+
         env: list[tuple[str, str]] = []
         if cfg.dev_mount_runtime is not None:
             env.append(("PYTHONPATH", CONTAINER_RUNTIME_DIR))
@@ -428,6 +529,10 @@ class ContainerDaemonHost:
             env.append((name, value))
         env.extend(cfg.extra_env)
 
+        if cfg.broker_proxy_url is not None:
+            env.extend(_broker_env_entries(cfg.broker_proxy_url))
+            env.extend(cfg.broker_placeholder_env)
+
         command: list[str] = [
             "--socket",
             CONTAINER_SOCKET_PATH,
@@ -445,6 +550,16 @@ class ContainerDaemonHost:
 
         user = cfg.user if cfg.user is not None else _current_uid_gid()
 
+        # Phase D: when an ``egress_network`` is configured, prepend
+        # ``--network <name>`` so the runtime attaches the container
+        # to that network instead of the default bridge.  Stays
+        # before ``extra_run_args`` so an operator can still append
+        # additional flags (``--userns=keep-id`` etc.) without
+        # having to know about the egress wiring.
+        run_args: tuple[str, ...] = cfg.extra_run_args
+        if cfg.egress_network is not None:
+            run_args = ("--network", cfg.egress_network) + run_args
+
         return ContainerSpec(
             image=cfg.image,
             name=cfg.container_name,
@@ -453,8 +568,41 @@ class ContainerDaemonHost:
             user=user,
             entrypoint=cfg.entrypoint,
             command=tuple(command),
-            extra_run_args=cfg.extra_run_args,
+            extra_run_args=run_args,
         )
+
+
+def _broker_env_entries(proxy_url: str) -> list[tuple[str, str]]:
+    """Env entries that route container traffic through the broker.
+
+    Both upper- and lower-case forms of ``HTTP[S]_PROXY`` /
+    ``NO_PROXY`` are emitted because client libraries are
+    inconsistent: ``curl`` honors the lowercase forms first while
+    most Python and Node clients honor the uppercase forms;
+    ``git`` reads only ``http_proxy`` / ``https_proxy``.  Setting
+    both is harmless and avoids per-tool surprises.
+
+    The four CA-bundle env vars cover the common stacks: OpenSSL
+    (``SSL_CERT_FILE``), Python ``requests``
+    (``REQUESTS_CA_BUNDLE``), Node TLS
+    (``NODE_EXTRA_CA_CERTS``), and Git
+    (``GIT_SSL_CAINFO``).  Tools using other TLS stacks (Go's
+    ``crypto/tls``, Rust's ``rustls`` defaults) need image-baked
+    trust anchors, addressed when those stacks become a
+    constraint.
+    """
+    return [
+        ("HTTPS_PROXY", proxy_url),
+        ("HTTP_PROXY", proxy_url),
+        ("https_proxy", proxy_url),
+        ("http_proxy", proxy_url),
+        ("NO_PROXY", NO_PROXY_DEFAULT),
+        ("no_proxy", NO_PROXY_DEFAULT),
+        ("SSL_CERT_FILE", CONTAINER_BROKER_CA_PATH),
+        ("REQUESTS_CA_BUNDLE", CONTAINER_BROKER_CA_PATH),
+        ("NODE_EXTRA_CA_CERTS", CONTAINER_BROKER_CA_PATH),
+        ("GIT_SSL_CAINFO", CONTAINER_BROKER_CA_PATH),
+    ]
 
 
 def _current_uid_gid() -> str | None:
@@ -480,6 +628,7 @@ def derive_container_name(agent_id: str, *, prefix: str = "thorn-agent-") -> str
 
 
 __all__ = [
+    "CONTAINER_BROKER_CA_PATH",
     "CONTAINER_CONTROL_DIR",
     "CONTAINER_HOME_DIR",
     "CONTAINER_LOG_PATH",
@@ -490,6 +639,7 @@ __all__ = [
     "ContainerHostConfig",
     "ContainerNotReadyError",
     "ContainerStartTimeoutError",
+    "NO_PROXY_DEFAULT",
     "SandboxImageMissingError",
     "derive_container_name",
 ]

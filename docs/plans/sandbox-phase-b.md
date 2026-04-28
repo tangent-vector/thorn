@@ -252,24 +252,50 @@ Phase A left it).  Phase C will move the lifecycle inside the
 container, so an MCP-using tool's network reach is bounded by the
 container's network policy rather than the host's.
 
-### Phase D — Credential broker (OneCLI)
+### Phase D — Credential broker (OneCLI) and egress policy
 
 Phase B punts on credential isolation: env-passthrough is opt-in
 and `extra_env` is supported as a literal-value mechanism, but
 both are honest about the fact that anything passed in is visible
-to the daemon and to all tools running under it.  Phase D
+to the daemon and to all tools running under it. Phase D
 integrates [OneCLI](https://github.com/onecli/onecli) as the
-credential broker -- placeholder strings live in the container's
+credential broker — placeholder strings live in the container's
 env, real credentials live in OneCLI, container HTTPS traffic
-flows through OneCLI for substitution -- and pairs that with an
-egress policy that bounds the container's outbound to the broker.
-Per the roadmap's *Resolved opens*, we deliberately do not ship a
-Thorn-internal alternative broker; OneCLI is the chosen solution.
+flows through OneCLI for substitution — and pairs that with a
+broker-only egress policy that bounds the container's outbound to
+the broker via OCI-network membership (operators create the
+broker network with `internal: true`; sandbox containers join only
+that network).  Per the roadmap's *Resolved opens*, we
+deliberately do not ship a Thorn-internal alternative broker;
+OneCLI is the chosen solution.
 
-Until Phase D lands, the env-passthrough mechanism remains useful
-for non-credential values (locale, timezone, dev-mode toggles).
-Even after, the *mechanism* will stay; the *guidance* will shift
-from "don't pass credentials" to "you can't pass credentials".
+Phase D also introduces the `ServiceCredential` newtype and the
+`assert_no_literal_credentials` audit invariant: post-registration,
+no literal-state credential is reachable from agent state. The
+audit fails loudly if anything survived, so a refactor that
+silently leaks a credential to the container is a noisy test
+failure rather than a silent secret-handling regression. See
+`docs/plans/sandbox-phase-d.md` for the as-built retro.
+
+Two Phase D items are deliberately deferred to follow-ups:
+
+* **Allow-list enforcement.** `sandbox.egress_allowlist` parses
+  but the firewall mechanism (per-agent network + iptables vs.
+  netns vs. OCI-runtime hooks) is open question R3 and pending.
+  The gateway logs a warning at startup when the list is
+  non-empty so operators are not surprised by the enforcement
+  gap.
+* **Real-runtime broker smoke.** Phase B's
+  `requires_podman` / `requires_docker` smoke covers the OCI
+  adapter; an end-to-end smoke that brings up the bundled
+  compose and asserts both successful credential substitution
+  *and* that direct upstream egress is blocked is a follow-up.
+
+The env-passthrough mechanism remains useful for non-credential
+values (locale, timezone, dev-mode toggles). The *guidance* has
+shifted: with the broker enabled and the sandbox backend in
+container mode, credentials are no longer routed through env at
+all.
 
 ### Phase E — Hardening
 

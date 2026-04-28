@@ -286,6 +286,173 @@ class TestSpecConstruction:
             await host.stop()
 
 
+class TestBrokerBinding:
+    """Phase D: ``broker_*`` fields wire the per-agent OneCLI binding
+    into the container environment.
+
+    The unit-level surface here is the spec produced by
+    ``_build_container_spec`` -- env entries and bind-mounts.  The
+    higher-level test (gateway → runtime → host config) lives in
+    :mod:`tests.sandbox.test_runtime_wiring`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_broker_fields_means_no_proxy_env_or_mount(
+        self, tmp_path: Path,
+    ) -> None:
+        cfg = _make_config(tmp_path)
+        host = ContainerDaemonHost(cfg)
+        await host.start()
+        try:
+            spec = cfg.adapter.container_spec("thorn-agent-agent-x")
+            env_dict = dict(spec.env)
+            assert "HTTPS_PROXY" not in env_dict
+            assert "https_proxy" not in env_dict
+            assert "REQUESTS_CA_BUNDLE" not in env_dict
+            targets = {str(m.target) for m in spec.mounts}
+            assert "/etc/thorn/onecli-ca.pem" not in targets
+        finally:
+            await host.stop()
+
+    @pytest.mark.asyncio
+    async def test_broker_fields_emit_proxy_env_and_ca_mount(
+        self, tmp_path: Path,
+    ) -> None:
+        from thorn.sandbox._container import (
+            CONTAINER_BROKER_CA_PATH,
+            NO_PROXY_DEFAULT,
+        )
+
+        ca_pem = tmp_path / "broker-ca.pem"
+        ca_pem.write_text("-----BEGIN CERTIFICATE-----\n...\n")
+
+        adapter = FakeOCIRuntimeAdapter(present_images=["img"])
+        cfg = _make_config(tmp_path, image="img", adapter=adapter)
+        cfg = ContainerHostConfig(
+            agent_id=cfg.agent_id,
+            container_name=cfg.container_name,
+            image=cfg.image,
+            adapter=cfg.adapter,
+            host_home_dir=cfg.host_home_dir,
+            host_workspace_dir=cfg.host_workspace_dir,
+            host_control_dir=cfg.host_control_dir,
+            env_passthrough=cfg.env_passthrough,
+            extra_env=cfg.extra_env,
+            broker_proxy_url="http://x:aoc_token@broker:8443/",
+            broker_ca_host_path=ca_pem,
+            broker_placeholder_env=(
+                ("GITHUB_TOKEN", "thorn-broker-placeholder-1"),
+                ("GITLAB_TOKEN", "thorn-broker-placeholder-2"),
+            ),
+            user=cfg.user,
+            container_ready_timeout_s=cfg.container_ready_timeout_s,
+            container_ready_poll_s=cfg.container_ready_poll_s,
+        )
+        host = ContainerDaemonHost(cfg)
+        await host.start()
+        try:
+            spec = cfg.adapter.container_spec("thorn-agent-agent-x")
+            env_dict = dict(spec.env)
+
+            for name in (
+                "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy",
+            ):
+                assert env_dict[name] == "http://x:aoc_token@broker:8443/"
+            assert env_dict["NO_PROXY"] == NO_PROXY_DEFAULT
+            assert env_dict["no_proxy"] == NO_PROXY_DEFAULT
+            for ca_var in (
+                "SSL_CERT_FILE",
+                "REQUESTS_CA_BUNDLE",
+                "NODE_EXTRA_CA_CERTS",
+                "GIT_SSL_CAINFO",
+            ):
+                assert env_dict[ca_var] == CONTAINER_BROKER_CA_PATH
+
+            assert env_dict["GITHUB_TOKEN"] == "thorn-broker-placeholder-1"
+            assert env_dict["GITLAB_TOKEN"] == "thorn-broker-placeholder-2"
+
+            ca_mounts = [
+                m for m in spec.mounts
+                if str(m.target) == CONTAINER_BROKER_CA_PATH
+            ]
+            assert len(ca_mounts) == 1
+            assert ca_mounts[0].source == ca_pem
+            assert ca_mounts[0].read_only is True
+        finally:
+            await host.stop()
+
+    @pytest.mark.asyncio
+    async def test_broker_proxy_without_ca_path_raises(
+        self, tmp_path: Path,
+    ) -> None:
+        cfg = _make_config(tmp_path)
+        cfg = ContainerHostConfig(
+            agent_id=cfg.agent_id,
+            container_name=cfg.container_name,
+            image=cfg.image,
+            adapter=cfg.adapter,
+            host_home_dir=cfg.host_home_dir,
+            host_workspace_dir=cfg.host_workspace_dir,
+            host_control_dir=cfg.host_control_dir,
+            broker_proxy_url="http://x:tok@broker:8443/",
+            broker_ca_host_path=None,
+            user=cfg.user,
+        )
+        host = ContainerDaemonHost(cfg)
+        with pytest.raises(ValueError, match="broker_ca_host_path"):
+            await host.start()
+
+
+class TestEgressNetwork:
+    """Phase D: ``egress_network`` is surfaced as ``--network <name>``
+    in the OCI run args.  Combined with an operator-created
+    ``internal: true`` network containing only the broker, this
+    achieves broker-only egress without Thorn touching iptables."""
+
+    @pytest.mark.asyncio
+    async def test_no_egress_network_means_no_network_flag(
+        self, tmp_path: Path,
+    ) -> None:
+        cfg = _make_config(tmp_path)
+        host = ContainerDaemonHost(cfg)
+        await host.start()
+        try:
+            spec = cfg.adapter.container_spec("thorn-agent-agent-x")
+            assert "--network" not in spec.extra_run_args
+        finally:
+            await host.stop()
+
+    @pytest.mark.asyncio
+    async def test_egress_network_prepends_network_flag(
+        self, tmp_path: Path,
+    ) -> None:
+        adapter = FakeOCIRuntimeAdapter(present_images=["t:1"])
+        base = _make_config(tmp_path, image="t:1", adapter=adapter)
+        cfg = ContainerHostConfig(
+            agent_id=base.agent_id,
+            container_name=base.container_name,
+            image=base.image,
+            adapter=base.adapter,
+            host_home_dir=base.host_home_dir,
+            host_workspace_dir=base.host_workspace_dir,
+            host_control_dir=base.host_control_dir,
+            egress_network="thorn-broker",
+            extra_run_args=("--userns=keep-id",),
+            user=base.user,
+            container_ready_timeout_s=base.container_ready_timeout_s,
+            container_ready_poll_s=base.container_ready_poll_s,
+        )
+        host = ContainerDaemonHost(cfg)
+        await host.start()
+        try:
+            spec = cfg.adapter.container_spec("thorn-agent-agent-x")
+            assert spec.extra_run_args == (
+                "--network", "thorn-broker", "--userns=keep-id",
+            )
+        finally:
+            await host.stop()
+
+
 class TestSocketPath:
     def test_socket_path_under_control_dir(self, tmp_path: Path) -> None:
         cfg = _make_config(tmp_path)

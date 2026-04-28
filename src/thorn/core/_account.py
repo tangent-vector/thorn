@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, Union
 
 from pydantic import BaseModel, Field
 
+from thorn.core._credentials import ServiceCredential
 from thorn.tools._github_connection import GitHubAppAuth, GitHubPatAuth
 
 if TYPE_CHECKING:
@@ -44,7 +45,9 @@ class GitLabCredentials(BaseModel):
     """Credentials for authenticating to a GitLab forge."""
 
     kind: Literal["gitlab-pat"] = "gitlab-pat"
-    token: str = Field(description="Personal access token with 'api' scope")
+    token: ServiceCredential = Field(
+        description="Personal access token with 'api' scope",
+    )
 
 
 ForgeCredentials = Annotated[

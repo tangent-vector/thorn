@@ -137,3 +137,84 @@ async def test_preload_with_no_agents_is_a_noop(tmp_path: Path) -> None:
     gateway = Gateway(runtime=runtime, sources=[])
     async with runtime:
         await gateway._startup()
+
+
+@pytest.mark.asyncio
+async def test_egress_allowlist_warning_when_set(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Phase D: the gateway emits a single warning at startup when
+    ``sandbox.egress_allowlist`` is non-empty, since enforcement is
+    not yet wired (open question R3 in the Phase D plan)."""
+    import logging
+
+    from thorn.gateway._config import EgressAllowlistEntry, SandboxConfig
+
+    paths = AgencyPaths(
+        home_root=tmp_path / "home",
+        workspace_root=tmp_path / "ws",
+    )
+    paths.home_root.mkdir(parents=True, exist_ok=True)
+    paths.workspace_root.mkdir(parents=True, exist_ok=True)
+    runtime = Runtime(
+        provider=_StubProvider(),  # type: ignore[arg-type]
+        workspace_root=paths.workspace_root,
+        paths=paths,
+        sandbox_executor_enabled=True,
+        sandbox_config=SandboxConfig(
+            backend="subprocess",
+            egress_allowlist=[
+                EgressAllowlistEntry(host="status.internal", port=443),
+            ],
+        ),
+    )
+
+    gateway = Gateway(runtime=runtime, sources=[])
+    caplog.set_level(logging.WARNING, logger="thorn.gateway._gateway")
+    async with runtime:
+        await gateway._startup()
+
+    matching = [
+        rec for rec in caplog.records
+        if "egress_allowlist" in rec.getMessage()
+    ]
+    assert len(matching) == 1, (
+        f"expected exactly one egress_allowlist warning, got "
+        f"{[r.getMessage() for r in matching]}"
+    )
+    assert "status.internal:443" in matching[0].getMessage()
+    assert "R3" in matching[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_egress_allowlist_silent_when_empty(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Empty allow-list (the default) emits no warning."""
+    import logging
+
+    from thorn.gateway._config import SandboxConfig
+
+    paths = AgencyPaths(
+        home_root=tmp_path / "home",
+        workspace_root=tmp_path / "ws",
+    )
+    paths.home_root.mkdir(parents=True, exist_ok=True)
+    paths.workspace_root.mkdir(parents=True, exist_ok=True)
+    runtime = Runtime(
+        provider=_StubProvider(),  # type: ignore[arg-type]
+        workspace_root=paths.workspace_root,
+        paths=paths,
+        sandbox_executor_enabled=True,
+        sandbox_config=SandboxConfig(backend="subprocess"),
+    )
+
+    gateway = Gateway(runtime=runtime, sources=[])
+    caplog.set_level(logging.WARNING, logger="thorn.gateway._gateway")
+    async with runtime:
+        await gateway._startup()
+
+    assert not [
+        rec for rec in caplog.records
+        if "egress_allowlist" in rec.getMessage()
+    ]

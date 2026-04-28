@@ -23,7 +23,7 @@ import contextvars
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Protocol, TypeVar, runtime_checkable
 
 from thorn.core._agent import Agent
 from thorn.core._context import (
@@ -53,6 +53,50 @@ if TYPE_CHECKING:
     from thorn.toolhost._host import DaemonHost
 
 _S = TypeVar("_S", bound=Service)
+
+
+@runtime_checkable
+class SandboxBrokerBinding(Protocol):
+    """Minimal shape the runtime needs to wire a sandbox to a broker.
+
+    A structural match for :class:`thorn.gateway._broker.BrokerBinding`
+    so the gateway can hand its binding objects to the runtime
+    without the runtime importing from ``thorn.gateway`` at runtime
+    (which would create a layering inversion: the gateway depends on
+    the runtime, not the other way around).
+
+    Carries exactly the three pieces of information the
+    :class:`~thorn.sandbox._container.ContainerHostConfig` consumes:
+    the proxy URL (with embedded Basic auth), the host-side path of
+    the broker's CA certificate, and the placeholder env entries
+    that replace literal credentials inside the sandbox.
+
+    Annotated as plain attributes (rather than ``@property``) so that
+    a ``@dataclass(frozen=True)`` exposing the same field names is
+    automatically structurally compatible at runtime under
+    :func:`isinstance` -- ``runtime_checkable`` Protocols match
+    attribute presence, and dataclass attributes are simpler to
+    satisfy from concrete implementations than properties.
+    """
+
+    proxy_url: str
+    ca_certificate_path: str
+    placeholder_env: tuple[tuple[str, str], ...]
+
+
+SandboxBrokerBindingLookup = Callable[
+    [AgentID], "SandboxBrokerBinding | None",
+]
+"""Callable the gateway installs on the runtime to expose bindings.
+
+Returning ``None`` for an agent means "no binding registered yet"
+(broker disabled, or the agent was created post-startup before the
+broker registration loop has run); the runtime then builds the
+sandbox without any broker wiring.  This degrades gracefully: the
+sandbox runs, but with no credential injection -- the audit
+invariant catches this on the brain side before it can ship a
+literal credential into the container.
+"""
 
 
 class Runtime:
@@ -87,6 +131,9 @@ class Runtime:
         sandbox_executor_enabled: bool = False,
         sandbox_config: SandboxConfig | None = None,
         oci_runtime_adapter: OCIRuntimeAdapter | None = None,
+        sandbox_broker_binding_lookup: (
+            SandboxBrokerBindingLookup | None
+        ) = None,
     ) -> None:
         self.provider = provider
         self.event_sink: EventSink = event_sink or NullEventSink()
@@ -140,6 +187,16 @@ class Runtime:
         self._oci_runtime_adapter_resolved: bool = (
             oci_runtime_adapter is not None
         )
+
+        # Phase D: the gateway installs a callback so per-agent
+        # ``ContainerHostConfig`` construction can pick up the broker
+        # binding (proxy URL + CA path + placeholder env).  Default
+        # ``None`` keeps the subprocess and container backends working
+        # in setups without a broker (CLI, tests, single-shot
+        # ``thorn run``).
+        self._sandbox_broker_binding_lookup: (
+            SandboxBrokerBindingLookup | None
+        ) = sandbox_broker_binding_lookup
 
     # -- Service registry ---------------------------------------------------
 
@@ -255,6 +312,39 @@ class Runtime:
 
     # -- Sandbox executor pool ---------------------------------------------
 
+    def set_sandbox_broker_binding_lookup(
+        self, lookup: SandboxBrokerBindingLookup | None,
+    ) -> None:
+        """Install (or clear) the broker-binding lookup callback.
+
+        The gateway calls this once startup-time broker registration
+        has populated its bindings dict, so subsequent
+        :meth:`get_or_create_sandbox_executor` calls can pick up the
+        right binding for each agent.  Passing ``None`` clears the
+        callback (used during shutdown / teardown so we never keep a
+        reference to a closed broker session).
+
+        Pre-existing cached executors are *not* rebuilt: the
+        gateway's startup ordering ensures schedulers exist (and
+        broker bindings get registered) *before* any sandbox
+        executor is materialised, so a late install is the
+        steady-state path for the in-memory pool.
+        """
+        self._sandbox_broker_binding_lookup = lookup
+
+    @property
+    def sandbox_config(self) -> SandboxConfig | None:
+        """The agency-wide :class:`SandboxConfig`, or ``None`` if absent.
+
+        Exposed read-only so the gateway (and tests) can inspect
+        the resolved sandbox block without reaching into the
+        private ``_sandbox_config`` attribute.  ``None`` matches the
+        constructor default and means the operator did not write a
+        ``sandbox`` block in ``gateway.json`` -- the runtime keeps
+        Phase-A subprocess defaults in that case.
+        """
+        return self._sandbox_config
+
     @property
     def sandbox_executor_enabled(self) -> bool:
         """Whether per-agent sandbox executors are enabled.
@@ -362,6 +452,27 @@ class Runtime:
 
         dev_mount = self._dev_mount_runtime_path(resolved)
 
+        # Phase D: pick up the broker binding for this agent, if the
+        # gateway has registered one.  ``None`` is the broker-disabled
+        # path (single-shot ``thorn run``, tests, gateway with no
+        # broker block); the container then runs without proxy
+        # interception.  Subprocess backend never consults this
+        # lookup -- broker integration is conditional on the
+        # container backend by design (the in-process daemon shares
+        # the host's network stack and credentials, so broker
+        # injection has nothing to attach to).
+        binding: SandboxBrokerBinding | None = None
+        if self._sandbox_broker_binding_lookup is not None:
+            binding = self._sandbox_broker_binding_lookup(agent.id)
+
+        broker_proxy_url: str | None = None
+        broker_ca_host_path: Path | None = None
+        broker_placeholder_env: tuple[tuple[str, str], ...] = ()
+        if binding is not None:
+            broker_proxy_url = binding.proxy_url
+            broker_ca_host_path = Path(binding.ca_certificate_path)
+            broker_placeholder_env = binding.placeholder_env
+
         container_config = ContainerHostConfig(
             agent_id=str(agent.id),
             container_name=derive_container_name(str(agent.id)),
@@ -372,6 +483,10 @@ class Runtime:
             host_control_dir=control_dir,
             env_passthrough=tuple(resolved.env_passthrough),
             extra_env=tuple(resolved.extra_env),
+            broker_proxy_url=broker_proxy_url,
+            broker_ca_host_path=broker_ca_host_path,
+            broker_placeholder_env=broker_placeholder_env,
+            egress_network=resolved.egress_network,
             dev_mount_runtime=dev_mount,
             container_ready_timeout_s=resolved.container_ready_timeout_s,
         )
