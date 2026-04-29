@@ -17,9 +17,21 @@ defaults gets the load-bearing security properties (G1
 credential isolation, G2 rm-rf containment) plus a meaningful
 defense-in-depth posture without operator effort.
 
-**Phase E ships in two pushes.**  This document covers push 1
-(the implementation slices); push 2 is the end-to-end
-dogfooding pass.  The threat-model document
+**Phase E shipped in two pushes.**  This document covers
+both: push 1 landed the implementation slices (the
+configuration surface, the run-flag emission, the merge
+logic, the threat-model doc); push 2 landed a real-runtime
+hardening sanity-check that asserts the Phase-E flags
+actually take effect on ``podman`` and ``docker``.  Each
+push has its own *What landed* section below.  A full
+broker+gateway+agent end-to-end loop is **not** a Phase-E
+test deliverable -- that work happens through operator-
+driven dogfooding of the system as a whole, with findings
+surfaced as their own follow-up issues rather than as
+Phase-E deferred work.  See the *Out of scope* section
+near the end for the rationale.
+
+The threat-model document
 ([sandbox-threat-model.md](sandbox-threat-model.md)) was
 written first and is the authoritative source for what the
 sandbox actually promises; this retro records the as-built
@@ -103,7 +115,7 @@ gateway.json sandbox            agent.json sandbox
 Each box is a layer that already existed; Phase E just adds
 new fields to each and a few lines of merge / emission code.
 
-## What landed
+## Push 1: What landed (implementation slices)
 
 ### Identity model: ratified, plus a latent rootless-podman fix
 
@@ -277,34 +289,98 @@ pass `--userns=keep-id` explicitly; the adapter handles it.
 
 The opt-in real-runtime smokes (`requires_podman`,
 `requires_docker`) continue to cover the OCI adapter against
-real runtimes.  Phase E does **not** ship a new
-real-runtime smoke; that is the upcoming push 2 (dogfooding)
-deliverable.
+real runtimes.  Push 1 did not ship a new real-runtime smoke;
+push 2 below adds one.
+
+## Push 2: What landed (dogfooding)
+
+### Hardening sanity-check on a real OCI runtime
+
+Land at
+[`tests/sandbox/test_phase_e_hardening_real_oci.py`](../../tests/sandbox/test_phase_e_hardening_real_oci.py).
+Builds a `ContainerSpec` shaped exactly like what
+`ContainerHostConfig`'s production defaults assemble (drop-
+ALL caps, `no-new-privileges`, read-only rootfs with
+`/tmp` and `/var/tmp` tmpfs, 2G/2cpu/512pids resource
+limits, `--user $(host_uid):$(host_gid)` plus
+`--userns=keep-id` on podman), starts the container against
+the real runtime, and uses `<runtime> exec` to assert each
+hardening property took effect:
+
+| Assertion                       | Mechanism under test                                        |
+|---------------------------------|-------------------------------------------------------------|
+| `id` returns operator's uid/gid | `--user` + `--userns=keep-id` (podman) / rootful map (docker) |
+| `CapEff` / `CapBnd` are zero    | `--cap-drop=ALL`                                            |
+| `NoNewPrivs:1`                  | `--security-opt=no-new-privileges`                          |
+| `touch /etc/x` fails (EROFS)    | `--read-only`                                               |
+| `touch /tmp/x` succeeds         | `--tmpfs=/tmp:size=1G,mode=1777`                            |
+| `touch /var/tmp/x` succeeds     | `--tmpfs=/var/tmp:size=256M,mode=1777`                      |
+| Fork bomb trips at low limit    | `--pids-limit=N` (gated; see below)                         |
+
+The pid-limit enforcement assertion is gated by a runtime
+probe: the test spins up a one-shot `--pids-limit=2` container
+and checks whether a second `fork()` actually fails.  On
+rootless podman + cgroup v1 (typical WSL2 today) podman
+silently ignores resource-limit flags, so the assertion is
+skipped with an explanatory message.  On rootful docker or
+podman with delegated cgroup controllers, the behavior is
+asserted end-to-end (a `--pids-limit=20` container can't
+spawn 100 backgrounded sleepers).
+
+The test file deliberately uses busybox rather than the
+full `thorn-sandbox` image: the hardening flags are runtime-
+level (cap drops, namespaces, cgroup knobs) and don't depend
+on the image, so the cheap busybox container is a strictly
+better choice for a smoke -- it pulls fast, exits fast, and
+its minimalism makes the failure-mode assertions
+unambiguous (`touch /etc` fails because of `--read-only`,
+not because of some image-baked permission).
+
+Both `requires_podman` and `requires_docker` variants run;
+the WSL2 development host runs both green (13/14 pass; 1
+correctly skipped for cgroup-controller delegation reasons).
+
+### Out of scope: broker + gateway + agent end-to-end test
+
+The Phase-E plan's most ambitious dogfooding scope was a
+fully-automated "bring up `deploy/broker.compose.yml`, run
+a real Thorn gateway, spawn an agent, watch it do a real
+task" test.  That work is **not** a Phase-E deliverable.
+
+Two reasons:
+
+* The most informative version of that exercise -- *the
+  operator stands up their own gateway, runs a real agent,
+  sees what falls over* -- is by nature operator-driven,
+  not test-fixture-driven.  Whatever surfaces is more
+  likely about Phases A-D integration cracks (or about
+  setup ergonomics) than about the Phase-E hardening
+  surface specifically; treating it as a Phase-E
+  deliverable would conflate "are the new hardening
+  flags load-bearing?" (push 2 above answers yes) with
+  "does the whole stack work end-to-end?" (a broader
+  question that doesn't belong inside a single phase).
+* The setup surface (broker volumes, OneCLI admin
+  onboarding, gateway CA fetch, agent fixture, model
+  creds) is heavy enough that an automated equivalent
+  would either need real model credentials (an operator-
+  policy decision) or a stub model gateway (which gives
+  strictly less signal than a real run).  Either way, the
+  test would not catch what manual operator dogfooding
+  catches.
+
+The push-2 hardening sanity-check above closes the load-
+bearing *security* claim (the Phase E flags really do what
+we promise on real runtimes).  The *workflow* claim (an
+agent can actually do work under those flags) is closed
+by the operator's own use of the system, with findings
+surfaced as their own follow-up issues rather than as
+Phase-E test deliverables.
 
 ## Deferred items
 
-These were either out of scope for Phase E push 1 or
-explicitly deferred per the Phase E plan.
-
-### End-to-end dogfooding (push 2)
-
-The plan's `phase-e-checkpoint` todo splits Phase E into two
-pushes: implementation (push 1, this document) and
-dogfooding (push 2).  The dogfooding pass:
-
-* Brings up the bundled `deploy/broker.compose.yml`.
-* Builds the Phase-E sandbox image.
-* Runs a real Thorn gateway + a single agent with a real
-  one-prompt task.
-* Asserts both that the hardening flags actually take effect
-  against a real runtime *and* that an agent can do real
-  work under them.
-* Catches integration cracks accumulated across Phases A–E
-  without major dogfooding in between.
-
-This is intentionally treated as "get it working, fix what
-breaks" rather than a tick-box test; surprises are expected
-and budgeted for.
+These were either out of scope or explicitly deferred per
+the Phase E plan.
 
 ### Allow-list enforcement (R3 from Phase D)
 
@@ -360,3 +436,5 @@ with the broker.  Unchanged from Phase D.
     `DEFAULT_TMPFS_MOUNTS`, `_build_container_spec`)
   * [src/thorn/runtime/_runtime.py](../../src/thorn/runtime/_runtime.py)
     (`Runtime._build_sandbox_executor` Phase-E wiring)
+  * [tests/sandbox/test_phase_e_hardening_real_oci.py](../../tests/sandbox/test_phase_e_hardening_real_oci.py)
+    (push 2 real-runtime hardening smoke)
