@@ -473,6 +473,17 @@ class Runtime:
             broker_ca_host_path = Path(binding.ca_certificate_path)
             broker_placeholder_env = binding.placeholder_env
 
+        # Phase E: surface tmpfs scratch mounts whenever the rootfs
+        # is read-only.  ``DEFAULT_TMPFS_MOUNTS`` covers ``/tmp`` and
+        # ``/var/tmp`` with sane sizes; operators with unusual needs
+        # can extend the surface later via a dedicated config field
+        # rather than having to disable read-only entirely.
+        from thorn.sandbox._container import DEFAULT_TMPFS_MOUNTS
+
+        tmpfs_mounts = (
+            DEFAULT_TMPFS_MOUNTS if resolved.read_only_root else ()
+        )
+
         container_config = ContainerHostConfig(
             agent_id=str(agent.id),
             container_name=derive_container_name(str(agent.id)),
@@ -489,6 +500,14 @@ class Runtime:
             egress_network=resolved.egress_network,
             dev_mount_runtime=dev_mount,
             container_ready_timeout_s=resolved.container_ready_timeout_s,
+            capabilities_drop=resolved.capabilities_drop,
+            capabilities_add=resolved.capabilities_add,
+            security_opts=resolved.security_opts,
+            read_only_root=resolved.read_only_root,
+            tmpfs_mounts=tmpfs_mounts,
+            memory_limit=resolved.memory_limit,
+            cpu_limit=resolved.cpu_limit,
+            pid_limit=resolved.pid_limit,
         )
         return ContainerDaemonHost(container_config)
 

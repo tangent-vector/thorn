@@ -58,6 +58,7 @@ from thorn.sandbox._runtime import (
     Mount,
     OCIImageMissing,
     OCIRuntimeAdapter,
+    Tmpfs,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,29 @@ as the other container-side paths above: the daemon's environment
 inside the sandbox is uniform across agents, and operators never
 have to think about it.
 """
+
+DEFAULT_TMPFS_MOUNTS: tuple[Tmpfs, ...] = (
+    Tmpfs(target=Path("/tmp"), options="size=1G,mode=1777"),
+    Tmpfs(target=Path("/var/tmp"), options="size=256M,mode=1777"),
+)
+"""Default tmpfs scratch mounts when ``read_only_root`` is enabled.
+
+When the container's rootfs is mounted read-only, tools that
+write to the canonical scratch paths (``/tmp``, ``/var/tmp``) need
+those paths to live on a tmpfs so the writes succeed.  Sizes are
+generous-but-bounded: 1 GiB at ``/tmp`` covers typical
+``pip``/``cargo``/``npm`` install scratch and per-test artifacts;
+256 MiB at ``/var/tmp`` covers the rarer "long-lived temp" use
+case (where ``/var/tmp`` is supposed to survive process restarts
+-- the container's lifecycle makes this distinction moot, but the
+size matches the OS convention).  Operators with larger needs
+override via :attr:`ContainerHostConfig.tmpfs_mounts`.
+
+Mode ``1777`` matches the standard sticky-world-writable layout
+``/tmp`` is expected to have, so user-mode software that checks
+permissions doesn't get surprised.
+"""
+
 
 NO_PROXY_DEFAULT = "localhost,127.0.0.1,::1,/agent/control"
 """Default ``NO_PROXY`` list for sandbox containers.
@@ -238,13 +262,98 @@ class ContainerHostConfig:
     so files written through bind-mounts land with the operator's
     ownership and no ``chown`` is ever required.  Set to a literal
     string to override (e.g. for tests or unusual setups).
+
+    Identity-model notes (Phase E):
+
+    * In-container processes run as the gateway operator's uid, both
+      inside and outside the container, by design.  See
+      :doc:`/docs/plans/sandbox-threat-model` for the rationale; the
+      short version is that the sandbox's load-bearing security
+      properties (G1: credential isolation, G2: rm-rf containment)
+      come from filesystem mount selection and network policy, not
+      from uid separation, and operator workflows depend on full
+      read/write access to bind-mounted state.
+    * On rootless podman this UID claim is only true when the
+      runtime is also passed ``--userns=keep-id``, which
+      :class:`~thorn.sandbox._runtime.PodmanAdapter` defaults in
+      automatically.  Phase B's bind-mount-ownership claim quietly
+      assumed this; Phase E makes it true unconditionally on the
+      podman path.
     """
 
     extra_run_args: tuple[str, ...] = ()
     """Extra arguments passed verbatim to ``<runtime> run`` (after the
-    standard mount/env/user flags, before the image).  Use cases:
-    ``--userns=keep-id`` for rootless podman, future Phase-F
-    ``--cap-drop`` flags."""
+    standard mount/env/user/hardening flags, before the image).
+    Operator escape hatch for one-off needs that don't have a
+    dedicated field; rarely used in production."""
+
+    capabilities_drop: tuple[str, ...] = ()
+    """Phase E: capabilities to drop from the container's bounding set.
+
+    Each entry becomes ``--cap-drop=<name>`` at run time.  The
+    runtime populates this from
+    :attr:`thorn.sandbox.ResolvedSandboxConfig.capabilities_drop`,
+    which defaults to ``("ALL",)``.  Empty tuple means "do not pass
+    ``--cap-drop`` at all" -- callers (CLI tests, smokes) that
+    want the runtime defaults can leave this alone.
+    """
+
+    capabilities_add: tuple[str, ...] = ()
+    """Phase E: capabilities to grant after :attr:`capabilities_drop`.
+
+    Each entry becomes ``--cap-add=<name>``.  Used for agents that
+    legitimately need a specific cap (e.g. ``"NET_RAW"`` for
+    ``ping``).
+    """
+
+    security_opts: tuple[str, ...] = ()
+    """Phase E: ``--security-opt=<value>`` entries.
+
+    The runtime populates this from
+    :attr:`thorn.sandbox.ResolvedSandboxConfig.security_opts`, which
+    defaults to ``("no-new-privileges",)``.
+    """
+
+    read_only_root: bool = False
+    """Phase E: when true, mount the container's rootfs read-only.
+
+    Pairs with :attr:`tmpfs_mounts` to keep ``/tmp`` and ``/var/tmp``
+    writable.  The runtime populates this from
+    :attr:`thorn.sandbox.ResolvedSandboxConfig.read_only_root`,
+    which defaults to ``True``.
+    """
+
+    tmpfs_mounts: tuple[Tmpfs, ...] = ()
+    """Phase E: in-container tmpfs scratch mounts.
+
+    The runtime populates this with :data:`DEFAULT_TMPFS_MOUNTS`
+    when :attr:`read_only_root` is true; an empty tuple means "no
+    tmpfs mounts".
+    """
+
+    memory_limit: str | None = None
+    """Phase E: ``--memory`` value (e.g. ``"2G"``); ``None`` means uncapped.
+
+    The runtime populates this from
+    :attr:`thorn.sandbox.ResolvedSandboxConfig.memory_limit`, which
+    defaults to ``"2G"``.
+    """
+
+    cpu_limit: float | None = None
+    """Phase E: ``--cpus`` value; ``None`` means uncapped.
+
+    The runtime populates this from
+    :attr:`thorn.sandbox.ResolvedSandboxConfig.cpu_limit`, which
+    defaults to ``2.0``.
+    """
+
+    pid_limit: int | None = None
+    """Phase E: ``--pids-limit`` value; ``None`` means uncapped.
+
+    The runtime populates this from
+    :attr:`thorn.sandbox.ResolvedSandboxConfig.pid_limit`, which
+    defaults to ``512``.
+    """
 
     egress_network: str | None = None
     """Phase D: name of the OCI network the container joins.
@@ -569,6 +678,14 @@ class ContainerDaemonHost:
             entrypoint=cfg.entrypoint,
             command=tuple(command),
             extra_run_args=run_args,
+            capabilities_drop=cfg.capabilities_drop,
+            capabilities_add=cfg.capabilities_add,
+            security_opts=cfg.security_opts,
+            read_only_root=cfg.read_only_root,
+            tmpfs_mounts=cfg.tmpfs_mounts,
+            memory_limit=cfg.memory_limit,
+            cpu_limit=cfg.cpu_limit,
+            pid_limit=cfg.pid_limit,
         )
 
 
@@ -639,6 +756,7 @@ __all__ = [
     "ContainerHostConfig",
     "ContainerNotReadyError",
     "ContainerStartTimeoutError",
+    "DEFAULT_TMPFS_MOUNTS",
     "NO_PROXY_DEFAULT",
     "SandboxImageMissingError",
     "derive_container_name",

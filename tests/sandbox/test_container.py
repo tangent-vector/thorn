@@ -460,6 +460,84 @@ class TestSocketPath:
         assert host.socket_path == cfg.host_control_dir / "toolhost.sock"
 
 
+class TestPhaseEHardeningPassthrough:
+    """Phase E: ``ContainerHostConfig`` carries hardening fields (caps,
+    security_opts, read-only rootfs, tmpfs mounts, resource limits)
+    and ``_build_container_spec`` threads them through to the
+    :class:`ContainerSpec` verbatim.  These tests pin the
+    pass-through so a future field addition can't silently drop
+    something."""
+
+    @pytest.mark.asyncio
+    async def test_caps_threaded_through(self, tmp_path: Path) -> None:
+        from thorn.sandbox import Tmpfs
+
+        adapter = FakeOCIRuntimeAdapter(present_images=["t:1"])
+        base = _make_config(tmp_path, image="t:1", adapter=adapter)
+        cfg = ContainerHostConfig(
+            agent_id=base.agent_id,
+            container_name=base.container_name,
+            image=base.image,
+            adapter=base.adapter,
+            host_home_dir=base.host_home_dir,
+            host_workspace_dir=base.host_workspace_dir,
+            host_control_dir=base.host_control_dir,
+            user=base.user,
+            container_ready_timeout_s=base.container_ready_timeout_s,
+            container_ready_poll_s=base.container_ready_poll_s,
+            capabilities_drop=("ALL",),
+            capabilities_add=("NET_RAW",),
+            security_opts=("no-new-privileges",),
+            read_only_root=True,
+            tmpfs_mounts=(
+                Tmpfs(target=Path("/tmp"), options="size=1G"),
+            ),
+            memory_limit="2G",
+            cpu_limit=2.0,
+            pid_limit=512,
+        )
+        host = ContainerDaemonHost(cfg)
+        await host.start()
+        try:
+            spec = cfg.adapter.container_spec("thorn-agent-agent-x")
+            assert spec.capabilities_drop == ("ALL",)
+            assert spec.capabilities_add == ("NET_RAW",)
+            assert spec.security_opts == ("no-new-privileges",)
+            assert spec.read_only_root is True
+            assert len(spec.tmpfs_mounts) == 1
+            assert spec.tmpfs_mounts[0].target == Path("/tmp")
+            assert spec.memory_limit == "2G"
+            assert spec.cpu_limit == 2.0
+            assert spec.pid_limit == 512
+        finally:
+            await host.stop()
+
+    @pytest.mark.asyncio
+    async def test_default_unset_fields_pass_through_as_unset(
+        self, tmp_path: Path,
+    ) -> None:
+        # When a caller leaves the new fields at their dataclass
+        # defaults (no hardening), the resulting ``ContainerSpec``
+        # carries the same no-op defaults so the adapter doesn't
+        # emit any flags for them.  This is the "tests don't have to
+        # know about hardening" property.
+        cfg = _make_config(tmp_path)
+        host = ContainerDaemonHost(cfg)
+        await host.start()
+        try:
+            spec = cfg.adapter.container_spec("thorn-agent-agent-x")
+            assert spec.capabilities_drop == ()
+            assert spec.capabilities_add == ()
+            assert spec.security_opts == ()
+            assert spec.read_only_root is False
+            assert spec.tmpfs_mounts == ()
+            assert spec.memory_limit is None
+            assert spec.cpu_limit is None
+            assert spec.pid_limit is None
+        finally:
+            await host.stop()
+
+
 class TestDeriveContainerName:
     @pytest.mark.parametrize(
         "agent_id,expected",

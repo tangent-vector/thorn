@@ -121,3 +121,140 @@ class TestEgressFields:
         override = AgentSandboxOverride()
         resolved = resolve_sandbox_config(agency, override)
         assert resolved.egress_network == "thorn-broker"
+
+
+class TestPhaseEHardeningDefaults:
+    """Phase E adds hardening fields to :class:`SandboxConfig` with
+    conservative-by-default values.  These tests pin the defaults so
+    a future operator-facing change to "what does an agency get when
+    they write ``sandbox: {}``?" cannot land silently."""
+
+    def test_fresh_agency_block_has_conservative_caps(self) -> None:
+        resolved = resolve_sandbox_config(SandboxConfig(), None)
+        assert resolved.capabilities_drop == ("ALL",)
+        assert resolved.capabilities_add == ()
+
+    def test_fresh_agency_block_emits_no_new_privileges(self) -> None:
+        resolved = resolve_sandbox_config(SandboxConfig(), None)
+        assert "no-new-privileges" in resolved.security_opts
+
+    def test_fresh_agency_block_has_readonly_rootfs(self) -> None:
+        resolved = resolve_sandbox_config(SandboxConfig(), None)
+        assert resolved.read_only_root is True
+
+    def test_fresh_agency_block_has_resource_limits(self) -> None:
+        resolved = resolve_sandbox_config(SandboxConfig(), None)
+        assert resolved.memory_limit == "2G"
+        assert resolved.cpu_limit == 2.0
+        assert resolved.pid_limit == 512
+
+    def test_no_agency_no_override_inherits_defaults(self) -> None:
+        # Even when ``gateway.json`` omits the sandbox block entirely
+        # (the implicit subprocess-backend path), the resolver still
+        # populates Phase-E hardening fields with their defaults.
+        # The subprocess backend ignores them; this just keeps the
+        # ResolvedSandboxConfig shape uniform across backends so
+        # downstream code can read the fields without conditional
+        # guards.
+        resolved = resolve_sandbox_config(None, None)
+        assert resolved.capabilities_drop == ("ALL",)
+        assert resolved.read_only_root is True
+        assert resolved.memory_limit == "2G"
+
+
+class TestPhaseEHardeningMergeRules:
+    """The Phase-E plan adopts the existing ``env_passthrough`` merge
+    rule for every list-typed hardening field (additive, dedup,
+    agency-first ordering) and a uniform "scalar replace when set"
+    rule for every scalar field.  These tests pin the rules so a
+    future config refactor cannot quietly diverge from them."""
+
+    def test_capabilities_drop_is_additive(self) -> None:
+        agency = SandboxConfig(capabilities_drop=["ALL"])
+        override = AgentSandboxOverride(capabilities_drop=["AUDIT_CONTROL"])
+        resolved = resolve_sandbox_config(agency, override)
+        # Agency value comes first; override entry appended.
+        assert resolved.capabilities_drop == ("ALL", "AUDIT_CONTROL")
+
+    def test_capabilities_drop_dedup_preserves_first(self) -> None:
+        agency = SandboxConfig(capabilities_drop=["ALL", "NET_RAW"])
+        override = AgentSandboxOverride(capabilities_drop=["NET_RAW", "AUDIT_CONTROL"])
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.capabilities_drop == ("ALL", "NET_RAW", "AUDIT_CONTROL")
+
+    def test_capabilities_add_is_additive(self) -> None:
+        agency = SandboxConfig(capabilities_add=["NET_BIND_SERVICE"])
+        override = AgentSandboxOverride(capabilities_add=["NET_RAW"])
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.capabilities_add == ("NET_BIND_SERVICE", "NET_RAW")
+
+    def test_security_opts_is_additive(self) -> None:
+        agency = SandboxConfig(security_opts=["no-new-privileges"])
+        override = AgentSandboxOverride(
+            security_opts=["apparmor=my-profile"],
+        )
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.security_opts == (
+            "no-new-privileges", "apparmor=my-profile",
+        )
+
+    def test_empty_override_list_is_no_op(self) -> None:
+        # Empty override list means "no addition", not "reset to
+        # nothing".  Mirrors the env_passthrough rule.
+        agency = SandboxConfig(capabilities_drop=["ALL"])
+        override = AgentSandboxOverride(capabilities_drop=[])
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.capabilities_drop == ("ALL",)
+
+    def test_read_only_root_per_agent_can_disable(self) -> None:
+        agency = SandboxConfig(read_only_root=True)
+        override = AgentSandboxOverride(read_only_root=False)
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.read_only_root is False
+
+    def test_read_only_root_per_agent_can_enable(self) -> None:
+        agency = SandboxConfig(read_only_root=False)
+        override = AgentSandboxOverride(read_only_root=True)
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.read_only_root is True
+
+    def test_read_only_root_unset_override_inherits_agency(self) -> None:
+        agency = SandboxConfig(read_only_root=False)
+        override = AgentSandboxOverride()
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.read_only_root is False
+
+    def test_memory_limit_override_replaces(self) -> None:
+        agency = SandboxConfig(memory_limit="2G")
+        override = AgentSandboxOverride(memory_limit="32G")
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.memory_limit == "32G"
+
+    def test_memory_limit_none_override_inherits_agency(self) -> None:
+        agency = SandboxConfig(memory_limit="2G")
+        override = AgentSandboxOverride(memory_limit=None)
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.memory_limit == "2G"
+
+    def test_cpu_limit_override_replaces(self) -> None:
+        agency = SandboxConfig(cpu_limit=2.0)
+        override = AgentSandboxOverride(cpu_limit=8.0)
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.cpu_limit == 8.0
+
+    def test_pid_limit_override_replaces(self) -> None:
+        agency = SandboxConfig(pid_limit=512)
+        override = AgentSandboxOverride(pid_limit=4096)
+        resolved = resolve_sandbox_config(agency, override)
+        assert resolved.pid_limit == 4096
+
+    def test_agency_can_remove_resource_caps(self) -> None:
+        # ``null`` in the agency JSON removes a default cap entirely;
+        # the override path's ``None`` then leaves it removed.
+        agency = SandboxConfig(
+            memory_limit=None, cpu_limit=None, pid_limit=None,
+        )
+        resolved = resolve_sandbox_config(agency, None)
+        assert resolved.memory_limit is None
+        assert resolved.cpu_limit is None
+        assert resolved.pid_limit is None

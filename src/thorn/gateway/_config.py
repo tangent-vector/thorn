@@ -625,6 +625,101 @@ class SandboxConfig(BaseModel):
         ),
     )
 
+    # ------------------------------------------------------------------
+    # Phase E hardening fields
+    #
+    # Conservative defaults match the threat-model document
+    # ([docs/plans/sandbox-threat-model.md]): drop all caps, enable
+    # no-new-privileges, run with a read-only rootfs (with tmpfs
+    # scratch space), and apply 2 GiB / 2 CPU / 512 pid limits.
+    # Operators with heavier workloads expand these per agent in
+    # ``agent.json sandbox`` (see :class:`AgentSandboxOverride`).
+    # ------------------------------------------------------------------
+
+    capabilities_drop: list[str] = Field(
+        default_factory=lambda: ["ALL"],
+        description=(
+            "Phase E: Linux capability names dropped from every "
+            "sandbox container's bounding set (each entry becomes "
+            "``--cap-drop=<name>``).  The literal ``\"ALL\"`` drops "
+            "every capability the runtime would otherwise grant; "
+            "this is the recommended Phase-E default and removes "
+            "kernel-level privilege as an attack surface entirely.  "
+            "Per-agent ``agent.json sandbox.capabilities_drop`` "
+            "extends this list additively (see "
+            ":class:`AgentSandboxOverride`)."
+        ),
+    )
+    capabilities_add: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Phase E: capability names granted *after* "
+            ":attr:`capabilities_drop`.  Used for agents that "
+            "legitimately need a specific cap (e.g. "
+            "``\"NET_RAW\"`` for ``ping``).  Adding caps is a "
+            "deliberate departure from the conservative default "
+            "and should be justified per agent."
+        ),
+    )
+    security_opts: list[str] = Field(
+        default_factory=lambda: ["no-new-privileges"],
+        description=(
+            "Phase E: values passed through ``--security-opt=<value>``. "
+            "The default ``no-new-privileges`` prevents setuid binaries "
+            "from elevating, even if one ends up in a derived image.  "
+            "Operators with their own profiles (AppArmor, custom "
+            "seccomp) extend this list per agency or per agent."
+        ),
+    )
+    read_only_root: bool = Field(
+        default=True,
+        description=(
+            "Phase E: when true, mount the container's root "
+            "filesystem read-only (``--read-only``) and provide "
+            "scratch tmpfs at ``/tmp`` and ``/var/tmp`` so tools "
+            "writing to those paths continue to work.  The default "
+            "is on because the agent's writable footprint is "
+            "intentionally limited to the bind-mounted "
+            "``/agent/{home,workspace,control}`` paths.  Per-agent "
+            "override exists for tool ecosystems that legitimately "
+            "need a writable rootfs (rare; typically dogfooding or "
+            "specialised toolchains)."
+        ),
+    )
+    memory_limit: str | None = Field(
+        default="2G",
+        description=(
+            "Phase E: maximum memory the container may use, in the "
+            "form accepted by ``podman``/``docker --memory`` (e.g. "
+            "``\"2G\"``, ``\"512M\"``).  Defaults to ``\"2G\"`` so a "
+            "leaking tool OOMs the container before crowding the "
+            "host.  Per-agent override raises (or lowers) this; set "
+            "to ``null`` to remove the cap."
+        ),
+    )
+    cpu_limit: float | None = Field(
+        default=2.0,
+        ge=0.0,
+        description=(
+            "Phase E: maximum fractional CPU the container may "
+            "consume (``--cpus``).  Defaults to ``2.0``.  Per-agent "
+            "override raises (or lowers) this; set to ``null`` to "
+            "remove the cap."
+        ),
+    )
+    pid_limit: int | None = Field(
+        default=512,
+        ge=0,
+        description=(
+            "Phase E: maximum number of processes the container's "
+            "pid namespace may hold (``--pids-limit``).  Defaults "
+            "to ``512`` -- roomy for shell + git + Python + a "
+            "couple of MCP servers, tight enough that a fork bomb "
+            "trips the limit before nuking the host.  Set to "
+            "``null`` to remove the cap."
+        ),
+    )
+
 
 class AgentSandboxOverride(BaseModel):
     """Per-agent overrides for the agency's :class:`SandboxConfig`.
@@ -687,6 +782,85 @@ class AgentSandboxOverride(BaseModel):
         gt=0.0,
         description=(
             "Per-agent override for the stage-one readiness timeout."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Phase E hardening overrides
+    #
+    # The merge rule for each field is documented on
+    # :func:`thorn.sandbox._resolve.resolve_sandbox_config`.  Lists
+    # are *additive* (agency + agent, dedup, agency-first); scalars
+    # replace when the agent value is non-``None``.
+    #
+    # Per the Phase E plan the per-agent override surface is broad:
+    # both ``gateway.json`` and ``agent.json`` are operator-controlled,
+    # so per-agent overrides are an operator-convenience knob, not a
+    # security boundary.  Agencies that want a uniform policy simply
+    # do not set per-agent fields.
+    # ------------------------------------------------------------------
+
+    capabilities_drop: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Capability names this agent additionally drops, on top "
+            "of the agency's ``capabilities_drop`` list.  Additive: "
+            "an empty list means \"no addition\" rather than \"reset "
+            "agency to nothing\".  Including ``\"ALL\"`` here when "
+            "the agency does not is the way to opt a single agent "
+            "into the conservative default."
+        ),
+    )
+    capabilities_add: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Capability names this agent adds on top of the agency's "
+            "``capabilities_add`` list.  Additive."
+        ),
+    )
+    security_opts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "``--security-opt`` values this agent adds on top of the "
+            "agency's list.  Additive."
+        ),
+    )
+    read_only_root: bool | None = Field(
+        default=None,
+        description=(
+            "Per-agent override for the read-only-rootfs policy.  "
+            "``None`` (the default) keeps the agency value; "
+            "``False`` opts a single agent out of the agency's "
+            "default-on policy (useful for dogfooding agents that "
+            "need a writable rootfs); ``True`` opts a single agent "
+            "in when the agency has it disabled."
+        ),
+    )
+    memory_limit: str | None = Field(
+        default=None,
+        description=(
+            "Per-agent override for ``--memory``.  ``None`` keeps "
+            "the agency value; a string replaces it; explicitly "
+            "passing ``null`` in the JSON does **not** remove the "
+            "limit -- the agency value is still inherited.  To "
+            "remove the cap for a single agent, set the agency "
+            "field to ``null`` and let the agent inherit."
+        ),
+    )
+    cpu_limit: float | None = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Per-agent override for ``--cpus``.  ``None`` keeps the "
+            "agency value; a float replaces it."
+        ),
+    )
+    pid_limit: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Per-agent override for ``--pids-limit``.  ``None`` "
+            "keeps the agency value; an integer replaces it."
         ),
     )
 

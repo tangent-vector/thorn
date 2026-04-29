@@ -116,19 +116,12 @@ async def _smoke(adapter) -> None:
     # Match the runtime's ``--user`` default so the daemon writes the
     # control dir's socket / log / mcp_state.json with the test's
     # ownership; otherwise we'd hit a "permission denied" on cleanup.
+    # On rootless podman, the matching ``--userns=keep-id`` flag is
+    # required for ``--user $(host_uid)`` to actually map 1:1 to the
+    # operator's host uid; :class:`PodmanAdapter` defaults this in, so
+    # this test does not have to pass it explicitly.
     import os
     user = f"{os.getuid()}:{os.getgid()}"
-
-    # Rootless podman maps the in-container UID through the user's
-    # subuid range by default, which means a file written by UID 1000
-    # *inside* the container shows up on the host as some random
-    # subuid -- and the test's bind-mounted ``control`` dir (owned by
-    # the host UID) becomes write-denied to the daemon.
-    # ``--userns=keep-id`` collapses the mapping so the in-container
-    # UID equals the host UID, matching what production rootless
-    # deployments configure.  Docker doesn't need this; ignored when
-    # the runtime is docker (it accepts the flag without effect).
-    extra_run_args = ("--userns=keep-id",) if isinstance(adapter, PodmanAdapter) else ()
 
     cfg = ContainerHostConfig(
         agent_id="smoke-agent",
@@ -141,7 +134,6 @@ async def _smoke(adapter) -> None:
         dev_mount_runtime=_dev_mount_src(),
         user=user,
         container_ready_timeout_s=30.0,
-        extra_run_args=extra_run_args,
     )
     host = ContainerDaemonHost(cfg)
 

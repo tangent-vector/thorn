@@ -53,6 +53,7 @@ from thorn.sandbox._runtime import (
     OCIRuntimeError,
     OCIRuntimeNotFound,
     PodmanAdapter,
+    Tmpfs,
     select_oci_runtime,
 )
 
@@ -81,6 +82,7 @@ __all__ = [
     "PodmanAdapter",
     "ResolvedSandboxConfig",
     "SandboxImageMissingError",
+    "Tmpfs",
     "build_default_sandbox_image",
     "default_sandbox_image_tag",
     "derive_container_name",

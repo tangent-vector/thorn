@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import pytest
 
+from pathlib import Path
+
 from thorn.sandbox._runtime import (
     ContainerSpec,
     DockerAdapter,
@@ -32,6 +34,7 @@ from thorn.sandbox._runtime import (
     OCIImageMissing,
     OCIRuntimeNotFound,
     PodmanAdapter,
+    Tmpfs,
     select_oci_runtime,
 )
 
@@ -198,3 +201,224 @@ class TestRealAdapterConstructorErrors:
 
         with pytest.raises(OCIRuntimeNotFound, match="docker"):
             DockerAdapter()
+
+
+class TestRuntimeSpecificDefaults:
+    """Phase E: adapters can contribute default ``run`` args needed for
+    the spec's other fields to mean what they say.  Today this only
+    matters on rootless podman, where ``--userns=keep-id`` is what
+    makes ``--user $(host_uid)`` actually map 1:1 to the host
+    operator's uid (without it, rootless podman maps host uid X to
+    in-container uid 0, so a ``--user X`` request lands on a sub-uid
+    and bind-mount writes are owned by an unprivileged sub-uid the
+    operator cannot read without a chown)."""
+
+    @staticmethod
+    def _make_podman(monkeypatch) -> PodmanAdapter:
+        from thorn.sandbox import _runtime as runtime_mod
+
+        monkeypatch.setattr(
+            runtime_mod.shutil, "which", lambda name: f"/usr/bin/{name}",
+        )
+        return PodmanAdapter()
+
+    @staticmethod
+    def _make_docker(monkeypatch) -> DockerAdapter:
+        from thorn.sandbox import _runtime as runtime_mod
+
+        monkeypatch.setattr(
+            runtime_mod.shutil, "which", lambda name: f"/usr/bin/{name}",
+        )
+        return DockerAdapter()
+
+    def test_podman_default_keep_id_emitted(self, monkeypatch) -> None:
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(image="x:1", name="agent-x", user="1000:1000")
+        args = list(adapter._build_run_args(spec))
+        assert "--userns=keep-id" in args
+
+    def test_podman_default_keep_id_suppressed_when_operator_overrides(
+        self, monkeypatch,
+    ) -> None:
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            user="1000:1000",
+            extra_run_args=("--userns=auto",),
+        )
+        args = list(adapter._build_run_args(spec))
+        assert "--userns=keep-id" not in args
+        assert "--userns=auto" in args
+
+    def test_podman_default_keep_id_suppressed_with_split_form(
+        self, monkeypatch,
+    ) -> None:
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            user="1000:1000",
+            extra_run_args=("--userns", "host"),
+        )
+        args = list(adapter._build_run_args(spec))
+        assert "--userns=keep-id" not in args
+        assert "host" in args
+
+    def test_docker_does_not_emit_userns(self, monkeypatch) -> None:
+        adapter = self._make_docker(monkeypatch)
+        spec = ContainerSpec(image="x:1", name="agent-x", user="1000:1000")
+        args = list(adapter._build_run_args(spec))
+        assert not any(a.startswith("--userns") for a in args)
+
+
+class TestPhaseEHardeningFlagEmission:
+    """Phase E: ``ContainerSpec`` carries hardening fields that the
+    base adapter translates to the canonical OCI run-flag spellings.
+    These tests pin the flag form so a future refactor of
+    :meth:`_CLIRuntimeAdapter._build_run_args` cannot silently change
+    what ends up on the command line."""
+
+    @staticmethod
+    def _make_podman(monkeypatch) -> PodmanAdapter:
+        from thorn.sandbox import _runtime as runtime_mod
+
+        monkeypatch.setattr(
+            runtime_mod.shutil, "which", lambda name: f"/usr/bin/{name}",
+        )
+        return PodmanAdapter()
+
+    def test_capabilities_drop_emits_cap_drop(self, monkeypatch) -> None:
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            capabilities_drop=("ALL",),
+        )
+        args = list(adapter._build_run_args(spec))
+        assert "--cap-drop=ALL" in args
+
+    def test_capabilities_add_emits_cap_add(self, monkeypatch) -> None:
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            capabilities_drop=("ALL",),
+            capabilities_add=("NET_RAW", "NET_BIND_SERVICE"),
+        )
+        args = list(adapter._build_run_args(spec))
+        # cap-drop comes first, then cap-add (matches both runtimes'
+        # documented evaluation order).
+        drop_idx = args.index("--cap-drop=ALL")
+        add_idxs = [
+            args.index("--cap-add=NET_RAW"),
+            args.index("--cap-add=NET_BIND_SERVICE"),
+        ]
+        assert all(i > drop_idx for i in add_idxs)
+
+    def test_security_opts_emitted(self, monkeypatch) -> None:
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            security_opts=("no-new-privileges", "label=disable"),
+        )
+        args = list(adapter._build_run_args(spec))
+        assert "--security-opt=no-new-privileges" in args
+        assert "--security-opt=label=disable" in args
+
+    def test_read_only_root_flag_emitted(self, monkeypatch) -> None:
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            read_only_root=True,
+        )
+        args = list(adapter._build_run_args(spec))
+        assert "--read-only" in args
+
+    def test_tmpfs_mounts_with_options(self, monkeypatch) -> None:
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            tmpfs_mounts=(
+                Tmpfs(target=Path("/tmp"), options="size=1G,mode=1777"),
+                Tmpfs(target=Path("/var/tmp"), options="size=256M,mode=1777"),
+            ),
+        )
+        args = list(adapter._build_run_args(spec))
+        # Tmpfs mounts appear immediately after bind mounts, each as
+        # ``--tmpfs <target>:<options>``.
+        tmpfs_idxs = [i for i, a in enumerate(args) if a == "--tmpfs"]
+        assert len(tmpfs_idxs) == 2
+        assert args[tmpfs_idxs[0] + 1] == "/tmp:size=1G,mode=1777"
+        assert args[tmpfs_idxs[1] + 1] == "/var/tmp:size=256M,mode=1777"
+
+    def test_tmpfs_mount_without_options(self, monkeypatch) -> None:
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            tmpfs_mounts=(Tmpfs(target=Path("/tmp"), options=""),),
+        )
+        args = list(adapter._build_run_args(spec))
+        idx = args.index("--tmpfs")
+        # Empty options yield ``--tmpfs <target>`` without any colon.
+        assert args[idx + 1] == "/tmp"
+
+    def test_resource_limits_emitted(self, monkeypatch) -> None:
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            memory_limit="2G",
+            cpu_limit=2.0,
+            pid_limit=512,
+        )
+        args = list(adapter._build_run_args(spec))
+        memory_idx = args.index("--memory")
+        assert args[memory_idx + 1] == "2G"
+        cpus_idx = args.index("--cpus")
+        assert args[cpus_idx + 1] == "2.0"
+        pids_idx = args.index("--pids-limit")
+        assert args[pids_idx + 1] == "512"
+
+    def test_unset_hardening_fields_emit_nothing(self, monkeypatch) -> None:
+        # The default ``ContainerSpec`` without Phase-E hardening
+        # populated should not emit any of the corresponding flags --
+        # this preserves the "test fixtures don't have to know about
+        # hardening" property that lets the suite stay readable.
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(image="x:1", name="agent-x")
+        args = list(adapter._build_run_args(spec))
+        assert not any(a.startswith("--cap-drop") for a in args)
+        assert not any(a.startswith("--cap-add") for a in args)
+        assert not any(a.startswith("--security-opt") for a in args)
+        assert "--read-only" not in args
+        assert "--tmpfs" not in args
+        assert "--memory" not in args
+        assert "--cpus" not in args
+        assert "--pids-limit" not in args
+
+    def test_hardening_flags_appear_before_extra_run_args(
+        self, monkeypatch,
+    ) -> None:
+        # The "operator escape hatch" extra_run_args should win
+        # over hardening defaults via the OCI runtime's
+        # last-value-wins convention -- so they must appear *after*
+        # the hardening flags in the assembled argv.
+        adapter = self._make_podman(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            memory_limit="2G",
+            extra_run_args=("--memory", "8G"),
+        )
+        args = list(adapter._build_run_args(spec))
+        first_memory = args.index("--memory")
+        # Find the second occurrence by searching past the first one.
+        second_memory = args.index("--memory", first_memory + 1)
+        assert args[first_memory + 1] == "2G"
+        assert args[second_memory + 1] == "8G"
+        assert second_memory > first_memory

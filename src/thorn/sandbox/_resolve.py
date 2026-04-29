@@ -34,6 +34,13 @@ class ResolvedSandboxConfig:
     All fields carry their *effective* value -- no nullable shape
     survives the merge.  Callers do not need to look at either the
     agency or the agent block again.
+
+    Phase E hardening fields (``capabilities_drop``,
+    ``capabilities_add``, ``security_opts``, ``read_only_root``,
+    ``memory_limit``, ``cpu_limit``, ``pid_limit``) are present on
+    every resolved config so the runtime can populate the matching
+    :class:`~thorn.sandbox._container.ContainerHostConfig` fields
+    uniformly without having to re-derive defaults at the use site.
     """
 
     backend: Literal["subprocess", "container"]
@@ -46,6 +53,15 @@ class ResolvedSandboxConfig:
     egress_network: str | None
     egress_allowlist: tuple[EgressAllowlistEntry, ...]
 
+    # Phase E hardening, all populated.
+    capabilities_drop: tuple[str, ...]
+    capabilities_add: tuple[str, ...]
+    security_opts: tuple[str, ...]
+    read_only_root: bool
+    memory_limit: str | None
+    cpu_limit: float | None
+    pid_limit: int | None
+
 
 _DEFAULT_AGENCY_SANDBOX = SandboxConfig(backend="subprocess")
 """Used when ``gateway.json`` omits the ``sandbox`` block entirely.
@@ -55,6 +71,34 @@ container backend by writing the block, so the implicit default is
 the Phase-A subprocess executor.  This keeps existing agencies that
 have not been told about Phase B running unchanged.
 """
+
+
+def _additive_str_list(
+    agency_values: list[str] | tuple[str, ...],
+    override_values: list[str] | tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    """Concatenate two string lists, preserving order and dropping duplicates.
+
+    First occurrence wins on ordering: agency values come first in
+    the order they were declared, then any override values that did
+    not already appear.  This mirrors the established
+    ``env_passthrough`` merge rule and gives operators a single
+    consistent mental model for "list of strings" fields across
+    Phase B (env_passthrough), Phase E (capabilities_drop / add,
+    security_opts), and any future additions.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in agency_values:
+        if value not in seen:
+            merged.append(value)
+            seen.add(value)
+    if override_values is not None:
+        for value in override_values:
+            if value not in seen:
+                merged.append(value)
+                seen.add(value)
+    return tuple(merged)
 
 
 def resolve_sandbox_config(
@@ -85,6 +129,16 @@ def resolve_sandbox_config(
       that should apply uniformly across an agency).
     * ``container_ready_timeout_s``: agent overrides agency overrides
       30s default.
+    * ``egress_network``, ``egress_allowlist``: agency-only at
+      this writing.  See the Phase D retro for rationale.
+    * Phase E hardening lists (``capabilities_drop``,
+      ``capabilities_add``, ``security_opts``): *additive*, same
+      semantics as ``env_passthrough``.  An empty per-agent list
+      means "no addition" rather than "reset agency to nothing".
+    * Phase E hardening scalars (``read_only_root``,
+      ``memory_limit``, ``cpu_limit``, ``pid_limit``): per-agent
+      value replaces the agency value when the override is set
+      (``None`` for the override means "use agency").
     """
     a = agency if agency is not None else _DEFAULT_AGENCY_SANDBOX
 
@@ -100,17 +154,10 @@ def resolve_sandbox_config(
     else:
         image = default_sandbox_image_tag()
 
-    merged_passthrough: list[str] = []
-    seen: set[str] = set()
-    for name in a.env_passthrough:
-        if name not in seen:
-            merged_passthrough.append(name)
-            seen.add(name)
-    if override is not None:
-        for name in override.env_passthrough:
-            if name not in seen:
-                merged_passthrough.append(name)
-                seen.add(name)
+    env_passthrough = _additive_str_list(
+        a.env_passthrough,
+        override.env_passthrough if override is not None else None,
+    )
 
     extra_env: tuple[tuple[str, str], ...] = ()
     if override is not None and override.extra_env:
@@ -120,11 +167,40 @@ def resolve_sandbox_config(
     if override is not None and override.container_ready_timeout_s is not None:
         timeout = override.container_ready_timeout_s
 
+    capabilities_drop = _additive_str_list(
+        a.capabilities_drop,
+        override.capabilities_drop if override is not None else None,
+    )
+    capabilities_add = _additive_str_list(
+        a.capabilities_add,
+        override.capabilities_add if override is not None else None,
+    )
+    security_opts = _additive_str_list(
+        a.security_opts,
+        override.security_opts if override is not None else None,
+    )
+
+    read_only_root = a.read_only_root
+    if override is not None and override.read_only_root is not None:
+        read_only_root = override.read_only_root
+
+    memory_limit = a.memory_limit
+    if override is not None and override.memory_limit is not None:
+        memory_limit = override.memory_limit
+
+    cpu_limit = a.cpu_limit
+    if override is not None and override.cpu_limit is not None:
+        cpu_limit = override.cpu_limit
+
+    pid_limit = a.pid_limit
+    if override is not None and override.pid_limit is not None:
+        pid_limit = override.pid_limit
+
     return ResolvedSandboxConfig(
         backend=backend,
         oci_runtime=a.oci_runtime,
         image=image,
-        env_passthrough=tuple(merged_passthrough),
+        env_passthrough=env_passthrough,
         extra_env=extra_env,
         dev_mount_runtime=a.dev_mount_runtime,
         container_ready_timeout_s=timeout,
@@ -137,6 +213,13 @@ def resolve_sandbox_config(
         # hatch.
         egress_network=a.egress_network,
         egress_allowlist=tuple(a.egress_allowlist),
+        capabilities_drop=capabilities_drop,
+        capabilities_add=capabilities_add,
+        security_opts=security_opts,
+        read_only_root=read_only_root,
+        memory_limit=memory_limit,
+        cpu_limit=cpu_limit,
+        pid_limit=pid_limit,
     )
 
 

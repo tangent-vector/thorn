@@ -150,6 +150,104 @@ class TestContainerBackend:
         assert isinstance(executor.host, SubprocessDaemonHost)
 
 
+class TestPhaseEHardeningWiring:
+    """Phase E: the runtime translates the resolved hardening fields
+    into the matching :class:`ContainerHostConfig` fields, and turns
+    on the canonical tmpfs scratch mounts when ``read_only_root`` is
+    enabled.  These tests confirm the wiring stays put across
+    refactors."""
+
+    def test_default_agency_block_lands_conservative_hardening(
+        self, tmp_path: Path,
+    ) -> None:
+        # ``SandboxConfig(image="t:1")`` implicitly carries every
+        # Phase-E default (ALL caps dropped, no-new-privileges,
+        # read-only rootfs, 2G/2cpu/512pids).  The runtime should
+        # surface those into ``ContainerHostConfig`` and wire up the
+        # default tmpfs scratch mounts.
+        adapter = FakeOCIRuntimeAdapter(present_images=["t:1"])
+        runtime = _make_runtime(
+            tmp_path,
+            sandbox_config=SandboxConfig(image="t:1"),
+            oci_adapter=adapter,
+        )
+        agent = _make_agent()
+        executor = runtime.get_or_create_sandbox_executor(agent)
+        assert isinstance(executor.host, ContainerDaemonHost)
+        cfg = executor.host._config  # type: ignore[attr-defined]
+
+        assert cfg.capabilities_drop == ("ALL",)
+        assert cfg.capabilities_add == ()
+        assert "no-new-privileges" in cfg.security_opts
+        assert cfg.read_only_root is True
+        assert cfg.memory_limit == "2G"
+        assert cfg.cpu_limit == 2.0
+        assert cfg.pid_limit == 512
+        # Default tmpfs scratch mounts at /tmp and /var/tmp.
+        from pathlib import Path as _Path
+        targets = {tmpfs.target for tmpfs in cfg.tmpfs_mounts}
+        assert _Path("/tmp") in targets
+        assert _Path("/var/tmp") in targets
+
+    def test_per_agent_disables_readonly_clears_tmpfs(
+        self, tmp_path: Path,
+    ) -> None:
+        # When an agent opts out of read-only rootfs (typical for
+        # dogfooding), the runtime should also drop the tmpfs
+        # scratch mounts -- they're only there to keep canonical
+        # scratch paths writable when the rootfs is locked down.
+        adapter = FakeOCIRuntimeAdapter(present_images=["t:1"])
+        runtime = _make_runtime(
+            tmp_path,
+            sandbox_config=SandboxConfig(image="t:1"),
+            oci_adapter=adapter,
+        )
+        agent = _make_agent(
+            override=AgentSandboxOverride(read_only_root=False),
+        )
+        executor = runtime.get_or_create_sandbox_executor(agent)
+        assert isinstance(executor.host, ContainerDaemonHost)
+        cfg = executor.host._config  # type: ignore[attr-defined]
+        assert cfg.read_only_root is False
+        assert cfg.tmpfs_mounts == ()
+
+    def test_per_agent_resource_limit_overrides_propagate(
+        self, tmp_path: Path,
+    ) -> None:
+        adapter = FakeOCIRuntimeAdapter(present_images=["t:1"])
+        runtime = _make_runtime(
+            tmp_path,
+            sandbox_config=SandboxConfig(image="t:1"),
+            oci_adapter=adapter,
+        )
+        agent = _make_agent(
+            override=AgentSandboxOverride(
+                memory_limit="32G", cpu_limit=12.0, pid_limit=4096,
+            ),
+        )
+        executor = runtime.get_or_create_sandbox_executor(agent)
+        cfg = executor.host._config  # type: ignore[attr-defined]
+        assert cfg.memory_limit == "32G"
+        assert cfg.cpu_limit == 12.0
+        assert cfg.pid_limit == 4096
+
+    def test_per_agent_caps_add_propagates(self, tmp_path: Path) -> None:
+        adapter = FakeOCIRuntimeAdapter(present_images=["t:1"])
+        runtime = _make_runtime(
+            tmp_path,
+            sandbox_config=SandboxConfig(image="t:1"),
+            oci_adapter=adapter,
+        )
+        agent = _make_agent(
+            override=AgentSandboxOverride(capabilities_add=["NET_RAW"]),
+        )
+        executor = runtime.get_or_create_sandbox_executor(agent)
+        cfg = executor.host._config  # type: ignore[attr-defined]
+        assert cfg.capabilities_add == ("NET_RAW",)
+        # Drop list is still ALL (agency default).
+        assert cfg.capabilities_drop == ("ALL",)
+
+
 class TestBrokerBindingLookup:
     """Phase D: the runtime threads the gateway-installed binding
     lookup into ``ContainerHostConfig`` at executor-construction

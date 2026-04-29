@@ -63,15 +63,35 @@ class Mount:
 
 
 @dataclass(frozen=True)
+class Tmpfs:
+    """One tmpfs mount entry for ``--tmpfs <target>[:<options>]``.
+
+    Phase E uses this to keep `/tmp` and `/var/tmp` writable when the
+    container's rootfs is mounted read-only.  *target* is the
+    in-container mount point; *options* is the comma-separated string
+    accepted by both runtimes (e.g. ``"size=1G,mode=1777"``).  Empty
+    options yield ``--tmpfs <target>`` with the runtime's defaults.
+    """
+
+    target: Path
+    options: str = ""
+
+
+@dataclass(frozen=True)
 class ContainerSpec:
     """Everything :meth:`OCIRuntimeAdapter.run` needs to launch a container.
 
-    Kept deliberately small: the Phase-B container's only job is to
-    run the toolhost daemon, so the spec is little more than image,
-    name, mounts, env, user, and the entrypoint argv.  Phase-F-flavored
-    knobs (caps, resources, network) will land here as new optional
-    fields rather than as a separate spec class so that the adapter
-    surface stays one method.
+    Phase B established the spec's shape.  Phase E adds optional
+    hardening fields (capability drops, security opts, read-only
+    rootfs + tmpfs, resource limits) as new fields with sensible
+    defaults (no-op when unset), so callers that don't care about
+    hardening continue to work unchanged while the
+    :class:`~thorn.sandbox.ContainerDaemonHost` and the resolver fill
+    them in for the production sandbox.
+
+    All fields the adapter consumes live here -- the
+    :class:`OCIRuntimeAdapter` surface deliberately remains a single
+    ``run`` method that takes one of these.
     """
 
     image: str
@@ -83,6 +103,88 @@ class ContainerSpec:
     entrypoint: tuple[str, ...] | None = None
     command: tuple[str, ...] = ()
     extra_run_args: tuple[str, ...] = ()
+
+    # Phase E hardening fields.  Each field's default is the no-op
+    # ("don't emit this flag at all") so existing test fixtures and
+    # callers that don't care about hardening continue to pass.  The
+    # production gateway populates them via
+    # :class:`~thorn.sandbox.ContainerHostConfig`, whose defaults
+    # encode the conservative-by-default policy.
+
+    capabilities_drop: tuple[str, ...] = ()
+    """Capabilities to remove from the container's bounding set.
+
+    Each entry becomes ``--cap-drop=<value>``; the special token
+    ``"ALL"`` drops every capability the runtime would otherwise grant
+    (the recommended Phase-E default).  Combined with a non-root
+    ``user``, "drop ALL" leaves the container with no capabilities at
+    all -- escalation paths via cap bugs require defeating both the
+    user-id check and the cap bounding set.
+    """
+
+    capabilities_add: tuple[str, ...] = ()
+    """Capabilities to grant after :attr:`capabilities_drop` is applied.
+
+    Each entry becomes ``--cap-add=<value>``.  Used for the rare agent
+    that legitimately needs a specific cap (e.g. ``CAP_NET_RAW`` for
+    ping).  Adding caps is a deliberate departure from "drop ALL" and
+    should be justified per agent.
+    """
+
+    security_opts: tuple[str, ...] = ()
+    """Values to pass through ``--security-opt=<value>``.
+
+    Phase E's default population includes ``"no-new-privileges"`` so
+    setuid binaries cannot escalate even if they end up in a derived
+    image.  Operators with their own needs (e.g. an AppArmor profile,
+    a custom seccomp profile) can extend this surface from
+    ``gateway.json`` / ``agent.json``.
+    """
+
+    read_only_root: bool = False
+    """Mount the container's rootfs read-only (``--read-only``).
+
+    Pairs with :attr:`tmpfs_mounts` to give the container scratch
+    space at well-known paths while keeping the rootfs immutable.
+    Phase E defaults this to ``True`` for the production sandbox;
+    agents that need a writable rootfs (rare; typically dogfooding
+    or unusual tool ecosystems) opt out via
+    ``agent.json sandbox.read_only_root: false``.
+    """
+
+    tmpfs_mounts: tuple[Tmpfs, ...] = ()
+    """In-container tmpfs mount points.
+
+    When :attr:`read_only_root` is true, scratch directories
+    (``/tmp``, ``/var/tmp``) need to live on tmpfs so tools that
+    write there continue to work.  Phase E populates ``/tmp`` (1 GiB)
+    and ``/var/tmp`` (256 MiB) by default.
+    """
+
+    memory_limit: str | None = None
+    """``--memory`` value (e.g. ``"2G"``); ``None`` means unlimited.
+
+    Hard cgroup memory cap.  Phase E defaults to ``"2G"`` for the
+    production sandbox so a leaking tool OOMs the container before
+    crowding the host.
+    """
+
+    cpu_limit: float | None = None
+    """``--cpus`` value (fractional CPU count); ``None`` means unlimited.
+
+    Cgroup CPU quota expressed as the maximum fraction of host CPU
+    seconds per second the container may consume.  Phase E defaults
+    to ``2.0``.
+    """
+
+    pid_limit: int | None = None
+    """``--pids-limit`` value; ``None`` means unlimited.
+
+    Hard cap on the number of processes the container's pid namespace
+    may hold.  Phase E defaults to ``512``: roomy for shell + git +
+    Python + a couple of MCP servers, tight enough that a fork bomb
+    bounces off the limit before nuking the host.
+    """
 
 
 @dataclass(frozen=True)
@@ -415,6 +517,12 @@ class _CLIRuntimeAdapter:
                 f"type=bind,source={mount.source},"
                 f"target={mount.target},{opts}"
             )
+        for tmpfs in spec.tmpfs_mounts:
+            yield "--tmpfs"
+            if tmpfs.options:
+                yield f"{tmpfs.target}:{tmpfs.options}"
+            else:
+                yield str(tmpfs.target)
         for key, value in spec.env:
             yield "-e"
             yield f"{key}={value}"
@@ -424,6 +532,39 @@ class _CLIRuntimeAdapter:
         if spec.workdir is not None:
             yield "--workdir"
             yield spec.workdir
+        # Phase E hardening flags.  Order chosen so the meaningful
+        # operator-readable flags appear early in the assembled argv
+        # (caps, security-opts, resource limits, read-only, tmpfs)
+        # before any escape-hatch ``extra_run_args`` -- which makes
+        # the rendered command line easy to scan for "what protections
+        # is this container running with?"  Per-flag emission is
+        # uniform across podman and docker for the verbs Phase E
+        # uses.
+        for cap in spec.capabilities_drop:
+            yield f"--cap-drop={cap}"
+        for cap in spec.capabilities_add:
+            yield f"--cap-add={cap}"
+        for opt in spec.security_opts:
+            yield f"--security-opt={opt}"
+        if spec.read_only_root:
+            yield "--read-only"
+        if spec.memory_limit is not None:
+            yield "--memory"
+            yield spec.memory_limit
+        if spec.cpu_limit is not None:
+            yield "--cpus"
+            yield str(spec.cpu_limit)
+        if spec.pid_limit is not None:
+            yield "--pids-limit"
+            yield str(spec.pid_limit)
+        # Adapter-specific defaults are injected before the operator's
+        # ``extra_run_args`` so that an operator-provided flag wins via
+        # the OCI runtime's "last value wins" convention for repeated
+        # flags.  Today this hook only matters for podman
+        # (``--userns=keep-id``); kept on the base class so docker can
+        # opt in too if a future correctness fix requires it.
+        for extra in self._runtime_specific_default_run_args(spec):
+            yield extra
         for extra in spec.extra_run_args:
             yield extra
         if spec.entrypoint is not None:
@@ -435,6 +576,25 @@ class _CLIRuntimeAdapter:
         yield spec.image
         for arg in spec.command:
             yield arg
+
+    def _runtime_specific_default_run_args(
+        self, spec: ContainerSpec,
+    ) -> Iterable[str]:
+        """Per-runtime defaults inserted before ``extra_run_args``.
+
+        Hook for subclasses to contribute flags that a particular
+        runtime needs in order for the spec's other fields to mean
+        what they say.  The base implementation returns nothing;
+        :class:`PodmanAdapter` overrides to default
+        ``--userns=keep-id`` so that ``spec.user`` lines up 1:1 with
+        the host operator's uid even on rootless podman.
+
+        The hook receives *spec* so subclasses can suppress their
+        default when the operator has already specified an equivalent
+        flag in ``extra_run_args`` (avoids a duplicated flag where the
+        runtime's "last value wins" rule would matter).
+        """
+        return ()
 
 
 def _container_state_from_inspect(
@@ -468,10 +628,18 @@ class PodmanAdapter(_CLIRuntimeAdapter):
     """Adapter for the ``podman`` CLI.
 
     Phase B's preferred runtime: rootless by default, no daemon to
-    manage.  The only divergence we surface today is
-    ``--userns=keep-id`` for the rootless case so the in-container
-    process sees the same UID as the gateway; ``ContainerDaemonHost``
-    can opt into that via :class:`ContainerSpec.extra_run_args`.
+    manage.  Defaults ``--userns=keep-id`` into every container's run
+    args because rootless podman, *without* ``keep-id``, maps
+    ``--user $(host_uid)`` to a sub-uid (because rootless podman's
+    default mapping puts in-container uid 0 at the host operator's
+    uid, so in-container uid N != 0 lands on host sub-uid). With
+    ``keep-id``, in-container uids that match host operator's uid map
+    1:1 instead, which is what every Phase-B/D/E claim about
+    "bind-mount writes land owned by the operator" actually requires.
+
+    The default is suppressed when the operator has already set
+    ``--userns=...`` in :attr:`ContainerSpec.extra_run_args`, on the
+    "operator knows what they're doing" principle.
     """
 
     binary = "podman"
@@ -479,6 +647,18 @@ class PodmanAdapter(_CLIRuntimeAdapter):
     @property
     def name(self) -> Literal["podman"]:
         return "podman"
+
+    def _runtime_specific_default_run_args(
+        self, spec: ContainerSpec,
+    ) -> Iterable[str]:
+        # If the operator has already specified a userns mode, don't
+        # second-guess them: rootful podman, custom userns layouts,
+        # and tests that intentionally exercise non-keep-id mappings
+        # all live here.
+        for arg in spec.extra_run_args:
+            if arg == "--userns" or arg.startswith("--userns="):
+                return ()
+        return ("--userns=keep-id",)
 
 
 class DockerAdapter(_CLIRuntimeAdapter):
@@ -707,5 +887,6 @@ __all__ = [
     "OCIRuntimeError",
     "OCIRuntimeNotFound",
     "PodmanAdapter",
+    "Tmpfs",
     "select_oci_runtime",
 ]
