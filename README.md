@@ -93,19 +93,15 @@ This writes three files under `.thorn/`:
 
 ### 5. Start the gateway
 
-Using Docker Compose (recommended):
-
-```console
-$ docker compose up --build
-```
-
-Or directly:
-
 ```console
 $ docker run --env-file .env \
     -v "$(pwd)/.thorn:/workspace/.thorn" \
     thorn-gateway
 ```
+
+For deployment with the credential broker (Phase D, recommended for
+multi-agent or multi-credential setups), see
+[Deployment modes](#deployment-modes) below.
 
 The gateway will poll the configured repository for events. When it
 sees activity (an @-mention on an issue, a new assignment, etc.), it
@@ -156,11 +152,87 @@ The polling interval, GitLab username, GitHub repository list, and
 similar non-secret values now live in `gateway.json` (or the
 inferred-source defaults).  Edit the JSON to change them.
 
-### Docker Compose
+Deployment modes
+----------------
 
-The included `docker-compose.yml` is the simplest way to run the
-gateway. It reads `.env`, mounts `.thorn/` as a volume (so agent state
-persists across restarts), and configures the git identity for commits:
+Thorn supports two deployment topologies.  The choice mainly comes
+down to whether you want the gateway itself to be a container or a
+host process; both shapes integrate with the OneCLI credential
+broker (Phase D) the same way.
+
+### Mode A: gateway as a host process + broker in compose (recommended)
+
+The simplest and most portable shape: the gateway runs directly on
+the host (a VM, a developer laptop, anywhere `uv run thorn` works);
+the broker (OneCLI + its Postgres) runs as containers managed by
+the bundled compose file.  The gateway talks to the broker over
+`http://127.0.0.1:10254` (admin) and tells the local Docker daemon
+to attach per-agent sandbox containers to the broker's network so
+they can reach the substitution proxy by service name.
+
+```console
+# 1. Bring up the broker stack.
+$ docker compose -f deploy/broker.compose.yml up -d
+
+# 2. Configure gateway.json's broker block.  Minimum needed:
+#      "broker": {
+#        "admin_url": "http://127.0.0.1:10254",
+#        "admin_api_key": "$ONECLI_ADMIN_KEY",
+#        "proxy_url": "http://onecli:10255"
+#      }
+#    The gateway resolves the CA to <agency_home>/onecli-ca.pem by
+#    default and fetches it from the broker at startup; you do not
+#    need to wire any volumes for the cert.
+
+# 3. Set sandbox.egress_network to thorn-broker so per-agent
+#    sandboxes join the broker network and inherit broker-only
+#    egress automatically:
+#      "sandbox": { "backend": "container", "egress_network": "thorn-broker" }
+
+# 4. Run the gateway directly.
+$ uv run thorn serve
+```
+
+This is the recommended mode for VM deployments (e.g. NVIDIA Brev;
+see `deploy/brev/`) and for development.
+
+### Mode B: everything in containers (optional)
+
+If you prefer the gateway in a container alongside the broker,
+`deploy/all-in-container.compose.yml` layers a `gateway` service on
+top of the broker stack via Compose's `include:`.  This requires
+bind-mounting the host's Docker socket into the gateway container
+so it can launch sibling sandbox containers (Docker-out-of-Docker).
+
+```console
+$ docker compose -f deploy/all-in-container.compose.yml up --build
+```
+
+> **Trade-off.**  Bind-mounting `/var/run/docker.sock` gives the
+> gateway container effective root on the host, since anything it
+> can ask the Docker daemon to do (launch privileged containers,
+> mount arbitrary host paths, etc.) bypasses the container
+> boundary.  For single-tenant operator-controlled deployments
+> this is fine; do not run this mode where the gateway is exposed
+> to untrusted input that could compromise the gateway process.
+> Mode A avoids the socket mount entirely and is strictly simpler;
+> prefer it unless you have a concrete reason to want the gateway
+> in a container.
+
+In Mode B, set the broker block's `admin_url` to
+`http://onecli:10254` (the service name, since the gateway is on
+the same Docker network as OneCLI).
+
+### Plain Docker (no broker)
+
+If you don't need the credential broker -- e.g. for a quick test
+of the gateway against a single forge with env-injected
+credentials -- the simplest shape is `docker run` with a `.thorn`
+bind mount, as shown in [Quick Start](#quick-start-docker) above.
+No compose file required.
+
+You can of course write your own minimal compose file too; the
+gateway service shape is small:
 
 ```yaml
 services:

@@ -633,6 +633,7 @@ def register_agent_with_broker(
     client: BrokerClient,
     agent: "Agent",
     config: "GatewayConfig",
+    ca_certificate_path: str,
 ) -> BrokerBinding:
     """Register *agent*'s forge credentials with the broker.
 
@@ -655,6 +656,18 @@ def register_agent_with_broker(
     is expected to fail-fast and surface the original error to the
     operator.  Cleanup of partial registrations falls to the
     per-load ``DELETE`` issued at shutdown.
+
+    *ca_certificate_path* is the host filesystem path the gateway
+    has already populated with the broker's MITM CA cert (one fetch
+    per startup, see :meth:`Gateway._register_broker_bindings`).
+    Threaded through here so the resulting :class:`BrokerBinding`
+    carries the resolved path alongside the other per-agent
+    sandbox-launch wiring -- the runtime then bind-mounts the same
+    file into every per-agent container.  Passing the path
+    explicitly (rather than reading it back off ``client._config``)
+    keeps the resolution policy a single concern of the gateway,
+    and makes the function trivially testable without a configured
+    CA file on disk.
 
     Returns a :class:`BrokerBinding` containing the proxy URL, CA
     path, and placeholder env entries for the per-agent sandbox to
@@ -727,7 +740,7 @@ def register_agent_with_broker(
         secret_ids=tuple(secret_ids),
         access_token=agent_registration.access_token,
         proxy_url=proxy_url,
-        ca_certificate_path=client._config.ca_certificate_path,
+        ca_certificate_path=ca_certificate_path,
         placeholder_env=tuple(placeholder_env),
     )
 

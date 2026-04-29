@@ -54,6 +54,7 @@ import logging
 import signal
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from thorn.core._agent import Agent
@@ -64,7 +65,7 @@ from thorn.gateway._broker import (
     BrokerError,
     register_agent_with_broker,
 )
-from thorn.gateway._config import GatewayConfig
+from thorn.gateway._config import BrokerConfig, GatewayConfig
 from thorn.gateway._event import EventSource, IncomingEvent
 from thorn.runtime import (
     DEFAULT_AGENT_CONCURRENCY,
@@ -860,8 +861,24 @@ class Gateway:
         if not self._schedulers:
             return
 
+        ca_path = self._resolve_broker_ca_path(config.broker)
+
         client = self._broker_client_factory(config)
         try:
+            # Fetch the broker's CA once at startup and persist it
+            # to the resolved path.  This is the canonical CA
+            # acquisition path: no operator-side volume wiring
+            # required, no assumption about how the broker is
+            # deployed (compose / standalone / remote).  Re-fetching
+            # on every gateway start also picks up CA rotations
+            # automatically.  Run in a worker thread because httpx
+            # is sync and the file write blocks; also gives us a
+            # clean place to log what happened.
+            await asyncio.to_thread(
+                self._fetch_and_persist_broker_ca, client, ca_path,
+            )
+            log.info("Broker: cached CA certificate at %s", ca_path)
+
             for agent_id, scheduler in self._schedulers.items():
                 agent = scheduler.agent
                 # Registration is sync (a small handful of HTTP calls
@@ -872,6 +889,7 @@ class Gateway:
                 binding = await asyncio.to_thread(
                     register_agent_with_broker,
                     client=client, agent=agent, config=config,
+                    ca_certificate_path=str(ca_path),
                 )
                 self._broker_bindings[agent_id] = binding
                 log.info(
@@ -886,6 +904,40 @@ class Gateway:
             await self._teardown_broker_bindings(client_override=client)
             raise
         self._broker_client = client
+
+    def _resolve_broker_ca_path(self, broker: BrokerConfig) -> Path:
+        """Resolve where the broker CA certificate should live on disk.
+
+        When the operator set ``broker.ca_certificate_path`` in
+        ``gateway.json``, that wins.  Otherwise we derive a default
+        under the agency home (``<agency_home>/onecli-ca.pem``):
+        the agency home is already a directory the gateway owns
+        with appropriate permissions, so we don't add a new
+        operator-facing concept just to find a place to drop a
+        public certificate.
+        """
+        if broker.ca_certificate_path is not None:
+            return Path(broker.ca_certificate_path)
+        return self._runtime.paths.home_root / "onecli-ca.pem"
+
+    @staticmethod
+    def _fetch_and_persist_broker_ca(
+        client: BrokerClient,
+        ca_path: Path,
+    ) -> None:
+        """Fetch the CA via the admin API and write it to *ca_path*.
+
+        Synchronous; the caller dispatches it through
+        :func:`asyncio.to_thread`.  Creates parent directories as
+        needed.  The CA cert is a public artefact (the
+        certificate's whole point is to be widely distributed for
+        validation) so file mode is plain ``0o644`` -- secret-grade
+        permissions would be cargo cult.
+        """
+        ca_bytes = client.fetch_ca_certificate()
+        ca_path.parent.mkdir(parents=True, exist_ok=True)
+        ca_path.write_bytes(ca_bytes)
+        ca_path.chmod(0o644)
 
     async def _teardown_broker_bindings(
         self,

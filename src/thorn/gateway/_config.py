@@ -759,15 +759,23 @@ class BrokerConfig(BaseModel):
             "'http://onecli-gateway:10255'."
         ),
     )
-    ca_certificate_path: str = Field(
+    ca_certificate_path: str | None = Field(
+        default=None,
         description=(
-            "Host filesystem path to OneCLI's gateway CA certificate "
-            "(PEM).  The gateway bind-mounts this file read-only into "
-            "every agent container so the in-container TLS clients "
-            "trust the broker's MITM certificates.  Obtain via "
-            "OneCLI's ``GET /api/gateway/ca`` endpoint and persist to "
-            "this path at deploy time, or point at a volume that "
-            "OneCLI's compose service writes."
+            "Optional host filesystem path where the gateway should "
+            "write OneCLI's MITM CA certificate (PEM).  When ``None`` "
+            "(the default), the gateway derives a path under the "
+            "agency home (``<agency_home>/onecli-ca.pem``).  At "
+            "startup, the gateway always pulls the CA from "
+            "``GET /api/gateway/ca`` and writes it to this path; the "
+            "file is then bind-mounted read-only into every per-agent "
+            "sandbox container so its TLS stacks trust the broker's "
+            "MITM certificates.  Setting this field is only necessary "
+            "when an operator wants the CA at a specific path (e.g. "
+            "to share it with non-Thorn tooling); the default keeps "
+            "the deployment story simple -- the gateway owns CA "
+            "acquisition and the operator does not need to wire any "
+            "shared volumes."
         ),
     )
 

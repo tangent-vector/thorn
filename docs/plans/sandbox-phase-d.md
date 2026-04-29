@@ -71,7 +71,9 @@ host:                                    container (per agent):
                               └── creates the container above with:
                                   • bind-mounts (Phase B)
                                   • broker CA mounted at
-                                    /etc/thorn/onecli-ca.pem (R/O)
+                                    /etc/thorn/onecli-ca.pem (R/O,
+                                    fetched by the gateway from
+                                    GET /api/gateway/ca at startup)
                                   • HTTP[S]_PROXY / NO_PROXY env
                                   • SSL_CERT_FILE etc. env
                                   • placeholder credential env
@@ -126,7 +128,7 @@ proxy to substitute against.
 | `_broker_env_entries`                    | `thorn/sandbox/_container.py`            | Emits HTTP[S]_PROXY (both cases), NO_PROXY, SSL_CERT_FILE / REQUESTS_CA_BUNDLE / NODE_EXTRA_CA_CERTS / GIT_SSL_CAINFO. |
 | `EgressAllowlistEntry`                   | `thorn/gateway/_config.py`               | Typed `(host, port)` entry for `sandbox.egress_allowlist`.                    |
 | `Gateway._warn_if_egress_allowlist_unenforced` | `thorn/gateway/_gateway.py`        | Startup warning when allow-list is non-empty (R3 enforcement gap).             |
-| Compose bundling                         | `docker-compose.yml`                     | OneCLI + Postgres profile; `thorn-broker` (internal) + `thorn-default`.       |
+| Compose bundling                         | `deploy/broker.compose.yml`, `deploy/all-in-container.compose.yml` | Broker stack (OneCLI + Postgres + `thorn-broker` / `thorn-default` networks) is deployment-mode-agnostic; the all-in-container variant `include:`s it and adds a gateway service. |
 
 ### Configuration surface
 
@@ -138,8 +140,7 @@ proxy to substitute against.
     "enabled": true,
     "admin_url": "http://onecli:10254",
     "admin_api_key": "$ONECLI_ADMIN_KEY",
-    "proxy_url": "http://onecli:10255",
-    "ca_certificate_path": "/var/lib/onecli/ca/ca.pem"
+    "proxy_url": "http://onecli:10255"
   }
 }
 ```
@@ -153,9 +154,17 @@ proxy to substitute against.
   operators can keep the secret out of `gateway.json` on disk.
 * `proxy_url`: where the in-container HTTP[S]_PROXY points
   (OneCLI gateway, port 10255).
-* `ca_certificate_path`: host-side path to the broker's
-  PEM-encoded CA. Bind-mounted R/O at
-  `/etc/thorn/onecli-ca.pem` inside every sandbox container.
+* `ca_certificate_path` (optional): host-side path the gateway
+  should write the broker's MITM CA to. The gateway always pulls
+  the CA fresh at startup via `GET /api/gateway/ca` and writes
+  it to this path. When unset (the recommended default), the
+  gateway resolves to `<agency_home>/onecli-ca.pem`. Operators
+  set this only when they want the CA at a specific path (for
+  example, to share it with non-Thorn tooling); making the
+  gateway own CA acquisition removes any need to wire shared
+  Docker volumes between OneCLI and the gateway, which lets the
+  same code work for both the host-gateway (Mode A) and
+  all-in-container (Mode B) deployment shapes.
 
 `gateway.json` also gains two new fields under `sandbox`:
 
@@ -176,8 +185,8 @@ proxy to substitute against.
   joins. Combined with operator-side network setup
   (`internal: true`, broker connected, no other containers), this
   implements the broker-only egress policy without Thorn touching
-  iptables. The bundled `docker-compose.yml` ships exactly this
-  shape under the name `thorn-broker`.
+  iptables. The bundled `deploy/broker.compose.yml` ships exactly
+  this shape under the (pinned) name `thorn-broker`.
 * `egress_allowlist`: typed `(host, port)` entries the operator
   declares as direct-egress exceptions. **Schema-only** in this
   phase — the gateway logs a warning at startup when the list is
@@ -295,20 +304,55 @@ anchors and are addressed when those stacks become a constraint.
 
 ### Egress policy (broker-only baseline)
 
-The bundled `docker-compose.yml` defines two networks:
+The bundled `deploy/broker.compose.yml` defines two networks
+with pinned names (so they are stable regardless of the compose
+project name and the host gateway's `docker run --network …` and
+the all-in-container's `include:` both find them):
 
-* `thorn-default` (driver: bridge): for the gateway and the
-  OneCLI broker to reach the internet (LLM provider, forge APIs).
+* `thorn-default` (driver: bridge): for the OneCLI broker to
+  reach the internet (LLM provider, forge APIs after credential
+  injection). When the gateway runs in a container (Mode B), it
+  also attaches here.
 * `thorn-broker` (driver: bridge, **internal: true**): for the
-  per-agent sandbox containers. Because the network is internal,
-  it has no NAT to the host, so a container on it cannot reach
-  the internet directly — the only reachable destination is the
-  broker.
+  per-agent sandbox containers and the broker. Because the
+  network is internal, it has no NAT to the host, so a container
+  on it cannot reach the internet directly — the only reachable
+  destination is the broker.
 
 The Thorn gateway sets `extra_run_args = ("--network", "thorn-broker")`
 on the per-agent sandbox container, making this the single
 network the container joins. There is no iptables work; the
 "broker-only" property is a network-membership consequence.
+
+### Deployment modes
+
+The compose split lets the same gateway code support two
+deployment topologies:
+
+* **Mode A: gateway as a host process + broker in compose** (the
+  recommended default for VM-style deployments). The broker
+  stack runs from `deploy/broker.compose.yml`; the gateway runs
+  directly on the host and reaches OneCLI via
+  `http://127.0.0.1:10254`. The gateway tells the local Docker
+  daemon to attach per-agent sandbox containers to
+  `thorn-broker`. CA acquisition is the gateway's job (see
+  `BrokerConfig.ca_certificate_path` above), so no shared volume
+  between OneCLI and the gateway is required.
+* **Mode B: everything in containers** (optional). The gateway
+  runs in a container alongside the broker, layered via
+  `deploy/all-in-container.compose.yml`. This requires
+  bind-mounting the host's Docker socket into the gateway
+  container so it can launch sibling sandbox containers
+  (Docker-out-of-Docker), which is a privilege trade-off
+  documented in the file's header. Mode A avoids the socket
+  mount entirely and is preferred unless the operator has a
+  concrete reason to want the gateway in a container.
+
+The compose split (broker stack first, gateway-as-container as a
+thin layer that `include:`s it) makes the supported case explicit
+in the file layout and removes any code-level coupling to the
+gateway's deployment shape: the broker integration is pure HTTP
+plus a Docker-network membership decision.
 
 ### R1 / R2 spike findings
 

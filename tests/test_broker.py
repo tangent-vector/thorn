@@ -44,8 +44,11 @@ def _broker_config(**overrides: object) -> BrokerConfig:
         "admin_url": "http://onecli-web:10254",
         "admin_api_key": "oc_admin_dummy",
         "proxy_url": "http://onecli-gateway:10255",
-        "ca_certificate_path": "/var/lib/onecli/ca.pem",
     }
+    # ca_certificate_path is gateway-resolved at startup (defaults
+    # to a path under the agency home).  Client-level tests
+    # exercise the BrokerClient surface directly and do not need it
+    # set on the config.
     base.update(overrides)
     return BrokerConfig.model_validate(base)
 
@@ -493,6 +496,23 @@ class _RegistrationHandler:
             self.secrets[secret_id] = {**body, "id": secret_id}
             return httpx.Response(201, json=self.secrets[secret_id])
 
+        if method == "GET" and path == "/api/gateway/ca":
+            # Phase D: gateway fetches the broker's CA from this
+            # endpoint at startup and writes the bytes to disk.
+            # Tests that drive ``Gateway._register_broker_bindings``
+            # need the handler to answer this call (otherwise the
+            # gateway hits a 404 and bails before any agent
+            # registration happens).
+            return httpx.Response(
+                200,
+                content=(
+                    b"-----BEGIN CERTIFICATE-----\n"
+                    b"FAKE-CA-FOR-TESTS\n"
+                    b"-----END CERTIFICATE-----\n"
+                ),
+                headers={"Content-Type": "application/x-pem-file"},
+            )
+
         return httpx.Response(404, json={"error": "unknown route"})
 
 
@@ -522,6 +542,7 @@ class TestRegisterAgentWithBroker:
         with _client_with_router(_broker_config(), handler) as client:
             binding = register_agent_with_broker(
                 client=client, agent=agent, config=gateway_cfg,
+                ca_certificate_path="/var/lib/onecli/ca.pem",
             )
 
         # Two secrets registered.
@@ -579,6 +600,7 @@ class TestRegisterAgentWithBroker:
         with _client_with_router(_broker_config(), handler) as client:
             binding = register_agent_with_broker(
                 client=client, agent=agent, config=gateway_cfg,
+                ca_certificate_path="/var/lib/onecli/ca.pem",
             )
 
         assert binding.secret_ids == ()
@@ -601,6 +623,7 @@ class TestRegisterAgentWithBroker:
             with pytest.raises(BrokerError, match="not declared"):
                 register_agent_with_broker(
                     client=client, agent=agent, config=gateway_cfg,
+                    ca_certificate_path="/var/lib/onecli/ca.pem",
                 )
 
     def test_app_auth_blocks_registration(self):
@@ -623,6 +646,7 @@ class TestRegisterAgentWithBroker:
             with pytest.raises(BrokerError, match="GitHub App"):
                 register_agent_with_broker(
                     client=client, agent=agent, config=gateway_cfg,
+                    ca_certificate_path="/var/lib/onecli/ca.pem",
                 )
 
     def test_audit_invariant_holds_post_registration(self):
@@ -642,6 +666,7 @@ class TestRegisterAgentWithBroker:
         with _client_with_router(_broker_config(), handler) as client:
             register_agent_with_broker(
                 client=client, agent=agent, config=gateway_cfg,
+                ca_certificate_path="/var/lib/onecli/ca.pem",
             )
 
         # If any literal credential survived, this would raise.
@@ -938,6 +963,171 @@ class TestGatewayBrokerHooks:
 
 
 # ---------------------------------------------------------------------------
+# CA acquisition (gateway-resolved path + fetch-at-startup)
+# ---------------------------------------------------------------------------
+
+
+class TestBrokerCAAcquisition:
+    """Phase D follow-up: the gateway acquires the broker's MITM CA
+    via ``GET /api/gateway/ca`` at startup and writes it to a path
+    it controls.
+
+    Two paths matter:
+
+    * **Default** (``ca_certificate_path`` unset in ``gateway.json``)
+      -- the gateway derives a path under the agency home so no
+      operator-side volume / shared-mount wiring is needed.  This
+      is the supported default for the host-gateway deployment
+      mode (Brev VM, single-host operator).
+    * **Operator override** -- when ``ca_certificate_path`` is set,
+      the gateway honours it (e.g. for an operator who wants the
+      CA at a specific spot to share with non-Thorn tooling).
+    """
+
+    def _gateway_with_broker(
+        self,
+        tmp_path: Any,
+        *,
+        ca_certificate_path: str | None,
+    ):
+        from unittest.mock import MagicMock
+
+        from thorn.core._provider import MockProvider
+        from thorn.gateway._config import GatewayConfig, SandboxConfig
+        from thorn.gateway._gateway import Gateway
+        from thorn.runtime import AgentID, Runtime
+
+        gateway_config = _gateway_config_with_forges()
+        broker_overrides: dict[str, object] = {}
+        if ca_certificate_path is not None:
+            broker_overrides["ca_certificate_path"] = ca_certificate_path
+        gateway_config = GatewayConfig.model_validate(
+            {
+                **gateway_config.model_dump(),
+                "broker": _broker_dict(**broker_overrides),
+            },
+        )
+        runtime = Runtime(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            sandbox_config=SandboxConfig(
+                backend="container", image="thorn-sandbox:test",
+            ),
+        )
+
+        handler = _RegistrationHandler()
+        factory = lambda cfg: BrokerClient(  # noqa: E731
+            cfg.broker, transport=httpx.MockTransport(handler),
+        )
+        gateway = Gateway(
+            runtime=runtime, sources=[],
+            gateway_config=gateway_config,
+            broker_client_factory=factory,
+        )
+
+        # No agents needed: CA fetch happens regardless of how
+        # many schedulers exist.  Add one stub so the registration
+        # loop doesn't short-circuit on "no schedulers".
+        agent = Agent(name="ca-test-agent", id="ca-test-agent-id")
+        scheduler = MagicMock()
+        scheduler.agent = agent
+        gateway._schedulers[AgentID("ca-test-agent-id")] = scheduler
+        return gateway, runtime
+
+    @pytest.mark.asyncio
+    async def test_default_path_is_under_agency_home(
+        self, tmp_path: Any,
+    ) -> None:
+        gateway, runtime = self._gateway_with_broker(
+            tmp_path, ca_certificate_path=None,
+        )
+        await gateway._register_broker_bindings()
+
+        expected = runtime.paths.home_root / "onecli-ca.pem"
+        assert expected.is_file()
+        assert expected.read_bytes().startswith(
+            b"-----BEGIN CERTIFICATE-----",
+        )
+
+        # Every binding should reference the same resolved path.
+        bindings = list(gateway._broker_bindings.values())
+        assert bindings, "expected at least one binding"
+        for binding in bindings:
+            assert binding.ca_certificate_path == str(expected)
+
+    @pytest.mark.asyncio
+    async def test_operator_override_wins(
+        self, tmp_path: Any,
+    ) -> None:
+        custom = tmp_path / "operator-ca-dir" / "broker.pem"
+        gateway, _runtime = self._gateway_with_broker(
+            tmp_path, ca_certificate_path=str(custom),
+        )
+        await gateway._register_broker_bindings()
+
+        assert custom.is_file(), (
+            "operator-supplied ca_certificate_path should be honoured "
+            "verbatim (parent dir created if missing)"
+        )
+        bindings = list(gateway._broker_bindings.values())
+        assert bindings
+        for binding in bindings:
+            assert binding.ca_certificate_path == str(custom)
+
+    @pytest.mark.asyncio
+    async def test_ca_fetch_failure_aborts_registration(
+        self, tmp_path: Any,
+    ) -> None:
+        """A CA-fetch failure short-circuits before any agent
+        registration runs (no half-registered agents on the broker)."""
+        from unittest.mock import MagicMock
+
+        from thorn.core._provider import MockProvider
+        from thorn.gateway._config import GatewayConfig, SandboxConfig
+        from thorn.gateway._gateway import Gateway
+        from thorn.runtime import AgentID, Runtime
+
+        class _NoCAHandler(_RegistrationHandler):
+            def __call__(self, request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/api/gateway/ca":
+                    return httpx.Response(500, json={"error": "broken"})
+                return super().__call__(request)
+
+        gateway_config = _gateway_config_with_forges()
+        gateway_config = GatewayConfig.model_validate(
+            {**gateway_config.model_dump(), "broker": _broker_dict()},
+        )
+        runtime = Runtime(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            sandbox_config=SandboxConfig(
+                backend="container", image="thorn-sandbox:test",
+            ),
+        )
+
+        handler = _NoCAHandler()
+        factory = lambda cfg: BrokerClient(  # noqa: E731
+            cfg.broker, transport=httpx.MockTransport(handler),
+        )
+        gateway = Gateway(
+            runtime=runtime, sources=[],
+            gateway_config=gateway_config,
+            broker_client_factory=factory,
+        )
+        agent = Agent(name="x", id="x-id")
+        scheduler = MagicMock()
+        scheduler.agent = agent
+        gateway._schedulers[AgentID("x-id")] = scheduler
+
+        with pytest.raises(BrokerError, match="fetch_ca_certificate"):
+            await gateway._register_broker_bindings()
+
+        # No agent registrations should have been attempted.
+        assert handler.agents == {}
+        assert gateway._broker_bindings == {}
+
+
+# ---------------------------------------------------------------------------
 # Phase D end-to-end audit flow
 # ---------------------------------------------------------------------------
 
@@ -1088,7 +1278,19 @@ class TestPhaseDAuditFlow:
         assert isinstance(executor.host, ContainerDaemonHost)
         cfg = executor.host._config  # type: ignore[attr-defined]
         assert cfg.broker_proxy_url == binding.proxy_url
-        assert str(cfg.broker_ca_host_path) == "/var/lib/onecli/ca.pem"
+        # Default CA path is under the agency home (no
+        # ``ca_certificate_path`` set in the broker block); the
+        # gateway pulls the CA via ``GET /api/gateway/ca`` and
+        # writes it there.  Asserting the relative shape rather
+        # than the absolute tmp_path keeps this readable.
+        assert cfg.broker_ca_host_path is not None
+        assert cfg.broker_ca_host_path.name == "onecli-ca.pem"
+        assert cfg.broker_ca_host_path.is_file(), (
+            "the gateway should have fetched and written the CA "
+            f"at {cfg.broker_ca_host_path} during registration"
+        )
+        ca_bytes = cfg.broker_ca_host_path.read_bytes()
+        assert ca_bytes.startswith(b"-----BEGIN CERTIFICATE-----")
         assert cfg.broker_placeholder_env == binding.placeholder_env
         assert cfg.egress_network == "thorn-broker"
 
@@ -1126,8 +1328,11 @@ def _broker_dict(**overrides: object) -> dict[str, object]:
         "admin_url": "http://onecli-web:10254",
         "admin_api_key": "oc_admin_dummy",
         "proxy_url": "http://onecli-gateway:10255",
-        "ca_certificate_path": "/var/lib/onecli/ca.pem",
     }
+    # ca_certificate_path is intentionally omitted from the default
+    # so gateway-level tests exercise the "gateway-resolved path
+    # under agency home" path -- the production-default codepath.
+    # Tests that need a specific path can override.
     base.update(overrides)
     return base
 
