@@ -268,9 +268,23 @@ class Gateway:
         # here the same way.  The dict is keyed on the event ``source``
         # string the source itself stamps on every ``RawIncomingEvent``
         # (e.g. ``"github"``, ``"gitlab"``).
+        #
+        # We key on the **resolved** forge list (operator-declared +
+        # synthesized for project fork URLs that lacked an explicit
+        # forge entry), not on ``gateway_config.forges`` directly.
+        # Walking only the operator-declared list would silently fall
+        # back to the default policy for forges that were synthesised
+        # from project URLs -- a latent bug that bit our peer-validation
+        # code in the same way before this refactor moved peer
+        # cross-config validation into the resolver.
         source_policies: dict[str, SourceTriggerPolicy] = {}
         if gateway_config is not None:
-            for forge in gateway_config.forges:
+            from thorn.gateway._config import _resolve_forges_and_projects
+
+            resolved_forges, _resolved_projects = _resolve_forges_and_projects(
+                gateway_config,
+            )
+            for forge in resolved_forges:
                 # Forges whose `name` collides on the event-source
                 # string would step on each other; in v1 there is one
                 # source-string per forge type, so the per-forge knob

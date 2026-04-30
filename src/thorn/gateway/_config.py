@@ -66,7 +66,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -1165,54 +1165,25 @@ class GatewayConfig(BaseModel):
            bundled broker with a subprocess sandbox would be
            pointless (no container to inject the proxy into); the
            rule encodes that.
+
+        Cross-config peer validation deliberately does **not** live
+        here, even though it would be tempting to add as a third
+        bullet.  The "every ``peer.account.service`` references a
+        real service" check has to wait until forge synthesis has
+        run -- otherwise a peer that names a forge derived from a
+        project fork URL (the common case for an operator who never
+        wrote an explicit ``forges:`` block) would spuriously fail.
+        That check lives in :func:`_resolve_forges_and_projects`,
+        where the resolved service-name set is in scope.  Per-peer
+        schema invariants (id grammar, account fields non-empty)
+        live on :class:`PeerSpec` itself; duplicate-id and
+        per-account-collision checks live on :class:`PeerRegistry`.
         """
         if self.sandbox is None:
             self.sandbox = SandboxConfig()
         if self.broker is None and self.sandbox.backend == "container":
             self.broker = BrokerConfig(mode="bundled")
-        self._validate_peers()
         return self
-
-    def _validate_peers(self) -> None:
-        """Cross-check ``peers`` against the rest of the config.
-
-        - Peer ids must be unique within the gateway.
-        - Each ``PeerAccount.service`` must reference a declared
-          ``forges[].name`` (other service categories will join this
-          set as they grow).
-        - A peer with zero accounts is allowed (the operator may be
-          mid-edit) but warned about, since no events will ever match.
-
-        Validation lives in the GatewayConfig validator -- not in
-        ``PeerSpec`` itself -- because the cross-cutting checks
-        require the rest of the config to be visible.
-        """
-        seen_ids: set[str] = set()
-        for peer in self.peers:
-            if peer.id in seen_ids:
-                raise ValueError(
-                    f"Duplicate peer id {peer.id!r} in gateway.peers; "
-                    "peer ids must be unique within the gateway."
-                )
-            seen_ids.add(peer.id)
-
-        known_services = {f.name for f in self.forges}
-        for peer in self.peers:
-            for account in peer.accounts:
-                if account.service not in known_services:
-                    raise ValueError(
-                        f"Peer {peer.id!r} has an account on service "
-                        f"{account.service!r}, but no `forges[].name` "
-                        "in this gateway matches.  Either add a "
-                        "matching forge entry or correct the peer's "
-                        "account.service."
-                    )
-            if not peer.accounts:
-                log.warning(
-                    "Peer %r has no accounts declared; no incoming "
-                    "events will match this peer until at least one "
-                    "account is added.", peer.id,
-                )
 
     def resolve_workspace(self, agency_home: Path) -> Path | None:
         """Resolve the configured workspace path against *agency_home*.
@@ -1269,6 +1240,68 @@ def _index_forges_by_host(
     return by_host
 
 
+def validate_peers_against_services(
+    peers: list[PeerSpec],
+    service_names: Iterable[str],
+) -> None:
+    """Cross-check that every peer account references a real service.
+
+    *service_names* must be the **resolved** set of service names --
+    the union of operator-declared ``forges[].name`` entries and
+    forges synthesised by :func:`_resolve_forges_and_projects` for
+    project fork URLs that lacked an explicit forge entry.  Passing
+    only the operator-declared list (e.g. ``GatewayConfig.forges``)
+    is a layering bug: a peer that names a synthesized forge would
+    spuriously fail validation.
+
+    Per-peer schema checks (id grammar) and registry-level checks
+    (duplicate ids, accounts claimed by two peers) live elsewhere
+    -- on :class:`PeerSpec` and :class:`PeerRegistry` respectively.
+    This function is the cross-config check that depends on having
+    the resolved service-name set in hand, and is therefore not
+    expressible as a pydantic post-validator on
+    :class:`GatewayConfig` (which runs at JSON-load time, before
+    forge synthesis).
+
+    Args:
+        peers: The :class:`PeerSpec` list from the gateway config.
+        service_names: Resolved set of service names the gateway
+            will instantiate.  Currently this is just resolved
+            forge names; future service categories that grow
+            peer-reference semantics will join the same set.
+
+    Raises:
+        ValueError: If any peer has an account whose ``service``
+            does not appear in *service_names*.
+
+    Logs at WARNING when a peer has zero accounts, since no
+    incoming event will ever match such a peer.  This is not a
+    fatal error -- operators may be mid-edit -- but it is worth
+    surfacing.
+    """
+    known = set(service_names)
+    for peer in peers:
+        for account in peer.accounts:
+            if account.service in known:
+                continue
+            raise ValueError(
+                f"Peer {peer.id!r} has an account on service "
+                f"{account.service!r}, but no service with that "
+                "name exists in this gateway (after forge "
+                "synthesis from project fork URLs).  Either add a "
+                "matching forge entry to the `forges:` array, "
+                "declare a project whose fork URL implies that "
+                "forge, or correct the peer's account.service.  "
+                f"Known services: {sorted(known)}"
+            )
+        if not peer.accounts:
+            log.warning(
+                "Peer %r has no accounts declared; no incoming "
+                "events will match this peer until at least one "
+                "account is added.", peer.id,
+            )
+
+
 def _resolve_forges_and_projects(
     config: GatewayConfig,
 ) -> tuple[list[ForgeSpec], list[ResolvedProject]]:
@@ -1281,6 +1314,12 @@ def _resolve_forges_and_projects(
       ``forge``, ``name``, ``native_id``, and ``clone_url`` are filled in.
     - Detects collisions where two different forge specs end up with
       the same ``name``.
+    - Validates :data:`GatewayConfig.peers` against the resolved
+      service-name set; a peer that references a forge synthesized
+      from a project fork URL (rather than from an explicit
+      ``forges[]`` entry) is accepted, while a peer that references
+      a service name nothing in this config produces is rejected
+      with a clear error.
 
     Returns ``(forges, projects)`` where ``forges`` includes both
     explicitly-declared and synthesized entries.
@@ -1346,6 +1385,17 @@ def _resolve_forges_and_projects(
                 forks=resolved_forks,
             )
         )
+
+    # Cross-config peer validation runs against the canonical
+    # service-name set, not against ``config.forges`` directly.
+    # See :func:`validate_peers_against_services` for why this
+    # belongs here rather than in the pydantic post-validator on
+    # :class:`GatewayConfig`.  Future service categories will join
+    # the ``service_names`` set as they grow peer-reference
+    # semantics; for now forges are the only category that takes
+    # peer accounts.
+    service_names = {fs.name for fs in forge_specs}
+    validate_peers_against_services(list(config.peers), service_names)
 
     return forge_specs, resolved_projects
 
@@ -1897,4 +1947,5 @@ __all__ = [
     "instantiate_services",
     "load_gateway_config",
     "parse_fork_url",
+    "validate_peers_against_services",
 ]

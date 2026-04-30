@@ -723,6 +723,253 @@ class TestListPeersTool:
         assert bot.kind is PeerKind.BOT
 
 
+class TestPeerCrossConfigValidation:
+    """Cross-config peer/service validation runs against the resolved set.
+
+    The pydantic validator on :class:`GatewayConfig` deliberately does
+    *not* check ``peer.account.service`` against ``self.forges`` --
+    that list is incomplete at parse time, before
+    :func:`_resolve_forges_and_projects` synthesises forges for
+    project fork URLs.  Validation moved into the resolver so a peer
+    that names a synthesised forge is accepted, while a peer that
+    names something nothing in the config produces is still rejected
+    with a clear error.
+    """
+
+    def test_peer_referencing_synthesised_forge_passes(self) -> None:
+        """No explicit ``forges:`` block; the github forge is synthesised."""
+        from thorn.gateway._config import (
+            ForkSpec,
+            GatewayConfig,
+            ProjectSpec,
+            _resolve_forges_and_projects,
+        )
+
+        cfg = GatewayConfig(
+            projects=[
+                ProjectSpec(
+                    name="tt",
+                    forks=[ForkSpec(url="https://github.com/x/y")],
+                ),
+            ],
+            peers=[
+                PeerSpec(
+                    id="alice",
+                    accounts=[PeerAccount(service="github", account_id="alice")],
+                ),
+            ],
+        )
+
+        # Should not raise, and the synthesised forge should be in the
+        # resolved list.
+        forge_specs, _ = _resolve_forges_and_projects(cfg)
+        assert {f.name for f in forge_specs} == {"github"}
+
+    def test_peer_referencing_explicit_forge_passes(self) -> None:
+        from thorn.gateway._config import (
+            ForgeSpec,
+            GatewayConfig,
+            _resolve_forges_and_projects,
+        )
+
+        cfg = GatewayConfig(
+            forges=[ForgeSpec(name="my-gh", url="https://github.com")],
+            peers=[
+                PeerSpec(
+                    id="alice",
+                    accounts=[PeerAccount(service="my-gh", account_id="alice")],
+                ),
+            ],
+        )
+
+        # No exception; resolver returns the explicit forge unchanged.
+        forge_specs, _ = _resolve_forges_and_projects(cfg)
+        assert "my-gh" in {f.name for f in forge_specs}
+
+    def test_peer_referencing_unknown_service_rejected(self) -> None:
+        from thorn.gateway._config import (
+            ForkSpec,
+            GatewayConfig,
+            ProjectSpec,
+            _resolve_forges_and_projects,
+        )
+
+        cfg = GatewayConfig(
+            projects=[
+                ProjectSpec(
+                    name="tt",
+                    forks=[ForkSpec(url="https://github.com/x/y")],
+                ),
+            ],
+            peers=[
+                PeerSpec(
+                    id="alice",
+                    accounts=[
+                        PeerAccount(service="githbu", account_id="alice"),
+                    ],
+                ),
+            ],
+        )
+
+        with pytest.raises(ValueError) as excinfo:
+            _resolve_forges_and_projects(cfg)
+
+        msg = str(excinfo.value)
+        # Error names the offending peer, the bad service, and the set
+        # of services the operator could have meant.
+        assert "alice" in msg
+        assert "githbu" in msg
+        assert "github" in msg  # in the "Known services" list
+
+    def test_pydantic_validation_no_longer_inspects_peers(self) -> None:
+        """Parsing a config with peers but no matching forge succeeds.
+
+        The cross-config check moved out of the pydantic validator
+        and into the resolver.  Loading the model alone (e.g. for a
+        partial inspection or for tooling that does not run resolution)
+        should therefore succeed even when the operator-declared
+        ``forges`` list does not yet contain the relevant entry.
+        """
+        from thorn.gateway._config import (
+            ForkSpec,
+            GatewayConfig,
+            ProjectSpec,
+        )
+
+        cfg = GatewayConfig(
+            projects=[
+                ProjectSpec(
+                    name="tt",
+                    forks=[ForkSpec(url="https://github.com/x/y")],
+                ),
+            ],
+            peers=[
+                PeerSpec(
+                    id="alice",
+                    accounts=[PeerAccount(service="github", account_id="alice")],
+                ),
+            ],
+        )
+
+        # Parse-time forges is the operator-declared list (empty),
+        # but the model loaded fine because cross-config validation
+        # was deferred to resolution time.
+        assert cfg.forges == []
+        assert cfg.peers[0].id == "alice"
+
+    def test_validate_peers_against_services_directly(self) -> None:
+        """The exposed helper takes a service-name set and validates."""
+        from thorn.gateway._config import validate_peers_against_services
+
+        peers = [
+            PeerSpec(
+                id="alice",
+                accounts=[PeerAccount(service="gh", account_id="alice")],
+            ),
+        ]
+        # Hit: should not raise.
+        validate_peers_against_services(peers, {"gh", "gl"})
+        # Miss: raises with the bad service named.
+        with pytest.raises(ValueError, match="bogus"):
+            validate_peers_against_services(peers, {"bogus"})
+
+    def test_peer_with_no_accounts_warns_but_passes(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A peer with zero accounts is allowed (mid-edit) but warned about."""
+        from thorn.gateway._config import validate_peers_against_services
+
+        peers = [PeerSpec(id="alice", accounts=[])]
+        with caplog.at_level("WARNING", logger="thorn.gateway._config"):
+            validate_peers_against_services(peers, set())
+        joined = "\n".join(r.message for r in caplog.records)
+        assert "alice" in joined
+        assert "no accounts" in joined.lower()
+
+
+class TestGatewaySourcePoliciesUseResolvedForges:
+    """``Gateway.__init__`` keys per-source policy off the resolved forge list.
+
+    The same layering bug that hit peer cross-config validation also
+    affected the per-source policy loop (``deliver_structural_from_non_peers``
+    and any future per-forge knobs).  This test pins down that
+    Gateway now walks the resolved forge list -- including forges
+    synthesised from project fork URLs -- when building its trigger
+    policy's per-source dict.
+    """
+
+    def test_synthesised_forge_appears_in_source_policies(
+        self, tmp_path: Path,
+    ) -> None:
+        from thorn.core._provider import MockProvider
+        from thorn.gateway._config import (
+            ForkSpec,
+            GatewayConfig,
+            ProjectSpec,
+        )
+        from thorn.gateway._gateway import Gateway
+
+        cfg = GatewayConfig(
+            projects=[
+                ProjectSpec(
+                    name="tt",
+                    forks=[ForkSpec(url="https://github.com/x/y")],
+                ),
+            ],
+        )
+
+        runtime = Runtime(
+            provider=MockProvider(),
+            workspace_root=tmp_path / "ws",
+        )
+        gateway = Gateway(runtime=runtime, sources=[], gateway_config=cfg)
+
+        # ``deliver_structural_from_non_peers=True`` is the default,
+        # but the important pin is that a per-source policy entry
+        # *exists* for the synthesised forge -- so a future per-forge
+        # knob set on a fork-derived forge will be honoured rather
+        # than silently falling back to the default.
+        source_policies = gateway._trigger_policy._source_policies  # noqa: SLF001
+        assert "github" in source_policies
+
+    def test_explicit_per_forge_knob_propagates_to_resolved_walk(
+        self, tmp_path: Path,
+    ) -> None:
+        """An operator-set knob on the explicit forge is honoured."""
+        from thorn.core._provider import MockProvider
+        from thorn.gateway._config import (
+            ForgeSpec,
+            ForkSpec,
+            GatewayConfig,
+            ProjectSpec,
+        )
+        from thorn.gateway._gateway import Gateway
+
+        cfg = GatewayConfig(
+            forges=[
+                ForgeSpec(
+                    url="https://github.com",
+                    deliver_structural_from_non_peers=False,
+                ),
+            ],
+            projects=[
+                ProjectSpec(
+                    name="tt",
+                    forks=[ForkSpec(url="https://github.com/x/y")],
+                ),
+            ],
+        )
+
+        runtime = Runtime(
+            provider=MockProvider(),
+            workspace_root=tmp_path / "ws",
+        )
+        gateway = Gateway(runtime=runtime, sources=[], gateway_config=cfg)
+
+        policy = gateway._trigger_policy._source_policies["github"]  # noqa: SLF001
+        assert policy.deliver_structural_from_non_peers is False
+
+
 class TestPeerToolsWithoutRuntime:
     """Tools must fail clearly when no Runtime is in scope."""
 
