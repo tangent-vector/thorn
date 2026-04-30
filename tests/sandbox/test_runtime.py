@@ -266,6 +266,77 @@ class TestMountFlagEmission:
         )
 
 
+class TestEntrypointEmission:
+    """The ``--entrypoint`` flag is emitted with Docker-compatible
+    syntax: a single executable string, with any remaining argv
+    elements prepended to the post-image command.  Docker's
+    ``run --entrypoint`` does *not* accept the JSON-array form that
+    Dockerfiles and ``podman run`` accept -- it tries to exec the
+    literal JSON string as a binary path and fails with
+    ``executable file not found``.  These tests pin the portable
+    spelling so a future refactor cannot silently re-break docker.
+    """
+
+    @staticmethod
+    def _make_docker(monkeypatch) -> DockerAdapter:
+        from thorn.sandbox import _runtime as runtime_mod
+
+        monkeypatch.setattr(
+            runtime_mod.shutil, "which", lambda name: f"/usr/bin/{name}",
+        )
+        return DockerAdapter()
+
+    def test_multi_arg_entrypoint_split_across_flag_and_command(
+        self, monkeypatch,
+    ) -> None:
+        adapter = self._make_docker(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            entrypoint=("python", "-m", "thorn.toolhost"),
+            command=("--socket", "/tmp/sock"),
+        )
+        args = list(adapter._build_run_args(spec))
+
+        # ``--entrypoint`` carries only the executable, never a JSON
+        # array string.
+        ep_idx = args.index("--entrypoint")
+        assert args[ep_idx + 1] == "python"
+        assert "[" not in args[ep_idx + 1]
+
+        image_idx = args.index("x:1")
+        post_image = args[image_idx + 1:]
+        # Remaining entrypoint args come immediately after the image,
+        # then the command args.
+        assert post_image == ["-m", "thorn.toolhost", "--socket", "/tmp/sock"]
+
+    def test_single_arg_entrypoint_leaves_command_alone(
+        self, monkeypatch,
+    ) -> None:
+        adapter = self._make_docker(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            entrypoint=("/usr/bin/myhost",),
+            command=("--flag",),
+        )
+        args = list(adapter._build_run_args(spec))
+        ep_idx = args.index("--entrypoint")
+        assert args[ep_idx + 1] == "/usr/bin/myhost"
+        image_idx = args.index("x:1")
+        assert args[image_idx + 1:] == ["--flag"]
+
+    def test_empty_entrypoint_tuple_rejected(self, monkeypatch) -> None:
+        adapter = self._make_docker(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            entrypoint=(),
+        )
+        with pytest.raises(ValueError, match="non-empty"):
+            list(adapter._build_run_args(spec))
+
+
 class TestRuntimeSpecificDefaults:
     """Phase E: adapters can contribute default ``run`` args needed for
     the spec's other fields to mean what they say.  Today this only

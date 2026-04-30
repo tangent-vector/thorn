@@ -574,13 +574,27 @@ class _CLIRuntimeAdapter:
             yield extra
         for extra in spec.extra_run_args:
             yield extra
+        # ``docker run --entrypoint`` accepts only a single executable
+        # string -- the JSON-array form documented for Dockerfiles and
+        # ``podman run`` is rejected by docker, which tries to exec
+        # the literal JSON ('["python", "-m", "thorn.toolhost"]') as
+        # a binary path and fails with ``executable file not found``.
+        # The portable form is to pass the first entrypoint element
+        # to ``--entrypoint`` and prepend the rest to ``command``;
+        # both runtimes accept this and execute it as expected.
+        entrypoint_extra: tuple[str, ...] = ()
         if spec.entrypoint is not None:
+            if not spec.entrypoint:
+                raise ValueError(
+                    "ContainerSpec.entrypoint must be a non-empty argv "
+                    "tuple when provided"
+                )
             yield "--entrypoint"
-            # Both podman and docker accept a JSON array string for
-            # multi-arg entrypoints; sticking with that uniformly
-            # avoids surprising shell-splitting differences.
-            yield json.dumps(list(spec.entrypoint))
+            yield spec.entrypoint[0]
+            entrypoint_extra = tuple(spec.entrypoint[1:])
         yield spec.image
+        for arg in entrypoint_extra:
+            yield arg
         for arg in spec.command:
             yield arg
 
