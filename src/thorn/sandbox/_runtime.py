@@ -511,12 +511,19 @@ class _CLIRuntimeAdapter:
         yield "--name"
         yield spec.name
         for mount in spec.mounts:
-            opts = "ro" if mount.read_only else "rw"
             yield "--mount"
-            yield (
-                f"type=bind,source={mount.source},"
-                f"target={mount.target},{opts}"
-            )
+            # Docker's ``--mount`` parser only accepts ``readonly`` (a
+            # bare flag) and rejects the ``-v``-style ``ro``/``rw``
+            # options outright; passing ``rw`` here yields
+            # ``invalid field 'rw' must be a key=value pair``.  Podman
+            # accepts both spellings, so emitting ``readonly`` only
+            # when actually read-only (and omitting any read-write
+            # option, since ``rw`` is the runtime default) is the one
+            # form both runtimes parse identically.
+            spec_str = f"type=bind,source={mount.source},target={mount.target}"
+            if mount.read_only:
+                spec_str += ",readonly"
+            yield spec_str
         for tmpfs in spec.tmpfs_mounts:
             yield "--tmpfs"
             if tmpfs.options:

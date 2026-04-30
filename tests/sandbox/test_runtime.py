@@ -203,6 +203,69 @@ class TestRealAdapterConstructorErrors:
             DockerAdapter()
 
 
+class TestMountFlagEmission:
+    """The ``--mount`` flag is emitted with Docker-compatible syntax.
+
+    Docker's ``--mount`` parser only accepts ``readonly`` (a bare
+    flag); it rejects ``ro`` / ``rw`` outright with
+    ``invalid field 'rw' must be a key=value pair``.  Podman accepts
+    both spellings, so emitting ``readonly`` for read-only mounts
+    and nothing extra for read-write mounts (``rw`` is the default)
+    is the one form both runtimes parse identically.  These tests
+    pin that spelling so a future refactor cannot silently re-break
+    docker.
+    """
+
+    @staticmethod
+    def _make_docker(monkeypatch) -> DockerAdapter:
+        from thorn.sandbox import _runtime as runtime_mod
+
+        monkeypatch.setattr(
+            runtime_mod.shutil, "which", lambda name: f"/usr/bin/{name}",
+        )
+        return DockerAdapter()
+
+    def test_read_write_mount_omits_ro_rw_flag(self, monkeypatch) -> None:
+        adapter = self._make_docker(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            mounts=(
+                Mount(
+                    source=Path("/host/home"),
+                    target=Path("/agent/home"),
+                    read_only=False,
+                ),
+            ),
+        )
+        args = list(adapter._build_run_args(spec))
+        mount_arg = args[args.index("--mount") + 1]
+        assert mount_arg == "type=bind,source=/host/home,target=/agent/home"
+        # Docker rejects ``rw`` / ``ro`` as ``--mount`` options;
+        # never emit them.
+        assert ",rw" not in mount_arg
+        assert ",ro" not in mount_arg
+
+    def test_read_only_mount_uses_readonly_flag(self, monkeypatch) -> None:
+        adapter = self._make_docker(monkeypatch)
+        spec = ContainerSpec(
+            image="x:1",
+            name="agent-x",
+            mounts=(
+                Mount(
+                    source=Path("/host/ca"),
+                    target=Path("/etc/ssl/ca.pem"),
+                    read_only=True,
+                ),
+            ),
+        )
+        args = list(adapter._build_run_args(spec))
+        mount_arg = args[args.index("--mount") + 1]
+        assert mount_arg == (
+            "type=bind,source=/host/ca,target=/etc/ssl/ca.pem,readonly"
+        )
+
+
 class TestRuntimeSpecificDefaults:
     """Phase E: adapters can contribute default ``run`` args needed for
     the spec's other fields to mean what they say.  Today this only
