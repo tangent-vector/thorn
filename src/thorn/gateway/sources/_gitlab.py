@@ -2,10 +2,13 @@
 
 Polls the GitLab Todos API for new notifications (e.g. @-mentions,
 assignments, review requests) and converts them into
-:class:`~thorn.gateway._event.IncomingEvent` objects for the gateway.
+:class:`~thorn.gateway._event.RawIncomingEvent` objects for the
+gateway-side notification formatter to wrap and route.
 
-Adapted from ``thorn-bot/src/thorn_bot/_poller.py`` and
-``thorn-bot/src/thorn_bot/_daemon.py``.
+The source captures the TODO ``author`` (numeric ``id``, ``username``,
+and bot flag) into an :class:`~thorn.gateway._actor.ActorIdentity` so
+the gateway's peer registry can look up the actor without
+re-fetching the user from GitLab.
 """
 
 from __future__ import annotations
@@ -17,7 +20,14 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from thorn.gateway._event import EventSource, IncomingEvent
+from thorn.gateway._actor import ActorIdentity
+from thorn.gateway._event import (
+    ContextItem,
+    ContextItemKind,
+    EventKind,
+    EventSource,
+    RawIncomingEvent,
+)
 from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
 from thorn.runtime._session import SessionKey
 
@@ -78,15 +88,123 @@ class GitLabSourceConfig(BaseModel):
             "can use whichever it has handy."
         ),
     )
+    forge_name: str = Field(
+        default="gitlab",
+        description=(
+            "Service name stamped on every "
+            "``ActorIdentity.service`` produced by this source.  "
+            "Should match the ``forges[].name`` entry in "
+            "``gateway.json`` so peer matching and per-forge "
+            "trigger policy line up."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Event formatting
+# Event classification
 # ---------------------------------------------------------------------------
 
 
-def _format_event_content(todo: Any) -> str:
-    """Build a human-readable prompt from a GitLab TODO object."""
+# GitLab TODO ``action_name`` values that represent direct
+# message-like activity from a human.  Anything not in this set is
+# treated as structural (an assignment changed, CI failed, an
+# approval is required, ...).  Same conservative-default rationale
+# as the GitHub source: structural-with-banner is the carve-out the
+# operator can disable, while a missed conversational classification
+# would silently drop legitimate events.
+_CONVERSATIONAL_ACTIONS: frozenset[str] = frozenset({
+    "mentioned",
+    "directly_addressed",
+    "review_requested",
+})
+
+
+def _classify_action(action_name: str) -> EventKind:
+    """Map a GitLab TODO ``action_name`` to an :class:`EventKind`."""
+    if action_name in _CONVERSATIONAL_ACTIONS:
+        return EventKind.CONVERSATIONAL
+    return EventKind.STRUCTURAL
+
+
+def _kind_for_target(target_type: str, action_name: str) -> ContextItemKind:
+    """Classify a context item by its containing target type."""
+    if action_name in _CONVERSATIONAL_ACTIONS:
+        return ContextItemKind.COMMENT
+    if target_type == "Issue":
+        return ContextItemKind.ISSUE_BODY
+    if target_type == "MergeRequest":
+        return ContextItemKind.PR_BODY
+    return ContextItemKind.COMMENT
+
+
+# ---------------------------------------------------------------------------
+# Actor extraction
+# ---------------------------------------------------------------------------
+
+
+def _actor_from_todo_author(
+    author: Any,
+    *,
+    service: str,
+) -> ActorIdentity | None:
+    """Build an :class:`ActorIdentity` from a GitLab TODO ``author`` field.
+
+    *author* may be a ``dict`` (when the TODO was deserialised from
+    JSON) or a ``Mapping``-like object (depending on ``python-gitlab``
+    version).  GitLab user objects expose ``id``, ``username``,
+    ``name``, and ``bot``; we capture all four where available, with
+    the numeric id as the immutable ``account_id`` and the
+    ``username`` as a fallback for textual operator config.
+    """
+    if author is None:
+        return None
+    if isinstance(author, dict):
+        get = author.get
+    else:
+        # ``python-gitlab`` user objects expose attributes; fall back
+        # to ``getattr`` so this works regardless of the source's
+        # serialisation style.
+        def get(key: str, default: Any = None) -> Any:
+            return getattr(author, key, default)
+
+    user_id = get("id")
+    username = (get("username") or "").strip()
+    name = get("name") or ""
+    bot_flag = get("bot")
+
+    if user_id is None and not username:
+        return None
+
+    account_id = str(user_id) if user_id is not None else username
+    secondary: tuple[str, ...] = (
+        (username,) if username and username != account_id else ()
+    )
+
+    is_bot: bool | None = None
+    if bot_flag is not None:
+        is_bot = bool(bot_flag)
+
+    return ActorIdentity(
+        service=service,
+        account_id=account_id,
+        display_name=name or username,
+        is_bot=is_bot,
+        secondary_account_ids=secondary,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Event content
+# ---------------------------------------------------------------------------
+
+
+def _make_summary(todo: Any) -> str:
+    """Build the harness-controlled summary line(s) for a GitLab TODO.
+
+    Source-controlled, *not* attacker-controlled: the comment body
+    (which *is* attacker-controlled) is surfaced via a separate
+    :class:`ContextItem`, never inlined into this string.
+    """
     project = todo.project
     project_id = project["id"]
     project_name = project.get("path_with_namespace", str(project_id))
@@ -96,7 +214,6 @@ def _format_event_content(todo: Any) -> str:
     noteable_type = todo.target_type
     noteable_iid = todo.target["iid"]
     action = todo.action_name
-    body = getattr(todo, "body", "")
 
     lines = [
         f"GitLab notification: you were {action} on "
@@ -114,12 +231,6 @@ def _format_event_content(todo: Any) -> str:
     if web_url:
         lines.append(f"Project URL: {web_url}")
     lines.append("")
-
-    if body:
-        lines.append("Comment body:")
-        lines.append(body)
-        lines.append("")
-
     lines.append(
         "Respond to the notification as appropriate.  The GitLab TODO "
         "has already been marked done on your behalf.",
@@ -198,13 +309,20 @@ def _make_external_key(gitlab_url: str, todo_id: int) -> str:
     return f"gitlab:{gitlab_url}:todo:{todo_id}"
 
 
-def _make_event(
+def _make_raw_event(
     todo: Any,
     project_id_to_name: dict[str, str] | None = None,
     *,
     gitlab_url: str = "",
-) -> IncomingEvent:
-    """Convert a GitLab TODO into an ``IncomingEvent``."""
+    forge_name: str = "gitlab",
+) -> RawIncomingEvent:
+    """Convert a GitLab TODO into a :class:`RawIncomingEvent`.
+
+    Captures the TODO's ``author`` as the primary actor and the
+    TODO's ``body`` (when present) as a single :class:`ContextItem`.
+    Classification of structural vs. conversational follows
+    :func:`_classify_action`.
+    """
     project = todo.project
     pid = project["id"]
     proj_name = _lookup_project_name(project, project_id_to_name)
@@ -213,10 +331,30 @@ def _make_event(
         noteable=_noteable_from_todo(todo),
         project_name=proj_name,
     )
-    return IncomingEvent(
+
+    actor = _actor_from_todo_author(
+        getattr(todo, "author", None), service=forge_name,
+    )
+
+    body = getattr(todo, "body", "") or ""
+    items: tuple[ContextItem, ...] = ()
+    if body:
+        items = (
+            ContextItem(
+                body=body,
+                kind=_kind_for_target(todo.target_type, todo.action_name),
+                actor=actor,
+                timestamp=getattr(todo, "created_at", "") or "",
+            ),
+        )
+
+    return RawIncomingEvent(
         source="gitlab",
         session_key=session_key,
-        content=_format_event_content(todo),
+        kind=_classify_action(todo.action_name),
+        primary_actor=actor,
+        summary=_make_summary(todo),
+        items=items,
         metadata={
             "todo_id": todo.id,
             "project_id": pid,
@@ -259,7 +397,7 @@ class GitLabTODOsSource(EventSource):
 
     async def start(
         self,
-        on_event: Callable[[IncomingEvent], Awaitable[None]],
+        on_event: Callable[[RawIncomingEvent], Awaitable[None]],
     ) -> None:
         self._stop_event = asyncio.Event()
 
@@ -304,7 +442,7 @@ class GitLabTODOsSource(EventSource):
 
     async def _poll_once(
         self,
-        on_event: Callable[[IncomingEvent], Awaitable[None]],
+        on_event: Callable[[RawIncomingEvent], Awaitable[None]],
     ) -> None:
         todos = await asyncio.to_thread(self._get_pending_todos)
         new_todos = [t for t in todos if t.id not in self._seen]
@@ -316,10 +454,11 @@ class GitLabTODOsSource(EventSource):
         id_to_name = self._config.project_id_to_name
         for todo in new_todos:
             self._seen.add(todo.id)
-            event = _make_event(
+            event = _make_raw_event(
                 todo,
                 project_id_to_name=id_to_name,
                 gitlab_url=self._config.url,
+                forge_name=self._config.forge_name,
             )
             try:
                 await on_event(event)
@@ -335,14 +474,15 @@ class GitLabTODOsSource(EventSource):
 
             # Proactively mark the TODO as done on GitLab's side once
             # it has been safely handed off to the gateway.  This
-            # happens regardless of whether the gateway deduplicated
-            # the post: the point is to keep GitLab from surfacing
-            # the same TODO on every poll.  If an earlier copy is
-            # already in flight (dedup path) the agent will still
-            # handle it; if mark_as_done itself fails we just log and
-            # move on -- the `_seen` cache prevents a re-emit within
-            # this process, and a restart will retry via the normal
-            # pending-TODOs path.
+            # happens regardless of whether the gateway delivered,
+            # deduplicated, or *dropped* the event: drops are
+            # terminal in the formatter's contract, so we want the
+            # platform to stop resurfacing the entity in all three
+            # cases.  If an earlier copy is already in flight (dedup
+            # path) the agent will still handle it; if mark_as_done
+            # itself fails we just log and move on -- the ``_seen``
+            # cache prevents a re-emit within this process, and a
+            # restart will retry via the normal pending-TODOs path.
             try:
                 await asyncio.to_thread(todo.mark_as_done)
             except Exception:

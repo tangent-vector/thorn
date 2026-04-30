@@ -71,7 +71,21 @@ from thorn.gateway._bundled_broker import (
     BundledBrokerSupervisor,
 )
 from thorn.gateway._config import BrokerConfig, GatewayConfig
-from thorn.gateway._event import EventSource, IncomingEvent
+from thorn.gateway._event import (
+    EventSource,
+    FormattedEvent,
+    RawIncomingEvent,
+)
+from thorn.gateway._formatter import (
+    FormatterDelivery,
+    FormatterDrop,
+    NotificationFormatter,
+)
+from thorn.gateway._peer import PeerRegistry
+from thorn.gateway._trigger_policy import (
+    SourceTriggerPolicy,
+    TriggerAuthorizationPolicy,
+)
 from thorn.runtime import (
     DEFAULT_AGENT_CONCURRENCY,
     AgentID,
@@ -237,6 +251,56 @@ class Gateway:
         self._schedulers: dict[AgentID, AgentScheduler] = {}
         self._inboxes: dict[SessionAddress, SessionInbox] = {}
         self._started = False
+
+        # Build the peer-aware notification pipeline from the config.
+        # When *gateway_config* is None (test path), an empty registry
+        # plus a permissive policy is constructed so the gateway is
+        # still usable in unit tests that drive ``_handle_event``
+        # directly.  Production callers always pass a config; the
+        # secure defaults the config schema enforces are what give
+        # the policy real teeth.
+        peers = list(gateway_config.peers) if gateway_config is not None else []
+        self._peer_registry = PeerRegistry(peers)
+
+        # Per-source policy: today the only knob is the structural
+        # carve-out toggle on ``ForgeSpec``.  Future service categories
+        # that grow their own per-instance trigger knobs will plug in
+        # here the same way.  The dict is keyed on the event ``source``
+        # string the source itself stamps on every ``RawIncomingEvent``
+        # (e.g. ``"github"``, ``"gitlab"``).
+        source_policies: dict[str, SourceTriggerPolicy] = {}
+        if gateway_config is not None:
+            for forge in gateway_config.forges:
+                # Forges whose `name` collides on the event-source
+                # string would step on each other; in v1 there is one
+                # source-string per forge type, so the per-forge knob
+                # is best-effort when an operator has multiple GitHub
+                # entries.  The "right" granularity for that case is
+                # per-service-instance keying, which is on the deferred
+                # list and tracked in the plan doc.
+                source_policies[forge.type or forge.name] = SourceTriggerPolicy(
+                    deliver_structural_from_non_peers=(
+                        forge.deliver_structural_from_non_peers
+                    ),
+                )
+
+        self._trigger_policy = TriggerAuthorizationPolicy(
+            self._peer_registry,
+            source_policies=source_policies,
+        )
+        self._formatter = NotificationFormatter(
+            peer_registry=self._peer_registry,
+            policy=self._trigger_policy,
+        )
+
+        # Make the registry visible to agent-side tools running inside
+        # this runtime: ``thorn.tools.peers`` looks up
+        # ``get_context().runtime.peer_registry``, and the runtime is
+        # the natural place for shared agency-level state.  The
+        # gateway is the single owner of the registry's lifecycle, so
+        # we install it here rather than asking each tool / runtime
+        # consumer to thread it through.
+        self._runtime.peer_registry = self._peer_registry
 
     @property
     def health_monitor(self) -> ProviderHealthMonitor:
@@ -691,8 +755,34 @@ class Gateway:
 
         return self._runtime.get_or_create_agent(_DEFAULT_AGENT_ID)
 
-    async def _handle_event(self, event: IncomingEvent) -> None:
-        """Post an event to the right inbox and wake its scheduler.
+    async def _handle_event(self, event: RawIncomingEvent) -> None:
+        """Apply the trigger-authorization policy and dispatch on success.
+
+        This is the source-facing entry point.  Sources construct a
+        :class:`RawIncomingEvent` and hand it to this callback; the
+        gateway runs it through the
+        :class:`~thorn.gateway._formatter.NotificationFormatter`,
+        which consults the peer registry and the
+        :class:`~thorn.gateway._trigger_policy.TriggerAuthorizationPolicy`
+        to decide whether to deliver, deliver-with-banner, or drop.
+        Dropped events are logged at INFO and discarded; delivered
+        events are routed through :meth:`_dispatch_formatted`.
+
+        Drops are *terminal* (see the threat-model docs and the
+        plan's open question #8): the source's mark-read / mark-done
+        behaviour fires uniformly for delivered, deduped, and
+        dropped events alike, so a non-peer event the policy
+        rejects does not stay in the source's "pending" set forever
+        and there is no replay path that could later inject it.
+        """
+        result = self._formatter.process(event)
+        if isinstance(result, FormatterDrop):
+            return
+        assert isinstance(result, FormatterDelivery)
+        await self._dispatch_formatted(result.event)
+
+    async def _dispatch_formatted(self, event: FormattedEvent) -> None:
+        """Post a formatted event to the right inbox and wake its scheduler.
 
         Does *not* execute the prompt directly.  The session driver
         inside the scheduler picks up the posted notification and

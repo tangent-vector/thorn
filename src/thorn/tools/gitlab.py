@@ -100,6 +100,7 @@ class GitLabClient:
         """Fetch a single issue and return its key fields as a dict."""
         project = self._gl.projects.get(project_id)
         issue: ProjectIssue = project.issues.get(issue_iid)  # type: ignore[assignment]
+        author = getattr(issue, "author", None) or None
         return {
             "iid": issue.iid,
             "title": issue.title,
@@ -108,6 +109,11 @@ class GitLabClient:
             "labels": list(issue.labels),
             "assignees": [a["username"] for a in issue.assignees],
             "web_url": issue.web_url,
+            # Author surfaced as the raw GitLab user dict so the
+            # forge tool wrapper can pull both the immutable id
+            # (`id`) and textual handle (`username`).
+            "author": author,
+            "created_at": getattr(issue, "created_at", None),
         }
 
     def create_issue(
@@ -272,6 +278,7 @@ class GitLabClient:
         """Fetch a single merge request and return its key fields."""
         project = self._gl.projects.get(project_id)
         mr: ProjectMergeRequest = project.mergerequests.get(mr_iid)  # type: ignore[assignment]
+        author = getattr(mr, "author", None) or None
         return {
             "iid": mr.iid,
             "title": mr.title,
@@ -281,6 +288,8 @@ class GitLabClient:
             "source_branch": mr.source_branch,
             "target_branch": mr.target_branch,
             "merge_status": mr.merge_status,
+            "author": author,
+            "created_at": getattr(mr, "created_at", None),
         }
 
     def list_merge_requests(
@@ -360,7 +369,13 @@ class GitLabClient:
         return [
             {
                 "id": note.id,
+                # Keep ``author`` as the username string for backwards
+                # compatibility with existing call sites that render
+                # it directly; surface the raw author dict separately
+                # under ``author_user`` so the forge tool wrapper has
+                # access to the immutable id and bot flag.
                 "author": note.author["username"] if note.author else "unknown",
+                "author_user": note.author or None,
                 "body": note.body,
                 "created_at": note.created_at,
                 "system": getattr(note, "system", False),

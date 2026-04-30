@@ -170,6 +170,19 @@ class Runtime:
             in_flight_index or InFlightIndex()
         )
 
+        # Peer registry: populated by the gateway from the
+        # operator-declared peer list once it has parsed
+        # ``gateway.json``.  Defaults to an empty registry so that
+        # tests / direct ``Runtime`` users (the in-process CLI paths)
+        # do not have to construct one explicitly.  An empty registry
+        # means "no peers" which causes the trigger-authorization
+        # policy to drop conversational events from every actor;
+        # that is the right strict-default for non-gateway code
+        # paths (which are not subject to a peer model at all and
+        # generally do not run the formatter).
+        from thorn.gateway._peer import PeerRegistry as _PeerRegistry
+        self.peer_registry: _PeerRegistry = _PeerRegistry([])
+
         self._services: dict[str, Service] = {}
 
         self._context: ExecutionContext | None = None

@@ -134,6 +134,16 @@ class GitHubClient:
         """Fetch a single issue and return its key fields as a dict."""
         repository = self._gh.get_repo(repo)
         issue = repository.get_issue(number=issue_number)
+        user = getattr(issue, "user", None)
+        author = (
+            {
+                "id": getattr(user, "id", None),
+                "login": getattr(user, "login", None),
+                "type": getattr(user, "type", None),
+            }
+            if user is not None
+            else None
+        )
         return {
             "number": issue.number,
             "title": issue.title,
@@ -142,6 +152,12 @@ class GitHubClient:
             "labels": [label.name for label in issue.labels],
             "assignees": [a.login for a in issue.assignees],
             "html_url": issue.html_url,
+            "author": author,
+            "created_at": (
+                issue.created_at.isoformat()
+                if getattr(issue, "created_at", None)
+                else None
+            ),
         }
 
     def create_issue(
@@ -290,6 +306,16 @@ class GitHubClient:
         """Fetch a single pull request and return its key fields."""
         repository = self._gh.get_repo(repo)
         pr = repository.get_pull(number=pr_number)
+        user = getattr(pr, "user", None)
+        author = (
+            {
+                "id": getattr(user, "id", None),
+                "login": getattr(user, "login", None),
+                "type": getattr(user, "type", None),
+            }
+            if user is not None
+            else None
+        )
         return {
             "number": pr.number,
             "title": pr.title,
@@ -301,6 +327,12 @@ class GitHubClient:
             "mergeable": pr.mergeable,
             "mergeable_state": pr.mergeable_state,
             "merged": pr.merged,
+            "author": author,
+            "created_at": (
+                pr.created_at.isoformat()
+                if getattr(pr, "created_at", None)
+                else None
+            ),
         }
 
     def list_pull_requests(
@@ -373,7 +405,19 @@ class GitHubClient:
         return [
             {
                 "id": comment.id,
+                # ``author`` retained as a login string for legacy
+                # call sites; ``author_user`` carries the structured
+                # form needed by the forge tool envelope helper.
                 "author": comment.user.login if comment.user else "unknown",
+                "author_user": (
+                    {
+                        "id": getattr(comment.user, "id", None),
+                        "login": getattr(comment.user, "login", None),
+                        "type": getattr(comment.user, "type", None),
+                    }
+                    if comment.user is not None
+                    else None
+                ),
                 "body": comment.body,
                 "created_at": comment.created_at.isoformat(),
                 "is_bot": (

@@ -329,6 +329,10 @@ The gateway is forge-agnostic: the agent uses a unified set of
 Further Reading
 ---------------
 
+- [Threat model and trust boundaries](docs/threat-model.md) --
+  what the peer registry, content envelopes, and tool-call sandbox
+  defend against; the "gossipy co-worker" rule for what to share
+  with an agent; operating guidance for public gateways.
 - [What `thorn serve` does on startup](docs/startup_flow.md) --
   the bring-up sequence for the bundled credential broker, where
   to look in the logs, and how to recover from a non-graceful

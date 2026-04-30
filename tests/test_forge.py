@@ -952,6 +952,211 @@ class TestForgeToolsIntegration:
         finally:
             reset_context(token)
 
+    # ------------------------------------------------------------------
+    # External-content envelope wrapping (peer-identity-and-trust)
+    # ------------------------------------------------------------------
+    #
+    # The threat model only holds if user-authored text returned from
+    # forge tools is labelled with the same envelope shape the gateway
+    # formatter uses on incoming notifications.  These tests pin down
+    # that contract: every tool that returns user-authored body text
+    # wraps it in ``[external-content ...]`` and stamps the right
+    # peer status.
+
+    @pytest.mark.asyncio
+    async def test_forge_read_issue_wraps_description_with_envelope(
+        self, tmp_path: Path,
+    ) -> None:
+        """The issue description (user-authored) is wrapped; metadata is not."""
+        from thorn.gateway._peer import PeerAccount, PeerKind, PeerRegistry, PeerSpec
+        from thorn.tools.forge import forge_read_issue
+
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
+        mock_client.get_issue.return_value = {
+            "id": 7,
+            "title": "Bug",
+            "state": "open",
+            "url": "https://gl.example.com/issues/7",
+            "description": "Bad things happen.",
+            "labels": ["bug"],
+            "assignees": ["alice"],
+            "author": {"id": 12345, "username": "alice-handle", "name": "Alice"},
+            "created_at": "2026-04-30T12:34:56Z",
+        }
+        runtime.peer_registry = PeerRegistry([
+            PeerSpec(
+                id="alice",
+                name="Alice",
+                kind=PeerKind.HUMAN,
+                accounts=[PeerAccount(service="gl", account_id="12345")],
+            ),
+        ])
+
+        async with runtime:
+            self._bind_agent(runtime, agent)
+            result = await forge_read_issue("test-proj", 7)
+
+        # Title/state/labels stay as plain prose.
+        assert "Issue #7: Bug" in result
+        assert "State: open" in result
+        # Body got wrapped with the matching peer status and a
+        # blockquote rendition.
+        assert "[external-content" in result
+        assert "kind=issue_body" in result
+        assert "peer=yes" in result
+        assert "> Bad things happen." in result
+
+    @pytest.mark.asyncio
+    async def test_forge_read_issue_wraps_with_unknown_peer_status_when_no_registry(
+        self, tmp_path: Path,
+    ) -> None:
+        """An empty peer registry yields ``peer=unknown`` rather than ``peer=no``.
+
+        Reporting NON_PEER on an empty registry would be misleading --
+        "no peers configured" is not the same as "this user is not a
+        peer."
+        """
+        from thorn.tools.forge import forge_read_issue
+
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
+        mock_client.get_issue.return_value = {
+            "id": 1, "title": "T", "state": "open",
+            "url": "https://x", "description": "Body",
+            "labels": [], "assignees": [],
+            "author": {"id": 99, "username": "stranger"},
+            "created_at": "2026-04-30T00:00:00Z",
+        }
+
+        async with runtime:
+            self._bind_agent(runtime, agent)
+            result = await forge_read_issue("test-proj", 1)
+
+        assert "peer=unknown" in result
+
+    @pytest.mark.asyncio
+    async def test_forge_read_issue_labels_non_peer_when_registry_has_others(
+        self, tmp_path: Path,
+    ) -> None:
+        """A registry with peers, but no match for *this* author, yields ``peer=no``."""
+        from thorn.gateway._peer import PeerAccount, PeerRegistry, PeerSpec
+        from thorn.tools.forge import forge_read_issue
+
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
+        mock_client.get_issue.return_value = {
+            "id": 1, "title": "T", "state": "open",
+            "url": "https://x", "description": "Body",
+            "labels": [], "assignees": [],
+            "author": {"id": 99, "username": "stranger"},
+            "created_at": "2026-04-30T00:00:00Z",
+        }
+        runtime.peer_registry = PeerRegistry([
+            PeerSpec(
+                id="someone-else",
+                accounts=[PeerAccount(service="gl", account_id="11111")],
+            ),
+        ])
+
+        async with runtime:
+            self._bind_agent(runtime, agent)
+            result = await forge_read_issue("test-proj", 1)
+
+        assert "peer=no" in result
+
+    @pytest.mark.asyncio
+    async def test_forge_get_change_request_wraps_description(
+        self, tmp_path: Path,
+    ) -> None:
+        from thorn.tools.forge import forge_get_change_request
+
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
+        mock_client.get_change_request.return_value = {
+            "id": 1, "title": "MR", "state": "open",
+            "url": "https://x", "description": "PR body text.",
+            "source_branch": "feat", "target_branch": "main",
+            "author": {"id": 1, "username": "alice"},
+            "created_at": "2026-04-30T00:00:00Z",
+        }
+
+        async with runtime:
+            self._bind_agent(runtime, agent)
+            result = await forge_get_change_request("test-proj", 1)
+
+        assert "[external-content" in result
+        assert "kind=pr_body" in result
+        assert "> PR body text." in result
+
+    @pytest.mark.asyncio
+    async def test_forge_list_comments_wraps_each_comment(
+        self, tmp_path: Path,
+    ) -> None:
+        """Each comment is its own envelope; per-author peer status is independent."""
+        from thorn.gateway._peer import PeerAccount, PeerRegistry, PeerSpec
+        from thorn.tools.forge import forge_list_comments
+
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
+        mock_client.list_comments.return_value = [
+            {
+                "author": "alice",
+                "author_user": {
+                    "id": 12345,
+                    "username": "alice",
+                    "name": "Alice",
+                },
+                "created_at": "2026-04-30T00:00:00Z",
+                "body": "First comment.",
+                "is_system": False,
+            },
+            {
+                "author": "stranger",
+                "author_user": {
+                    "id": 99999,
+                    "username": "stranger",
+                    "name": "Stranger",
+                },
+                "created_at": "2026-04-30T00:01:00Z",
+                "body": "Suspicious comment.",
+                "is_system": False,
+            },
+        ]
+        runtime.peer_registry = PeerRegistry([
+            PeerSpec(
+                id="alice",
+                name="Alice",
+                accounts=[PeerAccount(service="gl", account_id="12345")],
+            ),
+        ])
+
+        async with runtime:
+            self._bind_agent(runtime, agent)
+            result = await forge_list_comments(
+                "test-proj", "Issue", 1,
+            )
+
+        assert result.count("[external-content") == 2
+        # Distinct peer statuses for the two authors.
+        assert "peer=yes" in result
+        assert "peer=no" in result
+        assert "> First comment." in result
+        assert "> Suspicious comment." in result
+
+    @pytest.mark.asyncio
+    async def test_forge_list_comments_no_results_message_unchanged(
+        self, tmp_path: Path,
+    ) -> None:
+        from thorn.tools.forge import forge_list_comments
+
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
+        mock_client.list_comments.return_value = []
+
+        async with runtime:
+            self._bind_agent(runtime, agent)
+            result = await forge_list_comments(
+                "test-proj", "Issue", 42,
+            )
+
+        assert "No comments" in result
+        assert "[external-content" not in result
+
 
 class TestResolveWithAccounts:
     """``_resolve`` (the internal helper underneath every forge tool)

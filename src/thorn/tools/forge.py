@@ -188,6 +188,8 @@ class GitLabForgeClient:
             "description": raw.get("description", ""),
             "labels": raw.get("labels", []),
             "assignees": raw.get("assignees", []),
+            "author": raw.get("author"),
+            "created_at": raw.get("created_at"),
         }
 
     def post_comment(
@@ -236,6 +238,8 @@ class GitLabForgeClient:
             "source_branch": raw["source_branch"],
             "target_branch": raw["target_branch"],
             "merge_status": raw.get("merge_status", ""),
+            "author": raw.get("author"),
+            "created_at": raw.get("created_at"),
         }
 
     def list_change_requests(
@@ -268,6 +272,7 @@ class GitLabForgeClient:
         return [
             {
                 "author": n["author"],
+                "author_user": n.get("author_user"),
                 "created_at": n["created_at"],
                 "body": n["body"],
                 "is_system": n.get("system", False),
@@ -401,6 +406,8 @@ class GitHubForgeClient:
             "description": raw.get("body", ""),
             "labels": raw.get("labels", []),
             "assignees": raw.get("assignees", []),
+            "author": raw.get("author"),
+            "created_at": raw.get("created_at"),
         }
 
     def post_comment(
@@ -443,6 +450,8 @@ class GitHubForgeClient:
             "target_branch": raw["base"],
             "mergeable": raw.get("mergeable"),
             "mergeable_state": raw.get("mergeable_state", ""),
+            "author": raw.get("author"),
+            "created_at": raw.get("created_at"),
         }
 
     def list_change_requests(
@@ -483,6 +492,7 @@ class GitHubForgeClient:
         return [
             {
                 "author": c["author"],
+                "author_user": c.get("author_user"),
                 "created_at": c["created_at"],
                 "body": c["body"],
                 "is_system": c.get("is_bot", False),
@@ -1145,15 +1155,15 @@ class ProjectService(Service):
 # ---------------------------------------------------------------------------
 
 
-def _resolve(project: str) -> tuple[ForgeClient, str]:
-    """Resolve an authenticated ForgeClient + native ID for *project*.
+def _resolve_with_forge_name(project: str) -> tuple[ForgeClient, str, str]:
+    """Like :func:`_resolve` but also returns the forge service name.
 
-    Uses the current agent's :class:`AccountConfig` for the project's
-    forge to authenticate.  Raises a clear ``RuntimeError`` when no
-    matching account is configured -- forge operations now always
-    flow through per-agent credentials, so a missing account is a
-    configuration error rather than something to silently fall
-    through.
+    The forge service name is the same string that
+    ``ActorIdentity.service`` and ``PeerAccount.service`` carry in
+    the gateway's data model, which is what the registry indexes on.
+    Surface it here so the body-wrapping helpers can ask the registry
+    "is this user a peer on `<forge_name>`?" without re-walking the
+    runtime's service graph.
     """
     from thorn.core._account import resolve_account
 
@@ -1192,7 +1202,152 @@ def _resolve(project: str) -> tuple[ForgeClient, str]:
     return (
         forge_svc.authenticated_client(account),
         project_svc.native_id,
+        forge_svc.name,
     )
+
+
+def _actor_from_author(
+    author: Any,
+    *,
+    fallback_login: str | None,
+    service: str,
+) -> Any:
+    """Build an :class:`ActorIdentity` from a forge-adapter author dict.
+
+    The shape that arrives here depends on which forge produced it:
+    GitLab notes carry the raw user dict (``id``, ``username``,
+    ``name``); GitHub comments carry the projection
+    ``{"id", "login", "type"}``.  We accept either and pull out the
+    immutable id (``id``) and textual handle (``login`` /
+    ``username``) defensively.
+
+    Returns ``None`` when *author* is missing or contains no usable
+    handle -- the wrapper helper renders such bodies with
+    ``actor=unknown`` rather than fabricating an identity.
+
+    The :class:`ActorIdentity` import is deferred inside the helper
+    so that ``thorn.tools.forge`` itself does not import any
+    ``thorn.gateway`` module at module load time -- the gateway
+    package re-exports ``thorn.tools.forge`` via
+    ``thorn.gateway._agents``, and a top-level cross import would
+    create a cycle.
+    """
+    from thorn.gateway._actor import ActorIdentity
+
+    if isinstance(author, dict):
+        immutable_id = author.get("id")
+        login = author.get("login") or author.get("username")
+        kind_hint = author.get("type")
+        if immutable_id is None and login is None:
+            return None
+        return ActorIdentity(
+            service=service,
+            account_id=str(immutable_id) if immutable_id is not None else (
+                login or ""
+            ),
+            display_name=author.get("name", "") or "",
+            is_bot=(kind_hint == "Bot") if kind_hint is not None else None,
+            secondary_account_ids=(login,) if login else (),
+        )
+    if fallback_login:
+        return ActorIdentity(
+            service=service,
+            account_id=fallback_login,
+            display_name="",
+            is_bot=None,
+            secondary_account_ids=(),
+        )
+    return None
+
+
+def _peer_status_for(actor: Any) -> Any:
+    """Resolve *actor* against the runtime's peer registry.
+
+    Lives here rather than on the registry because the
+    "no peer registry visible to this code" case is a common /
+    expected one for in-process CLI runs that don't have a gateway.
+    Returns ``PeerStatus.UNKNOWN`` when the registry is empty or
+    when *actor* is ``None``.
+    """
+    from thorn.gateway._envelope import PeerStatus
+
+    if actor is None:
+        return PeerStatus.UNKNOWN
+    ctx = get_context()
+    runtime = ctx.runtime
+    if runtime is None:
+        return PeerStatus.UNKNOWN
+    registry = getattr(runtime, "peer_registry", None)
+    if registry is None:
+        return PeerStatus.UNKNOWN
+    spec = registry.lookup_actor(actor)
+    if spec is not None:
+        return PeerStatus.PEER
+    # Empty registry = "no peers configured"; reporting NON_PEER in
+    # that case would be misleading (no peers means we don't know
+    # whether the actor *would* be one).  An empty registry is
+    # detectable via no entries on the per-service bucket the actor
+    # falls into.
+    if not registry.all_peers():
+        return PeerStatus.UNKNOWN
+    return PeerStatus.NON_PEER
+
+
+def _wrap_authored_body(
+    *,
+    body: str,
+    author: Any,
+    fallback_login: str | None,
+    service: str,
+    kind: str,
+    timestamp: Any,
+) -> str:
+    """Render *body* inside an ``[external-content]`` envelope.
+
+    Single source of truth for forge-tool body wrapping: builds an
+    :class:`ActorIdentity`, resolves peer status against the active
+    registry, and delegates to :func:`wrap_external` so the envelope
+    shape matches what the gateway-side notification formatter
+    produces.  Empty / missing bodies are still wrapped (the envelope
+    body becomes a "(no body)" line); the data-vs-instruction rule
+    holds for a literal "this comment has no body" case the same way
+    it would for any other quoted content.
+    """
+    from thorn.gateway._envelope import wrap_external
+
+    actor = _actor_from_author(
+        author, fallback_login=fallback_login, service=service,
+    )
+    peer_status = _peer_status_for(actor)
+    ts = ""
+    if timestamp:
+        ts = (
+            timestamp.isoformat()
+            if hasattr(timestamp, "isoformat")
+            else str(timestamp)
+        )
+    # ``wrap_external`` already renders an empty body as a "(no body)"
+    # blockquote line, so we pass the raw value through unchanged
+    # rather than substituting a sentinel here.
+    return wrap_external(
+        body=body or "",
+        actor=actor,
+        source=service,
+        kind=kind,
+        peer_status=peer_status,
+        timestamp=ts,
+    )
+
+
+def _resolve(project: str) -> tuple[ForgeClient, str]:
+    """Resolve an authenticated ForgeClient + native ID for *project*.
+
+    Convenience wrapper around :func:`_resolve_with_forge_name` for
+    call sites that don't need the forge service name (most tools
+    don't -- only the user-authored-body wrappers do).
+    """
+    client, native_id, _forge_name = _resolve_with_forge_name(project)
+    return client, native_id
 
 
 @tool
@@ -1201,9 +1356,24 @@ async def forge_read_issue(project: str, issue_id: int) -> str:
 
     *project* is the name of the project service.  *issue_id* is the
     issue number within the project.
+
+    The issue's description (the user-authored body) is wrapped in an
+    ``[external-content]`` envelope so the agent's data-vs-instruction
+    rule applies the same way it does for an issue body that arrives
+    via a notification.  Metadata fields (state, labels, assignees,
+    URL) are not wrapped because they are platform-controlled
+    structured data, not free-form text.
     """
-    client, native_id = _resolve(project)
+    client, native_id, forge_name = _resolve_with_forge_name(project)
     info = await asyncio.to_thread(client.get_issue, native_id, issue_id)
+    wrapped_body = _wrap_authored_body(
+        body=info.get("description") or "",
+        author=info.get("author"),
+        fallback_login=None,
+        service=forge_name,
+        kind="issue_body",
+        timestamp=info.get("created_at"),
+    )
     lines = [
         f"Issue #{info['id']}: {info['title']}",
         f"State: {info['state']}",
@@ -1211,7 +1381,7 @@ async def forge_read_issue(project: str, issue_id: int) -> str:
         f"Assignees: {', '.join(info.get('assignees', [])) or '(none)'}",
         f"URL: {info['url']}",
         "",
-        info.get("description") or "(no description)",
+        wrapped_body,
     ]
     return "\n".join(lines)
 
@@ -1389,11 +1559,22 @@ async def forge_create_change_request(
 async def forge_get_change_request(project: str, cr_id: int) -> str:
     """Read details of a change request (merge request / pull request).
 
-    Returns the title, state, branches, and description.
+    Returns the title, state, branches, and description.  The
+    description (the user-authored body) is wrapped in an
+    ``[external-content]`` envelope; structural metadata (branches,
+    state, URL) is left as plain prose.
     """
-    client, native_id = _resolve(project)
+    client, native_id, forge_name = _resolve_with_forge_name(project)
     info = await asyncio.to_thread(
         client.get_change_request, native_id, cr_id,
+    )
+    wrapped_body = _wrap_authored_body(
+        body=info.get("description") or "",
+        author=info.get("author"),
+        fallback_login=None,
+        service=forge_name,
+        kind="pr_body",
+        timestamp=info.get("created_at"),
     )
     lines = [
         f"Change request #{info['id']}: {info['title']}",
@@ -1401,7 +1582,7 @@ async def forge_get_change_request(project: str, cr_id: int) -> str:
         f"Branches: {info['source_branch']} -> {info['target_branch']}",
         f"URL: {info['url']}",
         "",
-        info.get("description") or "(no description)",
+        wrapped_body,
     ]
     return "\n".join(lines)
 
@@ -1444,8 +1625,15 @@ async def forge_list_comments(
     *target_type* must be ``"Issue"`` or ``"ChangeRequest"``.
     Set *include_system* to ``True`` to also show auto-generated
     comments (label changes, bot comments, etc.).
+
+    Each comment body is wrapped in an ``[external-content]``
+    envelope with the author's peer status (``yes`` / ``no`` /
+    ``unknown``).  This is the consistency point for the
+    data-vs-instruction rule: an agent that re-reads a thread via
+    this tool sees comments labelled the same way it does when they
+    arrive as notifications.
     """
-    client, native_id = _resolve(project)
+    client, native_id, forge_name = _resolve_with_forge_name(project)
     comments = await asyncio.to_thread(
         client.list_comments, native_id, target_type, target_id,
     )
@@ -1460,10 +1648,17 @@ async def forge_list_comments(
 
     lines: list[str] = []
     for c in comments:
-        lines.append(f"[{c['author']}] ({c['created_at']}):")
-        lines.append(c["body"])
+        wrapped = _wrap_authored_body(
+            body=c.get("body") or "",
+            author=c.get("author_user"),
+            fallback_login=c.get("author"),
+            service=forge_name,
+            kind="comment",
+            timestamp=c.get("created_at"),
+        )
+        lines.append(wrapped)
         lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 @tool

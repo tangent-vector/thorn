@@ -13,7 +13,13 @@ import pytest
 from thorn.core._agent import Agent
 from thorn.core._provider import MockProvider
 from thorn.core._session import Session, _SessionPromptAccessor
-from thorn.gateway._event import EventSource, IncomingEvent
+from thorn.gateway._event import (
+    EventKind,
+    EventSource,
+    FormattedEvent,
+    IncomingEvent,
+    RawIncomingEvent,
+)
 from thorn.gateway._gateway import Gateway
 from thorn.gateway._routing import NoteableKind
 from thorn.runtime import AgentID, Runtime, SessionKey
@@ -78,6 +84,32 @@ class TestIncomingEvent:
 # ---------------------------------------------------------------------------
 
 
+def _formatted_to_raw_system(event: FormattedEvent) -> RawIncomingEvent:
+    """Wrap a fully-formatted ``FormattedEvent`` as a SYSTEM ``RawIncomingEvent``.
+
+    Tests that pre-date the actor/peer refactor build complete
+    ``FormattedEvent`` (``IncomingEvent``) shapes and feed them into a
+    stub source.  ``EventSource.start`` now expects a callback that
+    takes :class:`RawIncomingEvent`, and the gateway-side formatter
+    runs on every raw event.  Wrapping the legacy ``FormattedEvent``
+    as a ``EventKind.SYSTEM`` raw event makes the formatter a no-op
+    pass-through (system events are always delivered, with the
+    ``content`` of the resulting :class:`FormattedEvent` equal to the
+    rendered ``summary``).  Tests that care about envelope wrapping
+    or peer-status labelling should construct ``RawIncomingEvent``
+    instances directly.
+    """
+    return RawIncomingEvent(
+        source=event.source,
+        session_key=event.session_key,
+        kind=EventKind.SYSTEM,
+        summary=event.content,
+        metadata=dict(event.metadata),
+        external_key=event.external_key,
+        agent_id=event.agent_id,
+    )
+
+
 class StubSource(EventSource):
     """EventSource that emits a fixed list of events, then stops."""
 
@@ -93,12 +125,12 @@ class StubSource(EventSource):
 
     async def start(
         self,
-        on_event: Callable[[IncomingEvent], Awaitable[None]],
+        on_event: Callable[[RawIncomingEvent], Awaitable[None]],
     ) -> None:
         for event in self._events:
             if self._stop.is_set():
                 break
-            await on_event(event)
+            await on_event(_formatted_to_raw_system(event))
         self._stop.set()
 
     async def stop(self) -> None:
@@ -119,7 +151,7 @@ class SlowSource(EventSource):
 
     async def start(
         self,
-        on_event: Callable[[IncomingEvent], Awaitable[None]],
+        on_event: Callable[[RawIncomingEvent], Awaitable[None]],
     ) -> None:
         await self._stop.wait()
 
@@ -522,8 +554,8 @@ class TestGateway:
             ):
                 t0 = asyncio.get_event_loop().time()
                 await asyncio.gather(
-                    gateway._handle_event(event_a),
-                    gateway._handle_event(event_b),
+                    gateway._dispatch_formatted(event_a),
+                    gateway._dispatch_formatted(event_b),
                 )
                 total = asyncio.get_event_loop().time() - t0
 
@@ -1000,7 +1032,7 @@ class TestGatewayInboxIntegration:
             # source so we control timing).
             while not gateway._started:  # type: ignore[attr-defined]
                 await asyncio.sleep(0.01)
-            await gateway._handle_event(event)
+            await gateway._dispatch_formatted(event)
 
             errored_dir = runtime.paths.session_inbox_errored_dir(
                 agent_id, key,
@@ -1136,7 +1168,7 @@ class TestGatewayInboxIntegration:
                 agent_id=agent_id,
                 external_key="gitlab:example:todo:42",
             )
-            await gateway._handle_event(duplicate)
+            await gateway._dispatch_formatted(duplicate)
 
             # No agent was persisted, no session created, no inbox
             # registered -- the gateway short-circuited before any
@@ -1168,7 +1200,7 @@ class TestGatewayInboxIntegration:
                 agent_id=agent_id,
                 external_key="gitlab:example:todo:99",
             )
-            await gateway._handle_event(event)
+            await gateway._dispatch_formatted(event)
 
             assert runtime.sessions.session_exists(agent_id, key)
             assert "gitlab:example:todo:99" in runtime.in_flight_index
@@ -1188,6 +1220,7 @@ def _make_mock_todo(
     noteable_iid: int = 42,
     action_name: str = "mentioned",
     body: str = "Hey @thorn-bot, look at this!",
+    author: dict | None = None,
 ) -> MagicMock:
     todo = MagicMock()
     todo.id = todo_id
@@ -1202,6 +1235,11 @@ def _make_mock_todo(
     todo.target = {"iid": noteable_iid}
     todo.action_name = action_name
     todo.body = body
+    # ``author=None`` by default so tests that pre-date the actor
+    # capture refactor still produce events with ``primary_actor=None``
+    # and don't accidentally pick up MagicMock-shaped attributes.
+    todo.author = author
+    todo.created_at = ""
     return todo
 
 
@@ -1215,7 +1253,8 @@ class TestGitLabTODOsSourceEventFormatting:
         assert isinstance(key, SessionKey)
 
     def test_make_event(self):
-        from thorn.gateway.sources._gitlab import _make_event
+        from thorn.gateway._event import EventKind
+        from thorn.gateway.sources._gitlab import _make_raw_event
 
         todo = _make_mock_todo(
             todo_id=99,
@@ -1225,14 +1264,19 @@ class TestGitLabTODOsSourceEventFormatting:
             action_name="mentioned",
             body="Please help",
         )
-        event = _make_event(todo)
+        event = _make_raw_event(todo)
 
         assert event.source == "gitlab"
         assert event.session_key == SessionKey("gitlab/123/issue/42")
-        assert "mentioned" in event.content
-        assert "Issue #42" in event.content
-        assert "Please help" in event.content
-        assert "forge_mark_notification_done" not in event.content
+        assert event.kind is EventKind.CONVERSATIONAL
+        # The summary carries harness-controlled prose; body text is
+        # in items, not summary.
+        assert "mentioned" in event.summary
+        assert "Issue #42" in event.summary
+        assert "Please help" not in event.summary
+        # Body lives on the first context item.
+        assert len(event.items) == 1
+        assert event.items[0].body == "Please help"
         assert event.metadata["todo_id"] == 99
         assert event.metadata["project_id"] == 123
         assert event.metadata["clone_url"] == "https://gitlab.example.com/org/repo.git"
@@ -1270,45 +1314,67 @@ class TestGitLabTODOsSourceEventFormatting:
         assert key == SessionKey("lace/change-request/7")
 
     def test_make_event_with_project_name(self):
-        from thorn.gateway.sources._gitlab import _make_event
+        from thorn.gateway.sources._gitlab import _make_raw_event
 
         todo = _make_mock_todo(
             todo_id=99, project_id=123, noteable_type="Issue",
             noteable_iid=42, action_name="mentioned",
         )
-        event = _make_event(todo, project_id_to_name={"123": "my-proj"})
+        event = _make_raw_event(todo, project_id_to_name={"123": "my-proj"})
         assert event.session_key == SessionKey("my-proj/issue/42")
         assert event.metadata["project_name"] == "my-proj"
 
     def test_make_event_unknown_project_falls_back(self):
-        from thorn.gateway.sources._gitlab import _make_event
+        from thorn.gateway.sources._gitlab import _make_raw_event
 
         todo = _make_mock_todo(
             todo_id=99, project_id=999, noteable_type="Issue", noteable_iid=1,
         )
-        event = _make_event(todo, project_id_to_name={"123": "other"})
+        event = _make_raw_event(todo, project_id_to_name={"123": "other"})
         assert event.session_key == SessionKey("gitlab/999/issue/1")
         assert event.metadata["project_name"] == ""
 
-    def test_format_event_content_includes_project_info(self):
-        from thorn.gateway.sources._gitlab import _format_event_content
+    def test_summary_includes_project_info(self):
+        from thorn.gateway.sources._gitlab import _make_summary
 
         todo = _make_mock_todo()
-        content = _format_event_content(todo)
-        assert "forge_mark_notification_done" not in content
-        assert "marked done on your behalf" in content
-        assert "Clone URL:" in content
-        assert "Default branch:" in content
-        assert "Project URL:" in content
+        summary = _make_summary(todo)
+        assert "marked done on your behalf" in summary
+        assert "Clone URL:" in summary
+        assert "Default branch:" in summary
+        assert "Project URL:" in summary
+
+    def test_make_event_captures_actor_from_author(self):
+        from thorn.gateway.sources._gitlab import _make_raw_event
+
+        todo = _make_mock_todo(
+            author={"id": 7, "username": "alice", "name": "Alice", "bot": False},
+        )
+        event = _make_raw_event(todo, forge_name="gitlab.example.com")
+        assert event.primary_actor is not None
+        assert event.primary_actor.service == "gitlab.example.com"
+        assert event.primary_actor.account_id == "7"
+        assert "alice" in event.primary_actor.secondary_account_ids
+        assert event.primary_actor.is_bot is False
+
+    def test_make_event_flags_bot_authors(self):
+        from thorn.gateway.sources._gitlab import _make_raw_event
+
+        todo = _make_mock_todo(
+            author={"id": 99, "username": "ops-bot", "name": "Ops", "bot": True},
+        )
+        event = _make_raw_event(todo)
+        assert event.primary_actor is not None
+        assert event.primary_actor.is_bot is True
 
     def test_make_event_sets_namespaced_external_key(self):
-        from thorn.gateway.sources._gitlab import _make_event
+        from thorn.gateway.sources._gitlab import _make_raw_event
 
         todo = _make_mock_todo(
             todo_id=99, project_id=123, noteable_type="Issue",
             noteable_iid=42, action_name="mentioned",
         )
-        event = _make_event(
+        event = _make_raw_event(
             todo, gitlab_url="https://gitlab.example.com",
         )
         # Key must be source-namespaced and unique per TODO so the
@@ -1692,8 +1758,14 @@ class TestProjectCoordinator:
         from thorn.gateway._agents import ProjectCoordinator
 
         prompts = ProjectCoordinator._collect_system_prompts()
-        assert len(prompts) >= 1
-        assert "project coordinator" in prompts[0].lower()
+        # ``ProjectCoordinator`` carries at least the universal
+        # gateway-agent trust-model prompt and its own role-specific
+        # prompt; the role-specific one is the one that names the
+        # role.  We don't pin the index because additional universal
+        # prompts may be added in front of it later.
+        assert len(prompts) >= 2
+        joined = "\n".join(p for p in prompts if isinstance(p, str)).lower()
+        assert "project coordinator" in joined
 
     def test_has_forge_tools(self):
         from thorn.gateway._agents import ProjectCoordinator
@@ -1865,18 +1937,18 @@ class TestEndToEndWiring:
 
     @pytest.mark.asyncio
     async def test_event_content_includes_project_metadata(self):
-        from thorn.gateway.sources._gitlab import _format_event_content
+        from thorn.gateway.sources._gitlab import _make_summary
 
         todo = _make_mock_todo(
             project_id=999,
             noteable_type="Issue",
             noteable_iid=5,
         )
-        content = _format_event_content(todo)
+        summary = _make_summary(todo)
 
-        assert "Clone URL:" in content
-        assert "Default branch:" in content
-        assert "marked done on your behalf" in content
+        assert "Clone URL:" in summary
+        assert "Default branch:" in summary
+        assert "marked done on your behalf" in summary
 
 
 # ---------------------------------------------------------------------------
@@ -3726,11 +3798,11 @@ class TestExtractNoteableFromNotification:
         assert result is None
 
 
-class TestFormatNotificationContent:
+class TestMakeSummary:
     def test_includes_key_fields(self):
-        from thorn.gateway.sources._github import _format_notification_content
+        from thorn.gateway.sources._github import _make_summary
 
-        content = _format_notification_content(
+        summary = _make_summary(
             repo_full_name="owner/repo",
             repo_id=42,
             clone_url="https://github.com/owner/repo.git",
@@ -3741,20 +3813,18 @@ class TestFormatNotificationContent:
             reason="mention",
             thread_id="100",
             updated_at="2026-04-15T10:00:00Z",
-            comment_body="Please fix this ASAP",
         )
-        assert "mention" in content
-        assert "owner/repo" in content
-        assert "Fix the bug" in content
-        assert "100" in content
-        assert "Please fix this ASAP" in content
-        assert "Clone URL:" in content
-        assert "marked read on your behalf" in content
+        assert "mention" in summary
+        assert "owner/repo" in summary
+        assert "Fix the bug" in summary
+        assert "100" in summary
+        assert "Clone URL:" in summary
+        assert "marked read on your behalf" in summary
 
-    def test_empty_comment(self):
-        from thorn.gateway.sources._github import _format_notification_content
+    def test_no_body_in_summary(self):
+        from thorn.gateway.sources._github import _make_summary
 
-        content = _format_notification_content(
+        summary = _make_summary(
             repo_full_name="owner/repo",
             repo_id=42,
             clone_url="",
@@ -3765,54 +3835,65 @@ class TestFormatNotificationContent:
             reason="review_requested",
             thread_id="200",
             updated_at="2026-04-15T11:00:00Z",
-            comment_body="",
         )
-        assert "Comment body:" not in content
-        assert "review_requested" in content
+        # The summary intentionally never includes attacker-
+        # controlled body text -- that goes through the envelope
+        # via context items.
+        assert "Comment body:" not in summary
+        assert "review_requested" in summary
 
 
 class TestMakeIncomingEvent:
     def test_issue_notification(self):
-        from thorn.gateway.sources._github import _make_incoming_event
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
 
         thread = _make_notification_thread()
-        event = _make_incoming_event(
+        event = _make_raw_event(
             thread=thread,
-            comment_body="Hello",
+            comment_info=_LatestCommentInfo(body="Hello"),
             native_id_to_project_name={"owner/repo": "my-proj"},
         )
         assert event.source == "github"
         assert event.session_key == SessionKey("my-proj/issue/7")
-        assert "Hello" in event.content
+        assert event.items[0].body == "Hello"
         assert event.metadata["notification_id"] == "100"
         assert event.metadata["reason"] == "mention"
         assert event.metadata["repo_full_name"] == "owner/repo"
         assert event.metadata["project_name"] == "my-proj"
 
     def test_pull_request_notification(self):
-        from thorn.gateway.sources._github import _make_incoming_event
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
 
         thread = _make_notification_thread(
             subject_type="PullRequest",
             subject_url="https://api.github.com/repos/owner/repo/pulls/3",
         )
-        event = _make_incoming_event(
+        event = _make_raw_event(
             thread=thread,
-            comment_body="",
+            comment_info=_LatestCommentInfo(),
             native_id_to_project_name={},
         )
         assert event.session_key == SessionKey("github/42/change-request/3")
 
     def test_unknown_subject_type_uses_fallback_key(self):
-        from thorn.gateway.sources._github import _make_incoming_event
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
 
         thread = _make_notification_thread(
             subject_type="Commit",
             subject_url="https://api.github.com/repos/owner/repo/commits/abc",
         )
-        event = _make_incoming_event(
+        event = _make_raw_event(
             thread=thread,
-            comment_body="",
+            comment_info=_LatestCommentInfo(),
             native_id_to_project_name={},
         )
         assert event.session_key == SessionKey("github/42/commit/100")
@@ -3966,7 +4047,10 @@ class TestGitHubNotificationsSource:
         ev = events_received[0]
         assert ev.metadata["notification_id"] == "2"
         assert ev.metadata["reason"] == "assign"
-        assert "comment text" in ev.content
+        # Body text is in the items, not a pre-rendered ``content``
+        # field on the raw event; the formatter wraps each item in
+        # an envelope and renders the final ``content`` downstream.
+        assert any("comment text" in item.body for item in ev.items)
         assert patch_calls == [
             "/notifications/threads/1",
             "/notifications/threads/2",

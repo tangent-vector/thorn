@@ -76,6 +76,7 @@ from pydantic import BaseModel, Field, model_validator
 from thorn.core._credentials import ServiceCredential
 from thorn.core._service import Service
 from thorn.gateway._event import EventSource
+from thorn.gateway._peer import PeerSpec
 
 log = logging.getLogger(__name__)
 
@@ -348,6 +349,20 @@ class ForgeSpec(BaseModel):
         default=30,
         ge=5,
         description="Seconds between event polling cycles",
+    )
+    deliver_structural_from_non_peers: bool = Field(
+        default=True,
+        description=(
+            "When True (the default), structural events from "
+            "non-peer actors on this forge are delivered to the "
+            "agent with a non-peer banner.  When False, they are "
+            "dropped at the gateway boundary.  The trigger-"
+            "authorization policy uses this knob to honour the "
+            "carve-out described in the threat-model docs: a new "
+            "issue from a non-peer is high-signal context the "
+            "agent should usually know about, but operators of "
+            "strict-trust deployments can opt out per forge."
+        ),
     )
 
     @model_validator(mode="after")
@@ -1088,6 +1103,19 @@ class GatewayConfig(BaseModel):
     )
     forges: list[ForgeSpec] = Field(default_factory=list)
     projects: list[ProjectSpec] = Field(default_factory=list)
+    peers: list[PeerSpec] = Field(
+        default_factory=list,
+        description=(
+            "Operator-declared list of peers -- humans and bots whose "
+            "messages the gateway is willing to treat as instructions "
+            "for an agent.  An empty list means strict trust: every "
+            "conversational event from anyone other than the agent "
+            "itself is dropped at the event boundary, and every "
+            "structural event renders with a non-peer banner.  See "
+            "the threat-model docs for details on what peerhood "
+            "actually grants."
+        ),
+    )
     sandbox: SandboxConfig | None = Field(
         default=None,
         description=(
@@ -1142,7 +1170,49 @@ class GatewayConfig(BaseModel):
             self.sandbox = SandboxConfig()
         if self.broker is None and self.sandbox.backend == "container":
             self.broker = BrokerConfig(mode="bundled")
+        self._validate_peers()
         return self
+
+    def _validate_peers(self) -> None:
+        """Cross-check ``peers`` against the rest of the config.
+
+        - Peer ids must be unique within the gateway.
+        - Each ``PeerAccount.service`` must reference a declared
+          ``forges[].name`` (other service categories will join this
+          set as they grow).
+        - A peer with zero accounts is allowed (the operator may be
+          mid-edit) but warned about, since no events will ever match.
+
+        Validation lives in the GatewayConfig validator -- not in
+        ``PeerSpec`` itself -- because the cross-cutting checks
+        require the rest of the config to be visible.
+        """
+        seen_ids: set[str] = set()
+        for peer in self.peers:
+            if peer.id in seen_ids:
+                raise ValueError(
+                    f"Duplicate peer id {peer.id!r} in gateway.peers; "
+                    "peer ids must be unique within the gateway."
+                )
+            seen_ids.add(peer.id)
+
+        known_services = {f.name for f in self.forges}
+        for peer in self.peers:
+            for account in peer.accounts:
+                if account.service not in known_services:
+                    raise ValueError(
+                        f"Peer {peer.id!r} has an account on service "
+                        f"{account.service!r}, but no `forges[].name` "
+                        "in this gateway matches.  Either add a "
+                        "matching forge entry or correct the peer's "
+                        "account.service."
+                    )
+            if not peer.accounts:
+                log.warning(
+                    "Peer %r has no accounts declared; no incoming "
+                    "events will match this peer until at least one "
+                    "account is added.", peer.id,
+                )
 
     def resolve_workspace(self, agency_home: Path) -> Path | None:
         """Resolve the configured workspace path against *agency_home*.
@@ -1755,6 +1825,7 @@ def _create_github_source(
         base_url=forge_spec.api_url,
         poll_interval=forge_spec.poll_interval,
         native_id_to_project_name=native_id_to_project_name,
+        forge_name=forge_spec.name,
     )
     source = GitHubNotificationsSource(cfg, service_name=source_name)
     log.info(
@@ -1793,6 +1864,7 @@ def _create_gitlab_source(
         token=token,
         poll_interval=forge_spec.poll_interval,
         project_id_to_name=native_id_to_project_name,
+        forge_name=forge_spec.name,
     )
     source = GitLabTODOsSource(cfg, service_name=source_name)
     log.info(

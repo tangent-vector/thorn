@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from thorn.gateway._event import IncomingEvent
+from thorn.gateway._event import EventKind, RawIncomingEvent
 from thorn.gateway._routing import NoteableKind
 from thorn.runtime import SessionKey
 
@@ -55,6 +55,28 @@ def _make_notification_thread(
         "url": f"https://api.github.com/notifications/threads/{thread_id}",
         "subscription_url": f"https://api.github.com/notifications/threads/{thread_id}/subscription",
     }
+
+
+def _comment_payload(
+    *,
+    body: str = "comment text",
+    user_id: int | None = 12345,
+    user_login: str = "stranger",
+    user_type: str | None = "User",
+    created_at: str = "2026-04-15T09:30:00Z",
+) -> dict[str, Any]:
+    """Build a minimal GitHub comment / issue payload for tests."""
+    payload: dict[str, Any] = {"body": body, "created_at": created_at}
+    if user_id is not None or user_login or user_type is not None:
+        user: dict[str, Any] = {}
+        if user_id is not None:
+            user["id"] = user_id
+        if user_login:
+            user["login"] = user_login
+        if user_type is not None:
+            user["type"] = user_type
+        payload["user"] = user
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -126,72 +148,160 @@ class TestExtractNoteableFromNotification:
 
 
 # ---------------------------------------------------------------------------
-# _make_incoming_event
+# _make_raw_event
 # ---------------------------------------------------------------------------
 
 
-class TestMakeIncomingEvent:
+class TestMakeRawEvent:
     def test_metadata(self) -> None:
-        from thorn.gateway.sources._github import _make_incoming_event
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
 
         thread = _make_notification_thread()
-        ev = _make_incoming_event(
+        ev = _make_raw_event(
             thread=thread,
-            comment_body="Please fix this",
+            comment_info=_LatestCommentInfo(
+                body="Please fix this",
+                user={"id": 7, "login": "stranger", "type": "User"},
+                created_at="2026-04-15T09:00:00Z",
+            ),
             native_id_to_project_name={},
             base_url="https://api.github.com",
         )
         assert ev.source == "github"
+        assert ev.kind is EventKind.CONVERSATIONAL  # reason="mention"
         assert ev.metadata["notification_id"] == "100"
         assert ev.metadata["reason"] == "mention"
         assert ev.metadata["repo_id"] == 456
         assert ev.metadata["repo_full_name"] == "octocat/hello-world"
-        assert "Please fix this" in ev.content
+        # The summary carries harness-controlled prose; the body
+        # is *not* in the summary -- that is in items[0].
+        assert "Please fix this" not in ev.summary
+        assert "marked read on your behalf" in ev.summary
+        # Body lives on the first context item.
+        assert len(ev.items) == 1
+        assert ev.items[0].body == "Please fix this"
         # Source-namespaced external_key keyed on the API base URL,
         # the notification thread id, *and* the thread's
-        # ``updated_at`` snapshot -- this is what the InFlightIndex
-        # consults for cross-poll and cross-restart deduplication.
-        # Including ``updated_at`` ensures that two genuinely distinct
-        # events on the same thread (which share a stable thread ID
-        # but have different ``updated_at`` values) are treated as
-        # distinct logical notifications.
+        # ``updated_at`` snapshot.  Including ``updated_at`` ensures
+        # that two genuinely distinct events on the same thread
+        # (which share a stable thread ID but have different
+        # ``updated_at`` values) are treated as distinct logical
+        # notifications.
         assert ev.external_key == (
             "github:https://api.github.com:thread:100:updated:2026-04-15T10:00:00Z"
         )
-        # The content no longer instructs the agent to close out the
-        # notification itself: the source marks the thread read on
-        # GitHub at post time.
-        assert "forge_mark_notification_done" not in ev.content
-        assert "marked read on your behalf" in ev.content
+
+    def test_actor_captured_from_comment(self) -> None:
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
+
+        thread = _make_notification_thread()
+        ev = _make_raw_event(
+            thread=thread,
+            comment_info=_LatestCommentInfo(
+                body="hi",
+                user={"id": 12345, "login": "stranger", "type": "User"},
+                created_at="2026-04-15T09:00:00Z",
+            ),
+            native_id_to_project_name={},
+            forge_name="github",
+        )
+        actor = ev.primary_actor
+        assert actor is not None
+        assert actor.service == "github"
+        assert actor.account_id == "12345"
+        assert "stranger" in actor.secondary_account_ids
+        assert actor.is_bot is False
+
+    def test_bot_actor_is_flagged(self) -> None:
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
+
+        thread = _make_notification_thread()
+        ev = _make_raw_event(
+            thread=thread,
+            comment_info=_LatestCommentInfo(
+                body="bleep",
+                user={"id": 99, "login": "dependabot[bot]", "type": "Bot"},
+                created_at="",
+            ),
+            native_id_to_project_name={},
+        )
+        assert ev.primary_actor is not None
+        assert ev.primary_actor.is_bot is True
+
+    def test_no_user_yields_none_actor(self) -> None:
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
+
+        thread = _make_notification_thread()
+        ev = _make_raw_event(
+            thread=thread,
+            comment_info=_LatestCommentInfo(body="no user here", user=None),
+            native_id_to_project_name={},
+        )
+        assert ev.primary_actor is None
+
+    def test_reason_subscribed_classifies_as_structural(self) -> None:
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
+
+        thread = _make_notification_thread(reason="subscribed")
+        ev = _make_raw_event(
+            thread=thread,
+            comment_info=_LatestCommentInfo(),
+            native_id_to_project_name={},
+        )
+        assert ev.kind is EventKind.STRUCTURAL
 
     def test_issue_routes_to_issue_session(self) -> None:
-        from thorn.gateway.sources._github import _make_incoming_event
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
 
         thread = _make_notification_thread(repo_id=42)
-        ev = _make_incoming_event(
+        ev = _make_raw_event(
             thread=thread,
-            comment_body="",
+            comment_info=_LatestCommentInfo(),
             native_id_to_project_name={},
         )
         assert ev.session_key == SessionKey("github/42/issue/7")
 
     def test_pull_request_routes_to_change_request_session(self) -> None:
-        from thorn.gateway.sources._github import _make_incoming_event
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
 
         thread = _make_notification_thread(
             repo_id=42,
             subject_type="PullRequest",
             subject_url="https://api.github.com/repos/o/r/pulls/3",
         )
-        ev = _make_incoming_event(
+        ev = _make_raw_event(
             thread=thread,
-            comment_body="",
+            comment_info=_LatestCommentInfo(),
             native_id_to_project_name={},
         )
         assert ev.session_key == SessionKey("github/42/change-request/3")
 
     def test_commit_uses_per_thread_key(self) -> None:
-        from thorn.gateway.sources._github import _make_incoming_event
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
 
         thread = _make_notification_thread(
             thread_id="t999",
@@ -199,32 +309,38 @@ class TestMakeIncomingEvent:
             subject_type="Commit",
             subject_url="https://api.github.com/repos/o/r/commits/abc",
         )
-        ev = _make_incoming_event(
+        ev = _make_raw_event(
             thread=thread,
-            comment_body="",
+            comment_info=_LatestCommentInfo(),
             native_id_to_project_name={},
         )
         assert ev.session_key == SessionKey("github/42/commit/t999")
 
     def test_project_name_in_session_key(self) -> None:
-        from thorn.gateway.sources._github import _make_incoming_event
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
 
         thread = _make_notification_thread(repo_id=42)
-        ev = _make_incoming_event(
+        ev = _make_raw_event(
             thread=thread,
-            comment_body="",
+            comment_info=_LatestCommentInfo(),
             native_id_to_project_name={"octocat/hello-world": "my-proj"},
         )
         assert ev.session_key == SessionKey("my-proj/issue/7")
         assert ev.metadata["project_name"] == "my-proj"
 
     def test_empty_project_name_uses_legacy_key(self) -> None:
-        from thorn.gateway.sources._github import _make_incoming_event
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
 
         thread = _make_notification_thread(repo_id=42)
-        ev = _make_incoming_event(
+        ev = _make_raw_event(
             thread=thread,
-            comment_body="",
+            comment_info=_LatestCommentInfo(),
             native_id_to_project_name={},
         )
         assert ev.session_key == SessionKey("github/42/issue/7")
@@ -239,8 +355,8 @@ class TestGitHubNotificationsSourceFetchNewNotifications:
     """Exercise :meth:`GitHubNotificationsSource._fetch_new_notifications` directly.
 
     The source no longer maintains client-side dedup state -- it
-    returns one ``IncomingEvent`` per currently-unread thread on every
-    poll.  "Already processed" is tracked server-side via the
+    returns one ``RawIncomingEvent`` per currently-unread thread on
+    every poll.  "Already processed" is tracked server-side via the
     Notifications API's read/unread bit (see the startup-drain test
     below and the ``_poll_once`` mark-read tests).
     """
@@ -268,7 +384,7 @@ class TestGitHubNotificationsSourceFetchNewNotifications:
                 resp = MagicMock()
                 resp.status_code = 200
                 resp.raise_for_status = MagicMock()
-                resp.json.return_value = {"body": "comment text"}
+                resp.json.return_value = _comment_payload()
                 return resp
 
             resp = MagicMock()
@@ -388,7 +504,7 @@ class TestGitHubNotificationsSourceDrainExistingUnread:
                 resp = MagicMock()
                 resp.status_code = 200
                 resp.raise_for_status = MagicMock()
-                resp.json.return_value = {"body": "new comment"}
+                resp.json.return_value = _comment_payload(body="new comment")
                 return resp
             resp = MagicMock()
             resp.status_code = 200
@@ -416,7 +532,10 @@ class TestGitHubNotificationsSourceDrainExistingUnread:
 
 class TestGitHubExternalKey:
     def test_external_key_includes_updated_at(self) -> None:
-        from thorn.gateway.sources._github import _make_incoming_event
+        from thorn.gateway.sources._github import (
+            _LatestCommentInfo,
+            _make_raw_event,
+        )
 
         thread_v1 = _make_notification_thread(
             thread_id="111", updated_at="2026-04-15T10:00:00Z",
@@ -425,15 +544,15 @@ class TestGitHubExternalKey:
             thread_id="111", updated_at="2026-04-15T12:00:00Z",
         )
 
-        ev_v1 = _make_incoming_event(
+        ev_v1 = _make_raw_event(
             thread=thread_v1,
-            comment_body="",
+            comment_info=_LatestCommentInfo(),
             native_id_to_project_name={},
             base_url="https://api.github.com",
         )
-        ev_v2 = _make_incoming_event(
+        ev_v2 = _make_raw_event(
             thread=thread_v2,
-            comment_body="",
+            comment_info=_LatestCommentInfo(),
             native_id_to_project_name={},
             base_url="https://api.github.com",
         )
@@ -468,7 +587,7 @@ class TestGitHubNotificationsSourcePollOnce:
         comment_resp = MagicMock()
         comment_resp.status_code = 200
         comment_resp.raise_for_status = MagicMock()
-        comment_resp.json.return_value = {"body": "comment"}
+        comment_resp.json.return_value = _comment_payload(body="comment")
 
         patch_resp = MagicMock()
         patch_resp.status_code = 205
@@ -485,7 +604,7 @@ class TestGitHubNotificationsSourcePollOnce:
             patch_calls.append(url)
             return patch_resp
 
-        async def on_event(_event: IncomingEvent) -> None:
+        async def on_event(_event: RawIncomingEvent) -> None:
             pass
 
         with (
@@ -517,7 +636,7 @@ class TestGitHubNotificationsSourcePollOnce:
         comment_resp = MagicMock()
         comment_resp.status_code = 200
         comment_resp.raise_for_status = MagicMock()
-        comment_resp.json.return_value = {"body": "comment"}
+        comment_resp.json.return_value = _comment_payload(body="comment")
 
         def mock_get(url: str, **kwargs: Any) -> MagicMock:
             if "/issues/comments/" in url:
@@ -526,7 +645,7 @@ class TestGitHubNotificationsSourcePollOnce:
 
         patch_calls: list[str] = []
 
-        async def on_event(_event: IncomingEvent) -> None:
+        async def on_event(_event: RawIncomingEvent) -> None:
             raise RuntimeError("boom")
 
         with (
@@ -572,7 +691,7 @@ class TestGitHubNotificationsSourceStart:
                 return mock_user_resp
             return mock_notif_resp
 
-        async def on_event(_event: IncomingEvent) -> None:
+        async def on_event(_event: RawIncomingEvent) -> None:
             pass
 
         with patch.object(source._http, "get", side_effect=mock_get):

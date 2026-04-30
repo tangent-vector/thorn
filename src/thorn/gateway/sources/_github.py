@@ -4,14 +4,24 @@ Polls ``GET /notifications`` (the user-scoped Notifications API) to
 discover @-mentions, assignments, review requests, and other activity
 directed at the authenticated bot user.
 
-Read/unread state lives on GitHub.  After delivering an
-``IncomingEvent`` for a notification thread, the source ``PATCH``-es
-the thread to ``read`` so the next poll won't see it again.  At
-startup the source drains the existing unread set the same way so
-the agent isn't flooded with whatever accumulated while the gateway
-was down.  No client-side "seen" cache is maintained; cross-poll
-deduplication of in-flight events is handled by the gateway's
-:class:`~thorn.runtime._in_flight_index.InFlightIndex`.
+Read/unread state lives on GitHub.  After delivering a
+:class:`RawIncomingEvent` for a notification thread, the source
+``PATCH``-es the thread to ``read`` so the next poll won't see it
+again.  At startup the source drains the existing unread set the
+same way so the agent isn't flooded with whatever accumulated while
+the gateway was down.  No client-side "seen" cache is maintained;
+cross-poll deduplication of in-flight events is handled by the
+gateway's :class:`~thorn.runtime._in_flight_index.InFlightIndex`.
+
+The source produces *raw* events: it captures the actor (numeric
+``user.id`` plus textual ``login``, with the platform's ``type ==
+"Bot"`` flag mapped onto :attr:`ActorIdentity.is_bot`) and
+classifies the event as structural or conversational based on the
+notification's ``reason``.  The gateway-side
+:class:`~thorn.gateway._formatter.NotificationFormatter` then
+applies peer lookup, the trigger-authorization policy, and content-
+envelope wrapping centrally; this source does *not* render prose
+beyond a short harness-controlled summary line.
 
 The Notifications API requires a personal access token (classic) with
 the ``notifications`` scope.  GitHub App installation tokens cannot
@@ -26,12 +36,20 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, Field
 
-from thorn.gateway._event import EventSource, IncomingEvent
+from thorn.gateway._actor import ActorIdentity
+from thorn.gateway._event import (
+    ContextItem,
+    ContextItemKind,
+    EventKind,
+    EventSource,
+    RawIncomingEvent,
+)
 from thorn.gateway._routing import Noteable, NoteableKind, route_github_event
 
 log = logging.getLogger(__name__)
@@ -47,6 +65,87 @@ _SUBJECT_TYPE_TO_NOTEABLE: dict[str, NoteableKind] = {
     "Issue": NoteableKind.ISSUE,
     "PullRequest": NoteableKind.CHANGE_REQUEST,
 }
+
+# GitHub notification "reason" values that represent direct
+# message-like activity from a human or bot, where the natural
+# question for the agent is "should I act on what this person
+# said?".  Anything not in this set is treated as structural --
+# something the agent should know about but should not take
+# direction from solely on the basis of.  See:
+# https://docs.github.com/en/rest/activity/notifications#about-notification-reasons
+_CONVERSATIONAL_REASONS: frozenset[str] = frozenset({
+    "mention",
+    "comment",
+    "review_requested",
+    "team_mention",
+})
+
+
+def _classify_reason(reason: str) -> EventKind:
+    """Map a GitHub notification ``reason`` to an :class:`EventKind`.
+
+    Defaults to :attr:`EventKind.STRUCTURAL` for unknown reasons --
+    the conservative choice, since structural events are still
+    delivered (with a non-peer banner) and structural-from-non-peer
+    is the carve-out the operator can disable per forge.  A novel
+    conversational reason being treated as structural means the
+    agent sees one extra "non-peer mentioned you" banner; the
+    inverse miscategorisation (treating a novel structural reason
+    as conversational) would silently drop legitimate events.
+    """
+    if reason in _CONVERSATIONAL_REASONS:
+        return EventKind.CONVERSATIONAL
+    return EventKind.STRUCTURAL
+
+
+def _kind_for_subject(subject_type: str, reason: str) -> ContextItemKind:
+    """Classify a context item by its containing subject type."""
+    if reason in _CONVERSATIONAL_REASONS:
+        return ContextItemKind.COMMENT
+    if subject_type == "Issue":
+        return ContextItemKind.ISSUE_BODY
+    if subject_type == "PullRequest":
+        return ContextItemKind.PR_BODY
+    return ContextItemKind.COMMENT
+
+
+def _actor_from_user(
+    user: dict[str, Any] | None,
+    *,
+    service: str,
+) -> ActorIdentity | None:
+    """Build an :class:`ActorIdentity` from a GitHub ``user`` object.
+
+    Returns ``None`` when *user* is missing or contains neither an
+    immutable id nor a login.  The platform-provided ``type`` field
+    (``"User"`` / ``"Bot"``) becomes the ``is_bot`` flag; absence
+    of that key leaves ``is_bot`` as ``None`` (i.e. unknown), not
+    ``False``, so policy code can distinguish "platform said this
+    is a human" from "platform did not say."
+    """
+    if not user:
+        return None
+    user_id = user.get("id")
+    login = (user.get("login") or "").strip()
+    if user_id is None and not login:
+        return None
+
+    account_id = str(user_id) if user_id is not None else login
+    secondary: tuple[str, ...] = (
+        (login,) if login and login != account_id else ()
+    )
+
+    is_bot: bool | None = None
+    if "type" in user and user.get("type") is not None:
+        is_bot = user.get("type") == "Bot"
+
+    return ActorIdentity(
+        service=service,
+        account_id=account_id,
+        display_name=login,
+        is_bot=is_bot,
+        secondary_account_ids=secondary,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -81,10 +180,42 @@ class GitHubNotificationsSourceConfig(BaseModel):
             "logical project name, used for project-name-based session keys."
         ),
     )
+    forge_name: str = Field(
+        default="github",
+        description=(
+            "Service name stamped on every "
+            "``ActorIdentity.service`` produced by this source.  "
+            "Should match the ``forges[].name`` entry in "
+            "``gateway.json`` so that peer matching and per-forge "
+            "trigger policy line up.  Defaulted to ``\"github\"`` "
+            "for back-compat with tests and bare-bones setups."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Notification formatting
+# Latest-comment payload
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _LatestCommentInfo:
+    """The fields of a GitHub comment / issue / PR payload we care about.
+
+    GitHub's ``latest_comment_url`` points at one of three kinds of
+    resource depending on the thread state: a per-comment endpoint, an
+    issue endpoint (when the trigger was the issue body), or a PR
+    endpoint.  All three share the relevant fields (``body``,
+    ``user``, ``created_at``), so a single shape covers the cases.
+    """
+
+    body: str = ""
+    user: dict[str, Any] | None = None
+    created_at: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Notification -> RawIncomingEvent
 # ---------------------------------------------------------------------------
 
 
@@ -106,7 +237,7 @@ def _extract_noteable_from_notification(
     return Noteable(kind, int(match.group(1)))
 
 
-def _format_notification_content(
+def _make_summary(
     *,
     repo_full_name: str,
     repo_id: int,
@@ -118,9 +249,15 @@ def _format_notification_content(
     reason: str,
     thread_id: str,
     updated_at: str,
-    comment_body: str,
 ) -> str:
-    """Build a human-readable prompt from a GitHub notification thread."""
+    """Build the harness-controlled summary line(s) for a GitHub notification.
+
+    Source-controlled, *not* attacker-controlled: every piece of text
+    here is a structural field name or a value pulled from the
+    GitHub notification envelope (numeric ids, the platform's reason
+    string, etc.).  Body text (which *is* attacker-controlled) is
+    surfaced via :class:`ContextItem` items, never inlined here.
+    """
     lines = [
         f"GitHub notification: you were {reason} on "
         f"{subject_type} \"{subject_title}\" in project {repo_full_name} "
@@ -128,7 +265,7 @@ def _format_notification_content(
         "",
         f"Notification ID: {thread_id}",
         f"Reason: {reason}",
-        f"Target: {subject_type} — {subject_title}",
+        f"Target: {subject_type} -- {subject_title}",
         f"Updated: {updated_at}",
     ]
     if clone_url:
@@ -138,12 +275,6 @@ def _format_notification_content(
     if html_url:
         lines.append(f"Repository URL: {html_url}")
     lines.append("")
-
-    if comment_body:
-        lines.append("Comment body:")
-        lines.append(comment_body)
-        lines.append("")
-
     lines.append(
         "Respond to the notification as appropriate.  The GitHub "
         "notification thread has already been marked read on your "
@@ -178,14 +309,30 @@ def _make_external_key(base_url: str, thread_id: str, updated_at: str) -> str:
     return f"github:{base_url}:thread:{thread_id}:updated:{updated_at}"
 
 
-def _make_incoming_event(
+def _make_raw_event(
     *,
     thread: dict[str, Any],
-    comment_body: str,
+    comment_info: _LatestCommentInfo,
     native_id_to_project_name: dict[str, str],
     base_url: str = "",
-) -> IncomingEvent:
-    """Convert a GitHub notification thread dict into an :class:`IncomingEvent`."""
+    forge_name: str = "github",
+) -> RawIncomingEvent:
+    """Convert a GitHub notification thread + comment payload into a :class:`RawIncomingEvent`.
+
+    The returned event carries:
+
+    - ``primary_actor`` derived from the comment payload's ``user``
+      object (or ``None`` if absent), labelled with *forge_name*
+      so peer matching uses the right service namespace.
+    - ``items`` containing one :class:`ContextItem` for the comment
+      body when present, classified as ``COMMENT`` for
+      conversational reasons or as ``ISSUE_BODY`` / ``PR_BODY`` for
+      structural reasons against an issue/PR subject.
+    - ``kind`` derived from the notification's ``reason``.
+    - ``summary`` and ``metadata`` carrying the harness-controlled
+      structural information the formatter prepends to the rendered
+      content.
+    """
     repo = thread["repository"]
     repo_id: int = repo["id"]
     repo_full_name: str = repo["full_name"]
@@ -213,7 +360,9 @@ def _make_incoming_event(
         project_name=project_name,
     )
 
-    content = _format_notification_content(
+    actor = _actor_from_user(comment_info.user, service=forge_name)
+
+    summary = _make_summary(
         repo_full_name=repo_full_name,
         repo_id=repo_id,
         clone_url=clone_url,
@@ -224,13 +373,26 @@ def _make_incoming_event(
         reason=reason,
         thread_id=thread_id,
         updated_at=updated_at,
-        comment_body=comment_body,
     )
 
-    return IncomingEvent(
+    items: tuple[ContextItem, ...] = ()
+    if comment_info.body:
+        items = (
+            ContextItem(
+                body=comment_info.body,
+                kind=_kind_for_subject(subject_type, reason),
+                actor=actor,
+                timestamp=comment_info.created_at,
+            ),
+        )
+
+    return RawIncomingEvent(
         source="github",
         session_key=session_key,
-        content=content,
+        kind=_classify_reason(reason),
+        primary_actor=actor,
+        summary=summary,
+        items=items,
         metadata={
             "notification_id": thread_id,
             "reason": reason,
@@ -295,7 +457,7 @@ class GitHubNotificationsSource(EventSource):
 
     async def start(
         self,
-        on_event: Callable[[IncomingEvent], Awaitable[None]],
+        on_event: Callable[[RawIncomingEvent], Awaitable[None]],
     ) -> None:
         self._stop_event = asyncio.Event()
 
@@ -349,7 +511,7 @@ class GitHubNotificationsSource(EventSource):
 
     async def _poll_once(
         self,
-        on_event: Callable[[IncomingEvent], Awaitable[None]],
+        on_event: Callable[[RawIncomingEvent], Awaitable[None]],
     ) -> None:
         new_events = await asyncio.to_thread(self._fetch_new_notifications)
         if new_events:
@@ -369,10 +531,10 @@ class GitHubNotificationsSource(EventSource):
 
             # Mark the thread read so GitHub doesn't resurface the
             # same notification on every poll.  Runs regardless of
-            # whether the gateway actually posted or deduplicated the
-            # event -- the in-flight copy will be handled on its own
-            # schedule, and we want the *platform* to stop resurfacing
-            # the entity either way.
+            # whether the gateway delivered, deduplicated, or *dropped*
+            # the event -- drops are terminal in the formatter's
+            # contract, and we want the *platform* to stop resurfacing
+            # the entity in all three cases.
             thread_id = ev.metadata.get("notification_id")
             if thread_id:
                 await asyncio.to_thread(
@@ -432,8 +594,8 @@ class GitHubNotificationsSource(EventSource):
 
         return resp.json()
 
-    def _fetch_new_notifications(self) -> list[IncomingEvent]:
-        """Return one ``IncomingEvent`` per currently-unread notification thread.
+    def _fetch_new_notifications(self) -> list[RawIncomingEvent]:
+        """Return one :class:`RawIncomingEvent` per currently-unread thread.
 
         Has no client-side dedup state: threads we have already
         processed are filtered out by GitHub's own read/unread state
@@ -444,15 +606,16 @@ class GitHubNotificationsSource(EventSource):
         """
         threads = self._fetch_unread_thread_list()
 
-        incoming: list[IncomingEvent] = []
+        incoming: list[RawIncomingEvent] = []
         for thread in threads:
-            comment_body = self._fetch_latest_comment(thread)
+            comment_info = self._fetch_latest_comment_payload(thread)
             incoming.append(
-                _make_incoming_event(
+                _make_raw_event(
                     thread=thread,
-                    comment_body=comment_body,
+                    comment_info=comment_info,
                     native_id_to_project_name=self._config.native_id_to_project_name,
                     base_url=self._config.base_url,
+                    forge_name=self._config.forge_name,
                 ),
             )
 
@@ -468,7 +631,7 @@ class GitHubNotificationsSource(EventSource):
         deduplicates a re-emit while the original event is still in
         flight, so a transient PATCH failure is harmless: the next
         poll re-fetches the (still-unread) thread, the duplicate
-        ``IncomingEvent`` is dropped at the gateway, and the source
+        ``RawIncomingEvent`` is dropped at the gateway, and the source
         retries the PATCH.
 
         The unhandled edge case is a *persistent* PATCH failure
@@ -485,26 +648,37 @@ class GitHubNotificationsSource(EventSource):
                 thread_id,
             )
 
-    def _fetch_latest_comment(self, thread: dict[str, Any]) -> str:
-        """Fetch the body of the latest comment on the notification thread.
+    def _fetch_latest_comment_payload(
+        self,
+        thread: dict[str, Any],
+    ) -> _LatestCommentInfo:
+        """Fetch body / user / timestamp of the latest comment on the thread.
 
-        Returns an empty string if the URL is missing or the request
-        fails (best-effort).
+        Returns an empty :class:`_LatestCommentInfo` if the URL is
+        missing or the request fails (best-effort).  The returned
+        ``user`` is the raw GitHub user object (``id``, ``login``,
+        ``type``, ...) for downstream conversion to an
+        :class:`ActorIdentity`.
         """
         url = (thread.get("subject") or {}).get("latest_comment_url") or ""
         if not url:
-            return ""
+            return _LatestCommentInfo()
         try:
             resp = self._http.get(url)
             resp.raise_for_status()
-            return resp.json().get("body") or ""
+            data = resp.json() or {}
+            return _LatestCommentInfo(
+                body=data.get("body") or "",
+                user=data.get("user"),
+                created_at=data.get("created_at") or "",
+            )
         except Exception:
             log.debug(
                 "Failed to fetch latest comment for thread %s",
                 thread.get("id", "?"),
                 exc_info=True,
             )
-            return ""
+            return _LatestCommentInfo()
 
 
 __all__ = [

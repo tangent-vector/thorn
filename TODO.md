@@ -5,6 +5,8 @@
 
 - A system for determining which users to listen to/obey on projects (some basic notion of authority). Might involve filtering of notifications based on sender, checking against peer list, but also seems to require giving the agent both "push" and pull-mode information on the authority level of a peer.
 
+- Auto-resolver for textual peer/agent account handles → platform-immutable ids in `gateway.json`.  Operators currently write either form under `peers[].accounts[].account_id` (and the same applies to agent forge accounts); the registry matches both, but a textual handle silently desyncs when the user renames themselves on the platform.  A `thorn serve resolve-peers` (or similarly named) helper should look every textual handle up against the matching forge service, rewrite `gateway.json` in place with the immutable id (preserving the textual form in a comment / sidecar field for human readability), and warn on accounts that cannot be resolved.  Same idea applies to `agents[].accounts[].login`-shaped fields if any of those still accept a textual form.
+
 - some kind of plan for onboarding of users and (related) a plan for how users can interact with a Thorn agent to achieve configuration changes to their thorn gateway and agent settings (despite those settings being out of reach of the agent's tool-calling container). This might involve specific brain-side tools that are always wired up to an approval system (assuming we've implemented one...)
 
 - need config options for specifying default model (+ model-specific config parameters) for an agent, as well as overriding on specific sessions (or maybe for specific session templates?)
