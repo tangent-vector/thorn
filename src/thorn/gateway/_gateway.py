@@ -63,6 +63,7 @@ from thorn.gateway._broker import (
     BrokerBinding,
     BrokerClient,
     BrokerError,
+    admin_api_key_from_env,
     register_agent_with_broker,
 )
 from thorn.gateway._bundled_broker import (
@@ -90,6 +91,42 @@ from thorn.runtime import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _default_broker_client_factory(
+    config: GatewayConfig,
+    bundled_supervisor: "BundledBrokerSupervisor | None",
+) -> BrokerClient:
+    """Build a :class:`BrokerClient` for the gateway's broker config.
+
+    For ``mode='bundled'`` the supervisor minted the admin API key in
+    process memory and exposes it via :attr:`admin_api_key`; that
+    literal is what we hand to the client.
+
+    For ``mode='external'`` the operator named the env var holding
+    the key in ``broker.admin_api_key_env_var``;
+    :func:`admin_api_key_from_env` reads it and surfaces a clear
+    error when the var is unset.
+    """
+    if config.broker is None:
+        raise BrokerError(
+            "Cannot build a broker client: gateway.json has no "
+            "broker block (or it is None at this point in startup)."
+        )
+    if config.broker.mode == "bundled":
+        if bundled_supervisor is None or bundled_supervisor.admin_api_key is None:
+            raise BrokerError(
+                "Bundled broker mode requires a started supervisor "
+                "exposing the admin API key, but none is available.  "
+                "This indicates a wiring bug in gateway startup."
+            )
+        return BrokerClient(
+            config.broker, admin_api_key=bundled_supervisor.admin_api_key,
+        )
+    return BrokerClient(
+        config.broker, admin_api_key=admin_api_key_from_env(config.broker),
+    )
+
 
 _DEFAULT_AGENT_ID = AgentID("default")
 
@@ -147,7 +184,7 @@ class Gateway:
         health_monitor: ProviderHealthMonitor | None = None,
         gateway_config: GatewayConfig | None = None,
         broker_client_factory: (
-            "Callable[[GatewayConfig], BrokerClient] | None"
+            "Callable[[GatewayConfig, BundledBrokerSupervisor | None], BrokerClient] | None"
         ) = None,
         bundled_broker_supervisor_factory: (
             "Callable[[], BundledBrokerSupervisor] | None"
@@ -181,8 +218,7 @@ class Gateway:
         # for tests; production callers leave it None.
         self._gateway_config = gateway_config
         self._broker_client_factory = (
-            broker_client_factory
-            or (lambda cfg: BrokerClient(cfg.broker))  # type: ignore[arg-type]
+            broker_client_factory or _default_broker_client_factory
         )
         # The supervisor factory is an injection seam: tests pass a
         # fake supervisor that doesn't shell out to ``docker compose``.
@@ -996,7 +1032,9 @@ class Gateway:
 
         ca_path = self._resolve_broker_ca_path(config.broker)
 
-        client = self._broker_client_factory(config)
+        client = self._broker_client_factory(
+            config, self._bundled_broker_supervisor,
+        )
         try:
             # Fetch the broker's CA once at startup and persist it
             # to the resolved path.  This is the canonical CA
@@ -1021,7 +1059,8 @@ class Gateway:
                 # reason about in that form.
                 binding = await asyncio.to_thread(
                     register_agent_with_broker,
-                    client=client, agent=agent, config=config,
+                    client=client, agent=agent,
+                    service_lookup=self._runtime.get_service,
                     ca_certificate_path=str(ca_path),
                 )
                 self._broker_bindings[agent_id] = binding

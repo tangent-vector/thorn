@@ -293,27 +293,6 @@ log = logging.getLogger(__name__)
 # Agent accounts serialization
 # ---------------------------------------------------------------------------
 
-_SECRET_CREDENTIAL_FIELDS = frozenset({"token", "private_key_pem"})
-"""Credential dict keys that may hold ``$ENV_VAR`` references."""
-
-
-def _expand_credentials(cred_data: dict[str, Any]) -> dict[str, Any]:
-    """Expand ``$ENV_VAR`` references in secret credential fields only.
-
-    Non-secret fields (``kind``, ``app_id``, ``installation_id``) are
-    passed through unchanged so that literal values in the config are
-    not misinterpreted as env-var references.
-    """
-    from thorn.gateway._config import expand_env_vars
-
-    result: dict[str, Any] = {}
-    for key, value in cred_data.items():
-        if key in _SECRET_CREDENTIAL_FIELDS:
-            result[key] = expand_env_vars(value)
-        else:
-            result[key] = value
-    return result
-
 
 def _deserialize_accounts(
     raw_accounts: list[dict[str, Any]] | dict[str, Any],
@@ -322,13 +301,19 @@ def _deserialize_accounts(
 
     The on-disk shape is a flat JSON array of account objects, each
     of which has a ``service`` discriminator and a ``credentials``
-    block.  Env-var expansion is applied only to the secret fields
-    of ``credentials`` so that literal values elsewhere are not
-    misinterpreted as ``$ENV_VAR`` references.
+    list.  This helper performs only *parse-time* validation: each
+    entry is wrapped in an :class:`UntypedAccountConfig` so that
+    per-service fields survive intact for the gateway's
+    validation pass to consume against the right typed
+    :class:`AccountConfig` subclass.
 
-    Returns an :class:`AgentAccountsConfig` instance.
+    No environment-variable expansion happens here: credentials in
+    the new shape carry an explicit ``env_var_name`` field and the
+    literal value is read from ``os.environ`` only at the points
+    where it is actually needed (broker registration, direct
+    authentication).
     """
-    from thorn.core._account import AgentAccountsConfig
+    from thorn.core._account import AgentAccountsConfig, UntypedAccountConfig
 
     if not isinstance(raw_accounts, list):
         raise ValueError(
@@ -337,14 +322,20 @@ def _deserialize_accounts(
             "agent identity-file documentation for the expected shape."
         )
 
-    expanded: list[dict[str, Any]] = []
-    for acct in raw_accounts:
-        acct_copy = dict(acct)
-        if "credentials" in acct_copy and isinstance(acct_copy["credentials"], dict):
-            acct_copy["credentials"] = _expand_credentials(acct_copy["credentials"])
-        expanded.append(acct_copy)
-
-    return AgentAccountsConfig.model_validate({"accounts": expanded})
+    # Build UntypedAccountConfig instances explicitly: the
+    # AgentAccountsConfig.accounts field is typed as list[AccountConfig]
+    # so per-service fields would otherwise be stripped by base-class
+    # validation.  The gateway's validation pass replaces each of
+    # these with a typed concrete AccountConfig subclass once the
+    # services are known.
+    typed_entries = [
+        UntypedAccountConfig.model_validate(entry) for entry in raw_accounts
+    ]
+    # Bypass the field-level revalidation that would otherwise downgrade
+    # each UntypedAccountConfig back to its declared base shape and
+    # strip the per-service ``extra`` fields.  ``model_construct``
+    # writes the list straight through.
+    return AgentAccountsConfig.model_construct(accounts=typed_entries)
 
 
 def _serialize_accounts(agent: Agent) -> list[dict[str, Any]] | None:
@@ -353,19 +344,26 @@ def _serialize_accounts(agent: Agent) -> list[dict[str, Any]] | None:
     Returns ``None`` when the agent has no accounts configured, so
     the key can be omitted from the output JSON entirely.
 
-    Credential fields that originated from ``$ENV_VAR`` references
-    are written as their *expanded* values -- the original ``$``
-    reference is not preserved.  Users are expected to keep the
-    ``$ENV_VAR`` form in their hand-edited config files; the
-    serializer round-trips the resolved values.
+    Each entry is dumped through its own concrete model (rather
+    than via the container's ``model_dump``) so that per-service
+    extras carried by an :class:`UntypedAccountConfig` -- and
+    extras carried by typed subclasses with ``model_config =
+    extra="allow"`` -- survive the round-trip.  Dumping through
+    the parent ``AgentAccountsConfig.accounts: list[AccountConfig]``
+    strips extras, because Pydantic only serialises fields it
+    knows about on the declared element type.
+
+    Each credential entry's ``env_var_name`` (and other fields) is
+    written through unchanged; literal secret values are never on
+    the agent state, so there is nothing to redact at serialization
+    time either.
     """
     from thorn.core._account import AgentAccountsConfig
 
     accounts: AgentAccountsConfig | None = getattr(agent, "accounts", None)
     if accounts is None or not accounts.accounts:
         return None
-    dumped = accounts.model_dump(mode="json")
-    return dumped.get("accounts", [])
+    return [entry.model_dump(mode="json") for entry in accounts.accounts]
 
 
 # ---------------------------------------------------------------------------

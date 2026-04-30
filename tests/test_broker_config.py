@@ -1,12 +1,15 @@
 """Tests for the ``BrokerConfig`` block of ``gateway.json``.
 
 Covers the on-disk shape of both modes (``bundled`` and
-``external``), the omission-vs-explicit distinction at the
+``external``) and the omission-vs-explicit distinction at the
 :class:`GatewayConfig` level (omission auto-fills a bundled-mode
-default when sandbox is container-backed), and ``$ENV_VAR``
-expansion of the admin API key.  Broker behavior (how the admin
-client calls OneCLI) is covered separately in
-``tests/test_broker.py``; bundled-supervisor behavior lives in
+default when sandbox is container-backed).
+
+The admin API key is referenced via the operator-chosen environment
+variable name (``admin_api_key_env_var``), never carried inline in
+``gateway.json``.  Resolution from ``os.environ`` is the broker
+client's responsibility (covered in ``tests/test_broker.py``);
+bundled-supervisor behavior lives in
 ``tests/test_bundled_broker.py``.
 """
 
@@ -18,7 +21,6 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from thorn.core._credentials import ServiceCredential
 from thorn.gateway._config import (
     BrokerConfig,
     GatewayConfig,
@@ -32,7 +34,7 @@ def _make_external_broker_dict(**overrides: object) -> dict[str, object]:
     base: dict[str, object] = {
         "mode": "external",
         "admin_url": "http://onecli-web:10254",
-        "admin_api_key": "oc_dummy_admin_token",
+        "admin_api_key_env_var": "ONECLI_ADMIN_KEY",
         "proxy_url": "http://onecli-gateway:10255",
         "ca_certificate_path": "/var/lib/onecli/ca.pem",
     }
@@ -51,7 +53,7 @@ class TestBrokerConfigBundledMode:
         assert cfg.mode == "bundled"
         assert cfg.enabled is True
         assert cfg.admin_url == ""
-        assert cfg.admin_api_key is None
+        assert cfg.admin_api_key_env_var is None
         assert cfg.proxy_url == ""
 
     def test_bundled_with_admin_url_rejected(self):
@@ -60,17 +62,15 @@ class TestBrokerConfigBundledMode:
                 "mode": "bundled",
                 "admin_url": "http://onecli-web:10254",
             })
-        # The validator names the stray field so the operator knows
-        # what to remove (or that they meant ``mode='external'``).
         assert "admin_url" in str(exc.value)
 
-    def test_bundled_with_admin_api_key_rejected(self):
+    def test_bundled_with_admin_api_key_env_var_rejected(self):
         with pytest.raises(ValidationError) as exc:
             BrokerConfig.model_validate({
                 "mode": "bundled",
-                "admin_api_key": "oc_explicit",
+                "admin_api_key_env_var": "ONECLI_ADMIN_KEY",
             })
-        assert "admin_api_key" in str(exc.value)
+        assert "admin_api_key_env_var" in str(exc.value)
 
     def test_bundled_with_proxy_url_rejected(self):
         with pytest.raises(ValidationError) as exc:
@@ -96,20 +96,26 @@ class TestBrokerConfigExternalMode:
         assert cfg.admin_url == "http://onecli-web:10254"
         assert cfg.proxy_url == "http://onecli-gateway:10255"
         assert cfg.ca_certificate_path == "/var/lib/onecli/ca.pem"
-        assert isinstance(cfg.admin_api_key, ServiceCredential)
-        assert cfg.admin_api_key.is_literal
-        assert cfg.admin_api_key == "oc_dummy_admin_token"
+        assert cfg.admin_api_key_env_var == "ONECLI_ADMIN_KEY"
 
     def test_explicit_disabled(self):
-        cfg = BrokerConfig.model_validate(_make_external_broker_dict(enabled=False))
+        cfg = BrokerConfig.model_validate(
+            _make_external_broker_dict(enabled=False),
+        )
         assert cfg.enabled is False
 
-    def test_admin_api_key_repr_does_not_leak_value(self):
+    def test_admin_api_key_env_var_just_names_var_not_value(self):
+        # The schema deliberately does not accept a literal ``admin_api_key``
+        # value -- only the env var name is allowed in gateway.json so the
+        # serialized config never carries the secret value at rest.
         cfg = BrokerConfig.model_validate(
-            _make_external_broker_dict(admin_api_key="oc_super_secret_admin"),
+            _make_external_broker_dict(admin_api_key_env_var="MY_OC_KEY"),
         )
+        assert cfg.admin_api_key_env_var == "MY_OC_KEY"
         text = repr(cfg)
-        assert "oc_super_secret_admin" not in text
+        # The env var name is OK to appear, but no secret value lives in
+        # the model so there is nothing to leak.
+        assert "MY_OC_KEY" in text
 
     def test_external_missing_admin_url_raises(self):
         bad = _make_external_broker_dict()
@@ -118,12 +124,12 @@ class TestBrokerConfigExternalMode:
             BrokerConfig.model_validate(bad)
         assert "admin_url" in str(exc.value)
 
-    def test_external_missing_admin_api_key_raises(self):
+    def test_external_missing_admin_api_key_env_var_raises(self):
         bad = _make_external_broker_dict()
-        del bad["admin_api_key"]
+        del bad["admin_api_key_env_var"]
         with pytest.raises(ValidationError) as exc:
             BrokerConfig.model_validate(bad)
-        assert "admin_api_key" in str(exc.value)
+        assert "admin_api_key_env_var" in str(exc.value)
 
     def test_external_missing_proxy_url_raises(self):
         bad = _make_external_broker_dict()
@@ -140,9 +146,6 @@ class TestBrokerConfigExternalMode:
 
 class TestGatewayConfigBrokerBlock:
     def test_omitted_yields_bundled_default_when_sandbox_container(self):
-        # Empty config: GatewayConfig defaults sandbox to container,
-        # then auto-fills broker as a bundled-mode default since the
-        # resolved sandbox backend is container.
         config = GatewayConfig.model_validate({})
         assert config.sandbox is not None
         assert config.sandbox.backend == "container"
@@ -151,9 +154,6 @@ class TestGatewayConfigBrokerBlock:
         assert config.broker.enabled is True
 
     def test_omitted_broker_yields_none_when_sandbox_subprocess(self):
-        # Operator explicitly opts out of the container backend; the
-        # broker auto-fill is suppressed because a bundled broker
-        # without a container has nothing to inject the proxy into.
         config = GatewayConfig.model_validate({
             "sandbox": {"backend": "subprocess"},
         })
@@ -175,6 +175,7 @@ class TestGatewayConfigBrokerBlock:
         assert config.broker is not None
         assert config.broker.mode == "external"
         assert config.broker.proxy_url == "http://onecli-gateway:10255"
+        assert config.broker.admin_api_key_env_var == "ONECLI_ADMIN_KEY"
 
 
 class TestGatewayConfigSandboxDefault:
@@ -208,7 +209,7 @@ class TestGatewayConfigSandboxDefault:
 
 
 # ---------------------------------------------------------------------------
-# load_gateway_config (file-based, $ENV_VAR expansion)
+# load_gateway_config (file-based)
 # ---------------------------------------------------------------------------
 
 
@@ -226,6 +227,7 @@ class TestLoadGatewayConfigBrokerBlock:
         assert config.broker.mode == "external"
         assert config.broker.enabled
         assert config.broker.proxy_url == "http://onecli-gateway:10255"
+        assert config.broker.admin_api_key_env_var == "ONECLI_ADMIN_KEY"
 
     def test_load_empty_config_auto_fills_bundled_broker(self, tmp_path: Path):
         thorn_dir = tmp_path / ".thorn"
@@ -239,46 +241,10 @@ class TestLoadGatewayConfigBrokerBlock:
         assert config.broker is not None
         assert config.broker.mode == "bundled"
 
-    def test_admin_api_key_env_var_expansion(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ):
-        # The admin API key is a credential, so it follows the
-        # existing ``$ENV_VAR`` expansion path: storing it directly
-        # in gateway.json is discouraged.
-        monkeypatch.setenv("ONECLI_ADMIN_KEY", "oc_real_key_from_env")
-
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
-        (thorn_dir / "gateway.json").write_text(
-            json.dumps({"broker": _make_external_broker_dict(
-                admin_api_key="$ONECLI_ADMIN_KEY",
-            )}),
-            encoding="utf-8",
-        )
-
-        config = load_gateway_config(thorn_dir)
-        assert config.broker is not None
-        assert config.broker.admin_api_key == "oc_real_key_from_env"
-        assert config.broker.admin_api_key.is_literal
-
-    def test_admin_api_key_missing_env_raises(self, tmp_path: Path):
-        thorn_dir = tmp_path / ".thorn"
-        thorn_dir.mkdir()
-        (thorn_dir / "gateway.json").write_text(
-            json.dumps({"broker": _make_external_broker_dict(
-                admin_api_key="$DEFINITELY_NOT_SET_ONECLI_KEY",
-            )}),
-            encoding="utf-8",
-        )
-
-        with pytest.raises(ValueError, match="DEFINITELY_NOT_SET_ONECLI_KEY"):
-            load_gateway_config(thorn_dir)
-
 
 # Smoke: sandbox/broker fixtures used elsewhere should still be
 # constructible by tests that hand-craft them.
 class TestModelBuildSmoke:
     def test_sandbox_config_default(self):
-        # Used as a fixture in numerous downstream tests.
         cfg = SandboxConfig()
         assert cfg.backend == "container"

@@ -262,6 +262,11 @@ class BundledBrokerSupervisor:
         bundled stack."""
         self._endpoints: _BundledBrokerEndpoints | None = None
         self._broker_config: BrokerConfig | None = None
+        self._admin_api_key: ServiceCredential | None = None
+        """Literal admin API key minted by :meth:`start`, retained
+        in process memory only.  Exposed via :attr:`admin_api_key`
+        so the gateway hands it to the broker client without it
+        ever entering the persisted ``BrokerConfig``."""
         self._started = False
         self._shutdown_called = False
 
@@ -298,6 +303,18 @@ class BundledBrokerSupervisor:
     def broker_config(self) -> BrokerConfig | None:
         """The synthesised :class:`BrokerConfig`, if :meth:`start` ran."""
         return self._broker_config
+
+    @property
+    def admin_api_key(self) -> ServiceCredential | None:
+        """The minted admin API key, if :meth:`start` ran.
+
+        The literal value lives only in process memory; it is never
+        written into :class:`BrokerConfig` (which is intended to be
+        persistable on disk) or otherwise serialised.  The gateway
+        passes this directly to the broker client when constructing
+        it for a bundled-broker startup.
+        """
+        return self._admin_api_key
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -375,18 +392,25 @@ class BundledBrokerSupervisor:
             raise
 
         # The synthesised config is presented to the rest of the
-        # gateway as ``mode="external"``: from the broker-client
-        # perspective, the supervisor IS an external broker
-        # (already-running, URLs known) -- the only difference is
-        # who brought it up.  Using ``mode="external"`` here also
-        # keeps the schema validator happy, since it requires
-        # admin_url/admin_api_key/proxy_url to be present in that
-        # mode (they are, because we just discovered them).
-        self._broker_config = BrokerConfig(
-            mode="external",
+        # gateway as ``mode="bundled"``: it carries the discovered
+        # admin/proxy URLs but deliberately does NOT carry the
+        # literal admin API key (the key lives only on the
+        # supervisor's :attr:`admin_api_key` attribute, in process
+        # memory).  Bundled mode signals to the gateway that the
+        # admin key comes from the supervisor rather than from
+        # ``os.environ[admin_api_key_env_var]``.
+        #
+        # We sidestep the schema validator (which requires the
+        # bundled mode to leave admin_url/proxy_url empty) via
+        # ``model_construct``: the validator's invariant is for
+        # operator-written configs, not for our post-startup
+        # synthesised one.
+        self._admin_api_key = ServiceCredential(admin_key)
+        self._broker_config = BrokerConfig.model_construct(
+            mode="bundled",
             enabled=True,
             admin_url=f"http://{self._endpoints.admin_host}:{self._endpoints.admin_port}",
-            admin_api_key=ServiceCredential(admin_key, state="literal"),
+            admin_api_key_env_var=None,
             proxy_url=f"http://{self._endpoints.proxy_host}:{self._endpoints.proxy_port}",
             ca_certificate_path=None,
         )

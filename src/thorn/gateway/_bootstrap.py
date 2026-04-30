@@ -23,8 +23,10 @@ The new on-disk shape (see :mod:`thorn.gateway._config`) lets the
 project entry be just ``{name, url}`` for the common single-fork
 case; the forge type, name, and API URL are inferred from the URL
 host at startup, and the per-fork ``native_id`` and ``clone_url``
-are parsed from the same URL.  Only the secret access token uses an
-``$ENV_VAR`` reference.
+are parsed from the same URL.  Credentials are referenced by env
+var name (``"env_var_name": "GITHUB_TOKEN"``); the literal value
+is read from ``os.environ`` only at the points where it is needed
+(broker registration, direct authentication).
 
 Usage from code::
 
@@ -187,20 +189,20 @@ def bootstrap_coordinator(
     resolved_git_name = git_user_name or agent_id
     resolved_git_email = git_user_email or f"{agent_id}@thorn"
 
-    # Build credentials for the agent account.  The forge type
-    # inferred from the URL host selects the credential discriminator.
+    # Build the credentials reference for the agent account.  The
+    # account references its secret by env var name; broker
+    # registration and direct-authentication paths read the literal
+    # from ``os.environ`` at use time, so the agent's persisted
+    # state never holds the secret.
     if forge_type == "github":
-        credentials_block: dict[str, Any] = {
-            "kind": "pat",
-            "token": f"${access_token_env}",
-        }
+        credential_kind = "pat"
         service_name = "github"
     else:
-        credentials_block = {
-            "kind": "gitlab-pat",
-            "token": f"${access_token_env}",
-        }
+        credential_kind = "gitlab-pat"
         service_name = "gitlab"
+    credentials_list: list[dict[str, Any]] = [
+        {"kind": credential_kind, "env_var_name": access_token_env},
+    ]
 
     # -- Agent identity ------------------------------------------------------
 
@@ -219,7 +221,7 @@ def bootstrap_coordinator(
         "accounts": [
             {
                 "service": service_name,
-                "credentials": credentials_block,
+                "credentials": credentials_list,
                 "git_user_name": resolved_git_name,
                 "git_user_email": resolved_git_email,
             },

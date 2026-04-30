@@ -26,7 +26,6 @@ from thorn.tools.forge import (
     GitLabForgeServiceConfig,
     ProjectService,
     ProjectServiceConfig,
-    get_forge_for_project,
 )
 
 
@@ -576,239 +575,70 @@ class TestProjectService:
         with pytest.raises(KeyError, match="no forks"):
             svc.get_fork()
 
-    def test_resolve_default_branch_uses_per_fork_override(
-        self, tmp_path: Path,
-    ):
+    def test_resolve_default_branch_uses_per_fork_override(self):
         """A per-fork override wins over project- and forge-level values."""
-        mock_forge_client = MagicMock()
-        forge_config = GitLabForgeServiceConfig(
-            url="https://gl.example.com", token="t",
+        mock_client = MagicMock()
+        proj_svc = ProjectService(
+            ProjectServiceConfig(
+                forks=[ForkConfig(
+                    forge="gl", native_id="org/repo",
+                    default_branch="develop",
+                )],
+                default_branch="main",
+            ),
+            service_name="proj",
         )
-        forge_svc = GitLabForgeService(forge_config, service_name="gl")
-        forge_svc._client = mock_forge_client
+        # Per-fork override returned without ever calling the forge.
+        assert proj_svc.resolve_default_branch(mock_client) == "develop"
+        mock_client.get_project_info.assert_not_called()
 
-        proj_config = ProjectServiceConfig(
-            forks=[ForkConfig(
-                forge="gl", native_id="org/repo",
-                default_branch="develop",
-            )],
-            default_branch="main",
+    def test_resolve_default_branch_uses_project_override(self):
+        mock_client = MagicMock()
+        proj_svc = ProjectService(
+            ProjectServiceConfig(
+                forks=[ForkConfig(forge="gl", native_id="org/repo")],
+                default_branch="trunk",
+            ),
+            service_name="proj",
         )
-        proj_svc = ProjectService(proj_config, service_name="proj")
+        assert proj_svc.resolve_default_branch(mock_client) == "trunk"
+        mock_client.get_project_info.assert_not_called()
 
-        runtime = Runtime(
-            provider=MockProvider(), workspace_root=tmp_path,
-        )
-        runtime.register_service(forge_svc)
-        runtime.register_service(proj_svc)
-
-        # Per-fork override returned without consulting the forge.
-        assert proj_svc.resolve_default_branch(runtime) == "develop"
-        mock_forge_client.get_project_info.assert_not_called()
-
-    def test_resolve_default_branch_uses_project_override(
-        self, tmp_path: Path,
-    ):
-        mock_forge_client = MagicMock()
-        forge_config = GitLabForgeServiceConfig(
-            url="https://gl.example.com", token="t",
-        )
-        forge_svc = GitLabForgeService(forge_config, service_name="gl")
-        forge_svc._client = mock_forge_client
-
-        proj_config = ProjectServiceConfig(
-            forks=[ForkConfig(forge="gl", native_id="org/repo")],
-            default_branch="trunk",
-        )
-        proj_svc = ProjectService(proj_config, service_name="proj")
-
-        runtime = Runtime(
-            provider=MockProvider(), workspace_root=tmp_path,
-        )
-        runtime.register_service(forge_svc)
-        runtime.register_service(proj_svc)
-
-        assert proj_svc.resolve_default_branch(runtime) == "trunk"
-        mock_forge_client.get_project_info.assert_not_called()
-
-    def test_resolve_default_branch_falls_back_to_forge_lookup(
-        self, tmp_path: Path,
-    ):
+    def test_resolve_default_branch_falls_back_to_forge_lookup(self):
         """When no override is set, resolve via the forge API.  The
         result should be cached for subsequent calls."""
-        mock_forge_client = MagicMock()
-        mock_forge_client.get_project_info.return_value = {
+        mock_client = MagicMock()
+        mock_client.get_project_info.return_value = {
             "default_branch": "develop",
         }
-        forge_config = GitLabForgeServiceConfig(
-            url="https://gl.example.com", token="t",
+        proj_svc = ProjectService(
+            ProjectServiceConfig(
+                forks=[ForkConfig(forge="gl", native_id="org/repo")],
+            ),
+            service_name="proj",
         )
-        forge_svc = GitLabForgeService(forge_config, service_name="gl")
-        forge_svc._client = mock_forge_client
 
-        proj_config = ProjectServiceConfig(
-            forks=[ForkConfig(forge="gl", native_id="org/repo")],
-        )
-        proj_svc = ProjectService(proj_config, service_name="proj")
-
-        runtime = Runtime(
-            provider=MockProvider(), workspace_root=tmp_path,
-        )
-        runtime.register_service(forge_svc)
-        runtime.register_service(proj_svc)
-
-        assert proj_svc.resolve_default_branch(runtime) == "develop"
-        mock_forge_client.get_project_info.assert_called_once_with("org/repo")
+        assert proj_svc.resolve_default_branch(mock_client) == "develop"
+        mock_client.get_project_info.assert_called_once_with("org/repo")
 
         # Second call hits the cache, not the forge.
-        mock_forge_client.get_project_info.reset_mock()
-        assert proj_svc.resolve_default_branch(runtime) == "develop"
-        mock_forge_client.get_project_info.assert_not_called()
+        mock_client.get_project_info.reset_mock()
+        assert proj_svc.resolve_default_branch(mock_client) == "develop"
+        mock_client.get_project_info.assert_not_called()
 
-    def test_resolve_default_branch_defaults_to_main_when_forge_returns_empty(
-        self, tmp_path: Path,
-    ):
+    def test_resolve_default_branch_defaults_to_main_when_forge_returns_empty(self):
         """If the forge can't tell us, fall back to ``"main"`` rather
         than returning an empty string that callers would treat as
         "not configured"."""
-        mock_forge_client = MagicMock()
-        mock_forge_client.get_project_info.return_value = {"default_branch": ""}
-        forge_config = GitLabForgeServiceConfig(
-            url="https://gl.example.com", token="t",
-        )
-        forge_svc = GitLabForgeService(forge_config, service_name="gl")
-        forge_svc._client = mock_forge_client
-
-        proj_config = ProjectServiceConfig(
-            forks=[ForkConfig(forge="gl", native_id="org/repo")],
-        )
-        proj_svc = ProjectService(proj_config, service_name="proj")
-
-        runtime = Runtime(
-            provider=MockProvider(), workspace_root=tmp_path,
-        )
-        runtime.register_service(forge_svc)
-        runtime.register_service(proj_svc)
-
-        assert proj_svc.resolve_default_branch(runtime) == "main"
-
-    def test_get_forge_client_resolves_via_runtime(self, tmp_path: Path):
-        mock_forge_client = MagicMock()
-        forge_config = GitLabForgeServiceConfig(
-            url="https://gl.example.com", token="t",
-        )
-        forge_svc = GitLabForgeService(
-            forge_config, service_name="gl",
-        )
-        forge_svc._client = mock_forge_client
-
-        proj_config = ProjectServiceConfig(
-            forks=[ForkConfig(forge="gl", native_id="org/repo")],
-        )
-        proj_svc = ProjectService(proj_config, service_name="my-proj")
-
-        runtime = Runtime(
-            provider=MockProvider(), workspace_root=tmp_path,
-        )
-        runtime.register_service(forge_svc)
-        runtime.register_service(proj_svc)
-
-        client, native_id = proj_svc.get_forge_client(runtime)
-        assert client is mock_forge_client
-        assert native_id == "org/repo"
-
-
-# ---------------------------------------------------------------------------
-# get_forge_for_project
-# ---------------------------------------------------------------------------
-
-
-class TestGetForgeForProject:
-    def test_resolves_project_and_forge(self, tmp_path: Path):
-        mock_forge_client = MagicMock()
-        forge_config = GitLabForgeServiceConfig(
-            url="https://gl.example.com", token="t",
-        )
-        forge_svc = GitLabForgeService(
-            forge_config, service_name="gl",
-        )
-        forge_svc._client = mock_forge_client
-
-        proj_config = ProjectServiceConfig(
-            forks=[ForkConfig(forge="gl", native_id="99")],
-        )
-        proj_svc = ProjectService(proj_config, service_name="test-proj")
-
-        runtime = Runtime(
-            provider=MockProvider(), workspace_root=tmp_path,
-        )
-        runtime.register_service(forge_svc)
-        runtime.register_service(proj_svc)
-
-        client, native_id = get_forge_for_project(runtime, "test-proj")
-        assert client is mock_forge_client
-        assert native_id == "99"
-
-    def test_missing_project_raises_key_error(self, tmp_path: Path):
-        runtime = Runtime(
-            provider=MockProvider(), workspace_root=tmp_path,
-        )
-        with pytest.raises(KeyError, match="no-proj"):
-            get_forge_for_project(runtime, "no-proj")
-
-    def test_non_project_service_raises_type_error(self, tmp_path: Path):
-        from thorn.core._service import Service
-
-        class NotAProject(Service):
-            Config = type("C", (), {})  # type: ignore[assignment]
-
-            def __init__(self) -> None:
-                pass
-
-            @property
-            def name(self) -> str:
-                return "not-a-project"
-
-        runtime = Runtime(
-            provider=MockProvider(), workspace_root=tmp_path,
-        )
-        runtime.register_service(NotAProject())
-        with pytest.raises(TypeError, match="NotAProject"):
-            get_forge_for_project(runtime, "not-a-project")
-
-
-# ---------------------------------------------------------------------------
-# Runtime.get_forge_for_project
-# ---------------------------------------------------------------------------
-
-
-class TestRuntimeGetForgeForProject:
-    def test_delegates_to_module_function(self, tmp_path: Path):
         mock_client = MagicMock()
-        forge_svc = GitHubForgeService(
-            GitHubConnectionConfig(
-                auth=GitHubPatAuth(token="ghp_x"),
-            ),
-            service_name="gh",
-        )
-        forge_svc._forge_client = mock_client
-
+        mock_client.get_project_info.return_value = {"default_branch": ""}
         proj_svc = ProjectService(
-            ProjectServiceConfig(forks=[
-                ForkConfig(forge="gh", native_id="org/repo"),
-            ]),
-            service_name="my-proj",
+            ProjectServiceConfig(
+                forks=[ForkConfig(forge="gl", native_id="org/repo")],
+            ),
+            service_name="proj",
         )
-
-        runtime = Runtime(
-            provider=MockProvider(), workspace_root=tmp_path,
-        )
-        runtime.register_service(forge_svc)
-        runtime.register_service(proj_svc)
-
-        client, nid = runtime.get_forge_for_project("my-proj")
-        assert client is mock_client
-        assert nid == "org/repo"
+        assert proj_svc.resolve_default_branch(mock_client) == "main"
 
 
 # ---------------------------------------------------------------------------
@@ -845,18 +675,33 @@ class TestFORGE_TOOLS:
 
 
 class TestForgeToolsIntegration:
-    """Test that forge tools resolve services from the runtime context."""
+    """Test that forge tools resolve services from the runtime context.
+
+    All forge tools authenticate via the agent's account on the
+    forge, so each test wires up a runtime *and* an agent with a
+    matching :class:`GitLabAccountConfig` on the ``"gl"`` service.
+    The forge service's ``authenticated_client`` is patched to
+    return a mock client so we can assert on the call shape without
+    actually constructing a real GitLab connection.
+    """
 
     def _setup_runtime(
         self, tmp_path: Path,
-    ) -> tuple[Runtime, MagicMock]:
+    ) -> tuple[Runtime, MagicMock, "Agent"]:
+        from thorn.core._account import AgentAccountsConfig
+        from thorn.core._agent import Agent
+        from thorn.core._credentials import Credential
+        from thorn.tools.forge import GitLabAccountConfig
+
         mock_forge_client = MagicMock()
 
         forge_svc = GitLabForgeService(
-            GitLabForgeServiceConfig(url="https://gl.example.com", token="t"),
+            GitLabForgeServiceConfig(url="https://gl.example.com"),
             service_name="gl",
         )
-        forge_svc._client = mock_forge_client
+        forge_svc.authenticated_client = MagicMock(  # type: ignore[method-assign]
+            return_value=mock_forge_client,
+        )
 
         proj_svc = ProjectService(
             ProjectServiceConfig(forks=[
@@ -870,13 +715,30 @@ class TestForgeToolsIntegration:
         )
         runtime.register_service(forge_svc)
         runtime.register_service(proj_svc)
-        return runtime, mock_forge_client
+
+        agent = Agent(
+            metadata={"project": "test-proj"},
+            accounts=AgentAccountsConfig(accounts=[
+                GitLabAccountConfig(
+                    service="gl",
+                    credentials=[Credential(
+                        kind="gitlab-pat",
+                        env_var_name="THORN_TEST_GL_TOKEN",
+                    )],
+                ),
+            ]),
+        )
+        return runtime, mock_forge_client, agent
+
+    @staticmethod
+    def _bind_agent(runtime: Runtime, agent: "Agent") -> None:
+        runtime.context.agent = agent
 
     @pytest.mark.asyncio
     async def test_forge_read_issue(self, tmp_path: Path):
         from thorn.tools.forge import forge_read_issue
 
-        runtime, mock_client = self._setup_runtime(tmp_path)
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
         mock_client.get_issue.return_value = {
             "id": 7,
             "title": "Bug",
@@ -888,6 +750,7 @@ class TestForgeToolsIntegration:
         }
 
         async with runtime:
+            self._bind_agent(runtime, agent)
             result = await forge_read_issue("test-proj", 7)
 
         assert "Bug" in result
@@ -898,9 +761,10 @@ class TestForgeToolsIntegration:
     async def test_forge_post_comment(self, tmp_path: Path):
         from thorn.tools.forge import forge_post_comment
 
-        runtime, mock_client = self._setup_runtime(tmp_path)
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
 
         async with runtime:
+            self._bind_agent(runtime, agent)
             result = await forge_post_comment(
                 "test-proj", "Issue", 7, "looks good",
             )
@@ -914,7 +778,7 @@ class TestForgeToolsIntegration:
     async def test_forge_create_change_request(self, tmp_path: Path):
         from thorn.tools.forge import forge_create_change_request
 
-        runtime, mock_client = self._setup_runtime(tmp_path)
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
         mock_client.create_change_request.return_value = {
             "id": 1,
             "title": "My CR",
@@ -925,6 +789,7 @@ class TestForgeToolsIntegration:
         }
 
         async with runtime:
+            self._bind_agent(runtime, agent)
             result = await forge_create_change_request(
                 "test-proj", "feat", "My CR", "desc", "main",
             )
@@ -936,9 +801,10 @@ class TestForgeToolsIntegration:
     async def test_forge_mark_notification_done(self, tmp_path: Path):
         from thorn.tools.forge import forge_mark_notification_done
 
-        runtime, mock_client = self._setup_runtime(tmp_path)
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
 
         async with runtime:
+            self._bind_agent(runtime, agent)
             result = await forge_mark_notification_done("test-proj", "99")
 
         assert "99" in result
@@ -948,7 +814,7 @@ class TestForgeToolsIntegration:
     async def test_forge_create_issue(self, tmp_path: Path):
         from thorn.tools.forge import forge_create_issue
 
-        runtime, mock_client = self._setup_runtime(tmp_path)
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
         mock_client.create_issue.return_value = {
             "id": 10,
             "title": "New feature",
@@ -960,6 +826,7 @@ class TestForgeToolsIntegration:
         }
 
         async with runtime:
+            self._bind_agent(runtime, agent)
             result = await forge_create_issue(
                 "test-proj", "New feature", "Please add X",
                 ["enhancement"], ["alice"],
@@ -976,7 +843,7 @@ class TestForgeToolsIntegration:
     async def test_forge_list_issues(self, tmp_path: Path):
         from thorn.tools.forge import forge_list_issues
 
-        runtime, mock_client = self._setup_runtime(tmp_path)
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
         mock_client.list_issues.return_value = [
             {
                 "id": 1, "title": "Bug", "state": "open",
@@ -993,6 +860,7 @@ class TestForgeToolsIntegration:
         ]
 
         async with runtime:
+            self._bind_agent(runtime, agent)
             result = await forge_list_issues("test-proj", "open")
 
         assert "2 open issue(s)" in result
@@ -1004,10 +872,11 @@ class TestForgeToolsIntegration:
     async def test_forge_list_issues_empty(self, tmp_path: Path):
         from thorn.tools.forge import forge_list_issues
 
-        runtime, mock_client = self._setup_runtime(tmp_path)
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
         mock_client.list_issues.return_value = []
 
         async with runtime:
+            self._bind_agent(runtime, agent)
             result = await forge_list_issues("test-proj", "closed")
 
         assert "No closed issues" in result
@@ -1016,7 +885,7 @@ class TestForgeToolsIntegration:
     async def test_forge_update_issue_simple(self, tmp_path: Path):
         from thorn.tools.forge import forge_update_issue
 
-        runtime, mock_client = self._setup_runtime(tmp_path)
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
         mock_client.update_issue.return_value = {
             "id": 7, "title": "Renamed", "state": "open",
             "url": "https://gl.example.com/issues/7",
@@ -1024,6 +893,7 @@ class TestForgeToolsIntegration:
         }
 
         async with runtime:
+            self._bind_agent(runtime, agent)
             result = await forge_update_issue(
                 "test-proj", 7, title="Renamed",
             )
@@ -1039,7 +909,7 @@ class TestForgeToolsIntegration:
     async def test_forge_update_issue_add_remove_labels(self, tmp_path: Path):
         from thorn.tools.forge import forge_update_issue
 
-        runtime, mock_client = self._setup_runtime(tmp_path)
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
         mock_client.get_issue.return_value = {
             "id": 7, "title": "Bug", "state": "open",
             "url": "https://gl.example.com/issues/7",
@@ -1054,6 +924,7 @@ class TestForgeToolsIntegration:
         }
 
         async with runtime:
+            self._bind_agent(runtime, agent)
             result = await forge_update_issue(
                 "test-proj", 7,
                 add_labels=["confirmed"],
@@ -1083,19 +954,23 @@ class TestForgeToolsIntegration:
 
 
 class TestResolveWithAccounts:
-    """Test that _resolve uses account-based credentials when available."""
+    """``_resolve`` (the internal helper underneath every forge tool)
+    is the single point that ties together project lookup, account
+    resolution, and authenticated client construction.  The tests
+    here pin down the contract: an agent with a matching account on
+    the forge gets an authenticated client; an agent without one
+    surfaces a clear error rather than silently falling through.
+    """
 
     @pytest.mark.asyncio
     async def test_resolve_uses_account_credentials(self, tmp_path: Path):
-        """When the agent has an account on the forge, _resolve should use
-        authenticated_client rather than the legacy client property."""
-        from thorn.core._account import (
-            AgentAccountsConfig,
-            ForgeAccountConfig,
-            GitLabCredentials,
-        )
+        """An agent with an account on the forge causes ``_resolve``
+        to call ``forge_svc.authenticated_client(account)`` and pass
+        the resulting client to the tool body."""
+        from thorn.core._account import AgentAccountsConfig
         from thorn.core._agent import Agent
-        from thorn.tools.forge import forge_read_issue
+        from thorn.core._credentials import Credential
+        from thorn.tools.forge import GitLabAccountConfig, forge_read_issue
 
         mock_account_client = MagicMock()
         mock_account_client.get_issue.return_value = {
@@ -1108,13 +983,13 @@ class TestResolveWithAccounts:
             "assignees": [],
         }
 
-        mock_legacy_client = MagicMock()
-
         forge_svc = GitLabForgeService(
-            GitLabForgeServiceConfig(url="https://gl.example.com", token="legacy-t"),
+            GitLabForgeServiceConfig(url="https://gl.example.com"),
             service_name="gl",
         )
-        forge_svc._client = mock_legacy_client
+        forge_svc.authenticated_client = MagicMock(  # type: ignore[method-assign]
+            return_value=mock_account_client,
+        )
 
         proj_svc = ProjectService(
             ProjectServiceConfig(forks=[
@@ -1127,56 +1002,46 @@ class TestResolveWithAccounts:
         runtime.register_service(forge_svc)
         runtime.register_service(proj_svc)
 
-        accounts = AgentAccountsConfig(accounts=[
-            ForgeAccountConfig(
-                service="gl",
-                credentials=GitLabCredentials(token="account-token"),
-                git_user_name="bot",
-                git_user_email="bot@thorn",
-            ),
-        ])
         agent = Agent(
             metadata={"project": "test-proj"},
-            accounts=accounts,
+            accounts=AgentAccountsConfig(accounts=[
+                GitLabAccountConfig(
+                    service="gl",
+                    credentials=[Credential(
+                        kind="gitlab-pat",
+                        env_var_name="THORN_TEST_GL_TOKEN",
+                    )],
+                ),
+            ]),
         )
 
-        with MagicMock() as auth_patch:
-            forge_svc.authenticated_client = MagicMock(  # type: ignore[method-assign]
-                return_value=mock_account_client,
-            )
-
-            async with runtime:
-                runtime.context.agent = agent
-                result = await forge_read_issue("test-proj", 5)
+        async with runtime:
+            runtime.context.agent = agent
+            result = await forge_read_issue("test-proj", 5)
 
         assert "Account Bug" in result
         mock_account_client.get_issue.assert_called_once_with("42", 5)
-        mock_legacy_client.get_issue.assert_not_called()
+        # The forge service should have been asked for an
+        # authenticated client using the agent's account; we don't
+        # care about the exact account instance, just that it was
+        # called once.
+        forge_svc.authenticated_client.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_resolve_falls_back_to_legacy(self, tmp_path: Path):
-        """When the agent has no account on the forge, _resolve should
-        use the legacy client property."""
+    async def test_resolve_raises_when_agent_has_no_account(
+        self, tmp_path: Path,
+    ):
+        """An agent with no matching account on the forge surfaces a
+        clear ``KeyError`` rather than silently falling back to
+        unauthenticated access (which is what the pre-account-driven
+        code did, and which is exactly what the new design rejects)."""
         from thorn.core._agent import Agent
         from thorn.tools.forge import forge_read_issue
 
-        mock_legacy_client = MagicMock()
-        mock_legacy_client.get_issue.return_value = {
-            "id": 5,
-            "title": "Legacy Bug",
-            "state": "open",
-            "url": "https://gl.example.com/issues/5",
-            "description": "via legacy",
-            "labels": [],
-            "assignees": [],
-        }
-
         forge_svc = GitLabForgeService(
-            GitLabForgeServiceConfig(url="https://gl.example.com", token="t"),
+            GitLabForgeServiceConfig(url="https://gl.example.com"),
             service_name="gl",
         )
-        forge_svc._client = mock_legacy_client
-
         proj_svc = ProjectService(
             ProjectServiceConfig(forks=[
                 ForkConfig(forge="gl", native_id="42"),
@@ -1192,7 +1057,5 @@ class TestResolveWithAccounts:
 
         async with runtime:
             runtime.context.agent = agent
-            result = await forge_read_issue("test-proj", 5)
-
-        assert "Legacy Bug" in result
-        mock_legacy_client.get_issue.assert_called_once_with("42", 5)
+            with pytest.raises(KeyError, match="no account"):
+                await forge_read_issue("test-proj", 5)

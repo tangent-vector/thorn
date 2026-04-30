@@ -937,6 +937,25 @@ def _serve_gateway(
         runtime.sessions.load_agent(aid)
         for aid in runtime.sessions.list_agent_ids()
     ]
+
+    # Service-driven account validation: replace each loaded
+    # agent's parse-time UntypedAccountConfig entries with the typed
+    # AccountConfig subclass declared by the corresponding service.
+    # Doing this before `infer_event_sources` (and broker
+    # registration, which happens later inside `gateway.run`) means
+    # both code paths see typed accounts and per-service fields
+    # like git_user_email survive validation.  Misconfigured
+    # accounts (referencing an unknown service) surface here with
+    # a clear error.
+    from thorn.core._account import validate_agent_accounts
+
+    try:
+        for agent in agents:
+            validate_agent_accounts(agent, runtime.get_service)
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+
     sources = infer_event_sources(gateway_config, agents)
 
     if not sources:

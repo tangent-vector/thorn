@@ -28,12 +28,20 @@ from typing import Any, ClassVar, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from thorn.core._account import ForgeCredentials, GitLabCredentials
+from thorn.core._account import (
+    AccountConfig,
+    require_credential,
+)
+from thorn.core._brokering import (
+    BrokerableService,
+    BrokerCredentialPlan,
+    HeaderInjection,
+)
 from thorn.core._context import get_context
+from thorn.core._credentials import ServiceCredential
 from thorn.core._func import tool
 from thorn.core._service import Service
 from thorn.tools._github_connection import (
-    GitHubAppAuth,
     GitHubConnectionConfig,
     GitHubPatAuth,
 )
@@ -574,65 +582,107 @@ class GitLabForgeServiceConfig(BaseModel):
     """Configuration for a ``gitlab`` forge service."""
 
     url: str = Field(description="GitLab API base URL")
-    token: str = Field(description="Personal access token with API scope")
+    # Empty by default: per-agent credentials live on the agent's
+    # :class:`GitLabAccountConfig` and are injected via the broker
+    # at agent-load time.  The field is retained as an empty
+    # placeholder so older code paths that read ``config.token``
+    # continue to compile; new code paths use the account-side
+    # credential exclusively.
+    token: str = Field(default="", description="Deprecated; left empty")
 
 
-class ForgeHostService(Service, ABC):
-    """API client plus credentials for HTTPS git against this forge host.
+# ---------------------------------------------------------------------------
+# Per-agent forge account configs
+# ---------------------------------------------------------------------------
 
-    Concrete subclasses implement two families of methods:
 
-    **Legacy (credentials baked into the service config):**
-    ``client`` property and ``git_https_password()`` — used by
-    existing code that reads credentials from the forge service
-    config.  These will be removed once all consumers migrate to
-    the account-based methods below.
+class _ForgeAccountBase(AccountConfig):
+    """Common fields for accounts on a forge service.
 
-    **Account-based (credentials passed in):**
-    ``authenticated_client(credentials)`` and
-    ``git_https_password_for(credentials)`` — the target API.
-    Consumers resolve the agent's :class:`ForgeAccountConfig` for
-    this forge, then pass its credentials here.
+    Both GitHub and GitLab accounts carry the same git-author
+    identity fields (``git_user_name`` / ``git_user_email``); we
+    factor them onto an internal base to keep the per-forge classes
+    free of repetition.  Operators don't see this class -- the
+    discrimination at parse time is by the ``service`` discriminator
+    on :class:`UntypedAccountConfig`, which the gateway's validation
+    pass routes to the right concrete subclass.
     """
 
-    @property
-    @abstractmethod
-    def client(self) -> ForgeClient:
-        """Forge-neutral client for issues, MRs/PRs, etc.
+    git_user_name: str = Field(
+        default="",
+        description=(
+            "Git author/committer name when this account drives "
+            "git operations on its forge."
+        ),
+    )
+    git_user_email: str = Field(
+        default="",
+        description=(
+            "Git author/committer email when this account drives "
+            "git operations on its forge."
+        ),
+    )
 
-        .. deprecated::
-            Use :meth:`authenticated_client` with explicit credentials.
-        """
 
-    @abstractmethod
-    def git_https_password(self) -> str:
-        """Password (or token) for embedding in HTTPS git URLs.
+class GitHubAccountConfig(_ForgeAccountBase):
+    """An agent's account on a GitHub (or GitHub Enterprise) forge.
 
-        .. deprecated::
-            Use :meth:`git_https_password_for` with explicit credentials.
-        """
+    The credentials list typically holds a single ``"pat"`` entry
+    referencing the env var the operator put their PAT into; broker
+    registration reads the value from that env var at gateway
+    startup and keeps the literal out of agent state thereafter.
+    """
+
+
+class GitLabAccountConfig(_ForgeAccountBase):
+    """An agent's account on a GitLab forge.
+
+    The credentials list typically holds a single ``"gitlab-pat"``
+    entry referencing the env var the operator put their PAT into.
+    """
+
+
+class ForgeHostService(BrokerableService, ABC):
+    """API client plus credentials for HTTPS git against this forge host.
+
+    Concrete subclasses implement the account-driven authentication
+    methods below.  Account credentials are referenced from the
+    agent's :class:`AccountConfig` (a :class:`GitHubAccountConfig` or
+    :class:`GitLabAccountConfig`) and the literal secret value is
+    read from ``os.environ`` at the point of use -- the agent state
+    holds only the env var name.
+
+    Subclasses also implement
+    :meth:`BrokerableService.broker_credential_plans` so the gateway
+    can register this forge's credentials with the upstream
+    credential broker; that's how in-sandbox tools end up
+    authenticating without ever seeing the literal token.
+    """
 
     @abstractmethod
     def authenticated_client(
         self,
-        credentials: ForgeCredentials,
+        account: AccountConfig,
     ) -> ForgeClient:
-        """Build a forge client authenticated with the given credentials.
+        """Build a forge client authenticated with *account*'s credentials.
 
-        Unlike the ``client`` property, this does not rely on
-        credentials stored in the service config — they come from the
-        agent's :class:`ForgeAccountConfig` instead.
+        Implementations look up the appropriate credential on
+        *account* (typically the first ``"pat"`` entry), read its
+        value from ``os.environ``, and use the value to construct a
+        client.  Raise :class:`TypeError` when *account* is not a
+        typed account of the shape this forge expects.
         """
 
     @abstractmethod
     def git_https_password_for(
         self,
-        credentials: ForgeCredentials,
+        account: AccountConfig,
     ) -> str:
-        """Return the HTTPS password/token for git operations.
+        """Return the literal HTTPS password/token for git operations.
 
-        The credential material is extracted from *credentials*
-        (typically a PAT token string or an installation access token).
+        Reads the underlying env var and returns the raw string
+        (suitable for injection into git's HTTPS-auth env vars).
+        Returns ``""`` when the account has no usable credential.
         """
 
     @abstractmethod
@@ -648,11 +698,20 @@ class GitLabForgeService(ForgeHostService):
     """Connection to a GitLab instance."""
 
     Config: ClassVar[type[BaseModel]] = GitLabForgeServiceConfig
+    AccountConfig: ClassVar[type[AccountConfig] | None] = GitLabAccountConfig
+
+    _CREDENTIAL_KIND: ClassVar[str] = "gitlab-pat"
+    """Credential kind this forge expects on agent accounts.
+
+    Lives as a ClassVar so the per-credential discrimination logic
+    (looking up the credential on the account, planning broker
+    registration, etc.) all reads from one place rather than
+    repeating the literal in each method.
+    """
 
     def __init__(self, config: GitLabForgeServiceConfig, *, service_name: str) -> None:
         self._config = config
         self._service_name = service_name
-        self._client: ForgeClient | None = None
 
     @property
     def name(self) -> str:
@@ -663,43 +722,69 @@ class GitLabForgeService(ForgeHostService):
         """GitLab instance API base URL."""
         return self._config.url
 
-    @property
-    def client(self) -> ForgeClient:
-        if self._client is None:
-            from thorn.tools.gitlab import GitLabClient, GitLabConfig
-
-            gl_config = GitLabConfig(
-                url=self._config.url, token=self._config.token,
-            )
-            self._client = GitLabForgeClient(GitLabClient(gl_config))
-        return self._client
-
-    def git_https_password(self) -> str:
-        return self._config.token
-
-    def _extract_gitlab_token(self, credentials: ForgeCredentials) -> str:
-        if not isinstance(credentials, GitLabCredentials):
+    def _resolve_account(self, account: AccountConfig) -> GitLabAccountConfig:
+        if not isinstance(account, GitLabAccountConfig):
             raise TypeError(
-                f"GitLabForgeService requires GitLabCredentials, "
-                f"got {type(credentials).__name__}"
+                f"GitLabForgeService requires GitLabAccountConfig, "
+                f"got {type(account).__name__}"
             )
-        return credentials.token
+        return account
+
+    def _read_credential_value(self, account: AccountConfig) -> ServiceCredential:
+        gl_account = self._resolve_account(account)
+        cred = require_credential(gl_account, kind=self._CREDENTIAL_KIND)
+        return cred.read_value()
 
     def authenticated_client(
         self,
-        credentials: ForgeCredentials,
+        account: AccountConfig,
     ) -> ForgeClient:
         from thorn.tools.gitlab import GitLabClient, GitLabConfig
 
-        token = self._extract_gitlab_token(credentials)
-        gl_config = GitLabConfig(url=self._config.url, token=token)
+        token = self._read_credential_value(account)
+        gl_config = GitLabConfig(url=self._config.url, token=str(token))
         return GitLabForgeClient(GitLabClient(gl_config))
 
     def git_https_password_for(
         self,
-        credentials: ForgeCredentials,
+        account: AccountConfig,
     ) -> str:
-        return self._extract_gitlab_token(credentials)
+        return str(self._read_credential_value(account))
+
+    def broker_credential_plans(
+        self,
+        account: AccountConfig,
+    ) -> list[BrokerCredentialPlan]:
+        """Plan one broker registration per ``gitlab-pat`` credential.
+
+        Host pattern is the GitLab instance's hostname (the same
+        host serves the API and the git endpoints, so a single
+        registration covers both).  Path pattern is restricted to
+        ``/api/*`` because git HTTPS auth is handled separately via
+        ``GIT_CONFIG_*`` env vars (see :mod:`thorn.tools.git`); we
+        only want OneCLI substituting on REST calls.
+        """
+        from urllib.parse import urlparse
+
+        gl_account = self._resolve_account(account)
+        host = urlparse(self._config.url).hostname or ""
+        if not host:
+            return []
+        plans: list[BrokerCredentialPlan] = []
+        for cred in gl_account.credentials:
+            if cred.kind != self._CREDENTIAL_KIND:
+                continue
+            plans.append(BrokerCredentialPlan(
+                env_var_name=cred.env_var_name,
+                host_pattern=host,
+                path_pattern="/api/*",
+                injection=HeaderInjection(
+                    header_name="Authorization",
+                    value_format="Bearer {value}",
+                ),
+                secret_name_suffix="gitlab-pat",
+            ))
+        return plans
 
     def clone_url_for(self, native_id: str) -> str:
         """Derive an HTTPS clone URL for a GitLab project.
@@ -726,15 +811,26 @@ class GitLabForgeService(ForgeHostService):
 
 
 class GitHubForgeService(ForgeHostService):
-    """Connection to GitHub or GitHub Enterprise (PAT or GitHub App)."""
+    """Connection to GitHub or GitHub Enterprise (PAT auth)."""
 
     Config: ClassVar[type[BaseModel]] = GitHubConnectionConfig
+    AccountConfig: ClassVar[type[AccountConfig] | None] = GitHubAccountConfig
+
+    _CREDENTIAL_KIND: ClassVar[str] = "pat"
+    """Credential kind this forge expects on agent accounts.
+
+    GitHub App auth (``"app"``) is intentionally not supported by
+    the broker-routed path: OneCLI's substitution model handles
+    static tokens only, not the JWT-signing + installation-token
+    exchange flow App auth requires.  An account with only ``"app"``
+    credentials produces an empty :meth:`broker_credential_plans`
+    result; the operator should either move to PAT auth or run the
+    gateway without sandboxing for that agent.
+    """
 
     def __init__(self, config: GitHubConnectionConfig, *, service_name: str) -> None:
         self._config = config
         self._service_name = service_name
-        self._forge_client: ForgeClient | None = None
-        self._github_client: Any = None
 
     @property
     def name(self) -> str:
@@ -745,53 +841,76 @@ class GitHubForgeService(ForgeHostService):
         """GitHub REST API base URL."""
         return self._config.base_url
 
-    @property
-    def client(self) -> ForgeClient:
-        if self._forge_client is None:
-            from thorn.tools.github import GitHubClient
-
-            self._github_client = GitHubClient(self._config)
-            self._forge_client = GitHubForgeClient(self._github_client)
-        return self._forge_client
-
-    def git_https_password(self) -> str:
-        _ = self.client
-        assert self._github_client is not None
-        return self._github_client.bearer_token_for_http()
-
-    def _build_connection_config(
-        self,
-        credentials: ForgeCredentials,
-    ) -> GitHubConnectionConfig:
-        if not isinstance(credentials, (GitHubPatAuth, GitHubAppAuth)):
+    def _resolve_account(self, account: AccountConfig) -> GitHubAccountConfig:
+        if not isinstance(account, GitHubAccountConfig):
             raise TypeError(
-                f"GitHubForgeService requires GitHubPatAuth or "
-                f"GitHubAppAuth, got {type(credentials).__name__}"
+                f"GitHubForgeService requires GitHubAccountConfig, "
+                f"got {type(account).__name__}"
             )
-        return GitHubConnectionConfig(
-            base_url=self._config.base_url,
-            auth=credentials,
-        )
+        return account
+
+    def _read_credential_value(self, account: AccountConfig) -> ServiceCredential:
+        gh_account = self._resolve_account(account)
+        cred = require_credential(gh_account, kind=self._CREDENTIAL_KIND)
+        return cred.read_value()
 
     def authenticated_client(
         self,
-        credentials: ForgeCredentials,
+        account: AccountConfig,
     ) -> ForgeClient:
         from thorn.tools.github import GitHubClient
 
-        conn = self._build_connection_config(credentials)
+        value = self._read_credential_value(account)
+        conn = GitHubConnectionConfig(
+            base_url=self._config.base_url,
+            auth=GitHubPatAuth(token=str(value)),
+        )
         gh_client = GitHubClient(conn)
         return GitHubForgeClient(gh_client)
 
     def git_https_password_for(
         self,
-        credentials: ForgeCredentials,
+        account: AccountConfig,
     ) -> str:
-        from thorn.tools.github import GitHubClient
+        return str(self._read_credential_value(account))
 
-        conn = self._build_connection_config(credentials)
-        gh_client = GitHubClient(conn)
-        return gh_client.bearer_token_for_http()
+    def broker_credential_plans(
+        self,
+        account: AccountConfig,
+    ) -> list[BrokerCredentialPlan]:
+        """Plan one broker registration per ``pat`` credential.
+
+        Host pattern is the API host (``api.github.com`` for
+        GitHub.com, otherwise the host from ``base_url``).  GitHub
+        Enterprise serves the API under ``/api/v3/`` on the bare
+        host; we register the API host so OneCLI matches just the
+        REST traffic, with git HTTPS auth handled separately via
+        ``GIT_CONFIG_*`` env vars (see :mod:`thorn.tools.git`).
+        """
+        from urllib.parse import urlparse
+
+        gh_account = self._resolve_account(account)
+        parsed_host = urlparse(self._config.base_url).hostname or ""
+        api_host = (
+            "api.github.com" if parsed_host == "github.com" else parsed_host
+        )
+        if not api_host:
+            return []
+        plans: list[BrokerCredentialPlan] = []
+        for cred in gh_account.credentials:
+            if cred.kind != self._CREDENTIAL_KIND:
+                continue
+            plans.append(BrokerCredentialPlan(
+                env_var_name=cred.env_var_name,
+                host_pattern=api_host,
+                path_pattern="/*",
+                injection=HeaderInjection(
+                    header_name="Authorization",
+                    value_format="Bearer {value}",
+                ),
+                secret_name_suffix="github-pat",
+            ))
+        return plans
 
     def clone_url_for(self, native_id: str) -> str:
         """Derive an HTTPS clone URL for a GitHub repository.
@@ -963,7 +1082,7 @@ class ProjectService(Service):
 
     def resolve_default_branch(
         self,
-        runtime: Any,
+        forge_client: ForgeClient,
         fork_name: str = "",
     ) -> str:
         """Resolve the default branch for *fork_name*, looking it up if needed.
@@ -973,7 +1092,13 @@ class ProjectService(Service):
         1. Per-fork override on :attr:`ForkConfig.default_branch`.
         2. Project-level override on :attr:`default_branch`.
         3. Process-cached previous lookup.
-        4. Live ``get_project_info`` call against the fork's forge.
+        4. Live ``get_project_info`` call via *forge_client*.
+
+        The caller is responsible for supplying an authenticated
+        :class:`ForgeClient` (typically via the forge service's
+        ``authenticated_client(account)`` against the agent's
+        :class:`AccountConfig`); this method only knows how to
+        cascade through the override chain and cache the result.
 
         The result of step 4 is cached per fork for subsequent calls.
         Raises :class:`KeyError` for an unknown fork name.
@@ -990,13 +1115,7 @@ class ProjectService(Service):
         if cached:
             return cached
 
-        forge_svc = runtime.get_service(fork.forge)
-        if not isinstance(forge_svc, ForgeHostService):
-            raise TypeError(
-                f"Service {fork.forge!r} is a "
-                f"{type(forge_svc).__name__}, not a ForgeHostService"
-            )
-        info = forge_svc.client.get_project_info(fork.native_id)
+        info = forge_client.get_project_info(fork.native_id)
         resolved = info.get("default_branch") or "main"
         self._default_branch_cache[cache_key] = resolved
         return resolved
@@ -1021,45 +1140,6 @@ class ProjectService(Service):
             f"Available: {[f.name for f in forks]}"
         )
 
-    def get_forge_client(self, runtime: Any) -> tuple[ForgeClient, str]:
-        """Resolve this project's ``ForgeClient`` via the Runtime.
-
-        Returns ``(client, native_id)`` for the primary fork so
-        callers can make API calls using the forge-native project
-        identifier.
-        """
-        forge_service: ForgeHostService = runtime.get_service(self.forge_name)
-        if not isinstance(forge_service, ForgeHostService):
-            raise TypeError(
-                f"Service {self.forge_name!r} is a "
-                f"{type(forge_service).__name__}, not a ForgeHostService"
-            )
-        return forge_service.client, self.native_id
-
-
-# ---------------------------------------------------------------------------
-# Runtime convenience method (added via monkey-free helper)
-# ---------------------------------------------------------------------------
-
-
-def get_forge_for_project(
-    runtime: Any, project_name: str,
-) -> tuple[ForgeClient, str]:
-    """Look up a project service and return its ``(ForgeClient, native_id)``.
-
-    This is the primary entry point for forge tools: given a project
-    name from a tool parameter, obtain the client and native ID needed
-    to make API calls.
-    """
-    project: ProjectService = runtime.get_service(project_name)
-    if not isinstance(project, ProjectService):
-        raise TypeError(
-            f"Service {project_name!r} is a "
-            f"{type(project).__name__}, not a ProjectService"
-        )
-    return project.get_forge_client(runtime)
-
-
 # ---------------------------------------------------------------------------
 # FORGE_TOOLS
 # ---------------------------------------------------------------------------
@@ -1068,13 +1148,14 @@ def get_forge_for_project(
 def _resolve(project: str) -> tuple[ForgeClient, str]:
     """Resolve an authenticated ForgeClient + native ID for *project*.
 
-    Uses the current agent's :class:`ForgeAccountConfig` to
-    authenticate.  Falls back to the legacy ``ForgeHostService.client``
-    property when the agent has no account on the project's forge
-    (backward compat with old-style configs where credentials live on
-    the forge service itself).
+    Uses the current agent's :class:`AccountConfig` for the project's
+    forge to authenticate.  Raises a clear ``RuntimeError`` when no
+    matching account is configured -- forge operations now always
+    flow through per-agent credentials, so a missing account is a
+    configuration error rather than something to silently fall
+    through.
     """
-    from thorn.core._account import resolve_forge_account
+    from thorn.core._account import resolve_account
 
     ctx = get_context()
     if ctx.runtime is None:
@@ -1100,17 +1181,18 @@ def _resolve(project: str) -> tuple[ForgeClient, str]:
         )
 
     agent = ctx.agent
-    if agent is not None:
-        try:
-            account = resolve_forge_account(agent, forge_svc.name)
-            return (
-                forge_svc.authenticated_client(account.credentials),
-                project_svc.native_id,
-            )
-        except KeyError:
-            pass
+    if agent is None:
+        raise RuntimeError(
+            f"Forge tool for project {project!r} requires an active "
+            "agent context with an account on forge "
+            f"{forge_svc.name!r}, but no agent is in scope."
+        )
 
-    return forge_svc.client, project_svc.native_id
+    account = resolve_account(agent, forge_svc.name)
+    return (
+        forge_svc.authenticated_client(account),
+        project_svc.native_id,
+    )
 
 
 @tool
@@ -1469,7 +1551,9 @@ __all__ = [
     "ForgeClient",
     "ForkConfig",
     "ForgeHostService",
+    "GitHubAccountConfig",
     "GitHubForgeService",
+    "GitLabAccountConfig",
     "GitLabForgeService",
     "GitHubForgeClient",
     "GitLabForgeClient",
@@ -1489,5 +1573,4 @@ __all__ = [
     "forge_read_file",
     "forge_read_issue",
     "forge_update_issue",
-    "get_forge_for_project",
 ]

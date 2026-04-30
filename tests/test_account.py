@@ -1,273 +1,245 @@
-"""Tests for thorn.core._account -- credential models and account resolution."""
+"""Tests for ``thorn.core._account`` -- account models, lookup, validation."""
 
 from __future__ import annotations
-
-from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
 from thorn.core._account import (
+    AccountConfig,
     AgentAccountsConfig,
-    ForgeAccountConfig,
-    GitLabCredentials,
-    resolve_forge_account,
+    UntypedAccountConfig,
+    find_credential,
+    require_credential,
+    resolve_account,
+    validate_agent_accounts,
 )
 from thorn.core._agent import Agent
-from thorn.tools._github_connection import GitHubAppAuth, GitHubPatAuth
-from thorn.tools.forge import (
-    GitHubForgeClient,
-    GitHubForgeService,
-    GitLabForgeClient,
-    GitLabForgeService,
-    GitLabForgeServiceConfig,
-)
+from thorn.core._credentials import Credential
 
 
 # ---------------------------------------------------------------------------
-# Credential model construction
+# UntypedAccountConfig
 # ---------------------------------------------------------------------------
 
 
-class TestGitLabCredentials:
-    def test_defaults_kind(self):
-        creds = GitLabCredentials(token="glpat-abc")
-        assert creds.kind == "gitlab-pat"
-        assert creds.token == "glpat-abc"
+class TestUntypedAccountConfig:
+    def test_minimal_construction(self):
+        acc = UntypedAccountConfig(service="github")
+        assert acc.service == "github"
+        assert acc.credentials == []
 
-    def test_round_trip_json(self):
-        creds = GitLabCredentials(token="glpat-abc")
-        data = creds.model_dump()
-        assert data == {"kind": "gitlab-pat", "token": "glpat-abc"}
-        restored = GitLabCredentials.model_validate(data)
-        assert restored == creds
+    def test_preserves_extra_fields(self):
+        # ``extra='allow'`` so per-service fields survive parsing.
+        acc = UntypedAccountConfig.model_validate({
+            "service": "github",
+            "credentials": [{"kind": "pat", "env_var_name": "X"}],
+            "git_user_name": "bot",
+            "git_user_email": "bot@example.com",
+        })
+        # Extra fields are accessible via attribute access.
+        assert acc.git_user_name == "bot"
+        assert acc.git_user_email == "bot@example.com"
 
+    def test_is_subclass_of_account_config(self):
+        # UntypedAccountConfig is a subclass of AccountConfig so
+        # downstream code can ``isinstance(x, AccountConfig)`` and
+        # cover both shapes uniformly.
+        assert issubclass(UntypedAccountConfig, AccountConfig)
 
-class TestForgeAccountConfig:
-    def test_github_pat_account(self):
-        acct = ForgeAccountConfig(
-            service="github-com",
-            credentials=GitHubPatAuth(token="ghp_test"),
-            git_user_name="bot",
-            git_user_email="bot@example.com",
-        )
-        assert acct.service == "github-com"
-        assert acct.credentials.kind == "pat"
-        assert acct.git_user_name == "bot"
+    def test_credential_validation(self):
+        acc = UntypedAccountConfig.model_validate({
+            "service": "github",
+            "credentials": [
+                {"kind": "pat", "env_var_name": "GITHUB_TOKEN"},
+                {"kind": "pat", "name": "backup", "env_var_name": "BACKUP_TOKEN"},
+            ],
+        })
+        assert len(acc.credentials) == 2
+        assert all(isinstance(c, Credential) for c in acc.credentials)
 
-    def test_github_app_account(self):
-        acct = ForgeAccountConfig(
-            service="github-com",
-            credentials=GitHubAppAuth(
-                app_id="12345",
-                installation_id=67890,
-                private_key_pem="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
-            ),
-            git_user_name="app-bot",
-            git_user_email="app-bot@example.com",
-        )
-        assert acct.credentials.kind == "app"
-        assert acct.credentials.app_id == "12345"
-
-    def test_gitlab_pat_account(self):
-        acct = ForgeAccountConfig(
-            service="my-gitlab",
-            credentials=GitLabCredentials(token="glpat-xyz"),
-        )
-        assert acct.service == "my-gitlab"
-        assert acct.credentials.kind == "gitlab-pat"
-        assert acct.git_user_name == ""
-        assert acct.git_user_email == ""
-
-    def test_round_trip_json(self):
-        acct = ForgeAccountConfig(
-            service="github-com",
-            credentials=GitHubPatAuth(token="ghp_test"),
-            git_user_name="bot",
-            git_user_email="bot@thorn",
-        )
-        data = acct.model_dump()
-        restored = ForgeAccountConfig.model_validate(data)
-        assert restored.service == acct.service
-        assert restored.credentials.kind == "pat"
-        assert restored.credentials.token == "ghp_test"
-        assert restored.git_user_name == "bot"
-
-
-class TestAgentAccountsConfig:
-    def test_empty_default(self):
-        cfg = AgentAccountsConfig()
-        assert cfg.accounts == []
-        assert cfg.forge_accounts() == []
-
-    def test_multiple_accounts(self):
-        cfg = AgentAccountsConfig(accounts=[
-            ForgeAccountConfig(
-                service="github-com",
-                credentials=GitHubPatAuth(token="ghp_1"),
-            ),
-            ForgeAccountConfig(
-                service="my-gitlab",
-                credentials=GitLabCredentials(token="glpat-2"),
-            ),
-        ])
-        assert len(cfg.forge_accounts()) == 2
-        assert cfg.forge_accounts()[0].service == "github-com"
-        assert cfg.forge_accounts()[1].service == "my-gitlab"
+    def test_service_required(self):
+        with pytest.raises(ValueError):
+            UntypedAccountConfig.model_validate({"service": ""})
 
 
 # ---------------------------------------------------------------------------
-# resolve_forge_account
+# Lookup helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_agent_with_accounts(
-    accounts: AgentAccountsConfig,
-    name: str = "test-agent",
-) -> Agent:
-    agent = Agent(name=name)
-    agent.accounts = accounts
+def _account_with_creds(*creds: tuple[str, str, str | None]) -> AccountConfig:
+    return UntypedAccountConfig(
+        service="github",
+        credentials=[
+            Credential(kind=k, env_var_name=e, name=n)
+            for k, e, n in creds
+        ],
+    )
+
+
+class TestFindCredential:
+    def test_finds_first_by_kind(self):
+        acc = _account_with_creds(("pat", "A", None), ("pat", "B", "backup"))
+        cred = find_credential(acc, kind="pat")
+        assert cred is not None
+        assert cred.env_var_name == "A"
+
+    def test_finds_by_kind_and_name(self):
+        acc = _account_with_creds(("pat", "A", None), ("pat", "B", "backup"))
+        cred = find_credential(acc, kind="pat", name="backup")
+        assert cred is not None
+        assert cred.env_var_name == "B"
+
+    def test_returns_none_when_no_match(self):
+        acc = _account_with_creds(("pat", "A", None))
+        assert find_credential(acc, kind="other") is None
+        assert find_credential(acc, kind="pat", name="missing") is None
+
+
+class TestRequireCredential:
+    def test_returns_match(self):
+        acc = _account_with_creds(("pat", "A", None))
+        cred = require_credential(acc, kind="pat")
+        assert cred.env_var_name == "A"
+
+    def test_raises_with_helpful_kinds(self):
+        acc = _account_with_creds(("pat", "A", None))
+        with pytest.raises(KeyError, match="pat"):
+            require_credential(acc, kind="other")
+
+
+# ---------------------------------------------------------------------------
+# resolve_account
+# ---------------------------------------------------------------------------
+
+
+def _agent_with_typed_account(service: str) -> Agent:
+    agent = Agent(name="test")
+    typed = AccountConfig(service=service, credentials=[])
+    agent.accounts = AgentAccountsConfig.model_construct(accounts=[typed])
     return agent
 
 
-class TestResolveForgeAccount:
-    def test_finds_matching_account(self):
-        accounts = AgentAccountsConfig(accounts=[
-            ForgeAccountConfig(
-                service="github-com",
-                credentials=GitHubPatAuth(token="ghp_abc"),
-                git_user_name="bot",
-                git_user_email="bot@thorn",
-            ),
-        ])
-        agent = _make_agent_with_accounts(accounts)
-        result = resolve_forge_account(agent, "github-com")
-        assert result.service == "github-com"
-        assert result.credentials.token == "ghp_abc"
-        assert result.git_user_name == "bot"
+class TestResolveAccount:
+    def test_finds_typed_account(self):
+        agent = _agent_with_typed_account("github")
+        result = resolve_account(agent, "github")
+        assert result.service == "github"
 
-    def test_finds_second_account(self):
-        accounts = AgentAccountsConfig(accounts=[
-            ForgeAccountConfig(
-                service="github-com",
-                credentials=GitHubPatAuth(token="ghp_first"),
-            ),
-            ForgeAccountConfig(
-                service="my-gitlab",
-                credentials=GitLabCredentials(token="glpat-second"),
-            ),
-        ])
-        agent = _make_agent_with_accounts(accounts)
-        result = resolve_forge_account(agent, "my-gitlab")
-        assert result.credentials.kind == "gitlab-pat"
+    def test_raises_for_missing_service(self):
+        agent = _agent_with_typed_account("github")
+        with pytest.raises(KeyError, match="no account on service"):
+            resolve_account(agent, "gitlab")
 
-    def test_raises_for_missing_forge(self):
-        accounts = AgentAccountsConfig(accounts=[
-            ForgeAccountConfig(
-                service="github-com",
-                credentials=GitHubPatAuth(token="ghp_abc"),
-            ),
-        ])
-        agent = _make_agent_with_accounts(accounts)
-        with pytest.raises(KeyError, match="no account on forge 'other-forge'"):
-            resolve_forge_account(agent, "other-forge")
+    def test_raises_when_account_still_untyped(self):
+        agent = Agent(name="test")
+        untyped = UntypedAccountConfig(service="github")
+        agent.accounts = AgentAccountsConfig.model_construct(accounts=[untyped])
+        with pytest.raises(TypeError, match="UntypedAccountConfig"):
+            resolve_account(agent, "github")
 
-    def test_raises_for_no_accounts_attribute(self):
-        agent = Agent(name="bare-agent")
+    def test_raises_when_no_accounts_attribute(self):
+        agent = Agent(name="bare")
         with pytest.raises(KeyError, match="no accounts configured"):
-            resolve_forge_account(agent, "github-com")
-
-    def test_raises_for_empty_accounts(self):
-        agent = _make_agent_with_accounts(AgentAccountsConfig())
-        with pytest.raises(KeyError, match="no account on forge"):
-            resolve_forge_account(agent, "github-com")
+            resolve_account(agent, "github")
 
 
 # ---------------------------------------------------------------------------
-# ForgeHostService.authenticated_client / git_https_password_for
+# validate_agent_accounts
 # ---------------------------------------------------------------------------
 
 
-class TestGitLabForgeServiceAccountAuth:
-    def _make_service(self) -> GitLabForgeService:
-        config = GitLabForgeServiceConfig(
-            url="https://gitlab.example.com",
-            token="old-baked-in-token",
-        )
-        return GitLabForgeService(config, service_name="my-gitlab")
+class _FakeService:
+    """Minimal :class:`Service`-like object for validate_agent_accounts.
 
-    def test_authenticated_client_returns_forge_client(self):
-        svc = self._make_service()
-        creds = GitLabCredentials(token="new-agent-token")
-        client = svc.authenticated_client(creds)
-        assert isinstance(client, GitLabForgeClient)
-
-    def test_git_https_password_for_returns_token(self):
-        svc = self._make_service()
-        creds = GitLabCredentials(token="new-agent-token")
-        assert svc.git_https_password_for(creds) == "new-agent-token"
-
-    def test_rejects_github_credentials(self):
-        svc = self._make_service()
-        creds = GitHubPatAuth(token="ghp_wrong")
-        with pytest.raises(TypeError, match="GitLabCredentials"):
-            svc.authenticated_client(creds)
-
-    def test_rejects_github_credentials_for_password(self):
-        svc = self._make_service()
-        creds = GitHubPatAuth(token="ghp_wrong")
-        with pytest.raises(TypeError, match="GitLabCredentials"):
-            svc.git_https_password_for(creds)
-
-    def test_url_property(self):
-        svc = self._make_service()
-        assert svc.url == "https://gitlab.example.com"
-
-
-class TestGitHubForgeServiceAccountAuth:
-    """Test the account-based auth methods on GitHubForgeService.
-
-    These tests mock out GitHubClient to avoid needing PyGithub
-    installed, which mirrors how the existing test_forge.py tests work.
+    The real :class:`Service` ABC requires
+    :class:`pydantic.BaseModel`-typed ``Config``; we don't need it
+    here since validate_agent_accounts only calls
+    ``service.validate_account``.
     """
 
-    def _make_service(self) -> GitHubForgeService:
-        from thorn.tools._github_connection import GitHubConnectionConfig, GitHubPatAuth
-        config = GitHubConnectionConfig(
-            base_url="https://api.github.com",
-            auth=GitHubPatAuth(token="old-baked-in-token"),
+    def __init__(self, name: str, account_cls: type[AccountConfig]) -> None:
+        self._name = name
+        self._account_cls = account_cls
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def validate_account(self, raw: UntypedAccountConfig) -> AccountConfig:
+        return self._account_cls.model_validate(raw.model_dump())
+
+
+class _GitHubAccountFake(AccountConfig):
+    git_user_name: str = ""
+    git_user_email: str = ""
+
+
+class TestValidateAgentAccounts:
+    def _agent_with_untyped(self, *entries: dict) -> Agent:
+        agent = Agent(name="test")
+        agent.accounts = AgentAccountsConfig.model_construct(
+            accounts=[UntypedAccountConfig.model_validate(e) for e in entries],
         )
-        return GitHubForgeService(config, service_name="github-com")
+        return agent
 
-    def test_authenticated_client_with_pat(self):
-        svc = self._make_service()
-        creds = GitHubPatAuth(token="ghp_new")
+    def test_replaces_untyped_with_typed(self):
+        agent = self._agent_with_untyped({
+            "service": "github",
+            "credentials": [{"kind": "pat", "env_var_name": "T"}],
+            "git_user_name": "bot", "git_user_email": "bot@x",
+        })
+        services = {"github": _FakeService("github", _GitHubAccountFake)}
+        validate_agent_accounts(agent, services.__getitem__)
+        out = agent.accounts.accounts[0]
+        assert isinstance(out, _GitHubAccountFake)
+        assert out.git_user_name == "bot"
+        # No more UntypedAccountConfig either:
+        assert not isinstance(out, UntypedAccountConfig)
 
-        mock_gh_client = MagicMock()
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(
-                "thorn.tools.forge.GitHubForgeClient",
-                lambda client: MagicMock(spec=GitHubForgeClient),
-            )
-            mp.setattr(
-                "thorn.tools.github.GitHubClient",
-                lambda config: mock_gh_client,
-            )
-            client = svc.authenticated_client(creds)
-            assert client is not None
+    def test_raises_when_service_unknown(self):
+        agent = self._agent_with_untyped({
+            "service": "unknown", "credentials": [],
+        })
+        with pytest.raises(ValueError, match="unknown"):
+            validate_agent_accounts(agent, lambda _: (_ for _ in ()).throw(KeyError()))
 
-    def test_rejects_gitlab_credentials(self):
-        svc = self._make_service()
-        creds = GitLabCredentials(token="glpat-wrong")
-        with pytest.raises(TypeError, match="GitHubPatAuth or GitHubAppAuth"):
-            svc.authenticated_client(creds)
+    def test_idempotent_on_already_typed(self):
+        agent = Agent(name="test")
+        typed = _GitHubAccountFake(service="github")
+        agent.accounts = AgentAccountsConfig.model_construct(accounts=[typed])
+        validate_agent_accounts(
+            agent, {"github": _FakeService("github", _GitHubAccountFake)}.__getitem__,
+        )
+        assert agent.accounts.accounts[0] is typed
 
-    def test_rejects_gitlab_credentials_for_password(self):
-        svc = self._make_service()
-        creds = GitLabCredentials(token="glpat-wrong")
-        with pytest.raises(TypeError, match="GitHubPatAuth or GitHubAppAuth"):
-            svc.git_https_password_for(creds)
+    def test_no_op_for_agent_without_accounts(self):
+        agent = Agent(name="test")
+        # No accounts attribute -- must not crash.
+        validate_agent_accounts(agent, lambda _: None)  # type: ignore[arg-type, return-value]
 
-    def test_base_url_property(self):
-        svc = self._make_service()
-        assert svc.base_url == "https://api.github.com"
+
+# ---------------------------------------------------------------------------
+# AgentAccountsConfig wire shape
+# ---------------------------------------------------------------------------
+
+
+class TestAgentAccountsConfig:
+    def test_default_empty(self):
+        cfg = AgentAccountsConfig()
+        assert cfg.accounts == []
+
+    def test_validates_dict_entries(self):
+        cfg = AgentAccountsConfig.model_validate({
+            "accounts": [
+                {"service": "github", "credentials": []},
+            ],
+        })
+        # ``accounts`` is typed as list[AccountConfig], so a dict
+        # entry is validated as a base AccountConfig at parse time.
+        # The deserializer used by JsonSessionSerializer constructs
+        # UntypedAccountConfig instances explicitly to preserve
+        # per-service ``extra`` fields; that path is exercised in
+        # test_runtime.py.
+        assert len(cfg.accounts) == 1
+        assert cfg.accounts[0].service == "github"

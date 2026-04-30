@@ -233,18 +233,6 @@ class Runtime:
             if isinstance(s, service_type)
         ]
 
-    def get_forge_for_project(
-        self, project_name: str,
-    ) -> tuple[Any, str]:
-        """Look up a project service and return ``(ForgeClient, native_id)``.
-
-        Convenience method for forge tools.  Delegates to
-        :func:`thorn.tools.forge.get_forge_for_project`.
-        """
-        from thorn.tools.forge import get_forge_for_project
-
-        return get_forge_for_project(self, project_name)
-
     # -- Context management -------------------------------------------------
 
     def create_context(

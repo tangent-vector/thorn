@@ -2743,29 +2743,33 @@ class TestInstantiateServices:
 
 
 class TestInferEventSources:
-    def test_infers_gitlab_source_from_agent_account(self):
+    def test_infers_gitlab_source_from_agent_account(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
         with (
             patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
             patch("thorn.gateway.sources._gitlab._gitlab_lib"),
         ):
-            from thorn.core._account import (
-                AgentAccountsConfig,
-                ForgeAccountConfig,
-                GitLabCredentials,
-            )
+            from thorn.core._account import AgentAccountsConfig
             from thorn.core._agent import Agent
+            from thorn.core._credentials import Credential
             from thorn.gateway._config import ForgeSpec, GatewayConfig, infer_event_sources
             from thorn.gateway.sources._gitlab import GitLabTODOsSource
+            from thorn.tools.forge import GitLabAccountConfig
 
+            monkeypatch.setenv("THORN_TEST_GL_TOK", "tok")
             config = GatewayConfig(
                 forges=[ForgeSpec(name="gl", type="gitlab", url="https://gl.example.com")],
             )
             agent = Agent(
                 name="bot",
                 accounts=AgentAccountsConfig(accounts=[
-                    ForgeAccountConfig(
+                    GitLabAccountConfig(
                         service="gl",
-                        credentials=GitLabCredentials(token="tok"),
+                        credentials=[Credential(
+                            kind="gitlab-pat",
+                            env_var_name="THORN_TEST_GL_TOK",
+                        )],
                     ),
                 ]),
             )
@@ -2774,9 +2778,12 @@ class TestInferEventSources:
             assert isinstance(sources[0], GitLabTODOsSource)
             assert "bot-gl-events" in sources[0].name
 
-    def test_infers_github_source_from_agent_account(self):
-        from thorn.core._account import AgentAccountsConfig, ForgeAccountConfig
+    def test_infers_github_source_from_agent_account(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from thorn.core._account import AgentAccountsConfig
         from thorn.core._agent import Agent
+        from thorn.core._credentials import Credential
         from thorn.gateway._config import (
             ForgeSpec,
             GatewayConfig,
@@ -2784,8 +2791,9 @@ class TestInferEventSources:
             infer_event_sources,
         )
         from thorn.gateway.sources._github import GitHubNotificationsSource
-        from thorn.tools._github_connection import GitHubPatAuth
+        from thorn.tools.forge import GitHubAccountConfig
 
+        monkeypatch.setenv("THORN_TEST_GH_TOK", "ghp-tok")
         config = GatewayConfig(
             forges=[ForgeSpec(name="gh", type="github", url="https://github.com")],
             projects=[ProjectSpec(
@@ -2795,9 +2803,12 @@ class TestInferEventSources:
         agent = Agent(
             name="bot",
             accounts=AgentAccountsConfig(accounts=[
-                ForgeAccountConfig(
+                GitHubAccountConfig(
                     service="gh",
-                    credentials=GitHubPatAuth(token="ghp-tok"),
+                    credentials=[Credential(
+                        kind="pat",
+                        env_var_name="THORN_TEST_GH_TOK",
+                    )],
                 ),
             ]),
         )
@@ -2827,13 +2838,11 @@ class TestInferEventSources:
         assert sources == []
 
     def test_skips_unknown_forge_in_agent_account(self):
-        from thorn.core._account import (
-            AgentAccountsConfig,
-            ForgeAccountConfig,
-            GitLabCredentials,
-        )
+        from thorn.core._account import AgentAccountsConfig
         from thorn.core._agent import Agent
+        from thorn.core._credentials import Credential
         from thorn.gateway._config import ForgeSpec, GatewayConfig, infer_event_sources
+        from thorn.tools.forge import GitLabAccountConfig
 
         config = GatewayConfig(
             forges=[ForgeSpec(name="gl", type="gitlab", url="https://gl.example.com")],
@@ -2841,33 +2850,43 @@ class TestInferEventSources:
         agent = Agent(
             name="bot",
             accounts=AgentAccountsConfig(accounts=[
-                ForgeAccountConfig(
+                GitLabAccountConfig(
                     service="nonexistent",
-                    credentials=GitLabCredentials(token="tok"),
+                    credentials=[Credential(
+                        kind="gitlab-pat",
+                        env_var_name="THORN_TEST_TOK",
+                    )],
                 ),
             ]),
         )
         sources = infer_event_sources(config, [agent])
         assert sources == []
 
-    def test_github_created_even_without_project_repos(self):
+    def test_github_created_even_without_project_repos(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
         """GitHub notifications source is user-scoped and created even
         without project repos (unlike the old per-repo events source)."""
-        from thorn.core._account import AgentAccountsConfig, ForgeAccountConfig
+        from thorn.core._account import AgentAccountsConfig
         from thorn.core._agent import Agent
+        from thorn.core._credentials import Credential
         from thorn.gateway._config import ForgeSpec, GatewayConfig, infer_event_sources
         from thorn.gateway.sources._github import GitHubNotificationsSource
-        from thorn.tools._github_connection import GitHubPatAuth
+        from thorn.tools.forge import GitHubAccountConfig
 
+        monkeypatch.setenv("THORN_TEST_GH_TOK", "ghp-tok")
         config = GatewayConfig(
             forges=[ForgeSpec(name="gh", type="github", url="https://github.com")],
         )
         agent = Agent(
             name="bot",
             accounts=AgentAccountsConfig(accounts=[
-                ForgeAccountConfig(
+                GitHubAccountConfig(
                     service="gh",
-                    credentials=GitHubPatAuth(token="ghp-tok"),
+                    credentials=[Credential(
+                        kind="pat",
+                        env_var_name="THORN_TEST_GH_TOK",
+                    )],
                 ),
             ]),
         )
@@ -2876,12 +2895,16 @@ class TestInferEventSources:
         assert isinstance(sources[0], GitHubNotificationsSource)
 
     def test_github_skipped_for_app_credentials(self):
-        """GitHub App credentials are rejected since the Notifications
-        API requires a personal access token."""
-        from thorn.core._account import AgentAccountsConfig, ForgeAccountConfig
+        """An account whose only credential is an unsupported kind
+        (here ``"app"``, which the notifications source doesn't know
+        how to use) is silently skipped: the source needs a ``"pat"``
+        kind credential, and ``infer_event_sources`` declines to
+        guess at conversions across credential kinds."""
+        from thorn.core._account import AgentAccountsConfig
         from thorn.core._agent import Agent
+        from thorn.core._credentials import Credential
         from thorn.gateway._config import ForgeSpec, GatewayConfig, infer_event_sources
-        from thorn.tools._github_connection import GitHubAppAuth
+        from thorn.tools.forge import GitHubAccountConfig
 
         config = GatewayConfig(
             forges=[ForgeSpec(name="gh", type="github", url="https://github.com")],
@@ -2889,13 +2912,12 @@ class TestInferEventSources:
         agent = Agent(
             name="bot",
             accounts=AgentAccountsConfig(accounts=[
-                ForgeAccountConfig(
+                GitHubAccountConfig(
                     service="gh",
-                    credentials=GitHubAppAuth(
-                        app_id="123",
-                        installation_id=456,
-                        private_key_pem="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
-                    ),
+                    credentials=[Credential(
+                        kind="app",
+                        env_var_name="THORN_TEST_APP_KEY",
+                    )],
                 ),
             ]),
         )
@@ -2933,14 +2955,17 @@ class TestBootstrapCoordinator:
         assert data["metadata"]["project"] == "my-project"
 
         # New shape: ``accounts`` is a flat array discriminated on
-        # ``service`` (no inner ``forge_accounts`` wrapper, no
-        # ``forge`` field).
+        # ``service``; ``credentials`` is a list (so an account can
+        # carry several credential kinds in the future) of entries
+        # that name the env var the operator put the literal secret
+        # into.  The serialized config never carries the literal.
         acct = data["accounts"][0]
         assert acct["service"] == "gitlab"
         assert acct["git_user_name"] == "test-coord"
         assert acct["git_user_email"] == "test-coord@thorn"
-        assert acct["credentials"]["kind"] == "gitlab-pat"
-        assert acct["credentials"]["token"] == "$GITLAB_TOKEN"
+        assert acct["credentials"] == [
+            {"kind": "gitlab-pat", "env_var_name": "GITLAB_TOKEN"},
+        ]
 
         memory = (
             tmp_path / ".thorn" / "agents" / "test-coord" / "home" / "MEMORY.md"
@@ -3063,7 +3088,9 @@ class TestBootstrapCoordinator:
         )
         data = json.loads(identity.read_text(encoding="utf-8"))
         acct = data["accounts"][0]
-        assert acct["credentials"]["token"] == "$MY_TOKEN"
+        assert acct["credentials"] == [
+            {"kind": "pat", "env_var_name": "MY_TOKEN"},
+        ]
 
     def test_bootstrap_rejects_self_hosted_url(self, tmp_path: Path):
         """An unrecognised forge host is rejected with a clear error.
@@ -3110,7 +3137,11 @@ class TestBootstrapCoordinator:
         assert isinstance(agent, ProjectCoordinator)
         assert agent.metadata["project"] == "proj"
         assert hasattr(agent, "accounts")
-        assert len(agent.accounts.forge_accounts()) == 1
+        # The account is loaded as an UntypedAccountConfig until the
+        # gateway's eager-validation pass runs.  Either way it lives
+        # in ``accounts.accounts`` as the canonical list.
+        assert len(agent.accounts.accounts) == 1
+        assert agent.accounts.accounts[0].service == "gitlab"
 
     def test_cli_bootstrap_command(self, tmp_path: Path):
         from click.testing import CliRunner
@@ -3187,8 +3218,9 @@ class TestBootstrapCoordinator:
         assert acct["service"] == "github"
         assert acct["git_user_name"] == "gh-coord"
         assert acct["git_user_email"] == "gh-coord@thorn"
-        assert acct["credentials"]["kind"] == "pat"
-        assert acct["credentials"]["token"] == "$GITHUB_TOKEN"
+        assert acct["credentials"] == [
+            {"kind": "pat", "env_var_name": "GITHUB_TOKEN"},
+        ]
 
     def test_bootstrap_writes_git_identity(self, tmp_path: Path):
         """Bootstrap writes git identity into agent accounts."""
@@ -3267,17 +3299,17 @@ class TestBootstrapCoordinator:
             patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
             patch("thorn.gateway.sources._gitlab._gitlab_lib"),
         ):
-            from thorn.core._account import (
-                AgentAccountsConfig,
-                ForgeAccountConfig,
-                GitLabCredentials,
-            )
+            import os
+
+            from thorn.core._account import AgentAccountsConfig
             from thorn.core._agent import Agent
+            from thorn.core._credentials import Credential
             from thorn.gateway._bootstrap import bootstrap_coordinator
             from thorn.gateway._config import (
                 infer_event_sources,
                 load_gateway_config,
             )
+            from thorn.tools.forge import GitLabAccountConfig
 
             bootstrap_coordinator(
                 agency_home=tmp_path / ".thorn",
@@ -3289,16 +3321,23 @@ class TestBootstrapCoordinator:
 
             config = load_gateway_config(tmp_path / ".thorn")
 
-            agent = Agent(
-                name="bot",
-                accounts=AgentAccountsConfig(accounts=[
-                    ForgeAccountConfig(
-                        service="gitlab",
-                        credentials=GitLabCredentials(token="tok"),
-                    ),
-                ]),
-            )
-            sources = infer_event_sources(config, [agent])
+            os.environ["THORN_TEST_INFERRED_TOK"] = "tok"
+            try:
+                agent = Agent(
+                    name="bot",
+                    accounts=AgentAccountsConfig(accounts=[
+                        GitLabAccountConfig(
+                            service="gitlab",
+                            credentials=[Credential(
+                                kind="gitlab-pat",
+                                env_var_name="THORN_TEST_INFERRED_TOK",
+                            )],
+                        ),
+                    ]),
+                )
+                sources = infer_event_sources(config, [agent])
+            finally:
+                os.environ.pop("THORN_TEST_INFERRED_TOK", None)
             assert len(sources) == 1
             assert sources[0]._config.url == "https://gitlab.com"
 
@@ -4304,26 +4343,39 @@ class _FakeBundledSupervisor:
         admin_api_key: str = "oc_fake",
         start_error: Exception | None = None,
     ) -> None:
-        from thorn.gateway._config import BrokerConfig
         from thorn.core._credentials import ServiceCredential
+        from thorn.gateway._config import BrokerConfig
 
         self.project_name = project_name
         self.egress_network_name = egress_network_name
         self.start_calls = 0
         self.shutdown_calls = 0
         self._start_error = start_error
-        self._broker_config = BrokerConfig(
-            mode="external",
+        # The bundled supervisor reports ``mode="bundled"`` to the
+        # rest of the gateway and exposes the literal admin key as
+        # an in-process attribute (never carried in the on-disk
+        # config shape).  Use ``model_construct`` to bypass the
+        # bundled-mode invariants validator that disallows populated
+        # URL fields on a bundled-mode config.
+        self._broker_config = BrokerConfig.model_construct(
+            mode="bundled",
             enabled=True,
             admin_url=admin_url,
-            admin_api_key=ServiceCredential(admin_api_key, state="literal"),
+            admin_api_key_env_var=None,
             proxy_url=proxy_url,
             ca_certificate_path=None,
+        )
+        self._admin_api_key: ServiceCredential | None = ServiceCredential(
+            admin_api_key,
         )
 
     @property
     def broker_config(self):  # pragma: no cover - parity-only accessor
         return self._broker_config
+
+    @property
+    def admin_api_key(self):
+        return self._admin_api_key
 
     async def start(self):
         self.start_calls += 1
@@ -4410,7 +4462,6 @@ class TestGatewayBundledBrokerWiring:
         assert config.broker is not None
         assert config.broker.admin_url == "http://127.0.0.1:11111"
         assert config.broker.proxy_url == "http://127.0.0.1:22222"
-        assert str(config.broker.admin_api_key) == "oc_synthesized"
         # Sandbox egress_network is patched to the supervisor's network.
         assert runtime.sandbox_config is not None
         assert runtime.sandbox_config.egress_network == (
@@ -4486,7 +4537,6 @@ class TestGatewayBundledBrokerWiring:
             GatewayConfig,
             SandboxConfig,
         )
-        from thorn.core._credentials import ServiceCredential
 
         runtime = self._make_runtime_with_sandbox(tmp_path)
         config = GatewayConfig(
@@ -4495,7 +4545,7 @@ class TestGatewayBundledBrokerWiring:
                 mode="external",
                 enabled=True,
                 admin_url="http://my-broker:8080",
-                admin_api_key=ServiceCredential("oc_op", state="literal"),
+                admin_api_key_env_var="ONECLI_ADMIN_KEY",
                 proxy_url="http://my-broker:8081",
             ),
         )

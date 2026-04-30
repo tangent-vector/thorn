@@ -133,8 +133,12 @@ class TestGitAuthEnv:
         with patch(self._CTX_PATH, return_value=ctx):
             assert _git_auth_env_for_current_agent() == {}
 
-    def test_gitlab_legacy_token(self, tmp_path: Path) -> None:
-        """No agent account on the forge -> falls back to forge-config token."""
+    def test_no_account_on_forge_returns_empty(self, tmp_path: Path) -> None:
+        """Without an agent account on the project's forge, git falls
+        back to whatever ambient credential helper the OS provides
+        (so we return ``{}`` rather than synthesising auth from the
+        forge service config -- the forge service no longer carries
+        a usable token of its own under the account-driven model)."""
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
         from thorn.core._provider import MockProvider
@@ -150,9 +154,7 @@ class TestGitAuthEnv:
         runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
         runtime.register_service(
             GitLabForgeService(
-                GitLabForgeServiceConfig(
-                    url="https://gitlab.example.com", token="glpat-abc123",
-                ),
+                GitLabForgeServiceConfig(url="https://gitlab.example.com"),
                 service_name="gl-forge",
             ),
         )
@@ -170,25 +172,18 @@ class TestGitAuthEnv:
             workspace_root=tmp_path,
         )
         with patch(self._CTX_PATH, return_value=ctx):
-            env = _git_auth_env_for_current_agent()
+            assert _git_auth_env_for_current_agent() == {}
 
-        assert env["GIT_CONFIG_COUNT"] == "1"
-        assert env["GIT_CONFIG_KEY_0"] == (
-            "http.https://gitlab.example.com/.extraheader"
-        )
-        assert env["GIT_CONFIG_VALUE_0"] == _expected_basic_header(
-            "oauth2", "glpat-abc123",
-        )
-        assert "glpat-abc123" not in env["GIT_CONFIG_KEY_0"], (
-            "URL prefix should not contain the token"
-        )
-
-    def test_github_legacy_token_strips_api_subdomain(
-        self, tmp_path: Path,
+    def test_github_account_token_strips_api_subdomain(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """github.com's API host is api.github.com but git URLs use github.com."""
+        """github.com's API host is api.github.com but git URLs use
+        github.com.  The injected ``http.<URL>.extraheader`` config
+        must use the user-facing host."""
+        from thorn.core._account import AgentAccountsConfig
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
+        from thorn.core._credentials import Credential
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools._github_connection import (
@@ -197,15 +192,18 @@ class TestGitAuthEnv:
         )
         from thorn.tools.forge import (
             ForkConfig,
+            GitHubAccountConfig,
             GitHubForgeService,
             ProjectService,
             ProjectServiceConfig,
         )
 
+        monkeypatch.setenv("THORN_TEST_GH_TOK", "ghp_testtok")
+
         runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
         runtime.register_service(
             GitHubForgeService(
-                GitHubConnectionConfig(auth=GitHubPatAuth(token="ghp_testtok")),
+                GitHubConnectionConfig(auth=GitHubPatAuth(token="ignored")),
                 service_name="gh-forge",
             ),
         )
@@ -217,7 +215,18 @@ class TestGitAuthEnv:
                 service_name="proj",
             ),
         )
-        agent = Agent(metadata={"project": "proj"})
+        agent = Agent(
+            metadata={"project": "proj"},
+            accounts=AgentAccountsConfig(accounts=[
+                GitHubAccountConfig(
+                    service="gh-forge",
+                    credentials=[Credential(
+                        kind="pat",
+                        env_var_name="THORN_TEST_GH_TOK",
+                    )],
+                ),
+            ]),
+        )
         ctx = ExecutionContext(
             provider=MockProvider(), agent=agent, runtime=runtime,
             workspace_root=tmp_path,
@@ -230,30 +239,33 @@ class TestGitAuthEnv:
             "x-access-token", "ghp_testtok",
         )
 
-    def test_gitlab_account_token_takes_precedence(self, tmp_path: Path) -> None:
-        from thorn.core._account import (
-            AgentAccountsConfig,
-            ForgeAccountConfig,
-            GitLabCredentials,
-        )
+    def test_gitlab_account_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The agent's account credential is read from its env var
+        and used as the basic-auth password against the configured
+        GitLab host."""
+        from thorn.core._account import AgentAccountsConfig
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
+        from thorn.core._credentials import Credential
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools.forge import (
             ForkConfig,
+            GitLabAccountConfig,
             GitLabForgeService,
             GitLabForgeServiceConfig,
             ProjectService,
             ProjectServiceConfig,
         )
 
+        monkeypatch.setenv("THORN_TEST_GL_TOK", "account-token")
+
         runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
         runtime.register_service(
             GitLabForgeService(
-                GitLabForgeServiceConfig(
-                    url="https://gitlab.example.com", token="forge-config-token",
-                ),
+                GitLabForgeServiceConfig(url="https://gitlab.example.com"),
                 service_name="gl-forge",
             ),
         )
@@ -266,9 +278,12 @@ class TestGitAuthEnv:
             ),
         )
         accounts = AgentAccountsConfig(accounts=[
-            ForgeAccountConfig(
+            GitLabAccountConfig(
                 service="gl-forge",
-                credentials=GitLabCredentials(token="account-token"),
+                credentials=[Credential(
+                    kind="gitlab-pat",
+                    env_var_name="THORN_TEST_GL_TOK",
+                )],
                 git_user_name="bot",
                 git_user_email="bot@thorn",
             ),
@@ -281,10 +296,13 @@ class TestGitAuthEnv:
         with patch(self._CTX_PATH, return_value=ctx):
             env = _git_auth_env_for_current_agent()
 
+        assert env["GIT_CONFIG_COUNT"] == "1"
+        assert env["GIT_CONFIG_KEY_0"] == (
+            "http.https://gitlab.example.com/.extraheader"
+        )
         assert env["GIT_CONFIG_VALUE_0"] == _expected_basic_header(
             "oauth2", "account-token",
         )
-        assert "forge-config-token" not in env["GIT_CONFIG_VALUE_0"]
 
 
 class TestRunGitAuthInjection:
@@ -354,26 +372,29 @@ class TestRunGitAuthInjection:
         assert captured["GIT_CONFIG_COUNT"] is None
 
     async def test_auth_true_merges_git_config_vars(
-        self, git_repo: Path, tmp_path: Path,
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        from thorn.core._account import AgentAccountsConfig
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
+        from thorn.core._credentials import Credential
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools.forge import (
             ForkConfig,
+            GitLabAccountConfig,
             GitLabForgeService,
             GitLabForgeServiceConfig,
             ProjectService,
             ProjectServiceConfig,
         )
 
+        monkeypatch.setenv("THORN_TEST_GL_RUNTOK", "abc")
+
         runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
         runtime.register_service(
             GitLabForgeService(
-                GitLabForgeServiceConfig(
-                    url="https://gitlab.example.com", token="abc",
-                ),
+                GitLabForgeServiceConfig(url="https://gitlab.example.com"),
                 service_name="gl-forge",
             ),
         )
@@ -385,7 +406,18 @@ class TestRunGitAuthInjection:
                 service_name="my-proj",
             ),
         )
-        agent = Agent(metadata={"project": "my-proj"})
+        agent = Agent(
+            metadata={"project": "my-proj"},
+            accounts=AgentAccountsConfig(accounts=[
+                GitLabAccountConfig(
+                    service="gl-forge",
+                    credentials=[Credential(
+                        kind="gitlab-pat",
+                        env_var_name="THORN_TEST_GL_RUNTOK",
+                    )],
+                ),
+            ]),
+        )
         ctx = ExecutionContext(
             provider=MockProvider(), agent=agent, runtime=runtime,
             workspace_root=tmp_path,
@@ -425,12 +457,15 @@ class TestRunGitAuthInjection:
     ) -> None:
         """If the parent process already exports GIT_CONFIG_*, our entries
         are appended after the existing ones rather than overwriting them."""
+        from thorn.core._account import AgentAccountsConfig
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
+        from thorn.core._credentials import Credential
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools.forge import (
             ForkConfig,
+            GitLabAccountConfig,
             GitLabForgeService,
             GitLabForgeServiceConfig,
             ProjectService,
@@ -440,13 +475,12 @@ class TestRunGitAuthInjection:
         monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
         monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.email")
         monkeypatch.setenv("GIT_CONFIG_VALUE_0", "site@policy.example")
+        monkeypatch.setenv("THORN_TEST_GL_RUNTOK2", "tok")
 
         runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
         runtime.register_service(
             GitLabForgeService(
-                GitLabForgeServiceConfig(
-                    url="https://gitlab.example.com", token="t",
-                ),
+                GitLabForgeServiceConfig(url="https://gitlab.example.com"),
                 service_name="gl-forge",
             ),
         )
@@ -458,11 +492,22 @@ class TestRunGitAuthInjection:
                 service_name="my-proj",
             ),
         )
-        agent = Agent(metadata={
-            "project": "my-proj",
-            "git_user_name": "bot",
-            "git_user_email": "bot@thorn",
-        })
+        agent = Agent(
+            metadata={
+                "project": "my-proj",
+                "git_user_name": "bot",
+                "git_user_email": "bot@thorn",
+            },
+            accounts=AgentAccountsConfig(accounts=[
+                GitLabAccountConfig(
+                    service="gl-forge",
+                    credentials=[Credential(
+                        kind="gitlab-pat",
+                        env_var_name="THORN_TEST_GL_RUNTOK2",
+                    )],
+                ),
+            ]),
+        )
         ctx = ExecutionContext(
             provider=MockProvider(), agent=agent, runtime=runtime,
             workspace_root=tmp_path,
@@ -627,17 +672,15 @@ class TestGitIdentityEnvWithAccounts:
     def test_prefers_account_identity_over_metadata(
         self, tmp_path: Path,
     ) -> None:
-        from thorn.core._account import (
-            AgentAccountsConfig,
-            ForgeAccountConfig,
-            GitLabCredentials,
-        )
+        from thorn.core._account import AgentAccountsConfig
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
+        from thorn.core._credentials import Credential
         from thorn.core._provider import MockProvider
         from thorn.runtime import Runtime
         from thorn.tools.forge import (
             ForkConfig,
+            GitLabAccountConfig,
             GitLabForgeService,
             GitLabForgeServiceConfig,
             ProjectService,
@@ -647,9 +690,7 @@ class TestGitIdentityEnvWithAccounts:
         runtime = Runtime(provider=MockProvider(), workspace_root=tmp_path)
         runtime.register_service(
             GitLabForgeService(
-                GitLabForgeServiceConfig(
-                    url="https://gitlab.example.com", token="t",
-                ),
+                GitLabForgeServiceConfig(url="https://gitlab.example.com"),
                 service_name="gl-forge",
             ),
         )
@@ -662,9 +703,12 @@ class TestGitIdentityEnvWithAccounts:
             ),
         )
         accounts = AgentAccountsConfig(accounts=[
-            ForgeAccountConfig(
+            GitLabAccountConfig(
                 service="gl-forge",
-                credentials=GitLabCredentials(token="t"),
+                credentials=[Credential(
+                    kind="gitlab-pat",
+                    env_var_name="THORN_TEST_TOK_IDENT",
+                )],
                 git_user_name="account-bot",
                 git_user_email="account-bot@thorn",
             ),
@@ -714,19 +758,20 @@ class TestGitIdentityEnvWithAccounts:
         self, tmp_path: Path,
     ) -> None:
         """Account is set but no runtime -> can't resolve project -> fallback."""
-        from thorn.core._account import (
-            AgentAccountsConfig,
-            ForgeAccountConfig,
-            GitLabCredentials,
-        )
+        from thorn.core._account import AgentAccountsConfig
         from thorn.core._agent import Agent
         from thorn.core._context import ExecutionContext
+        from thorn.core._credentials import Credential
         from thorn.core._provider import MockProvider
+        from thorn.tools.forge import GitLabAccountConfig
 
         accounts = AgentAccountsConfig(accounts=[
-            ForgeAccountConfig(
+            GitLabAccountConfig(
                 service="gl-forge",
-                credentials=GitLabCredentials(token="t"),
+                credentials=[Credential(
+                    kind="gitlab-pat",
+                    env_var_name="THORN_TEST_TOK_FB",
+                )],
                 git_user_name="account-bot",
                 git_user_email="account-bot@thorn",
             ),

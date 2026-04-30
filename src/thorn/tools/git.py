@@ -90,7 +90,7 @@ def _resolve_git_identity(
     forge first, then falls back to ``agent.metadata`` keys.  Returns
     ``("", "")`` when nothing is available.
     """
-    from thorn.core._account import resolve_forge_account
+    from thorn.core._account import resolve_account
     from thorn.tools.forge import ForgeHostService, ProjectService
 
     metadata: dict[str, object] = getattr(agent, "metadata", {})
@@ -103,9 +103,9 @@ def _resolve_git_identity(
                 if isinstance(project_svc, ProjectService):
                     forge_svc = runtime.get_service(project_svc.forge_name)  # type: ignore[union-attr]
                     if isinstance(forge_svc, ForgeHostService):
-                        account = resolve_forge_account(agent, forge_svc.name)  # type: ignore[arg-type]
-                        acct_name = account.git_user_name
-                        acct_email = account.git_user_email
+                        account = resolve_account(agent, forge_svc.name)  # type: ignore[arg-type]
+                        acct_name = getattr(account, "git_user_name", "")
+                        acct_email = getattr(account, "git_user_email", "")
                         if acct_name or acct_email:
                             return acct_name, acct_email
             except KeyError:
@@ -190,22 +190,17 @@ def _git_auth_env_for_current_agent() -> dict[str, str]:
     this never leaks into requests git makes to unrelated hosts (e.g.
     submodules from another forge).
 
-    Resolves credentials the same way the old URL-embedding path did:
-
-    1. From the agent's :class:`ForgeAccountConfig` for the project's
-       forge (looked up via ``metadata["project"]``), preferred.
-    2. Falling back to the legacy
-       :meth:`ForgeHostService.git_https_password` when the agent has
-       no account on that forge.
-
+    Resolves credentials from the agent's :class:`AccountConfig`
+    for the project's forge (looked up via ``metadata["project"]``).
     Returns ``{}`` when there is no active agent context, no project
-    metadata, no resolvable forge service, no credential, or the
-    forge service is of an unexpected type.  Callers should treat
-    that as "let git fall through to whatever ambient credential
-    helper the OS provides," which is the right behavior for both
-    local development and unauthenticated public-repo clones.
+    metadata, no resolvable forge service, no matching account, or
+    the forge service is of an unexpected type.  Callers should
+    treat that as "let git fall through to whatever ambient
+    credential helper the OS provides," which is the right behavior
+    for both local development and unauthenticated public-repo
+    clones.
     """
-    from thorn.core._account import resolve_forge_account
+    from thorn.core._account import resolve_account
     from thorn.core._context import get_context
     from thorn.tools.forge import (
         ForgeHostService,
@@ -243,12 +238,15 @@ def _git_auth_env_for_current_agent() -> dict[str, str]:
     if not isinstance(forge_svc, ForgeHostService):
         return {}
 
-    token: str | None = None
     try:
-        account = resolve_forge_account(agent, forge_svc.name)
-        token = forge_svc.git_https_password_for(account.credentials)
+        account = resolve_account(agent, forge_svc.name)
     except KeyError:
-        token = forge_svc.git_https_password()
+        return {}
+
+    try:
+        token = forge_svc.git_https_password_for(account)
+    except (KeyError, LookupError):
+        return {}
 
     if not token:
         return {}

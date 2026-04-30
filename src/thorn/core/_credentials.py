@@ -1,132 +1,84 @@
-"""Service credential wrapper distinguishing literal vs placeholder values.
+"""Credential reference and in-process redaction wrapper.
 
-A :class:`ServiceCredential` is a string-subclass wrapper around a value
-that holds (or held) authentication material for an external service.
-The wrapper carries a ``state`` (``"literal"`` or ``"placeholder"``) so
-that gateway code, logs, and audit tests can tell at a glance whether a
-particular credential instance currently carries a real secret or a
-broker placeholder.
+This module defines two types that are deliberately kept narrow:
 
-Two reasons this type exists:
+- :class:`Credential` -- a *reference* to a secret that lives in an
+  environment variable.  An agent account's ``credentials`` list is
+  built from these.  A ``Credential`` carries no literal secret value;
+  it carries the *name* of the env var the operator chose to put the
+  secret into.  The value itself is read from ``os.environ`` at the
+  point of use (broker registration, direct authentication, etc.) by
+  calling :meth:`Credential.read_value`.
 
-- **Audit invariant.**  Phase D's invariant is "post-registration, no
-  ``ServiceCredential`` reachable from the gateway's loaded agent state
-  carries a literal value -- everything has been swapped to a broker
-  placeholder."  Without an explicit type, that invariant cannot be
-  expressed mechanically; with one, the audit reduces to a tree walk
-  via :func:`walk_credentials`.
+- :class:`ServiceCredential` -- a thin :class:`str` subclass whose
+  ``__repr__`` redacts the underlying value.  Used as the type for
+  *in-process* secret strings (broker access tokens fetched from the
+  broker, secret values read out of env vars, etc.) so that printing
+  an object that holds one does not leak the secret into logs or
+  error messages.
 
-- **Logging hygiene.**  ``__repr__`` redacts the value entirely so that
-  printing an agent's loaded state, formatting a ``ValidationError``,
-  or dumping a Pydantic model never leaks live tokens.
+Why not just store ``value: str`` on ``Credential``?
 
-``ServiceCredential`` subclasses :class:`str` so existing call sites
-that pass the value to HTTP clients, git commands, and the like do not
-break: ``cred`` is the credential string, ``str(cred)`` is the same
-string, equality and hashing match plain ``str``.  Code that wants to
-*test* the state should use :attr:`ServiceCredential.is_placeholder` /
-:attr:`is_literal` or match on :attr:`state`; code that wants to
-*display* the credential should call :func:`repr` (or
-:meth:`redacted`), which will not include the underlying value.
+Because Thorn never needs the literal secret to live in agent state.
+The broker-registration path reads ``os.environ[env_var_name]`` once,
+forwards the value to the credential broker over its TLS-bridged
+admin connection, and immediately drops the literal -- only the
+broker stores it after that.  Sandbox containers receive a
+placeholder env value plus an ``HTTPS_PROXY`` URL pointing at the
+broker; the upstream HTTP request is the broker's first sight of
+the literal token, and it substitutes the real value into the
+matching outbound header before forwarding.
 
-Pydantic v2 integration is via :meth:`__get_pydantic_core_schema__`:
-plain strings coming from JSON / dict input are wrapped as
-``"literal"`` credentials by default (matching the existing
-``$ENV_VAR`` -> ``str`` path in gateway config loading); already-wrapped
-values are passed through unchanged so re-validation preserves state.
-Serialization uses the underlying string, which means
-``model_dump_json()`` of a placeholder model produces a JSON string
-that, on re-load, comes back as ``"literal"`` -- this is intentional:
-placeholder state lives only in-process, never on disk.
+Storing the literal on ``Credential`` would mean every loaded agent
+state object on the gateway side held a copy of the literal, which
+would defeat the point of having the broker -- a memory dump of the
+gateway process should *not* be enough to recover all the agents'
+upstream credentials.
+
+Why is the kind a free-form ``str``?
+
+Because the credential ecosystem is not yet settled.  We only have
+two concrete kinds today (``"pat"`` for GitHub PATs / generic
+bearer tokens, ``"gitlab-pat"`` for GitLab personal access tokens),
+and the structure of e.g. GitHub App auth is still under design.
+Per-service code matches on ``kind`` to decide what to do; there is
+no central registry that would have to be updated when a service
+introduces a new credential kind.  When the design firms up we can
+revisit and introduce a typed enum / discriminated-union here.
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterator, Literal
+import os
+from typing import Any
 
-from pydantic import GetCoreSchemaHandler
+from pydantic import BaseModel, ConfigDict, Field, GetCoreSchemaHandler
 from pydantic_core import CoreSchema, core_schema
-
-CredentialState = Literal["literal", "placeholder"]
-"""Lifecycle state of a :class:`ServiceCredential` instance.
-
-- ``"literal"``: the wrapped value is a real credential read from the
-  operator's configuration (env var, agent.json, gateway.json).  Found
-  in agent state during the agent-load window before broker
-  registration runs.
-- ``"placeholder"``: the wrapped value is a broker-issued placeholder
-  string.  Real credential lives in the broker; this string only needs
-  to be non-empty so in-container HTTP clients attempt the call.
-"""
 
 
 class ServiceCredential(str):
-    """A token / API key / similar secret with explicit lifecycle state.
+    """A redacted-on-repr string subclass for in-process secret values.
 
-    Subclass of :class:`str`; passing this to any function that takes a
-    ``str`` Just Works.  The :attr:`state` attribute records whether
-    the wrapped value is a real credential (``"literal"``) or a broker
-    placeholder (``"placeholder"``).
+    Subclass of :class:`str`, so any function that takes a ``str``
+    Just Works: ``cred`` is the credential string, ``str(cred)`` is
+    the same string, equality and hashing match plain ``str``.  The
+    only behavior that differs from ``str`` is :meth:`__repr__`,
+    which redacts the underlying value entirely.
 
-    Construct with the keyword-only ``state`` argument::
+    This type intentionally carries no metadata (no ``state`` field,
+    no audit hooks).  Its sole job is logging hygiene -- it exists
+    so that a stray ``log.info("got %r", cred)`` or a
+    ``ValidationError`` rendering an object that holds a credential
+    cannot leak the secret into operator-visible logs.
 
-        ServiceCredential("ghp_abc...", state="literal")
-        ServiceCredential("aoc_placeholder", state="placeholder")
-
-    Pydantic v2 validates plain strings into ``"literal"``-state
-    instances by default; the broker registration code is the (only)
-    place that constructs ``"placeholder"``-state instances.
+    ``Credential.read_value`` returns one of these; broker-side code
+    that mints fresh access tokens wraps them in this type before
+    handing them off to anything that might log the value.
     """
-
-    state: CredentialState
-
-    def __new__(
-        cls,
-        value: str,
-        *,
-        state: CredentialState = "literal",
-    ) -> "ServiceCredential":
-        if state not in ("literal", "placeholder"):
-            raise ValueError(
-                f"invalid credential state {state!r}: "
-                "must be 'literal' or 'placeholder'"
-            )
-        # Empty values are allowed: forge service-level configs use
-        # ``ServiceCredential("")`` as a structural placeholder when
-        # the real credential comes from a per-agent
-        # :class:`ForgeAccountConfig` at call time.  The audit
-        # invariant (:func:`assert_no_literal_credentials`) treats
-        # empty literal credentials as harmless because they cannot
-        # carry meaningful auth material.
-        instance = super().__new__(cls, value)
-        # str subclasses don't support __dict__; we reach around with
-        # object.__setattr__ to attach state without enabling general
-        # mutability.
-        object.__setattr__(instance, "state", state)
-        return instance
-
-    @property
-    def is_placeholder(self) -> bool:
-        """``True`` iff this credential is a broker placeholder."""
-        return self.state == "placeholder"
-
-    @property
-    def is_literal(self) -> bool:
-        """``True`` iff this credential carries a real secret."""
-        return self.state == "literal"
 
     def redacted(self) -> str:
         """Return a logging-safe summary that hides the underlying value."""
-        return f"<{self.state} len={len(self)}>"
-
-    def with_state(self, state: CredentialState) -> "ServiceCredential":
-        """Return a fresh ``ServiceCredential`` wrapping the same value but
-        in *state*.
-
-        Used by registration code that wants to swap a literal value
-        for a placeholder without mutating the existing instance.
-        """
-        return ServiceCredential(str.__str__(self), state=state)
+        return f"<redacted len={len(self)}>"
 
     def __repr__(self) -> str:
         return f"ServiceCredential({self.redacted()})"
@@ -137,16 +89,10 @@ class ServiceCredential(str):
         source_type: Any,
         handler: GetCoreSchemaHandler,
     ) -> CoreSchema:
-        # Use a plain validator (not after-str-validator) so an
-        # already-wrapped ``ServiceCredential`` passes through with its
-        # state intact.  An after-validator would let Pydantic's
-        # ``str_schema`` coerce the subclass back to plain ``str``
-        # before our wrapper runs, silently downgrading any
-        # ``placeholder``-state credential to ``literal``.
         return core_schema.no_info_plain_validator_function(
             cls._validate,
             serialization=core_schema.plain_serializer_function_ser_schema(
-                cls._serialize,
+                str.__str__,
                 return_schema=core_schema.str_schema(),
                 when_used="always",
             ),
@@ -157,105 +103,107 @@ class ServiceCredential(str):
         if isinstance(value, ServiceCredential):
             return value
         if isinstance(value, str):
-            return cls(value, state="literal")
+            return cls(value)
         raise TypeError(
             f"ServiceCredential requires str input, "
             f"got {type(value).__name__}"
         )
 
-    @staticmethod
-    def _serialize(value: "ServiceCredential") -> str:
-        return str.__str__(value)
 
+class CredentialMissingError(LookupError):
+    """Raised when a :class:`Credential`'s env var is not set in os.environ.
 
-# ---------------------------------------------------------------------------
-# Audit traversal
-# ---------------------------------------------------------------------------
-
-
-def walk_credentials(obj: Any) -> Iterator[ServiceCredential]:
-    """Yield every :class:`ServiceCredential` reachable from *obj*.
-
-    Walks Pydantic models (via ``model_fields``), plain objects (via
-    ``__dict__``), dicts, and iterable sequences.  Used by the Phase D
-    audit assertion to confirm that no literal-state credential
-    survives in a loaded gateway state after broker registration.
-
-    Identity-based deduplication via :func:`id` prevents infinite loops
-    on cyclic graphs and avoids visiting interned strings repeatedly.
+    Distinct from :class:`KeyError` so callers can distinguish "the
+    operator never set the secret" from incidental dict misses, and
+    so the error message can mention the credential's logical
+    identity (kind + env var name) rather than just the env var key.
     """
-    seen: set[int] = set()
-    stack: list[Any] = [obj]
-    while stack:
-        node = stack.pop()
-        node_id = id(node)
-        if node_id in seen:
-            continue
-        seen.add(node_id)
-
-        if isinstance(node, ServiceCredential):
-            yield node
-            continue
-
-        # Leaf scalar types: nothing to descend into.  ``str`` matches
-        # plain strings (after the ServiceCredential check above).
-        if isinstance(node, (str, bytes, int, float, bool)) or node is None:
-            continue
-
-        if isinstance(node, dict):
-            stack.extend(node.values())
-            continue
-
-        if isinstance(node, (list, tuple, set, frozenset)):
-            stack.extend(node)
-            continue
-
-        # Pydantic v2 BaseModel exposes its fields via ``model_fields``
-        # on the class (instance access is deprecated in Pydantic
-        # v2.11+).  Iterate by field name so we use the validated
-        # attribute access path rather than internal storage.
-        node_cls = type(node)
-        cls_model_fields = getattr(node_cls, "model_fields", None)
-        if cls_model_fields is not None:
-            for field_name in cls_model_fields:
-                stack.append(getattr(node, field_name, None))
-            continue
-
-        if hasattr(node, "__dict__"):
-            stack.extend(node.__dict__.values())
 
 
-def assert_no_literal_credentials(obj: Any) -> None:
-    """Raise :class:`AssertionError` if any non-empty literal-state
-    credential is reachable from *obj*.
+class Credential(BaseModel):
+    """A reference to a secret stored in an environment variable.
 
-    The audit invariant for Phase D's broker integration:
-    post-registration, every meaningful ``ServiceCredential`` instance
-    reachable from the loaded gateway state must be in ``placeholder``
-    state.  Tests and (eventually) operator-facing diagnostics use
-    this helper to enforce that invariant.
+    *kind* is a free-form short string identifying what kind of
+    credential this is from the consuming service's point of view
+    (e.g. ``"pat"``, ``"gitlab-pat"``).  Service-side code matches
+    on this to decide how to use the credential.  Operators write the
+    kind in their agent JSON files and Thorn does not validate the
+    string against any registry -- a typo means the consuming service
+    will not recognise the credential and surface an error of its
+    own.
 
-    Empty literal credentials are tolerated because they are
-    structural shims (forge service-level configs use ``""`` as a
-    "no service-level credential, fill from per-agent account at
-    call time" sentinel) and carry no auth material that could leak.
+    *name* is an optional human-facing label (``"primary"``,
+    ``"backup"``, etc.) used to disambiguate multiple credentials of
+    the same kind on the same account.  Most accounts have exactly
+    one credential and leave this unset.
+
+    *env_var_name* is the name of the environment variable the
+    operator put the literal secret into.  Thorn reads that env var
+    *only* at the points where it is genuinely needed -- broker
+    registration, direct service authentication when the broker is
+    not in use -- via :meth:`read_value`.  Persisted agent state
+    never holds the literal value; only the env var name (which is
+    not itself a secret).
     """
-    offenders = [
-        c for c in walk_credentials(obj) if c.is_literal and len(c) > 0
-    ]
-    if offenders:
-        # Don't include the values themselves -- this is the whole
-        # point of the redaction story.
-        summaries = ", ".join(c.redacted() for c in offenders)
-        raise AssertionError(
-            f"audit failure: {len(offenders)} literal-state credential(s) "
-            f"reachable from object: {summaries}"
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: str = Field(
+        min_length=1,
+        description=(
+            "Short identifier for this credential's shape from the "
+            "consuming service's point of view (e.g. 'pat')."
+        ),
+    )
+    name: str | None = Field(
+        default=None,
+        description=(
+            "Optional human-facing label disambiguating multiple "
+            "credentials of the same kind on a single account."
+        ),
+    )
+    env_var_name: str = Field(
+        min_length=1,
+        description=(
+            "Name of the environment variable holding the literal "
+            "secret.  Resolved via ``os.environ`` at use time; not "
+            "stored anywhere in agent state."
+        ),
+    )
+
+    def read_value(self) -> ServiceCredential:
+        """Read the literal credential value from ``os.environ``.
+
+        Returns a :class:`ServiceCredential` so that any logging
+        surface that incidentally holds the value redacts on
+        ``repr``.
+
+        Raises :class:`CredentialMissingError` (a ``LookupError``
+        subclass) when the env var is not set; callers are expected
+        to surface that to the operator so they can set the variable
+        and retry.
+        """
+        try:
+            raw = os.environ[self.env_var_name]
+        except KeyError as exc:
+            raise CredentialMissingError(
+                f"Credential (kind={self.kind!r}, "
+                f"name={self.name!r}) references environment variable "
+                f"{self.env_var_name!r}, which is not set.  Export "
+                f"the variable in the gateway's environment and "
+                "restart `thorn serve`."
+            ) from exc
+        return ServiceCredential(raw)
+
+    def __repr__(self) -> str:
+        return (
+            f"Credential(kind={self.kind!r}, name={self.name!r}, "
+            f"env_var_name={self.env_var_name!r})"
         )
 
 
 __all__ = [
-    "CredentialState",
+    "Credential",
+    "CredentialMissingError",
     "ServiceCredential",
-    "assert_no_literal_credentials",
-    "walk_credentials",
 ]

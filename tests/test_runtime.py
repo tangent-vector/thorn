@@ -889,17 +889,24 @@ class TestJsonSessionSerializerAgent:
 
 
 class TestJsonSessionSerializerAgentAccounts:
+    """Cover the on-disk shape of agent accounts: a flat
+    ``"accounts"`` array of objects, each carrying a ``service``
+    discriminator and a ``credentials`` list.  Per-service fields
+    (``git_user_name`` etc.) live alongside ``service`` and survive
+    parse-time validation via :class:`UntypedAccountConfig`.
+    """
+
     def test_save_and_load_accounts_roundtrip(self, tmp_path: Path):
-        from thorn.core._account import (
-            AgentAccountsConfig,
-            ForgeAccountConfig,
-            GitLabCredentials,
-        )
+        from thorn.core._account import AgentAccountsConfig, UntypedAccountConfig
+        from thorn.core._credentials import Credential
 
         accounts = AgentAccountsConfig(accounts=[
-            ForgeAccountConfig(
+            UntypedAccountConfig(
                 service="my-forge",
-                credentials=GitLabCredentials(token="glpat-secret"),
+                credentials=[Credential(
+                    kind="gitlab-pat",
+                    env_var_name="MY_GL_TOKEN",
+                )],
                 git_user_name="bot",
                 git_user_email="bot@thorn",
             ),
@@ -919,26 +926,32 @@ class TestJsonSessionSerializerAgentAccounts:
 
         restored_accounts = getattr(restored, "accounts", None)
         assert restored_accounts is not None
-        assert len(restored_accounts.forge_accounts()) == 1
+        assert len(restored_accounts.accounts) == 1
 
-        acct = restored_accounts.forge_accounts()[0]
+        acct = restored_accounts.accounts[0]
         assert acct.service == "my-forge"
-        assert acct.git_user_name == "bot"
-        assert acct.git_user_email == "bot@thorn"
-        assert acct.credentials.token == "glpat-secret"
+        # Service-specific extras flow through UntypedAccountConfig
+        # (the parse-time shape, before the gateway's per-service
+        # validation pass swaps in a typed AccountConfig).
+        dump = acct.model_dump()
+        assert dump["git_user_name"] == "bot"
+        assert dump["git_user_email"] == "bot@thorn"
+        assert acct.credentials == [
+            Credential(kind="gitlab-pat", env_var_name="MY_GL_TOKEN"),
+        ]
 
     def test_accounts_written_to_json(self, tmp_path: Path):
-        """Verify the on-disk JSON structure includes 'accounts'."""
-        from thorn.core._account import (
-            AgentAccountsConfig,
-            ForgeAccountConfig,
-            GitLabCredentials,
-        )
+        """The on-disk JSON shape is a flat ``accounts`` array."""
+        from thorn.core._account import AgentAccountsConfig, UntypedAccountConfig
+        from thorn.core._credentials import Credential
 
         accounts = AgentAccountsConfig(accounts=[
-            ForgeAccountConfig(
+            UntypedAccountConfig(
                 service="gl",
-                credentials=GitLabCredentials(token="t"),
+                credentials=[Credential(
+                    kind="gitlab-pat",
+                    env_var_name="GL_TOKEN",
+                )],
             ),
         ])
         agent = Agent(id=AgentID("a"), name="a", accounts=accounts)
@@ -949,11 +962,12 @@ class TestJsonSessionSerializerAgentAccounts:
 
         data = json.loads(path.read_text(encoding="utf-8"))
         assert "accounts" in data
-        # New on-disk shape: "accounts" is a flat array of account
-        # objects (no inner "forge_accounts" wrapper).
         assert isinstance(data["accounts"], list)
         assert len(data["accounts"]) == 1
         assert data["accounts"][0]["service"] == "gl"
+        assert data["accounts"][0]["credentials"] == [
+            {"kind": "gitlab-pat", "env_var_name": "GL_TOKEN", "name": None},
+        ]
 
     def test_no_accounts_key_when_empty(self, tmp_path: Path):
         """Agents without accounts should not have an 'accounts' key in JSON."""
@@ -966,123 +980,117 @@ class TestJsonSessionSerializerAgentAccounts:
         data = json.loads(path.read_text(encoding="utf-8"))
         assert "accounts" not in data
 
-    def test_env_var_expansion_in_credential_token(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ):
-        """$ENV_VAR in credential fields should be expanded on load."""
-        monkeypatch.setenv("MY_GL_TOKEN", "expanded-secret")
+    def test_load_credentials_list_shape(self, tmp_path: Path):
+        """The deserializer accepts the new ``credentials: [...]`` shape
+        and preserves per-service extras unchanged for the gateway's
+        eager validation pass."""
+        from thorn.core._account import UntypedAccountConfig
+        from thorn.core._credentials import Credential
 
         agent_data = {
             "agent_class": "Agent",
-            "name": "env-test",
+            "name": "shape-test",
             "metadata": {},
             "accounts": [
                 {
                     "service": "gl",
-                    "credentials": {
-                        "kind": "gitlab-pat",
-                        "token": "$MY_GL_TOKEN",
-                    },
+                    "credentials": [
+                        {"kind": "gitlab-pat", "env_var_name": "MY_GL_TOKEN"},
+                    ],
                     "git_user_name": "bot",
                     "git_user_email": "bot@thorn",
                 },
             ],
         }
-        path = tmp_path / "env-test.json"
+        path = tmp_path / "shape-test.json"
         path.write_text(json.dumps(agent_data), encoding="utf-8")
 
         serializer = JsonSessionSerializer()
         restored = serializer.load_agent(path)
 
-        acct = restored.accounts.forge_accounts()[0]
-        assert acct.credentials.token == "expanded-secret"
+        acct = restored.accounts.accounts[0]
+        assert isinstance(acct, UntypedAccountConfig)
+        assert acct.credentials == [
+            Credential(kind="gitlab-pat", env_var_name="MY_GL_TOKEN"),
+        ]
 
-    def test_env_var_not_expanded_in_non_secret_fields(
+    def test_load_preserves_per_service_extra_fields(
         self, tmp_path: Path,
     ):
-        """git_user_name etc. should NOT be treated as env var references."""
+        """Service-specific fields (``git_user_name`` etc.) are not
+        recognised by the base :class:`AccountConfig`; the
+        deserializer must use :class:`UntypedAccountConfig` so those
+        fields survive intact for the gateway's per-service
+        validation pass to consume."""
         agent_data = {
             "agent_class": "Agent",
-            "name": "no-expand",
+            "name": "no-strip",
             "metadata": {},
             "accounts": [
                 {
                     "service": "gl",
-                    "credentials": {
-                        "kind": "gitlab-pat",
-                        "token": "literal-token",
-                    },
+                    "credentials": [
+                        {"kind": "gitlab-pat", "env_var_name": "TOK"},
+                    ],
                     "git_user_name": "$NOT_AN_ENV_VAR",
                     "git_user_email": "$ALSO_NOT",
+                    "custom_field": "preserved",
                 },
             ],
         }
-        path = tmp_path / "no-expand.json"
+        path = tmp_path / "no-strip.json"
         path.write_text(json.dumps(agent_data), encoding="utf-8")
 
         serializer = JsonSessionSerializer()
         restored = serializer.load_agent(path)
 
-        acct = restored.accounts.forge_accounts()[0]
-        assert acct.git_user_name == "$NOT_AN_ENV_VAR"
-        assert acct.git_user_email == "$ALSO_NOT"
+        acct = restored.accounts.accounts[0]
+        # Unknown / per-service extras are preserved verbatim;
+        # values are NOT subjected to ``$ENV_VAR`` expansion (the
+        # framework dropped that magic in favour of explicit
+        # ``env_var_name`` on credentials).
+        dump = acct.model_dump()
+        assert dump["git_user_name"] == "$NOT_AN_ENV_VAR"
+        assert dump["git_user_email"] == "$ALSO_NOT"
+        assert dump["custom_field"] == "preserved"
 
-    def test_github_pat_env_var_expansion(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    def test_load_multiple_credentials_on_one_account(
+        self, tmp_path: Path,
     ):
-        monkeypatch.setenv("GH_TOKEN", "ghp-expanded")
+        """An account may carry multiple credentials of distinct kinds
+        in the same list; the loader keeps all of them."""
+        from thorn.core._credentials import Credential
 
         agent_data = {
             "agent_class": "Agent",
-            "name": "gh-env",
+            "name": "multi-cred",
             "metadata": {},
             "accounts": [
                 {
                     "service": "gh",
-                    "credentials": {
-                        "kind": "pat",
-                        "token": "$GH_TOKEN",
-                    },
+                    "credentials": [
+                        {"kind": "pat", "env_var_name": "GH_PAT"},
+                        {
+                            "kind": "app", "name": "release-app",
+                            "env_var_name": "GH_APP_KEY",
+                        },
+                    ],
                 },
             ],
         }
-        path = tmp_path / "gh-env.json"
-        path.write_text(json.dumps(agent_data), encoding="utf-8")
-
-        serializer = JsonSessionSerializer()
-        restored = serializer.load_agent(path)
-        assert restored.accounts.forge_accounts()[0].credentials.token == "ghp-expanded"
-
-    def test_github_app_private_key_env_var_expansion(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ):
-        monkeypatch.setenv("GH_APP_KEY", "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----")
-
-        agent_data = {
-            "agent_class": "Agent",
-            "name": "gh-app",
-            "metadata": {},
-            "accounts": [
-                {
-                    "service": "gh",
-                    "credentials": {
-                        "kind": "app",
-                        "app_id": "12345",
-                        "installation_id": 67890,
-                        "private_key_pem": "$GH_APP_KEY",
-                    },
-                },
-            ],
-        }
-        path = tmp_path / "gh-app.json"
+        path = tmp_path / "multi-cred.json"
         path.write_text(json.dumps(agent_data), encoding="utf-8")
 
         serializer = JsonSessionSerializer()
         restored = serializer.load_agent(path)
 
-        creds = restored.accounts.forge_accounts()[0].credentials
-        assert creds.kind == "app"
-        assert "BEGIN RSA PRIVATE KEY" in creds.private_key_pem
+        creds = restored.accounts.accounts[0].credentials
+        assert creds == [
+            Credential(kind="pat", env_var_name="GH_PAT"),
+            Credential(
+                kind="app", name="release-app", env_var_name="GH_APP_KEY",
+            ),
+        ]
 
     def test_load_without_accounts_field_leaves_agent_unconfigured(
         self, tmp_path: Path,

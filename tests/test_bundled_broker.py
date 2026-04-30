@@ -283,19 +283,20 @@ class TestSupervisorStart:
 
         config = await supervisor.start()
 
-        # The synthesised config is presented as ``mode="external"`` --
-        # downstream broker code treats the supervisor as just another
-        # already-running broker; the only thing that's different is
-        # who brought it up.
-        assert config.mode == "external"
+        # The synthesised config carries ``mode="bundled"``; the
+        # admin key is exposed separately via the supervisor's
+        # ``admin_api_key`` attribute (in-process only -- never
+        # written to disk and never exposed via an env var name on
+        # the config object).
+        assert config.mode == "bundled"
         assert config.enabled is True
         assert config.admin_url == "http://127.0.0.1:34567"
         assert config.proxy_url == "http://127.0.0.1:34568"
-        assert config.admin_api_key is not None
-        # ServiceCredential is a ``str`` subclass; the wrapped value
-        # is the credential itself.
-        assert str(config.admin_api_key) == "oc_existing"
-        assert config.admin_api_key.is_literal
+        assert config.admin_api_key_env_var is None
+        # The literal admin key is held in process memory on the
+        # supervisor, not on the config.
+        assert supervisor.admin_api_key is not None
+        assert str(supervisor.admin_api_key) == "oc_existing"
 
         # ``project_name`` is populated post-start for the gateway
         # to derive ``egress_network_name`` from.
@@ -336,8 +337,9 @@ class TestSupervisorStart:
         supervisor = _make_supervisor(recorder=recorder, handler=handler)
 
         config = await supervisor.start()
-        assert config.admin_api_key is not None
-        assert str(config.admin_api_key) == "oc_minted"
+        assert config.mode == "bundled"
+        assert supervisor.admin_api_key is not None
+        assert str(supervisor.admin_api_key) == "oc_minted"
 
     @pytest.mark.asyncio
     async def test_unexpected_status_on_get_raises(self) -> None:

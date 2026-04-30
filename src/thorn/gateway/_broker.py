@@ -2,12 +2,21 @@
 
 This module is the gateway's interface to OneCLI's admin / management
 HTTP API.  It is consumed by the agent-load path: for each agent that
-declares forge credentials, the gateway uses :class:`BrokerClient` to
-(a) ensure an OneCLI agent identity exists, (b) register one
-"secret" per credential with the appropriate host+path policy and
-injection config, (c) bind those secrets to the OneCLI agent, and
-(d) compose the per-agent ``HTTPS_PROXY`` URL the sandbox container
-will see.
+declares accounts on services that participate in upstream credential
+brokering (i.e. services implementing
+:class:`thorn.core._brokering.BrokerableService`), the gateway uses
+:class:`BrokerClient` to (a) ensure an OneCLI agent identity exists,
+(b) register one "secret" per credential the service plans, with the
+appropriate host+path policy and injection config, (c) bind those
+secrets to the OneCLI agent, and (d) compose the per-agent
+``HTTPS_PROXY`` URL the sandbox container will see.
+
+The broker code is deliberately ignorant of which services exist or
+what credential shapes they accept; the
+:meth:`BrokerableService.broker_credential_plans` protocol pushes
+that knowledge into the service module.  Adding a new
+broker-routed service is a purely local change in the service
+module, no edits required here.
 
 R1/R2 research notes (verified against OneCLI ``main`` at
 ``apps/gateway/src/inject.rs::extract_agent_token`` and
@@ -49,55 +58,47 @@ R1/R2 research notes (verified against OneCLI ``main`` at
 from __future__ import annotations
 
 import logging
+import os
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
+from thorn.core._brokering import (
+    BrokerableService,
+    BrokerCredentialPlan,
+    HeaderInjection,
+    InjectionConfig,
+    ParamInjection,
+)
 from thorn.core._credentials import (
+    Credential,
+    CredentialMissingError,
     ServiceCredential,
-    assert_no_literal_credentials,
 )
 from thorn.gateway._config import BrokerConfig
 
 if TYPE_CHECKING:
-    from thorn.core._account import ForgeAccountConfig
+    from thorn.core._account import AccountConfig
     from thorn.core._agent import Agent
-    from thorn.gateway._config import GatewayConfig
+    from thorn.core._service import Service
 
 log = logging.getLogger(__name__)
 
 
+# Re-exported so existing callers (and tests) that import the
+# injection types from here keep working without ten-line shims; the
+# canonical home is :mod:`thorn.core._brokering`.
+__injection_reexports__ = (HeaderInjection, ParamInjection, InjectionConfig)
+
+
 # ---------------------------------------------------------------------------
-# Injection config and result types
+# Result types
 # ---------------------------------------------------------------------------
-
-
-class HeaderInjection(BaseModel):
-    """Inject the secret value into a request header.
-
-    ``value_format`` is OneCLI's templating syntax: the literal token
-    ``{value}`` is replaced with the decrypted secret at proxy time.
-    Examples: ``"Bearer {value}"`` (PAT-style), ``"token {value}"``
-    (some legacy GitHub clients), ``"Basic {value}"`` (when the
-    credential is already base64-encoded user:pass).
-    """
-
-    header_name: str = Field(min_length=1)
-    value_format: str = Field(default="{value}", min_length=1)
-
-
-class ParamInjection(BaseModel):
-    """Inject the secret value into a URL query parameter."""
-
-    param_name: str = Field(min_length=1)
-    param_format: str = Field(default="{value}", min_length=1)
-
-
-InjectionConfig = HeaderInjection | ParamInjection
 
 
 class AgentRegistration(BaseModel):
@@ -109,12 +110,10 @@ class AgentRegistration(BaseModel):
     access_token: ServiceCredential
     """Per-agent proxy access token (``aoc_...``).
 
-    Carries ``state="literal"`` because it is a real, freshly-minted
-    secret -- it just happens to authenticate to *our* broker rather
-    than to any upstream service.  The audit invariant deliberately
-    tolerates this kind of broker-managed credential when the
-    enclosing object is the broker binding rather than the agent's
-    forge accounts.
+    A real, freshly-minted secret -- it just happens to authenticate
+    to *our* broker rather than to any upstream service.  The
+    :class:`ServiceCredential` wrapper exists so logging surfaces
+    redact this value.
     """
 
 
@@ -136,23 +135,24 @@ class BrokerError(RuntimeError):
     Phase D's agent-load contract is "broker failures fail agent-load":
     the gateway propagates this to the operator rather than silently
     falling back to env injection, because doing so would break the
-    audit invariant in a way that's hard to detect later.
+    isolation invariant in a way that's hard to detect later.
     """
 
 
 class BrokerClient:
     """Synchronous OneCLI admin / management API client.
 
-    Constructed once per gateway process from a :class:`BrokerConfig`,
-    then driven by the agent-load path.  Sync (rather than async)
-    because agent-load itself is sync today; the broker calls are a
-    handful of REST round-trips per agent at startup, not on the hot
-    path.
+    Constructed once per gateway process from a :class:`BrokerConfig`
+    plus the literal admin API key (read from ``os.environ`` by the
+    gateway), then driven by the agent-load path.  Sync (rather than
+    async) because agent-load itself is sync today; the broker calls
+    are a handful of REST round-trips per agent at startup, not on
+    the hot path.
 
     Use as a context manager to ensure the underlying HTTP connection
     pool is closed::
 
-        with BrokerClient(config) as broker:
+        with BrokerClient(config, admin_api_key=key) as broker:
             registration = broker.register_agent(...)
             ...
 
@@ -167,40 +167,44 @@ class BrokerClient:
         self,
         config: BrokerConfig,
         *,
+        admin_api_key: ServiceCredential,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         """Build the client.
+
+        *admin_api_key* is the literal Bearer token (already read
+        from ``os.environ`` by the gateway) used as the
+        ``Authorization`` header value.  Wrapping in
+        :class:`ServiceCredential` keeps log surfaces from leaking
+        the value.
 
         *transport* is an injection seam for tests (use
         :class:`httpx.MockTransport`).  Production callers leave it
         unset and httpx uses its default ``HTTPTransport``.
 
         Refuses to build when *config* is missing the bits we need
-        (``admin_url`` empty or ``admin_api_key`` ``None``).  These
-        are expected to be populated by the time we get here:
-        ``mode='external'`` configs require them at schema-validation
-        time, and ``mode='bundled'`` configs are mutated by the
-        :class:`~thorn.gateway._bundled_broker.BundledBrokerSupervisor`
-        before any client is constructed.  Reaching this guard
-        indicates a wiring bug -- for example, instantiating the
-        client outside the supervised startup path -- so we surface
-        it loudly rather than silently sending an ``Authorization:
-        Bearer None`` header.
+        (``admin_url`` empty).  Reaching this guard indicates a
+        wiring bug -- for example, instantiating the client outside
+        the supervised startup path -- so we surface it loudly
+        rather than silently sending requests to an empty base URL.
         """
-        if not config.admin_url or config.admin_api_key is None:
+        if not config.admin_url:
             raise BrokerError(
-                "BrokerClient requires both admin_url and admin_api_key "
-                "to be populated; got admin_url="
-                f"{config.admin_url!r}, admin_api_key="
-                f"{config.admin_api_key!r}.  This typically means the "
-                "bundled-broker supervisor has not run yet, or the "
-                "external broker config is missing required fields."
+                "BrokerClient requires admin_url to be populated; got "
+                f"admin_url={config.admin_url!r}.  This typically means "
+                "the bundled-broker supervisor has not run yet, or "
+                "the external broker config is missing required fields."
+            )
+        if not admin_api_key:
+            raise BrokerError(
+                "BrokerClient requires a non-empty admin API key."
             )
         self._config = config
+        self._admin_api_key = admin_api_key
         self._http = httpx.Client(
             base_url=config.admin_url.rstrip("/"),
             headers={
-                "Authorization": f"Bearer {config.admin_api_key}",
+                "Authorization": f"Bearer {admin_api_key}",
                 "Accept": "application/json",
             },
             timeout=30.0,
@@ -272,7 +276,7 @@ class BrokerClient:
             raise BrokerError(
                 f"regenerate_agent_token: unexpected response shape: {body!r}"
             ) from e
-        return ServiceCredential(token, state="literal")
+        return ServiceCredential(token)
 
     # ── Secrets ──────────────────────────────────────────────────────
 
@@ -280,17 +284,16 @@ class BrokerClient:
         self,
         *,
         name: str,
-        value: ServiceCredential | str,
+        value: str,
         host_pattern: str,
         path_pattern: str | None = None,
         injection: InjectionConfig,
     ) -> SecretRegistration:
         """Register a credential with OneCLI for proxy injection.
 
-        *value* is the actual secret -- a ``ServiceCredential`` or
-        plain ``str``.  The wire body uses the underlying string; the
-        ``ServiceCredential`` wrapper exists for type-tracking inside
-        Thorn, not on the wire.
+        *value* is the actual secret string to forward to the broker
+        (passed as a plain ``str`` so callers can't accidentally
+        retain a reference inside agent state).
 
         *host_pattern* must be a hostname (no scheme, no path); see
         OneCLI's ``hostPatternSchema`` validation.  *path_pattern* is
@@ -303,7 +306,7 @@ class BrokerClient:
         body: dict[str, Any] = {
             "name": name,
             "type": "generic",
-            "value": str(value),
+            "value": value,
             "hostPattern": host_pattern,
             "injectionConfig": _injection_to_wire(injection),
         }
@@ -457,8 +460,8 @@ class BrokerBinding:
     """Per-agent state captured at broker-registration time.
 
     Produced by :func:`register_agent_with_broker`, owned by the
-    gateway, and consumed by the per-agent sandbox executor (Phase D
-    work item 6) when it builds the agent's container environment.
+    gateway, and consumed by the per-agent sandbox executor when it
+    builds the agent's container environment.
 
     Concretely, the sandbox executor uses *this* object to:
 
@@ -470,8 +473,7 @@ class BrokerBinding:
 
     The binding also retains :attr:`agent_id` and :attr:`secret_ids`
     so the gateway can issue a ``DELETE /api/agents/{id}`` (and
-    matching secret deletions) at shutdown -- the per-load
-    create+delete lifecycle decided in the Phase D plan.
+    matching secret deletions) at shutdown.
 
     Frozen so the binding is safe to share across the agent's
     sandbox lifetime; the underlying broker secrets do not change
@@ -485,15 +487,8 @@ class BrokerBinding:
     """OneCLI secret UUIDs registered for this agent."""
 
     access_token: ServiceCredential
-    """Per-agent proxy access token (``aoc_...``).
-
-    Carries ``state="literal"`` because it is a real credential that
-    the sandbox container's HTTPS_PROXY URL embeds.  The audit
-    invariant deliberately tolerates broker-managed credentials -- it
-    only enforces placeholder state on credentials reachable from the
-    *agent state* surface (forge accounts), not on this binding,
-    which is held by the gateway and never persisted to disk.
-    """
+    """Per-agent proxy access token (``aoc_...``).  The sandbox
+    container's ``HTTPS_PROXY`` URL embeds this."""
 
     proxy_url: str
     """Composed ``HTTPS_PROXY``-style URL with the access token
@@ -537,140 +532,51 @@ def _make_placeholder_value() -> str:
     return f"{_PLACEHOLDER_ENV_PREFIX}{secrets.token_urlsafe(16)}"
 
 
-@dataclass(frozen=True)
-class _CredentialPlan:
-    """Internal: how to register one ForgeAccountConfig with the broker."""
+ServiceLookup = Callable[[str], "Service"]
+"""Callable resolving a service name to a registered :class:`Service`.
 
-    secret_name: str
-    host_pattern: str
-    path_pattern: str | None
-    injection: InjectionConfig
-    env_var_name: str | None
-    """The env-var name in-container tools expect (e.g. ``"GITHUB_TOKEN"``).
-    ``None`` when there is no canonical env var (so we just register
-    the secret without adding a placeholder)."""
-
-
-def _plan_for_account(
-    account: "ForgeAccountConfig",
-    forge_url: str,
-) -> _CredentialPlan:
-    """Map a forge account to a broker-registration plan.
-
-    *forge_url* is the human-facing forge URL declared in
-    ``gateway.json`` (e.g. ``"https://github.com"``).  We compute the
-    hostPattern from this URL plus the credential variant.
-
-    Phase D first-cut scope: GitHub PATs (``GitHubPatAuth``) and
-    GitLab PATs (``GitLabCredentials``).  GitHub App auth
-    (``GitHubAppAuth``) is rejected because OneCLI's substitution
-    model handles static-token injection only -- App auth needs JWT
-    signing + installation-token exchange, which is a separate
-    integration concern out of scope for the first phase D pass.
-    """
-    from thorn.core._account import GitLabCredentials
-    from thorn.tools._github_connection import GitHubAppAuth, GitHubPatAuth
-
-    creds = account.credentials
-    parsed = urlsplit(forge_url)
-    host = parsed.hostname or ""
-
-    if isinstance(creds, GitHubPatAuth):
-        # GitHub.com vs Enterprise: the REST API lives at
-        # ``api.github.com`` for the public host but on the same
-        # hostname (under ``/api/v3/``) for GHE.  We register the API
-        # host so OneCLI matches just the API path; git HTTPS auth
-        # (which goes to the bare host) is handled by an additional
-        # per-host registration in a future pass.
-        api_host = "api.github.com" if host == "github.com" else host
-        return _CredentialPlan(
-            secret_name=f"{account.service}-github-pat",
-            host_pattern=api_host,
-            path_pattern="/*",
-            injection=HeaderInjection(
-                header_name="Authorization",
-                value_format="Bearer {value}",
-            ),
-            env_var_name="GITHUB_TOKEN",
-        )
-
-    if isinstance(creds, GitLabCredentials):
-        # GitLab.com and self-hosted both serve the API on the same
-        # host the operator points the forge at.
-        return _CredentialPlan(
-            secret_name=f"{account.service}-gitlab-pat",
-            host_pattern=host,
-            path_pattern="/api/*",
-            injection=HeaderInjection(
-                header_name="Authorization",
-                value_format="Bearer {value}",
-            ),
-            env_var_name="GITLAB_TOKEN",
-        )
-
-    if isinstance(creds, GitHubAppAuth):
-        raise BrokerError(
-            f"GitHub App authentication for forge {account.service!r} "
-            "cannot be registered with the broker in Phase D: OneCLI's "
-            "substitution model handles static tokens only, not the "
-            "JWT-signing + installation-token-exchange flow App auth "
-            "requires.  Either disable the broker for this agent "
-            "(remove gateway.json's broker block) or migrate the "
-            "account to PAT auth."
-        )
-
-    raise BrokerError(
-        f"Cannot register credentials of type {type(creds).__name__} "
-        f"for forge {account.service!r} with the broker"
-    )
-
-
-def _forge_url_for_service(
-    config: "GatewayConfig",
-    service_name: str,
-) -> str:
-    """Look up the human-facing forge URL for an agent account's service.
-
-    The agent's ``ForgeAccountConfig.service`` field references an
-    entry in ``gateway.json``'s ``forges[]`` by ``name``; that entry
-    carries the URL.
-    """
-    for forge in config.forges:
-        if forge.name == service_name:
-            if not forge.url:
-                raise BrokerError(
-                    f"forge {service_name!r} has no URL configured in "
-                    "gateway.json; cannot derive broker hostPattern"
-                )
-            return forge.url
-    raise BrokerError(
-        f"forge {service_name!r} (referenced by an agent account) is "
-        f"not declared in gateway.json's forges[] array"
-    )
+Typically the gateway passes :meth:`Runtime.get_service` directly.
+Defining the alias here keeps the broker module from importing the
+``Runtime`` class -- the broker only needs the lookup capability,
+not the full runtime.  The callable should raise :class:`KeyError`
+when no service with the given name is registered.
+"""
 
 
 def register_agent_with_broker(
     *,
     client: BrokerClient,
     agent: "Agent",
-    config: "GatewayConfig",
+    service_lookup: ServiceLookup,
     ca_certificate_path: str,
 ) -> BrokerBinding:
-    """Register *agent*'s forge credentials with the broker.
+    """Register *agent*'s broker-routed credentials with the broker.
 
-    Performs the full Phase D agent-load registration sequence:
+    Performs the full agent-load registration sequence:
 
-    1. For each forge account on *agent*: register its credential as
-       an OneCLI secret (with the appropriate host+path policy and
-       injection config), keeping track of the resulting secret ID.
-    2. Create a fresh OneCLI agent and mint its proxy access token.
-    3. Bind the registered secrets to the freshly-created agent.
-    4. Replace each agent account's literal credential with a
-       placeholder ``ServiceCredential`` (state ``"placeholder"``)
-       so that subsequent in-process reads see only the placeholder.
-       This is the swap that makes the audit invariant true.
-    5. Run :func:`assert_no_literal_credentials` over the agent to
-       confirm the swap fully scrubbed the agent's reachable state.
+    1. Walk the agent's accounts.  For each account whose
+       backing :class:`Service` implements
+       :class:`~thorn.core._brokering.BrokerableService`, ask the
+       service for its
+       :class:`~thorn.core._brokering.BrokerCredentialPlan`\\ s.
+    2. For each plan: read the literal secret value from
+       ``os.environ[plan.env_var_name]``, register an OneCLI secret
+       carrying the value with the plan's host/path policy and
+       injection config, and remember the resulting secret ID.
+       Generate a placeholder env entry keyed on the same env var
+       name so the sandbox container sees a non-empty value
+       in-place.
+    3. Create a fresh OneCLI agent and mint its proxy access token.
+    4. Bind the registered secrets to the freshly-created agent.
+
+    The agent state itself is not mutated -- credentials never held
+    the literal value in the first place; the env var stays in
+    ``os.environ`` and the placeholder ends up in the sandbox
+    container's environment via the returned :class:`BrokerBinding`.
+
+    Accounts whose service does not implement
+    :class:`BrokerableService` are silently skipped (e.g. project
+    services, future non-credential service families).
 
     On any broker error this function raises :class:`BrokerError`
     without attempting partial cleanup; the caller (gateway startup)
@@ -683,52 +589,36 @@ def register_agent_with_broker(
     per startup, see :meth:`Gateway._register_broker_bindings`).
     Threaded through here so the resulting :class:`BrokerBinding`
     carries the resolved path alongside the other per-agent
-    sandbox-launch wiring -- the runtime then bind-mounts the same
-    file into every per-agent container.  Passing the path
-    explicitly (rather than reading it back off ``client._config``)
-    keeps the resolution policy a single concern of the gateway,
-    and makes the function trivially testable without a configured
-    CA file on disk.
-
-    Returns a :class:`BrokerBinding` containing the proxy URL, CA
-    path, and placeholder env entries for the per-agent sandbox to
-    consume.
+    sandbox-launch wiring.
     """
     if agent.id is None:
         raise BrokerError(
             "Cannot register an agent without an id with the broker"
         )
 
-    accounts_state = getattr(agent, "accounts", None)
-    forge_accounts: list[ForgeAccountConfig]
-    if accounts_state is None:
-        forge_accounts = []
-    else:
-        forge_accounts = list(accounts_state.forge_accounts())
+    plans = _collect_plans(agent, service_lookup)
 
-    plans: list[tuple[ForgeAccountConfig, _CredentialPlan]] = [
-        (account, _plan_for_account(
-            account, _forge_url_for_service(config, account.service),
-        ))
-        for account in forge_accounts
-    ]
-
-    # Phase 1: register each credential as a secret.
+    # Phase 1: register each credential as a secret.  We resolve the
+    # literal value from ``os.environ`` here and forward it to the
+    # broker.  The literal does NOT enter agent state.
     secret_ids: list[str] = []
-    for account, plan in plans:
-        # Use the actual ServiceCredential value (the literal) here;
-        # this is the only point in the registration flow where the
-        # literal leaves the agent's process boundary, and only over
-        # the broker's TLS-bridged admin connection.
-        secret_value = _credential_secret_value(account.credentials)
+    placeholder_env: list[tuple[str, str]] = []
+    for service_name, plan, credential in plans:
+        try:
+            value = credential.read_value()
+        except CredentialMissingError as exc:
+            raise BrokerError(str(exc)) from exc
         registration = client.register_secret(
-            name=f"{agent.id}-{plan.secret_name}",
-            value=secret_value,
+            name=_broker_secret_name(agent.id, service_name, plan),
+            value=str(value),
             host_pattern=plan.host_pattern,
             path_pattern=plan.path_pattern,
             injection=plan.injection,
         )
         secret_ids.append(registration.secret_id)
+        placeholder_env.append(
+            (plan.env_var_name, _make_placeholder_value()),
+        )
 
     # Phase 2: create the OneCLI agent and bind the secrets.
     agent_registration = client.register_agent(
@@ -740,20 +630,6 @@ def register_agent_with_broker(
             agent_registration.agent_id, secret_ids,
         )
 
-    # Phase 3: rewrite the agent's in-memory credentials to placeholders.
-    placeholder_env: list[tuple[str, str]] = []
-    for account, plan in plans:
-        placeholder_value = _make_placeholder_value()
-        _replace_credential_with_placeholder(account, placeholder_value)
-        if plan.env_var_name is not None:
-            placeholder_env.append((plan.env_var_name, placeholder_value))
-
-    # Phase 4: audit -- the agent must hold no non-empty literal
-    # credentials at this point.  Hard-fail if it does so we surface
-    # programming errors loudly rather than letting a literal token
-    # ride along into the container env.
-    assert_no_literal_credentials(agent)
-
     proxy_url = client.proxy_url_for_agent(agent_registration.access_token)
 
     return BrokerBinding(
@@ -764,6 +640,88 @@ def register_agent_with_broker(
         ca_certificate_path=ca_certificate_path,
         placeholder_env=tuple(placeholder_env),
     )
+
+
+def _collect_plans(
+    agent: "Agent",
+    service_lookup: ServiceLookup,
+) -> list[tuple[str, BrokerCredentialPlan, Credential]]:
+    """Walk the agent's accounts and collect per-credential plans.
+
+    Returns a list of ``(service_name, plan, credential)`` triples,
+    one per credential the broker should register.  Accounts whose
+    service does not exist on the runtime raise :class:`BrokerError`
+    so misconfigured agents fail fast at registration time rather
+    than producing confusing downstream errors.
+
+    Accounts whose service is registered but does not implement
+    :class:`BrokerableService` are silently skipped: that is how a
+    service tells us "no broker-routed credentials here, please".
+    """
+    accounts = getattr(agent, "accounts", None)
+    if accounts is None:
+        return []
+
+    plans: list[tuple[str, BrokerCredentialPlan, Credential]] = []
+    for account in accounts.accounts:
+        try:
+            service = service_lookup(account.service)
+        except KeyError as exc:
+            raise BrokerError(
+                f"Agent {agent.name!r} declares an account on service "
+                f"{account.service!r}, which is not registered on "
+                "the runtime.  This typically means the service was "
+                "not declared in gateway.json (or could not be "
+                "inferred from a project URL)."
+            ) from exc
+
+        if not isinstance(service, BrokerableService):
+            # Service exists but does not participate in broker
+            # registration -- silently skip.  Future service
+            # families (project services, event sources) live here
+            # naturally without the broker module needing to know
+            # about them.
+            continue
+
+        service_plans = service.broker_credential_plans(account)
+        # Pair plans back to the agent's credentials by env var name
+        # so the registration loop above can call read_value() on
+        # the right Credential instance (and, in turn, surface a
+        # clear error if the env var is unset).  The service's plans
+        # name an env var; the account's credentials list names env
+        # vars; we look up the matching credential here so the
+        # broker code never has to reach into per-credential fields
+        # itself.
+        creds_by_env_var = {c.env_var_name: c for c in account.credentials}
+        for plan in service_plans:
+            cred = creds_by_env_var.get(plan.env_var_name)
+            if cred is None:
+                # The service planned for an env var the account
+                # doesn't carry -- a wiring bug in the service's
+                # plan-construction logic.  Surface loudly.
+                raise BrokerError(
+                    f"Service {service.name!r} planned a broker "
+                    f"registration for env var {plan.env_var_name!r}, "
+                    "but the agent's account on that service has no "
+                    "credential referencing that env var."
+                )
+            plans.append((service.name, plan, cred))
+    return plans
+
+
+def _broker_secret_name(
+    agent_id: Any,
+    service_name: str,
+    plan: BrokerCredentialPlan,
+) -> str:
+    """Compose a stable, operator-readable broker secret name.
+
+    The name surfaces in OneCLI's UI / logs, so we make it
+    human-meaningful: ``"<agent_id>-<service>-<plan-suffix>"``.  The
+    suffix is service-chosen (see
+    :attr:`BrokerCredentialPlan.secret_name_suffix`).
+    """
+    return f"{agent_id}-{service_name}-{plan.secret_name_suffix}"
 
 
 def _broker_identifier_for_agent(agent: "Agent") -> str:
@@ -787,47 +745,37 @@ def _broker_identifier_for_agent(agent: "Agent") -> str:
     return sanitized[:50]
 
 
-def _credential_secret_value(creds: Any) -> str:
-    """Extract the underlying credential string from a forge-credential.
+def admin_api_key_from_env(broker_config: BrokerConfig) -> ServiceCredential:
+    """Read the admin API key for an external broker out of ``os.environ``.
 
-    Returns the string the broker should store as the secret's
-    ``value`` (i.e. the real token).  Type dispatch is intentional so
-    that adding a future credential type is a localized change here.
+    Returns a :class:`ServiceCredential` so the value redacts on
+    repr.  Raises :class:`BrokerError` (with a clear message) when
+    the env var named by
+    :attr:`BrokerConfig.admin_api_key_env_var` is unset or when the
+    config does not name an env var.
+
+    Bundled-broker mode mints the key in process memory and supplies
+    it directly to the client; this helper is only used by the
+    external-broker path.
     """
-    from thorn.core._account import GitLabCredentials
-    from thorn.tools._github_connection import GitHubPatAuth
-
-    if isinstance(creds, GitHubPatAuth):
-        return str(creds.token)
-    if isinstance(creds, GitLabCredentials):
-        return str(creds.token)
-    raise BrokerError(
-        f"Cannot extract secret value from credentials of type "
-        f"{type(creds).__name__}"
-    )
-
-
-def _replace_credential_with_placeholder(
-    account: "ForgeAccountConfig",
-    placeholder: str,
-) -> None:
-    """Mutate *account* in place: swap its literal credential for a
-    placeholder-state ``ServiceCredential``."""
-    from thorn.core._account import GitLabCredentials
-    from thorn.tools._github_connection import GitHubPatAuth
-
-    creds = account.credentials
-    placeholder_cred = ServiceCredential(placeholder, state="placeholder")
-    if isinstance(creds, GitHubPatAuth):
-        creds.token = placeholder_cred
-        return
-    if isinstance(creds, GitLabCredentials):
-        creds.token = placeholder_cred
-        return
-    raise BrokerError(
-        f"Cannot rewrite placeholder for credentials of type "
-        f"{type(creds).__name__}"
-    )
+    name = broker_config.admin_api_key_env_var
+    if name is None:
+        raise BrokerError(
+            "BrokerConfig.admin_api_key_env_var is unset; cannot "
+            "resolve the admin API key.  This typically means the "
+            "broker block in gateway.json is missing the "
+            "admin_api_key_env_var field for an external broker."
+        )
+    try:
+        value = os.environ[name]
+    except KeyError as exc:
+        raise BrokerError(
+            f"Environment variable {name!r} (named by "
+            "BrokerConfig.admin_api_key_env_var) is not set; "
+            "export the variable in the gateway's environment "
+            "and restart `thorn serve`."
+        ) from exc
+    return ServiceCredential(value)
 
 
 __all__ = [
@@ -839,5 +787,7 @@ __all__ = [
     "InjectionConfig",
     "ParamInjection",
     "SecretRegistration",
+    "ServiceLookup",
+    "admin_api_key_from_env",
     "register_agent_with_broker",
 ]

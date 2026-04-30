@@ -256,8 +256,13 @@ def parse_fork_url(forge_type: str, url: str) -> ForkLocation:
 
 
 # ---------------------------------------------------------------------------
-# $ENV_VAR expansion
+# $ENV_VAR expansion (deprecated; retained for any out-of-tree caller)
 # ---------------------------------------------------------------------------
+#
+# The framework no longer expands ``$ENV_VAR`` strings in config
+# files: credentials carry an explicit ``env_var_name`` field.  This
+# helper is left in place because removing it eagerly would break
+# any custom code that imported it; new code should not call it.
 
 
 def expand_env_vars(data: Any) -> Any:
@@ -948,19 +953,18 @@ class BrokerConfig(BaseModel):
             "'http://onecli-web:10254'."
         ),
     )
-    admin_api_key: ServiceCredential | None = Field(
+    admin_api_key_env_var: str | None = Field(
         default=None,
         description=(
-            "OneCLI admin API key (Bearer token, prefix 'oc_'), used "
-            "by the gateway as ``Authorization`` when driving the "
-            "admin API.  This is a META-credential: it grants the "
-            "gateway the ability to manage agents and secrets within "
-            "our broker, NOT the ability to call any upstream service "
-            "directly.  The Phase D audit invariant tolerates this "
-            "credential by design (see "
-            ":func:`thorn.core._credentials.assert_no_literal_credentials`).  "
-            "Required when ``mode == \"external\"``; MUST be left "
-            "unset when ``mode == \"bundled\"``."
+            "Name of the environment variable holding the OneCLI "
+            "admin API key (Bearer token, prefix 'oc_'), used by "
+            "the gateway as ``Authorization`` when driving the "
+            "admin API.  The literal value is read from "
+            "``os.environ`` at gateway startup; the gateway state "
+            "never persists the literal.  Required when ``mode == "
+            "\"external\"``; MUST be left unset when ``mode == "
+            "\"bundled\"`` (the supervisor mints the key in process "
+            "memory)."
         ),
     )
     proxy_url: str = Field(
@@ -1012,8 +1016,8 @@ class BrokerConfig(BaseModel):
             stray: list[str] = []
             if self.admin_url:
                 stray.append("admin_url")
-            if self.admin_api_key is not None:
-                stray.append("admin_api_key")
+            if self.admin_api_key_env_var is not None:
+                stray.append("admin_api_key_env_var")
             if self.proxy_url:
                 stray.append("proxy_url")
             if stray:
@@ -1029,15 +1033,14 @@ class BrokerConfig(BaseModel):
             missing: list[str] = []
             if not self.admin_url:
                 missing.append("admin_url")
-            if self.admin_api_key is None:
-                missing.append("admin_api_key")
+            if self.admin_api_key_env_var is None:
+                missing.append("admin_api_key_env_var")
             if not self.proxy_url:
                 missing.append("proxy_url")
             if missing:
                 raise ValueError(
                     f"broker.mode='external' requires {', '.join(missing)}; "
-                    "set them in gateway.json (admin_api_key may use the "
-                    "$ENV_VAR convention).  Switch to "
+                    "set them in gateway.json.  Switch to "
                     "broker.mode='bundled' (or omit the broker block "
                     "entirely) if you want `thorn serve` to manage the "
                     "broker for you."
@@ -1489,14 +1492,14 @@ def load_gateway_config(agency_home: Path) -> GatewayConfig:
     agency's home root).  Raises :class:`FileNotFoundError` if the
     config file does not exist.
 
-    The ``broker`` block (when present) has its string values expanded
-    through :func:`expand_env_vars` before validation so that the
-    admin API key can be sourced from an environment variable
-    (``"admin_api_key": "$ONECLI_ADMIN_KEY"``) instead of being
-    written literally to disk.  Other top-level fields are NOT
-    expanded -- they are structural (URLs, paths, names) and the
-    framework deliberately keeps the env-var convention scoped to
-    credential-bearing blocks to avoid surprise for operators with
+    No environment-variable expansion happens here: credentials are
+    never literal in the config files.  The broker block holds an
+    explicit ``admin_api_key_env_var`` field naming the variable;
+    agent account credentials carry an explicit ``env_var_name``
+    on each entry.  Structural fields (URLs, paths, names) are
+    written literally and the framework deliberately keeps the
+    env-var convention scoped to credential-bearing blocks to avoid
+    surprise for operators with
     literal ``$``-prefixed strings elsewhere.
     """
     config_path = agency_home / GATEWAY_CONFIG_FILENAME
@@ -1506,8 +1509,6 @@ def load_gateway_config(agency_home: Path) -> GatewayConfig:
             "Run 'thorn serve bootstrap' to create one, or write it manually."
         )
     raw = json.loads(config_path.read_text(encoding="utf-8"))
-    if isinstance(raw, dict) and "broker" in raw and raw["broker"] is not None:
-        raw["broker"] = expand_env_vars(raw["broker"])
     return GatewayConfig.model_validate(raw)
 
 
@@ -1630,13 +1631,14 @@ def infer_event_sources(
         if accounts is None:
             continue
 
-        for acct in accounts.forge_accounts():
+        for acct in accounts.accounts:
             forge_spec = forge_specs_by_name.get(acct.service)
             if forge_spec is None:
-                log.warning(
-                    "Agent %r has account on forge %r which is not in gateway config; skipping.",
-                    getattr(agent, "name", "?"), acct.service,
-                )
+                # Account references a service that is not a configured
+                # forge -- could be a non-forge service we're not
+                # responsible for here, or a typo.  Either way, the
+                # event-source inference path only handles forge
+                # accounts; skip silently.
                 continue
 
             info = forge_project_info.get(forge_spec.name, _ForgeProjectInfo())
@@ -1660,9 +1662,6 @@ def _create_event_source_for_account(
     native_id_to_project_name: dict[str, str],
 ) -> EventSource | None:
     """Create a single event source for an agent's account on a forge."""
-    from thorn.core._account import ForgeAccountConfig
-
-    assert isinstance(account, ForgeAccountConfig)
     agent_name = getattr(agent, "name", None) or getattr(agent, "id", "unknown")
 
     if forge_spec.type == "github":
@@ -1688,6 +1687,42 @@ def _create_event_source_for_account(
     return None
 
 
+def _resolve_event_source_token(
+    account: Any,
+    *,
+    kind: str,
+    forge_spec: ForgeSpec,
+    agent_name: str,
+) -> str | None:
+    """Look up and read the event-source credential off *account*.
+
+    Returns ``None`` (with a warning logged) when the account has
+    no credential of the requested *kind*, or when the env var
+    referenced by the credential is not set.  Centralising this
+    keeps the per-forge source helpers free of the same
+    walk-the-credentials boilerplate.
+    """
+    from thorn.core._account import find_credential
+    from thorn.core._credentials import CredentialMissingError
+
+    cred = find_credential(account, kind=kind)
+    if cred is None:
+        log.warning(
+            "Skipping event source for forge %r (agent=%r): account "
+            "has no credential of kind %r.",
+            forge_spec.name, agent_name, kind,
+        )
+        return None
+    try:
+        return str(cred.read_value())
+    except CredentialMissingError as exc:
+        log.warning(
+            "Skipping event source for forge %r (agent=%r): %s",
+            forge_spec.name, agent_name, exc,
+        )
+        return None
+
+
 def _create_github_source(
     *,
     forge_spec: ForgeSpec,
@@ -1698,19 +1733,14 @@ def _create_github_source(
     """Create a GitHub notifications source for one (agent, forge) pair.
 
     The Notifications API is user-scoped (like GitLab TODOs), so no
-    repository list is needed.  Only PAT credentials are supported;
-    GitHub App installation tokens cannot access the Notifications API.
+    repository list is needed.  Only ``"pat"``-kind credentials are
+    used; the GitHub App auth flow is not supported here.
     """
-    from thorn.tools._github_connection import GitHubPatAuth
-
-    creds = account.credentials
-    if not isinstance(creds, GitHubPatAuth):
-        log.warning(
-            "GitHub notifications require a PAT; credential type %s "
-            "for forge %r is not supported (agent=%r). "
-            "GitHub App installation tokens cannot access the Notifications API.",
-            type(creds).__name__, forge_spec.name, agent_name,
-        )
+    token = _resolve_event_source_token(
+        account, kind="pat",
+        forge_spec=forge_spec, agent_name=agent_name,
+    )
+    if token is None:
         return None
 
     from thorn.gateway.sources._github import (
@@ -1721,7 +1751,7 @@ def _create_github_source(
     source_name = f"{agent_name}-{forge_spec.name}-events"
 
     cfg = GitHubNotificationsSourceConfig(
-        token=creds.token,
+        token=token,
         base_url=forge_spec.api_url,
         poll_interval=forge_spec.poll_interval,
         native_id_to_project_name=native_id_to_project_name,
@@ -1748,25 +1778,19 @@ def _create_gitlab_source(
     project's path-with-namespace) is passed through to the source so
     that session keys use project-name-based routing.
     """
-    from thorn.core._account import GitLabCredentials
-
-    creds = account.credentials
-    if not isinstance(creds, GitLabCredentials):
-        log.warning(
-            "Unsupported credential type %s for GitLab forge %r",
-            type(creds).__name__, forge_spec.name,
-        )
+    token = _resolve_event_source_token(
+        account, kind="gitlab-pat",
+        forge_spec=forge_spec, agent_name=agent_name,
+    )
+    if token is None:
         return None
 
     from thorn.gateway.sources._gitlab import GitLabSourceConfig, GitLabTODOsSource
 
     source_name = f"{agent_name}-{forge_spec.name}-events"
-    # GitLab source uses the instance URL (python-gitlab adds /api/v4
-    # internally).  api_url and url collapse to the same value for
-    # GitLab in the resolved spec.
     cfg = GitLabSourceConfig(
         url=forge_spec.api_url,
-        token=creds.token,
+        token=token,
         poll_interval=forge_spec.poll_interval,
         project_id_to_name=native_id_to_project_name,
     )

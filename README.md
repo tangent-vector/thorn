@@ -87,9 +87,9 @@ This writes three files under `.thorn/`:
 
 | File | Purpose |
 |------|---------|
-| `agents/my-coordinator.json` | Agent identity, including the forge account and a `$GITHUB_TOKEN` reference for the secret token. |
+| `agents/my-coordinator.json` | Agent identity, including the forge account and a `credentials[*].env_var_name` reference (e.g. `"GITHUB_TOKEN"`) naming the env var the operator put the literal token into. |
 | `agents/my-coordinator/MEMORY.md` | Persistent memory (project facts, active work) |
-| `gateway.json` | Forge entries (with literal `base_url`) and project metadata.  No secrets live here -- the agent identity references them via `$ENV_VAR`. |
+| `gateway.json` | Forge entries (with literal `base_url`) and project metadata.  No secrets live here -- the agent identity names env vars from which the gateway reads the literal at use time. |
 
 ### 5. Start the gateway
 
@@ -126,12 +126,12 @@ from all other configuration (held in JSON on disk).  The on-disk
 files live under `.thorn/`:
 
 - `gateway.json` -- forge entries (name, type, literal `base_url`) and
-  project metadata.  Contains *no* secrets and *no* `$ENV_VAR`
-  references.
-- `agents/<agent-id>.json` -- the agent identity, including a
-  `forge_accounts` list whose `credentials.token` field is a
-  `$ENV_VAR` reference (e.g. `"$GITHUB_TOKEN"`) that the gateway
-  resolves at startup.
+  project metadata.  Contains *no* secrets.
+- `agents/<agent-id>.json` -- the agent identity, including an
+  `accounts` list whose `credentials[*].env_var_name` field names
+  the env var the operator put the literal secret into (e.g.
+  `"GITHUB_TOKEN"`).  The literal value lives only in the
+  environment; the agent state never carries it.
 
 To change a forge URL, edit `gateway.json` (no env-var indirection
 needed).  To rotate a secret, change the env var the agent identity
@@ -220,7 +220,9 @@ Thorn at it instead of having the gateway manage one of its own:
   "broker": {
     "mode": "external",
     "admin_url": "http://my-broker:10254",
-    "admin_api_key": "$ONECLI_ADMIN_KEY",
+    // Names the env var the operator put the literal admin key
+    // into; gateway.json never carries the secret value at rest.
+    "admin_api_key_env_var": "ONECLI_ADMIN_KEY",
     "proxy_url": "http://my-broker:10255"
   }
 }
