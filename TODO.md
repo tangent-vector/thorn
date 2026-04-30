@@ -1,17 +1,21 @@
 - need some kind of send_notification() tool to notify another session
 - might want a way to move a notification into the inbox of another session
 
+- major overhaul/rewrite of the agency/gateway bootstrap flow
+
+- A system for determining which users to listen to/obey on projects (some basic notion of authority). Might involve filtering of notifications based on sender, checking against peer list, but also seems to require giving the agent both "push" and pull-mode information on the authority level of a peer.
+
+- some kind of plan for onboarding of users and (related) a plan for how users can interact with a Thorn agent to achieve configuration changes to their thorn gateway and agent settings (despite those settings being out of reach of the agent's tool-calling container). This might involve specific brain-side tools that are always wired up to an approval system (assuming we've implemented one...)
+
+- need config options for specifying default model (+ model-specific config parameters) for an agent, as well as overriding on specific sessions (or maybe for specific session templates?)
+
 - need basic web acces tools for the agent
 
 - Validation feedback is appended to tool results via `ValidationTracker`, but validation is only triggered when workflow tools explicitly record results. Consider whether validation should be triggered automatically in response to file writes (or other actions), rather than requiring explicit opt-in from each tool.
 
 - survey current built-in tools and make sure they are following industry best practices
 
-- `thorn do` instead of `thorn run`, and then rename `thorn.prompt` over to be `thorn.do` (and similarly, `Agent.prompt` becomes `agent.do`)
-
-- In the workflow: a "clarify and then delegate" role/step/tool that the concierge can invoke, that works to explore the project and (optionally) grill the user to get clarification on their intent, before moving on to actually delegating to a `coordinator` agent to get the work done.
-
-- Consider splitting `@skill` so that there's a distinction between "a function whose implementation is a prompt" and the exposure of such a function to the rest of the system
+- `thorn do` instead of `thorn run`?
 
 - Unify the two skill/tool-discovery pipelines.  Today there are two parallel paths: (a) `discover_tools` in `thorn.core._discovery` walks ancestor `.agents/thorn/*.py` files, imports them, and collects `@tool` / `@skill`-decorated Python callables, and (b) the unified per-prompt context-gathering pipeline (`thorn.runtime._context_layers`) walks `.agents/skills/<name>/SKILL.md` files and produces `SkillEntry`s consumed by phase-3 prompt assembly.  The two systems answer different questions today (Python-callable vs. Markdown-prompt skill) but they both descend from the same ancestor walk and both register against the same agent.  A future iteration should rationalise them — most likely by routing `discover_tools` through the new per-prompt pipeline rather than running its own walker, so directory selection (operator/agent-home/agent-workspace, kind-filtering, dedup) only has one home.
 

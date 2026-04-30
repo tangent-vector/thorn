@@ -4213,6 +4213,7 @@ class TestGatewayWorkspaceRouting:
         """When a specific agent handles the event, the workspace path
         includes that agent's ID."""
         from thorn.gateway._bootstrap import bootstrap_coordinator
+        from thorn.tools.forge import GitLabForgeService
 
         bootstrap_coordinator(
             agency_home=tmp_path / ".thorn",
@@ -4222,6 +4223,17 @@ class TestGatewayWorkspaceRouting:
             project_url="https://gitlab.com/group/proj",
         )
         runtime = self._make_runtime(tmp_path)
+        # bootstrap_coordinator wrote an agent with a gitlab account;
+        # the gateway's startup validation pass needs the gitlab
+        # service registered so the account can be typed correctly.
+        from thorn.tools.forge import GitLabForgeServiceConfig
+
+        runtime.register_service(
+            GitLabForgeService(
+                GitLabForgeServiceConfig(url="https://gitlab.com"),
+                service_name="gitlab",
+            ),
+        )
         event = IncomingEvent(
             source="test",
             session_key=SessionKey("gitlab/10/issue/5"),

@@ -351,8 +351,22 @@ class Gateway:
         ):
             log.info("Startup sweep completed: %s", report)
 
+        # Load every persisted agent and run the per-service account
+        # validation pass before handing the agent to a scheduler.
+        # Validation has to happen here -- not just at the CLI surface
+        # -- because the gateway is the single point that owns the
+        # agent objects the schedulers (and broker registration, and
+        # sandbox executor materialisation) actually use.  An agent
+        # whose accounts are still ``UntypedAccountConfig`` instances
+        # would crash service-driven code paths (e.g.
+        # :meth:`BrokerableService.broker_credential_plans`) on first
+        # use, so we surface configuration errors here at startup
+        # rather than mid-flight.
+        from thorn.core._account import validate_agent_accounts
+
         for agent_id in self._runtime.sessions.list_agent_ids():
             agent = self._runtime.get_or_create_agent(agent_id)
+            validate_agent_accounts(agent, self._runtime.get_service)
             self._ensure_scheduler_for_agent(agent)
 
         self._warn_if_egress_allowlist_unenforced()
