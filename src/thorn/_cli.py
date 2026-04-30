@@ -1356,5 +1356,124 @@ def sandbox_status(agency_path: str | None) -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# thorn broker (group: status, down)
+# ---------------------------------------------------------------------------
+
+@main.group()
+def broker() -> None:
+    """Inspect or clean up bundled OneCLI broker stacks.
+
+    The bundled broker is normally entirely transparent: ``thorn
+    serve`` brings it up on startup and tears it down on shutdown.
+    These subcommands exist for the unhappy path -- a previous
+    ``thorn serve`` was killed without graceful shutdown (kill -9,
+    OOM, host crash) and left compose stacks behind that the next
+    startup needs to know about.
+    """
+
+
+@broker.command("status")
+def broker_status() -> None:
+    """List bundled OneCLI broker compose stacks visible on this host.
+
+    Filters ``docker compose ls`` / ``podman compose ls`` output to
+    the ``thorn-broker-*`` project prefix used by
+    :class:`BundledBrokerSupervisor`.  Emits one line per stack with
+    its compose project name, runtime, and status.
+
+    No exit-code semantics beyond "found something / found nothing"
+    -- ``thorn broker status`` exits 0 either way; orphans are an
+    expected (if mildly annoying) state of the world, not an error.
+    """
+    from thorn.gateway._bundled_broker import list_bundled_broker_stacks
+
+    stacks = asyncio.run(list_bundled_broker_stacks())
+    if not stacks:
+        console.print("[dim]No bundled-broker compose stacks found.[/dim]")
+        return
+    console.print(
+        f"[bold]Bundled-broker stacks ({len(stacks)}):[/bold]"
+    )
+    for stack in stacks:
+        console.print(
+            f"  {stack.project_name}  ({stack.runtime_name})  "
+            f"[dim]{stack.status}[/dim]"
+        )
+    console.print(
+        "\nRun [yellow]thorn broker down[/yellow] to tear them all down."
+    )
+
+
+@broker.command("down")
+@click.option(
+    "--project",
+    "project_name",
+    default=None,
+    help=(
+        "Tear down only the named compose project (must begin with "
+        "'thorn-broker-').  When omitted, every matching stack on the "
+        "host is torn down."
+    ),
+)
+def broker_down(project_name: str | None) -> None:
+    """Best-effort ``compose down --volumes --remove-orphans`` on stale stacks.
+
+    Used after a non-graceful ``thorn serve`` exit to clean up
+    compose stacks that the supervisor did not get a chance to tear
+    down itself.  Always safe to run -- it only touches projects
+    matching the bundled-broker prefix, and only ever issues
+    ``compose down``, never ``compose up``.
+
+    Exits non-zero only when one or more individual ``compose down``
+    invocations failed; the CLI emits a per-stack outcome line in all
+    cases so the operator can see which (if any) need manual cleanup.
+    """
+    from thorn.gateway._bundled_broker import (
+        BundledBrokerError,
+        list_bundled_broker_stacks,
+        shutdown_bundled_broker_stack,
+    )
+
+    async def _run() -> int:
+        stacks = await list_bundled_broker_stacks()
+        if project_name is not None:
+            stacks = [s for s in stacks if s.project_name == project_name]
+            if not stacks:
+                console.print(
+                    f"[yellow]No matching stack {project_name!r} "
+                    "(did you mean a different project?)[/yellow]"
+                )
+                return 1
+        if not stacks:
+            console.print(
+                "[dim]No bundled-broker compose stacks to tear down.[/dim]"
+            )
+            return 0
+        failures = 0
+        for stack in stacks:
+            try:
+                await shutdown_bundled_broker_stack(stack)
+            except BundledBrokerError as exc:
+                console.print(
+                    f"  [red]FAILED[/red]  {stack.project_name}  ({exc})"
+                )
+                failures += 1
+            else:
+                console.print(
+                    f"  [green]down[/green]    {stack.project_name}"
+                )
+        if failures:
+            console.print(
+                f"\n[red]{failures} stack(s) failed to tear down.[/red]  "
+                "You may need to clean them up manually with "
+                "`<runtime> compose -p <project> down --volumes`."
+            )
+            return 1
+        return 0
+
+    sys.exit(asyncio.run(_run()))
+
+
 if __name__ == "__main__":
     main()

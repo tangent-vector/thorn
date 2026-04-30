@@ -27,6 +27,14 @@ github = ["PyGithub>=2.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/thorn"]
+# Force-include the non-Python resource files (broker compose YAML
+# and sandbox Dockerfile) so they ride along in the wheel.  Hatch
+# would normally drop these because its default `include` patterns
+# only catch Python sources.  Without this rule, BundledBrokerSupervisor
+# can't find broker.compose.yml at runtime in wheel-based installs.
+[tool.hatch.build.targets.wheel.force-include]
+"src/thorn/sandbox/_resources/Dockerfile.sandbox" = "thorn/sandbox/_resources/Dockerfile.sandbox"
+"src/thorn/gateway/_resources/broker.compose.yml" = "thorn/gateway/_resources/broker.compose.yml"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -65,6 +65,10 @@ from thorn.gateway._broker import (
     BrokerError,
     register_agent_with_broker,
 )
+from thorn.gateway._bundled_broker import (
+    BundledBrokerError,
+    BundledBrokerSupervisor,
+)
 from thorn.gateway._config import BrokerConfig, GatewayConfig
 from thorn.gateway._event import EventSource, IncomingEvent
 from thorn.runtime import (
@@ -145,6 +149,9 @@ class Gateway:
         broker_client_factory: (
             "Callable[[GatewayConfig], BrokerClient] | None"
         ) = None,
+        bundled_broker_supervisor_factory: (
+            "Callable[[], BundledBrokerSupervisor] | None"
+        ) = None,
     ) -> None:
         self._runtime = runtime
         self._sources = sources
@@ -177,6 +184,15 @@ class Gateway:
             broker_client_factory
             or (lambda cfg: BrokerClient(cfg.broker))  # type: ignore[arg-type]
         )
+        # The supervisor factory is an injection seam: tests pass a
+        # fake supervisor that doesn't shell out to ``docker compose``.
+        # Production callers leave it ``None`` and the gateway
+        # instantiates the real :class:`BundledBrokerSupervisor` on
+        # demand only when ``broker.mode == "bundled"``.
+        self._bundled_broker_supervisor_factory = (
+            bundled_broker_supervisor_factory or BundledBrokerSupervisor
+        )
+        self._bundled_broker_supervisor: BundledBrokerSupervisor | None = None
         self._broker_client: BrokerClient | None = None
         self._broker_bindings: dict[AgentID, BrokerBinding] = {}
 
@@ -215,28 +231,36 @@ class Gateway:
 
         async with self._runtime:
             self._install_signal_handlers()
-            await self._startup()
-
-            for source in self._sources:
-                task = asyncio.create_task(
-                    source.start(self._handle_event),
-                )
-                self._source_tasks.append(task)
-
-            if self._source_tasks:
-                asyncio.create_task(
-                    self._stop_when_sources_done(),
-                )
-
-            log.info(
-                "Gateway started with %d source(s)", len(self._sources),
-            )
 
             try:
-                await self._stop_event.wait()
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                pass
+                await self._startup()
+
+                for source in self._sources:
+                    task = asyncio.create_task(
+                        source.start(self._handle_event),
+                    )
+                    self._source_tasks.append(task)
+
+                if self._source_tasks:
+                    asyncio.create_task(
+                        self._stop_when_sources_done(),
+                    )
+
+                log.info(
+                    "Gateway started with %d source(s)", len(self._sources),
+                )
+
+                try:
+                    await self._stop_event.wait()
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    pass
             finally:
+                # ``finally`` covers both the normal exit path (sources
+                # finished or stop_event set by signal) and the
+                # startup-failure path: if ``_startup`` raises after
+                # the bundled-broker supervisor has already brought
+                # the stack up, ``shutdown`` is what tears it back
+                # down so we don't leak compose projects on the host.
                 await self.shutdown()
 
     # ------------------------------------------------------------------
@@ -296,6 +320,20 @@ class Gateway:
             self._ensure_scheduler_for_agent(agent)
 
         self._warn_if_egress_allowlist_unenforced()
+
+        # Bundled-broker bring-up runs *before* broker registration
+        # and *before* sandbox-executor preload.  The supervisor
+        # synthesises the broker URLs/key into ``gateway_config.broker``
+        # in place, then patches the runtime's sandbox config with
+        # the per-project egress network so per-agent container
+        # launches join the broker's network rather than the host
+        # default.  Both effects must be visible by the time
+        # :meth:`_register_broker_bindings` and
+        # :meth:`_preload_sandbox_executors` run, which is why this
+        # is the first thing past the warning above.  No-op when the
+        # broker mode is "external" (the operator brought up their
+        # own OneCLI) or when the broker block is absent / disabled.
+        await self._maybe_start_bundled_broker()
 
         # Phase D: register every loaded agent with the broker before
         # the sandbox executor preload runs, so the per-agent
@@ -760,6 +798,15 @@ class Gateway:
         # exiting cleanly.
         await self._teardown_broker_bindings()
 
+        # Bundled broker tear-down runs *after* per-agent broker
+        # bindings have been unwound -- the DELETE calls in
+        # _teardown_broker_bindings still need the broker to be
+        # serving the admin API.  Best-effort: a hung ``compose
+        # down`` should not block exit; the supervisor logs a
+        # remediation hint when it cannot tear the stack down so
+        # operators know to run ``thorn broker down`` manually.
+        await self._maybe_shutdown_bundled_broker()
+
         self._inboxes.clear()
         log.info("Gateway stopped.")
 
@@ -813,6 +860,92 @@ class Gateway:
         is unknown, or the agent's registration was skipped.
         """
         return self._broker_bindings.get(agent_id)
+
+    async def _maybe_start_bundled_broker(self) -> None:
+        """Bring up the bundled broker stack when configured.
+
+        Runs only when:
+
+        * A :class:`GatewayConfig` is present (test paths that pass
+          ``gateway_config=None`` have no broker shape to honour).
+        * The broker block is set with ``mode == "bundled"`` and
+          ``enabled``.
+        * The resolved sandbox backend is ``container`` (a bundled
+          broker without a container is a configuration mistake;
+          handled in the schema validator, but we hard-fail here too
+          as a defence in depth).
+
+        On success, mutates the in-memory ``gateway_config.broker``
+        so it carries the supervisor-discovered URLs/key (the
+        downstream broker code reads from this object), and sets
+        the runtime's ``sandbox.egress_network`` to the supervisor's
+        per-project network so per-agent container launches join the
+        right Docker network.
+
+        Failures propagate -- bringing the broker up is a precondition
+        for the rest of startup, and we want ``thorn serve`` to exit
+        non-zero with a clear error rather than run with the broker
+        silently absent.  Best-effort cleanup of the partial stack
+        happens in :meth:`shutdown`, which is invoked from
+        :meth:`run`'s ``finally`` block on any startup failure.
+        """
+        config = self._gateway_config
+        if config is None or config.broker is None or not config.broker.enabled:
+            return
+        if config.broker.mode != "bundled":
+            return
+
+        sandbox_config = self._runtime.sandbox_config
+        sandbox_backend = (
+            sandbox_config.backend if sandbox_config is not None else None
+        )
+        if sandbox_backend != "container":
+            # The schema validator on GatewayConfig already drops the
+            # bundled-broker default when sandbox.backend resolves to
+            # subprocess.  Reaching here means the operator wrote
+            # ``broker.mode = "bundled"`` *explicitly* alongside
+            # ``sandbox.backend = "subprocess"``.  Hard-fail rather
+            # than silently no-op: this combination is incoherent
+            # (no container to inject the proxy into) and a soft
+            # warning would let the operator believe the broker is
+            # active when it isn't.
+            raise BundledBrokerError(
+                "broker.mode='bundled' requires sandbox.backend='container'; "
+                f"resolved sandbox backend is {sandbox_backend or 'subprocess'!r}.  "
+                "Either set sandbox.backend='container' (or omit the sandbox "
+                "block to inherit the secure default), or set "
+                "broker.enabled=false to opt out of broker integration entirely.",
+            )
+
+        log.info("Bringing up bundled OneCLI broker (this may take ~10s) ...")
+        supervisor = self._bundled_broker_supervisor_factory()
+        self._bundled_broker_supervisor = supervisor
+        synthesized = await supervisor.start()
+
+        # Mutate the gateway_config.broker in place so the existing
+        # _register_broker_bindings code path -- which reaches for
+        # ``config.broker.admin_url`` / ``admin_api_key`` /
+        # ``proxy_url`` -- picks up the supervisor's values without
+        # any further wiring.  The mutation is safe: gateway startup
+        # is single-threaded and no consumer reads ``config.broker``
+        # before this point.
+        config.broker = synthesized
+
+        # Patch the runtime's sandbox config with the supervisor's
+        # per-project Docker network so that per-agent sandbox
+        # container launches join it (and therefore reach the broker
+        # by service DNS while having no NAT to the host network).
+        # Also a single-threaded mutation; happens before any sandbox
+        # executor materialises.
+        if (
+            sandbox_config is not None
+            and supervisor.egress_network_name is not None
+        ):
+            sandbox_config.egress_network = supervisor.egress_network_name
+            log.info(
+                "Bundled broker: sandbox containers will join network %r",
+                supervisor.egress_network_name,
+            )
 
     async def _register_broker_bindings(self) -> None:
         """Register every loaded agent with the broker.
@@ -969,6 +1102,28 @@ class Gateway:
             log.exception("Broker: error closing client during teardown")
         if client_override is None:
             self._broker_client = None
+
+    async def _maybe_shutdown_bundled_broker(self) -> None:
+        """Tear down the bundled broker stack if we brought one up.
+
+        Idempotent and best-effort: ``BundledBrokerSupervisor.shutdown``
+        already swallows compose-down errors and logs them; this
+        wrapper exists to (a) clear the supervisor reference so a
+        re-entry from a signal-driven double-shutdown is a no-op, and
+        (b) make the call site in :meth:`shutdown` self-documenting.
+        """
+        supervisor = self._bundled_broker_supervisor
+        if supervisor is None:
+            return
+        self._bundled_broker_supervisor = None
+        try:
+            await supervisor.shutdown()
+        except Exception:
+            log.exception(
+                "Bundled broker: unexpected error during supervisor "
+                "shutdown; the compose stack may be orphaned.  Run "
+                "`thorn broker down` to clean up.",
+            )
 
     def _install_signal_handlers(self) -> None:
         """Register SIGINT/SIGTERM to trigger a clean shutdown on POSIX."""

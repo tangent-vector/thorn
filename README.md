@@ -99,9 +99,10 @@ $ docker run --env-file .env \
     thorn-gateway
 ```
 
-For deployment with the credential broker (Phase D, recommended for
-multi-agent or multi-credential setups), see
-[Deployment modes](#deployment-modes) below.
+For sandboxed multi-agent deployments with the credential broker
+(Phase D), see [Deployment modes](#deployment-modes) below -- with
+the new defaults this is just `thorn serve` against an unpopulated
+`broker` / `sandbox` block.
 
 The gateway will poll the configured repository for events. When it
 sees activity (an @-mention on an issue, a new assignment, etc.), it
@@ -157,56 +158,85 @@ Deployment modes
 
 Thorn supports two deployment topologies.  The choice mainly comes
 down to whether you want the gateway itself to be a container or a
-host process; both shapes integrate with the OneCLI credential
-broker (Phase D) the same way.
+host process.  In both shapes, the OneCLI credential broker
+(Phase D) is brought up and torn down automatically by `thorn serve`
+-- you do not need to run any compose commands yourself.
 
-### Mode A: gateway as a host process + broker in compose (recommended)
+### Mode A: just run `thorn serve` (recommended)
 
 The simplest and most portable shape: the gateway runs directly on
-the host (a VM, a developer laptop, anywhere `uv run thorn` works);
-the broker (OneCLI + its Postgres) runs as containers managed by
-the bundled compose file.  The gateway talks to the broker over
-`http://127.0.0.1:10254` (admin) and tells the local Docker daemon
-to attach per-agent sandbox containers to the broker's network so
-they can reach the substitution proxy by service name.
+the host (a VM, a developer laptop, anywhere `uv run thorn` works).
+On startup, the gateway brings up its own dedicated OneCLI + Postgres
+stack with anonymous Docker volumes, mints an admin API key in
+process memory, joins per-agent sandbox containers to the broker's
+network, and -- on graceful shutdown -- runs `compose down --volumes`
+so no broker artefacts survive on disk.
+
+The only operator-visible requirement beyond the LLM provider env
+vars is having `docker` (or `podman`) installed; `thorn serve`
+discovers and uses whichever is present.  See
+[`docs/startup_flow.md`](docs/startup_flow.md) for the bring-up
+sequence in detail.
 
 ```console
-# 1. Bring up the broker stack.
-$ docker compose -f deploy/broker.compose.yml up -d
-
-# 2. Configure gateway.json's broker block.  Minimum needed:
-#      "broker": {
-#        "admin_url": "http://127.0.0.1:10254",
-#        "admin_api_key": "$ONECLI_ADMIN_KEY",
-#        "proxy_url": "http://onecli:10255"
-#      }
-#    The gateway resolves the CA to <agency_home>/onecli-ca.pem by
-#    default and fetches it from the broker at startup; you do not
-#    need to wire any volumes for the cert.
-
-# 3. Set sandbox.egress_network to thorn-broker so per-agent
-#    sandboxes join the broker network and inherit broker-only
-#    egress automatically:
-#      "sandbox": { "backend": "container", "egress_network": "thorn-broker" }
-
-# 4. Run the gateway directly.
 $ uv run thorn serve
+```
+
+A bare-minimum `gateway.json` (no `sandbox` block, no `broker`
+block) gives you secure container sandboxing + bundled broker by
+default.  Explicit opt-out is supported:
+
+```jsonc
+{
+  // Bypass the bundled broker (and the container sandbox);
+  // the gateway falls back to subprocess-backed agent execution.
+  "sandbox": { "backend": "subprocess" }
+}
+```
+
+```jsonc
+{
+  // Keep container sandboxing but do not bring up a broker; agent
+  // credentials flow through the legacy env-injection path.
+  "broker": { "enabled": false }
+}
 ```
 
 This is the recommended mode for VM deployments (e.g. NVIDIA Brev;
 see `deploy/brev/`) and for development.
 
-### Mode B: everything in containers (optional)
+If a previous `thorn serve` was killed ungracefully (e.g. `kill -9`)
+and left an orphaned broker stack behind, `thorn broker status`
+lists matching compose projects and `thorn broker down` cleans them
+up.
 
-If you prefer the gateway in a container alongside the broker,
-`deploy/all-in-container.compose.yml` layers a `gateway` service on
-top of the broker stack via Compose's `include:`.  This requires
-bind-mounting the host's Docker socket into the gateway container
-so it can launch sibling sandbox containers (Docker-out-of-Docker).
+### Mode A advanced: external (operator-managed) broker
 
-```console
-$ docker compose -f deploy/all-in-container.compose.yml up --build
+When you already run an OneCLI broker for other workloads, point
+Thorn at it instead of having the gateway manage one of its own:
+
+```jsonc
+{
+  "broker": {
+    "mode": "external",
+    "admin_url": "http://my-broker:10254",
+    "admin_api_key": "$ONECLI_ADMIN_KEY",
+    "proxy_url": "http://my-broker:10255"
+  }
+}
 ```
+
+In this mode the gateway never invokes `docker compose`; it just
+makes admin-API calls against the URLs you configured.  This is the
+right shape when the broker outlives `thorn serve` (e.g. shared
+across multiple agencies on a host).
+
+### Mode B: gateway in a container alongside the broker (optional)
+
+If you prefer the gateway itself to be a container, run the wheel
+inside any Python image you like and bind-mount `.thorn` and the
+host's Docker socket so the gateway can spawn the bundled broker
+and sandbox sibling containers.
 
 > **Trade-off.**  Bind-mounting `/var/run/docker.sock` gives the
 > gateway container effective root on the host, since anything it
@@ -219,16 +249,13 @@ $ docker compose -f deploy/all-in-container.compose.yml up --build
 > prefer it unless you have a concrete reason to want the gateway
 > in a container.
 
-In Mode B, set the broker block's `admin_url` to
-`http://onecli:10254` (the service name, since the gateway is on
-the same Docker network as OneCLI).
-
-### Plain Docker (no broker)
+### Plain Docker (no broker, no sandbox)
 
 If you don't need the credential broker -- e.g. for a quick test
 of the gateway against a single forge with env-injected
 credentials -- the simplest shape is `docker run` with a `.thorn`
-bind mount, as shown in [Quick Start](#quick-start-docker) above.
+bind mount and a `gateway.json` that explicitly opts out of the
+secure defaults (`{"sandbox": {"backend": "subprocess"}}`).
 No compose file required.
 
 You can of course write your own minimal compose file too; the
@@ -300,6 +327,10 @@ The gateway is forge-agnostic: the agent uses a unified set of
 Further Reading
 ---------------
 
+- [What `thorn serve` does on startup](docs/startup_flow.md) --
+  the bring-up sequence for the bundled credential broker, where
+  to look in the logs, and how to recover from a non-graceful
+  shutdown.
 - [Python library and CLI reference](docs/library.md) -- using Thorn
   as a Python library for building custom agent workflows with
   `@tool`, `@skill`, prompt orchestration, and MCP tool serving.

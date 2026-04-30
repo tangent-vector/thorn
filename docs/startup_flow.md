@@ -1,0 +1,209 @@
+# What `thorn serve` does on startup
+
+This document walks through the bring-up sequence of `thorn serve`
+in the default configuration (no `sandbox` block, no `broker` block
+in `gateway.json`).  The goal is to give operators a mental model of
+what they're seeing in the logs and where to look when something
+goes wrong.
+
+The corresponding code lives in
+`src/thorn/gateway/_gateway.py::Gateway._startup` and
+`src/thorn/gateway/_bundled_broker.py::BundledBrokerSupervisor`.
+
+## TL;DR
+
+1. Load and validate `gateway.json` (auto-fills container sandbox +
+   bundled broker defaults).
+2. Bring up a per-process OneCLI + Postgres compose stack (`<oci>
+   compose up -d --wait`).
+3. Discover the bound ports, wait for OneCLI's `/api/health`.
+4. Mint (or fetch) the OneCLI admin API key in process memory.
+5. Register every loaded agent with the broker; swap each agent's
+   literal credentials for broker-issued placeholders.
+6. Hand over to the event-source poll loop.
+
+On graceful shutdown:
+
+1. Drain in-flight events; let schedulers finish.
+2. Tear down per-agent broker registrations.
+3. `<oci> compose down --volumes --remove-orphans` for the broker
+   stack -- no broker artefacts survive on disk.
+
+## Step by step
+
+### 1. Load configuration
+
+`thorn serve` reads `gateway.json` from the agency home directory
+and validates it against `GatewayConfig`.  The schema applies two
+"absent block -> secure default" rules at this point:
+
+* No `sandbox` block -> `SandboxConfig(backend="container")` with
+  Phase E hardening (caps drop, read-only rootfs, resource limits).
+* No `broker` block, when sandbox resolves to container ->
+  `BrokerConfig(mode="bundled")`.
+
+These defaults apply only when `gateway.json` is the thing being
+loaded; `thorn run` and `thorn chat` (which never read
+`gateway.json`) fall back to subprocess sandboxing as before.
+
+### 2. Bring up the bundled broker stack
+
+When `broker.mode == "bundled"` and the sandbox backend is
+`container`, the gateway constructs a `BundledBrokerSupervisor` and
+calls `start()` on it.  The supervisor:
+
+* Picks a per-process compose project name
+  (`thorn-broker-<short-random>`) so concurrent `thorn serve` runs
+  on the same host don't collide.
+* Materialises the bundled `broker.compose.yml` (shipped inside the
+  installed wheel) to a real on-disk path.
+* Detects the OCI runtime (prefers podman, falls back to docker;
+  fails loudly when neither is on PATH).
+* Runs `<oci> compose -p <project> -f <yaml> up -d --wait` with
+  `ONECLI_ADMIN_PORT=0` / `ONECLI_PROXY_PORT=0` so docker picks free
+  host ports.
+
+Cold-start cost on the first run is dominated by image pulls
+(typically a couple of minutes); subsequent runs reuse cached
+images and complete in ~10 seconds.
+
+You'll see something like:
+
+```
+INFO Bringing up bundled OneCLI broker (this may take ~10s) ...
+INFO Bundled broker: bringing up compose project 'thorn-broker-a1b2c3d4'
+     (runtime=podman, compose=/tmp/.../broker.compose.yml)
+```
+
+### 3. Discover ports + wait for OneCLI
+
+After `compose up` returns, the supervisor reads the actual bound
+ports back via `<oci> compose port` and polls
+`http://<host>:<admin-port>/api/health` until it returns 200 (with a
+default 60s budget).  `compose --wait` already gates on Postgres'
+own healthcheck, so the supervisor is only waiting on OneCLI's
+Next.js boot here.
+
+### 4. Acquire the admin API key
+
+OneCLI in its single-user "local" mode (`NEXTAUTH_SECRET` unset)
+exposes its admin-key endpoints unauthenticated.  The supervisor:
+
+* `GET /api/user/api-key`: if 200, parse `apiKey` out of the body.
+* If 404, `POST /api/user/api-key/regenerate` to mint one.
+
+The minted key is held only in process memory and burned on
+shutdown -- nothing is written to disk.
+
+The supervisor synthesises a `BrokerConfig` carrying the discovered
+URLs / key / `egress_network` and passes it to the rest of the
+gateway.  From here on, the broker code paths are identical to the
+external-broker case: `BrokerClient` makes admin-API calls against
+the supervisor-provided URLs without knowing it's talking to a
+managed-by-us stack.
+
+### 5. Register agents with the broker
+
+The existing `_register_broker_bindings` flow (unchanged by the
+bundled supervisor) creates an OneCLI agent + secret per loaded
+Thorn agent, fetches the substitution-proxy CA cert, and swaps each
+agent's literal credentials for broker-issued placeholders.  Per-agent
+state lives in OneCLI's Postgres DB only for the lifetime of the
+gateway process.
+
+### 6. Sandbox containers
+
+When the gateway later spawns a per-agent sandbox container, it
+joins the supervisor's per-project Docker network
+(`<project>_thorn-broker`, an `internal: true` bridge with no NAT
+to the host network).  Sandboxes therefore reach OneCLI by service
+DNS (`onecli:10255`) and have no direct internet egress.  All
+upstream HTTP requests flow through the substitution proxy, which
+injects the broker-issued credentials and forwards the call.
+
+### 7. Steady state
+
+After all of the above, the gateway hands over to its event-source
+poll loop and per-agent schedulers.  Operator-visible logs from the
+bundled broker stop here; everything from here on is the same as
+the existing event-driven gateway loop.
+
+## Shutdown
+
+Graceful shutdown (SIGINT / SIGTERM, or `gateway.shutdown()`):
+
+1. Drain in-flight events.
+2. Tear down per-agent broker registrations (deletes agents +
+   secrets; OneCLI's substitution proxy stops routing for them).
+3. Run `<oci> compose -p <project> down --volumes --remove-orphans`
+   so the OneCLI + Postgres stack and all anonymous volumes
+   evaporate.
+
+Failures during compose-down are logged but do not propagate -- a
+hung compose teardown cannot block the gateway from exiting.
+
+## Recovering from a non-graceful shutdown
+
+If `thorn serve` was killed (`kill -9`, OOM kill, host crash) and
+left an orphaned compose stack behind:
+
+```console
+$ thorn broker status
+runtime  project                     status
+podman   thorn-broker-a1b2c3d4       running(2)
+
+$ thorn broker down
+Tore down 1 stack.
+```
+
+`thorn broker status` filters compose projects on the host by the
+bundled-broker prefix so it never touches operator-managed stacks.
+`thorn broker down` runs `compose down --volumes --remove-orphans`
+against each match.
+
+## When things go wrong
+
+Common failure modes and where to look:
+
+* **"No OCI runtime with a 'compose' subcommand found on PATH"**:
+  install podman or docker.  If you really do want to run without
+  containerised sandboxing (and therefore without the broker), set
+  `"sandbox": { "backend": "subprocess" }` in `gateway.json` to opt
+  out of both.
+
+* **"OneCLI /api/health did not return 200 within 60s"**: the
+  OneCLI image is taking unusually long to boot.  Check
+  `<oci> logs <project>-onecli-1` (or similar) for the failure.
+  If the image pull itself is slow, pre-pull
+  `ghcr.io/onecli/onecli:latest` and `postgres:18-alpine` and
+  retry.
+
+* **Bundled broker on a subprocess sandbox**: explicit
+  `broker.mode = "bundled"` alongside
+  `sandbox.backend = "subprocess"` is rejected at startup with a
+  clear error.  Either set the sandbox backend to `container` (or
+  omit the block entirely to inherit the secure default), or set
+  `broker.enabled = false` to opt out of broker integration.
+
+## Why per-process and fully transient?
+
+Two design constraints drive this:
+
+* **`<agency_home>` should hold only the kind of state you'd
+  happily check into git** (gateway config, agent identities,
+  journals, sessions).  Binaries, secrets, and compose state
+  explicitly do not belong there.
+* **`<workspace_root>` is for in-flight work** that ideally
+  persists but is recoverable.
+
+Trying to persist the broker across `thorn serve` restarts would
+either violate the first constraint (broker DB under
+`<agency_home>`) or push state into `<workspace_root>` for
+something that doesn't belong there.  Per-process + transient
+sidesteps both: there is no broker state to manage, because there
+is no broker state that survives the gateway exit.
+
+The cost is a one-time ~10s warm-start (after first-run image
+pulls) on every `thorn serve` invocation.  For the single-VM,
+hours-to-days-uptime deployment shape this is aimed at, that's
+firmly in the noise.

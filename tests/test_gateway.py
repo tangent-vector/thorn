@@ -2084,9 +2084,17 @@ class TestGatewayConfigLoading:
         config = load_gateway_config(thorn_dir)
         assert config.forges == []
         assert config.projects == []
-        # Sandbox is opt-in: omitting the block leaves it None so the
-        # runtime keeps the Phase-A subprocess executor.
-        assert config.sandbox is None
+        # The new secure defaults: omitting the sandbox block in
+        # gateway.json fills in a SandboxConfig() with the container
+        # backend, and omitting the broker block fills in the
+        # bundled-mode default that ``thorn serve`` brings up itself
+        # at startup.  Together this is the "just run thorn serve"
+        # baseline -- no operator ceremony beyond having an OCI
+        # runtime installed.
+        assert config.sandbox is not None
+        assert config.sandbox.backend == "container"
+        assert config.broker is not None
+        assert config.broker.mode == "bundled"
 
     def test_load_with_sandbox_block(self, tmp_path: Path):
         import json
@@ -2956,6 +2964,36 @@ class TestBootstrapCoordinator:
         proj = gw_data["projects"][0]
         assert proj["name"] == "my-project"
         assert proj["url"] == "https://gitlab.com/group/my-project"
+
+    def test_bootstrap_output_loads_with_secure_defaults(self, tmp_path: Path):
+        """The post-bootstrap gateway.json round-trips through
+        :func:`load_gateway_config` and picks up the auto-filled
+        secure defaults (container sandbox + bundled broker).
+
+        This is the load-bearing assertion for the "just run thorn
+        serve" promise: bootstrap writes only the project / workspace
+        entries, and the new GatewayConfig defaults fill in the
+        sandbox + broker shapes that ``thorn serve`` needs.
+        """
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+        from thorn.gateway._config import load_gateway_config
+
+        bootstrap_coordinator(
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
+            agent_id="test-coord",
+            project_name="my-project",
+            project_url="https://github.com/owner/my-project",
+        )
+
+        loaded = load_gateway_config(tmp_path / ".thorn")
+        # bootstrap deliberately emits no sandbox / broker block;
+        # the schema validators fill in the secure defaults.
+        assert loaded.sandbox is not None
+        assert loaded.sandbox.backend == "container"
+        assert loaded.broker is not None
+        assert loaded.broker.mode == "bundled"
+        assert loaded.broker.enabled is True
 
     def test_bootstrap_appends_to_existing_gateway_config(self, tmp_path: Path):
         import json
@@ -4229,3 +4267,329 @@ class TestGatewayWorkspaceRouting:
             agent, SessionKey("simple_key"),
         )
         assert loaded.workspace_root == expected_ws
+
+
+# ---------------------------------------------------------------------------
+# TestGatewayBundledBrokerWiring
+# ---------------------------------------------------------------------------
+#
+# These tests pin down ``Gateway._maybe_start_bundled_broker`` /
+# ``_maybe_shutdown_bundled_broker`` -- the supervisor wiring on top
+# of which the per-process bundled-broker model is built.  We reach
+# directly into the private hooks rather than driving full
+# ``gateway.run()`` because the rest of the startup pipeline
+# (broker bindings, agent registration) requires a live OneCLI; the
+# point of these tests is "did the gateway construct + drive the
+# supervisor correctly?", not "does broker registration work end to
+# end?".  The latter is covered by the existing httpx-mock-driven
+# tests in ``tests/test_broker.py``.
+
+
+class _FakeBundledSupervisor:
+    """Test double for :class:`BundledBrokerSupervisor`.
+
+    Records ``start`` / ``shutdown`` calls and returns a synthesized
+    :class:`BrokerConfig` matching the contract of the real one
+    (``mode="external"`` from the rest-of-gateway perspective, with
+    populated ``admin_url``/``proxy_url``/``admin_api_key``).
+    """
+
+    def __init__(
+        self,
+        *,
+        project_name: str = "thorn-broker-fake",
+        egress_network_name: str = "thorn-broker-fake_thorn-broker",
+        admin_url: str = "http://127.0.0.1:54321",
+        proxy_url: str = "http://127.0.0.1:54322",
+        admin_api_key: str = "oc_fake",
+        start_error: Exception | None = None,
+    ) -> None:
+        from thorn.gateway._config import BrokerConfig
+        from thorn.core._credentials import ServiceCredential
+
+        self.project_name = project_name
+        self.egress_network_name = egress_network_name
+        self.start_calls = 0
+        self.shutdown_calls = 0
+        self._start_error = start_error
+        self._broker_config = BrokerConfig(
+            mode="external",
+            enabled=True,
+            admin_url=admin_url,
+            admin_api_key=ServiceCredential(admin_api_key, state="literal"),
+            proxy_url=proxy_url,
+            ca_certificate_path=None,
+        )
+
+    @property
+    def broker_config(self):  # pragma: no cover - parity-only accessor
+        return self._broker_config
+
+    async def start(self):
+        self.start_calls += 1
+        if self._start_error is not None:
+            raise self._start_error
+        return self._broker_config
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+class TestGatewayBundledBrokerWiring:
+    """Direct tests for :meth:`Gateway._maybe_start_bundled_broker` /
+    :meth:`Gateway._maybe_shutdown_bundled_broker`.
+
+    These hooks are the load-bearing seam between the per-process
+    supervisor and the rest of the gateway startup pipeline; if they
+    drift, the bundled-broker promise from the plan ("just run
+    ``thorn serve``") silently breaks.
+    """
+
+    def _make_runtime_with_sandbox(
+        self, tmp_path: Path, *, backend: str = "container",
+    ) -> Runtime:
+        from thorn.gateway._config import SandboxConfig
+
+        return Runtime(
+            provider=MockProvider(),
+            workspace_root=tmp_path,
+            sandbox_config=SandboxConfig(backend=backend),
+        )
+
+    def _make_gateway_config(
+        self,
+        *,
+        broker_mode: str | None = "bundled",
+        broker_enabled: bool = True,
+    ):
+        from thorn.gateway._config import (
+            BrokerConfig,
+            GatewayConfig,
+            SandboxConfig,
+        )
+
+        broker = None
+        if broker_mode is not None:
+            broker = BrokerConfig(mode=broker_mode, enabled=broker_enabled)  # type: ignore[arg-type]
+        return GatewayConfig(
+            sandbox=SandboxConfig(backend="container"),
+            broker=broker,
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_brings_up_supervisor_and_mutates_config(
+        self, tmp_path: Path,
+    ) -> None:
+        # The contract:
+        #   1. Supervisor.start() runs.
+        #   2. The synthesized config is hung off ``gateway_config.broker``
+        #      so the existing broker-registration path picks it up.
+        #   3. The runtime's sandbox.egress_network is set to the
+        #      supervisor's per-project network so sandbox containers
+        #      land on it.
+        runtime = self._make_runtime_with_sandbox(tmp_path)
+        config = self._make_gateway_config()
+        supervisor = _FakeBundledSupervisor(
+            egress_network_name="thorn-broker-xyz_thorn-broker",
+            admin_url="http://127.0.0.1:11111",
+            proxy_url="http://127.0.0.1:22222",
+            admin_api_key="oc_synthesized",
+        )
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[],
+            gateway_config=config,
+            bundled_broker_supervisor_factory=lambda: supervisor,
+        )
+
+        await gateway._maybe_start_bundled_broker()
+
+        assert supervisor.start_calls == 1
+        # The gateway_config.broker has been swapped in-place to the
+        # supervisor's synthesized one.
+        assert config.broker is not None
+        assert config.broker.admin_url == "http://127.0.0.1:11111"
+        assert config.broker.proxy_url == "http://127.0.0.1:22222"
+        assert str(config.broker.admin_api_key) == "oc_synthesized"
+        # Sandbox egress_network is patched to the supervisor's network.
+        assert runtime.sandbox_config is not None
+        assert runtime.sandbox_config.egress_network == (
+            "thorn-broker-xyz_thorn-broker"
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_no_op_when_subprocess_sandbox_leaves_broker_unset(
+        self, tmp_path: Path,
+    ) -> None:
+        # When the sandbox backend resolves to ``subprocess``, the
+        # ``GatewayConfig`` schema validator leaves ``broker = None``
+        # (a bundled broker would have nothing to inject a proxy into).
+        # The supervisor must not be constructed in that case --
+        # spinning up an unused OneCLI stack would burn cold-start time
+        # for nothing.  Also confirms ``shutdown`` is a no-op when
+        # there's no supervisor reference.
+        from thorn.gateway._config import GatewayConfig
+
+        runtime = self._make_runtime_with_sandbox(tmp_path, backend="subprocess")
+        config = GatewayConfig()  # bare config: validator picks the defaults
+        # Subprocess backend explicitly: opt out of the secure-default
+        # container backend that the schema validator would otherwise
+        # fill in.
+        from thorn.gateway._config import SandboxConfig
+        config.sandbox = SandboxConfig(backend="subprocess")
+        config.broker = None
+        supervisor = _FakeBundledSupervisor()
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[],
+            gateway_config=config,
+            bundled_broker_supervisor_factory=lambda: supervisor,
+        )
+
+        await gateway._maybe_start_bundled_broker()
+        assert supervisor.start_calls == 0
+        # And shutdown doesn't try to drive a supervisor that was
+        # never constructed.
+        await gateway._maybe_shutdown_bundled_broker()
+        assert supervisor.shutdown_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_start_no_op_when_broker_disabled(
+        self, tmp_path: Path,
+    ) -> None:
+        # Explicit ``broker.enabled = False`` is the supported way to
+        # have a sandbox without a broker.  No supervisor in that case.
+        runtime = self._make_runtime_with_sandbox(tmp_path)
+        config = self._make_gateway_config(
+            broker_mode="bundled", broker_enabled=False,
+        )
+        supervisor = _FakeBundledSupervisor()
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[],
+            gateway_config=config,
+            bundled_broker_supervisor_factory=lambda: supervisor,
+        )
+
+        await gateway._maybe_start_bundled_broker()
+        assert supervisor.start_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_start_no_op_when_broker_mode_external(
+        self, tmp_path: Path,
+    ) -> None:
+        # External broker case: the operator manages OneCLI themselves,
+        # gateway.json points at it via URLs.  The bundled supervisor
+        # path must not engage.
+        from thorn.gateway._config import (
+            BrokerConfig,
+            GatewayConfig,
+            SandboxConfig,
+        )
+        from thorn.core._credentials import ServiceCredential
+
+        runtime = self._make_runtime_with_sandbox(tmp_path)
+        config = GatewayConfig(
+            sandbox=SandboxConfig(backend="container"),
+            broker=BrokerConfig(
+                mode="external",
+                enabled=True,
+                admin_url="http://my-broker:8080",
+                admin_api_key=ServiceCredential("oc_op", state="literal"),
+                proxy_url="http://my-broker:8081",
+            ),
+        )
+        supervisor = _FakeBundledSupervisor()
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[],
+            gateway_config=config,
+            bundled_broker_supervisor_factory=lambda: supervisor,
+        )
+
+        await gateway._maybe_start_bundled_broker()
+        assert supervisor.start_calls == 0
+        # External broker config is preserved verbatim.
+        assert config.broker is not None
+        assert config.broker.admin_url == "http://my-broker:8080"
+
+    @pytest.mark.asyncio
+    async def test_start_raises_on_subprocess_with_explicit_bundled(
+        self, tmp_path: Path,
+    ) -> None:
+        # ``broker.mode = "bundled"`` + ``sandbox.backend = "subprocess"``
+        # is incoherent: there's no container to inject the proxy into.
+        # The schema validator already drops the bundled-broker default
+        # in this case; reaching ``_maybe_start_bundled_broker`` means
+        # the operator wrote both blocks explicitly, which we hard-fail
+        # rather than silently no-op so they get a clear error message.
+        from thorn.gateway._bundled_broker import BundledBrokerError
+
+        runtime = self._make_runtime_with_sandbox(tmp_path, backend="subprocess")
+        config = self._make_gateway_config(broker_mode="bundled")
+        # Override the schema's auto-cleanup of broker on subprocess by
+        # leaving the broker block explicitly populated -- we want to
+        # exercise the ``_maybe_start_bundled_broker`` defensive check.
+        supervisor = _FakeBundledSupervisor()
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[],
+            gateway_config=config,
+            bundled_broker_supervisor_factory=lambda: supervisor,
+        )
+
+        with pytest.raises(BundledBrokerError, match="container"):
+            await gateway._maybe_start_bundled_broker()
+        # The supervisor must not have been constructed at all -- the
+        # check happens before the factory call.
+        assert supervisor.start_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_shutdown_drives_supervisor_shutdown_once(
+        self, tmp_path: Path,
+    ) -> None:
+        # After a successful start, ``_maybe_shutdown_bundled_broker``
+        # must call ``supervisor.shutdown`` exactly once and clear the
+        # internal reference so a re-entrant double-shutdown is a no-op.
+        runtime = self._make_runtime_with_sandbox(tmp_path)
+        config = self._make_gateway_config()
+        supervisor = _FakeBundledSupervisor()
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[],
+            gateway_config=config,
+            bundled_broker_supervisor_factory=lambda: supervisor,
+        )
+
+        await gateway._maybe_start_bundled_broker()
+        await gateway._maybe_shutdown_bundled_broker()
+        await gateway._maybe_shutdown_bundled_broker()
+        assert supervisor.shutdown_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_shutdown_swallows_supervisor_failure(
+        self, tmp_path: Path,
+    ) -> None:
+        # A failing ``supervisor.shutdown`` must not propagate -- the
+        # gateway shutdown sequence should still complete the rest of
+        # its work even if compose-down failed.
+        runtime = self._make_runtime_with_sandbox(tmp_path)
+        config = self._make_gateway_config()
+
+        class _BoomSupervisor(_FakeBundledSupervisor):
+            async def shutdown(self) -> None:
+                self.shutdown_calls += 1
+                raise RuntimeError("compose down failed")
+
+        supervisor = _BoomSupervisor()
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[],
+            gateway_config=config,
+            bundled_broker_supervisor_factory=lambda: supervisor,
+        )
+
+        await gateway._maybe_start_bundled_broker()
+        # Should not raise.
+        await gateway._maybe_shutdown_bundled_broker()
+        assert supervisor.shutdown_calls == 1

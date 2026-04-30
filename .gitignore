@@ -25,3 +25,5 @@ Thumbs.db
 # Thorn agent state (CLI mode)
 .thorn/
 .cursor/plans/
+
+dogfood-agency/

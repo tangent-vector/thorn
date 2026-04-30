@@ -865,33 +865,65 @@ class AgentSandboxOverride(BaseModel):
     )
 
 
+BrokerMode = Literal["bundled", "external"]
+"""Discriminator for :class:`BrokerConfig.mode`.
+
+* ``"bundled"`` (default): ``thorn serve`` brings up its own OneCLI
+  + Postgres compose stack on startup, mints an admin key, and tears
+  the stack down on shutdown.  Operators do not have to write
+  ``admin_url`` / ``admin_api_key`` / ``proxy_url`` themselves; the
+  bundled supervisor synthesises those at runtime.
+* ``"external"``: the operator runs OneCLI themselves (bare metal,
+  Kubernetes, an existing compose deployment, etc.) and points
+  Thorn at it via explicit ``admin_url`` / ``admin_api_key`` /
+  ``proxy_url``.  This is the pre-bundled-broker integration shape
+  preserved for advanced setups.
+"""
+
+
 class BrokerConfig(BaseModel):
     """Agency-wide configuration for the OneCLI credential broker.
 
-    Phase D introduces the broker as the substitution proxy that the
-    per-agent sandbox container's outbound HTTPS funnels through.
-    When this block is absent from ``gateway.json`` (or when present
-    with ``enabled: false``), the broker is disabled and credentials
-    continue to flow via the Phase-B env-injection path
-    (``env_passthrough`` / ``extra_env``); the audit invariant is not
-    enforced.  When present and enabled, the gateway registers each
-    agent's credentials with the broker at agent-load and the
-    container env carries only placeholder values.
+    The broker is the substitution proxy that per-agent sandbox
+    containers funnel their outbound HTTPS through.  When this block
+    is set with ``enabled: true`` (the default when ``GatewayConfig``
+    auto-fills it), the gateway registers each agent's credentials
+    with the broker at agent-load and the container env carries only
+    placeholder values.  When ``enabled: false`` (or when the
+    sandbox backend resolves to ``subprocess``), the broker is not
+    used and credentials flow via the Phase-B env-injection path;
+    the audit invariant is not enforced in that case.
 
-    The broker process can be either bundled (the default deploy
-    compose runs an OneCLI sidecar) or standalone (an existing OneCLI
-    deployment the operator already runs).  Both shapes share this
-    config; only the URLs differ.
+    Two modes:
 
-    See [docs/aspirational/architecture.md] and the Phase D plan
-    (``~/.cursor/plans/sandbox_phase_d_plan_*.plan.md``) for the
-    integration shape.  R1/R2 confirm: the proxy accepts ``Basic``
-    auth via embedded ``HTTPS_PROXY`` URL credentials (no per-tool
-    bearer wiring needed); the admin surface is OneCLI's Next.js
-    ``/api/agents``, ``/api/secrets``, and friends authenticated with
-    ``Authorization: Bearer oc_<hex>``.
+    * ``mode: "bundled"`` (default): ``thorn serve`` manages its own
+      OneCLI stack via ``BundledBrokerSupervisor``.  ``admin_url``,
+      ``admin_api_key``, and ``proxy_url`` MUST be left unset --
+      they are filled in at runtime from the supervisor-discovered
+      values.
+    * ``mode: "external"``: the operator points the gateway at an
+      OneCLI deployment they manage themselves.  ``admin_url``,
+      ``admin_api_key``, and ``proxy_url`` are all required.
+
+    See [docs/aspirational/architecture.md] for the integration
+    shape.  R1/R2 confirm: the proxy accepts ``Basic`` auth via
+    embedded ``HTTPS_PROXY`` URL credentials (no per-tool bearer
+    wiring needed); the admin surface is OneCLI's Next.js
+    ``/api/agents``, ``/api/secrets``, and friends authenticated
+    with ``Authorization: Bearer oc_<hex>``.
     """
 
+    mode: BrokerMode = Field(
+        default="bundled",
+        description=(
+            "How ``thorn serve`` obtains the broker.  ``\"bundled\"`` "
+            "(the default) brings up a per-process OneCLI compose "
+            "stack on startup and tears it down on shutdown.  "
+            "``\"external\"`` connects to an OneCLI deployment the "
+            "operator is responsible for; in that case ``admin_url``, "
+            "``admin_api_key``, and ``proxy_url`` are all required."
+        ),
+    )
     enabled: bool = Field(
         default=True,
         description=(
@@ -899,19 +931,25 @@ class BrokerConfig(BaseModel):
             "if other fields are set; agent-load uses Phase-B env "
             "injection and the audit invariant is not enforced.  "
             "Useful for temporarily disabling the broker without "
-            "removing the configuration."
+            "removing the configuration -- typically paired with "
+            "sandbox.backend = 'subprocess', in which case the "
+            "agency runs without isolation or broker."
         ),
     )
     admin_url: str = Field(
+        default="",
         description=(
             "Base URL of OneCLI's admin/management API (the Next.js "
-            "service, default port 10254 in OneCLI's bundled compose).  "
-            "The gateway calls this to create agent identities, "
-            "register secrets, and mint per-agent proxy tokens.  "
-            "Example: 'http://onecli-web:10254'."
+            "service, default port 10254).  The gateway calls this "
+            "to create agent identities, register secrets, and mint "
+            "per-agent proxy tokens.  Required when ``mode == "
+            "\"external\"``; MUST be left empty when ``mode == "
+            "\"bundled\"`` (the supervisor fills it in).  Example: "
+            "'http://onecli-web:10254'."
         ),
     )
-    admin_api_key: ServiceCredential = Field(
+    admin_api_key: ServiceCredential | None = Field(
+        default=None,
         description=(
             "OneCLI admin API key (Bearer token, prefix 'oc_'), used "
             "by the gateway as ``Authorization`` when driving the "
@@ -920,16 +958,21 @@ class BrokerConfig(BaseModel):
             "our broker, NOT the ability to call any upstream service "
             "directly.  The Phase D audit invariant tolerates this "
             "credential by design (see "
-            ":func:`thorn.core._credentials.assert_no_literal_credentials`)."
+            ":func:`thorn.core._credentials.assert_no_literal_credentials`).  "
+            "Required when ``mode == \"external\"``; MUST be left "
+            "unset when ``mode == \"bundled\"``."
         ),
     )
     proxy_url: str = Field(
+        default="",
         description=(
             "URL of OneCLI's HTTP/HTTPS substitution proxy (the Rust "
             "gateway, default port 10255).  Each per-agent sandbox "
             "container's ``HTTPS_PROXY`` env var points at this URL "
             "with the per-agent proxy token embedded as Basic-auth "
-            "credentials in the URL.  Example: "
+            "credentials in the URL.  Required when ``mode == "
+            "\"external\"``; MUST be left empty when ``mode == "
+            "\"bundled\"`` (the supervisor fills it in).  Example: "
             "'http://onecli-gateway:10255'."
         ),
     )
@@ -953,6 +996,54 @@ class BrokerConfig(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def _check_mode_invariants(self) -> BrokerConfig:
+        """Enforce the bundled/external invariants documented above.
+
+        Bundled mode is "the supervisor fills everything in", so
+        carrying any of the URL / key fields is a configuration
+        mistake (the operator typed values that the runtime is going
+        to overwrite, which is confusing and indicates they probably
+        wanted ``mode: external``).  External mode requires all three
+        because the supervisor will not run, so missing values would
+        only surface as a confusing 404 / connection-refused later.
+        """
+        if self.mode == "bundled":
+            stray: list[str] = []
+            if self.admin_url:
+                stray.append("admin_url")
+            if self.admin_api_key is not None:
+                stray.append("admin_api_key")
+            if self.proxy_url:
+                stray.append("proxy_url")
+            if stray:
+                raise ValueError(
+                    f"broker.mode='bundled' must not carry "
+                    f"{', '.join(stray)}; those fields are filled in "
+                    "at startup by the bundled-broker supervisor.  "
+                    "Drop the field(s), or switch to "
+                    "broker.mode='external' if you intend to point "
+                    "Thorn at an OneCLI deployment you manage yourself."
+                )
+        else:  # external
+            missing: list[str] = []
+            if not self.admin_url:
+                missing.append("admin_url")
+            if self.admin_api_key is None:
+                missing.append("admin_api_key")
+            if not self.proxy_url:
+                missing.append("proxy_url")
+            if missing:
+                raise ValueError(
+                    f"broker.mode='external' requires {', '.join(missing)}; "
+                    "set them in gateway.json (admin_api_key may use the "
+                    "$ENV_VAR convention).  Switch to "
+                    "broker.mode='bundled' (or omit the broker block "
+                    "entirely) if you want `thorn serve` to manage the "
+                    "broker for you."
+                )
+        return self
+
 
 class GatewayConfig(BaseModel):
     """Top-level model for an agency's ``gateway.json``.
@@ -961,6 +1052,24 @@ class GatewayConfig(BaseModel):
     forges and projects.  Future plug-in service categories will
     appear as additional typed array fields (for example,
     ``messaging_services: list[...]``).
+
+    Defaults are deliberately *secure*: an agency with no
+    ``sandbox`` and no ``broker`` block boots with the Phase-E
+    container sandbox + the bundled OneCLI broker.  Operators who
+    need to opt out of containerised execution set
+    ``sandbox.backend = "subprocess"`` explicitly; the model
+    validator then drops the broker default (a broker without a
+    container has nothing to inject the proxy into).
+
+    Note: these schema-level defaults only apply when
+    :func:`load_gateway_config` parses an actual ``gateway.json``,
+    which today is done exclusively by ``thorn serve``.  The
+    in-process CLI entry points (``thorn run`` / ``thorn chat``)
+    construct ``Runtime`` with ``sandbox_config=None``, which falls
+    through to the unchanged
+    :data:`thorn.sandbox._resolve._DEFAULT_AGENCY_SANDBOX` (still
+    ``backend="subprocess"``).  Flipping schema defaults here does
+    not silently change CLI behavior.
     """
 
     workspace: str = Field(
@@ -979,23 +1088,58 @@ class GatewayConfig(BaseModel):
     sandbox: SandboxConfig | None = Field(
         default=None,
         description=(
-            "Agency-wide sandbox defaults.  When omitted, the runtime "
-            "keeps the Phase-A subprocess executor behavior; setting "
-            "this block (even to '{}') opts the agency into the Phase-B "
-            "container backend by default."
+            "Agency-wide sandbox defaults.  When omitted from "
+            "gateway.json, defaults to a fresh ``SandboxConfig()`` "
+            "with the Phase-E container backend on; set explicitly "
+            "to ``{\"backend\": \"subprocess\"}`` to opt out of "
+            "containerised sandboxing (which also disables the "
+            "bundled broker, since there is no container to "
+            "inject the proxy into)."
         ),
     )
     broker: BrokerConfig | None = Field(
         default=None,
         description=(
             "Agency-wide credential-broker configuration.  When "
-            "omitted (or set with ``enabled: false``), the gateway "
-            "uses Phase-B env injection for credentials and does not "
-            "enforce the Phase-D audit invariant.  Setting this block "
-            "opts the agency into broker-routed credentials; see "
-            ":class:`BrokerConfig` for the deployment topology."
+            "omitted from gateway.json AND the resolved sandbox "
+            "backend is ``container``, defaults to a fresh "
+            "``BrokerConfig(mode='bundled')`` so ``thorn serve`` "
+            "brings up its own OneCLI stack on startup.  When the "
+            "sandbox backend resolves to ``subprocess``, defaults "
+            "to ``None`` (no broker -- there's no container to "
+            "inject into).  Set explicitly with ``mode: 'external'`` "
+            "to point Thorn at an OneCLI deployment you manage "
+            "yourself, or with ``enabled: false`` to keep the "
+            "container backend without a broker."
         ),
     )
+
+    @model_validator(mode="after")
+    def _fill_secure_defaults(self) -> GatewayConfig:
+        """Apply the "absent block -> secure default" rules.
+
+        Two cases the schema cannot express via plain ``default=``:
+
+        1. Sandbox block omitted -> default to a container-backend
+           ``SandboxConfig()``.  We can't use a default-factory at
+           the field level because we want ``"subprocess"`` to remain
+           the default for the runtime-level
+           :data:`thorn.sandbox._resolve._DEFAULT_AGENCY_SANDBOX`,
+           which is what the in-process CLI paths fall back to.
+           Flipping the GatewayConfig field default keeps the schema
+           secure-by-default exactly when a ``gateway.json`` is the
+           thing being loaded.
+        2. Broker block omitted -> default to bundled, *but only
+           when* the resolved sandbox backend is ``container``.  A
+           bundled broker with a subprocess sandbox would be
+           pointless (no container to inject the proxy into); the
+           rule encodes that.
+        """
+        if self.sandbox is None:
+            self.sandbox = SandboxConfig()
+        if self.broker is None and self.sandbox.backend == "container":
+            self.broker = BrokerConfig(mode="bundled")
+        return self
 
     def resolve_workspace(self, agency_home: Path) -> Path | None:
         """Resolve the configured workspace path against *agency_home*.

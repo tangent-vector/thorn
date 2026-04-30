@@ -61,7 +61,13 @@ class TestBuild:
         ctx, dockerfile, used_tag = adapter.build_calls[0]
         assert dockerfile.name == DEFAULT_SANDBOX_DOCKERFILE
         assert used_tag == tag
-        assert ctx == dockerfile.parent
+        # The bundled Dockerfile.sandbox does ``COPY pyproject.toml ./``
+        # so the resolved build context must be the source-tree root,
+        # not the dockerfile's parent (which is now the wheel-shipped
+        # ``_resources/`` directory).
+        assert (ctx / "pyproject.toml").is_file(), (
+            f"resolved build context {ctx} does not contain pyproject.toml"
+        )
         # The image should now be in the cache via the fake adapter.
         assert await adapter.image_exists(tag)
 

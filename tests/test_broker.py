@@ -40,7 +40,12 @@ from thorn.gateway._config import BrokerConfig, ForgeSpec, GatewayConfig
 
 
 def _broker_config(**overrides: object) -> BrokerConfig:
+    # ``mode='external'`` because the client tests exercise an
+    # already-running broker with explicit URLs/key (the bundled-mode
+    # supervisor would otherwise be the source of truth and the
+    # schema validator would reject explicit values here).
     base: dict[str, object] = {
+        "mode": "external",
         "admin_url": "http://onecli-web:10254",
         "admin_api_key": "oc_admin_dummy",
         "proxy_url": "http://onecli-gateway:10255",
@@ -1324,7 +1329,12 @@ class TestPhaseDAuditFlow:
 
 
 def _broker_dict(**overrides: object) -> dict[str, object]:
+    # Gateway-level broker tests exercise an already-running broker
+    # (URLs / key supplied directly), so the natural mode is
+    # ``external``.  The bundled-mode supervisor lifecycle is covered
+    # separately in ``tests/test_bundled_broker.py``.
     base: dict[str, object] = {
+        "mode": "external",
         "admin_url": "http://onecli-web:10254",
         "admin_api_key": "oc_admin_dummy",
         "proxy_url": "http://onecli-gateway:10255",

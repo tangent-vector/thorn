@@ -174,7 +174,28 @@ class BrokerClient:
         *transport* is an injection seam for tests (use
         :class:`httpx.MockTransport`).  Production callers leave it
         unset and httpx uses its default ``HTTPTransport``.
+
+        Refuses to build when *config* is missing the bits we need
+        (``admin_url`` empty or ``admin_api_key`` ``None``).  These
+        are expected to be populated by the time we get here:
+        ``mode='external'`` configs require them at schema-validation
+        time, and ``mode='bundled'`` configs are mutated by the
+        :class:`~thorn.gateway._bundled_broker.BundledBrokerSupervisor`
+        before any client is constructed.  Reaching this guard
+        indicates a wiring bug -- for example, instantiating the
+        client outside the supervised startup path -- so we surface
+        it loudly rather than silently sending an ``Authorization:
+        Bearer None`` header.
         """
+        if not config.admin_url or config.admin_api_key is None:
+            raise BrokerError(
+                "BrokerClient requires both admin_url and admin_api_key "
+                "to be populated; got admin_url="
+                f"{config.admin_url!r}, admin_api_key="
+                f"{config.admin_api_key!r}.  This typically means the "
+                "bundled-broker supervisor has not run yet, or the "
+                "external broker config is missing required fields."
+            )
         self._config = config
         self._http = httpx.Client(
             base_url=config.admin_url.rstrip("/"),
