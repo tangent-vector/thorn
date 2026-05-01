@@ -267,6 +267,7 @@ class DaemonToolExecutor(ToolExecutor):
                     call_id=invocation.call_id,
                     tool_name=invocation.tool_name,
                     arguments=dict(invocation.arguments),
+                    per_call_context=dict(invocation.per_call_context),
                     mcp_server_config=invocation.mcp_server_config,
                 )
             )

@@ -57,6 +57,12 @@ class ToolInvocation:
     name (post-normalization) and ``arguments`` is the pre-parsed
     keyword payload.
 
+    ``per_call_context`` carries runtime metadata that varies per tool
+    call but is not part of the model-visible tool arguments.  The
+    daemon uses it to reconstruct the effective execution context for
+    sandboxed calls, including the session workspace subdirectory and
+    session-key scope tag.
+
     ``mcp_server_config`` carries an MCP server's connection
     parameters when the call should be routed through the daemon's
     :class:`~thorn.toolhost._mcp_host.MCPHost` rather than the static
@@ -68,6 +74,7 @@ class ToolInvocation:
     call_id: str
     tool_name: str
     arguments: dict[str, Any] = field(default_factory=dict)
+    per_call_context: dict[str, Any] = field(default_factory=dict)
     mcp_server_config: "MCPServerConfig | None" = None
 
 

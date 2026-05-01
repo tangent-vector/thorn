@@ -49,6 +49,18 @@ markers = [
 # or ``-m 'requires_podman or requires_docker'``).
 addopts = "-m 'not requires_podman and not requires_docker'"
 
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.12",
+]

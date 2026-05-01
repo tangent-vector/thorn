@@ -31,9 +31,14 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from thorn.core._context import ExecutionContext, NullEventSink, set_context, reset_context
+from thorn.core._context import (
+    ExecutionContext,
+    NullEventSink,
+    reset_context,
+    set_context,
+)
 from thorn.core._executor import (
     InProcessToolExecutor,
     ToolInvocation,
@@ -527,6 +532,7 @@ class ToolhostServer:
                 call_id=request.call_id,
                 tool_name=entry.name,
                 arguments=dict(request.arguments),
+                per_call_context=dict(request.per_call_context),
             )
             try:
                 result = await self._executor.invoke(invocation)
