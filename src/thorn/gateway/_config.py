@@ -416,6 +416,11 @@ class ForkSpec(BaseModel):
       :meth:`ProjectSpec.resolved_forks`).
     - ``forge``: the name of the :class:`ForgeSpec` entry that hosts
       this fork.  Inferred from the URL host when omitted.
+    - ``native_id``: optional forge-native project identifier override.
+      Normally this is parsed from ``url``.  Set it when a forge
+      requires a different API identifier than its human URL path, such
+      as GitLab instances where a bot can access a project by numeric
+      ID but not by ``path_with_namespace``.
     - ``default_branch``: per-fork override for the default branch.
       When omitted, falls back to :attr:`ProjectSpec.default_branch`,
       and ultimately to a live lookup against the forge.
@@ -436,6 +441,13 @@ class ForkSpec(BaseModel):
         description=(
             "Name of the ForgeSpec hosting this fork.  Inferred from "
             "the URL host when omitted."
+        ),
+    )
+    native_id: str = Field(
+        default="",
+        description=(
+            "Forge-native project identifier override.  When empty, "
+            "derived from `url`."
         ),
     )
     default_branch: str = Field(
@@ -469,6 +481,14 @@ class ProjectSpec(BaseModel):
             "writing a single-element `forks: [{ url: ... }]`."
         ),
     )
+    native_id: str = Field(
+        default="",
+        description=(
+            "Shorthand for a single-fork native_id override.  Only "
+            "valid with top-level `url`; multi-fork projects should "
+            "put native_id on the relevant fork."
+        ),
+    )
     default_branch: str = Field(
         default="",
         description=(
@@ -489,6 +509,12 @@ class ProjectSpec(BaseModel):
                 "`url` and a `forks` array.  Use `url` for the "
                 "single-fork shorthand or `forks` for the explicit form."
             )
+        if self.native_id and self.forks:
+            raise ValueError(
+                f"Project {self.name!r} cannot specify top-level "
+                "`native_id` with a `forks` array.  Put native_id on "
+                "the specific fork instead."
+            )
         if not self.url and not self.forks:
             raise ValueError(
                 f"Project {self.name!r} must specify either `url` (for "
@@ -500,7 +526,7 @@ class ProjectSpec(BaseModel):
         """Return the effective fork list (synthesizing from `url` when needed)."""
         if self.forks:
             return list(self.forks)
-        return [ForkSpec(url=self.url)]
+        return [ForkSpec(url=self.url, native_id=self.native_id)]
 
 
 class EgressAllowlistEntry(BaseModel):
@@ -1372,7 +1398,7 @@ def _resolve_forges_and_projects(
                     forge_name=forge_spec.name,
                     forge_type=forge_spec.type,
                     name=fork_name,
-                    native_id=location.native_id,
+                    native_id=fork.native_id or location.native_id,
                     clone_url=location.clone_url,
                     default_branch=fork.default_branch,
                 )
