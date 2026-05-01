@@ -9,9 +9,10 @@ OneCLI credential broker:
 * Mints / fetches the broker's admin API key against OneCLI's
   unauthenticated single-user-mode endpoints
   (``GET /api/user/api-key`` and ``POST /api/user/api-key/regenerate``).
-* Synthesises an in-memory :class:`BrokerConfig` whose ``admin_url``,
-  ``proxy_url``, and ``admin_api_key`` reflect the discovered ports
-  and minted key.  Everything downstream
+* Synthesises an in-memory :class:`BrokerConfig` whose ``admin_url``
+  points at the host-published admin port, whose ``proxy_url`` points
+  at the sandbox-facing compose service DNS name, and whose admin key
+  reflects the minted key.  Everything downstream
   (:class:`~thorn.gateway._broker.BrokerClient`,
   :func:`~thorn.gateway._broker.register_agent_with_broker`, the CA
   fetch + bind-mount flow) consumes this config unmodified.
@@ -82,6 +83,9 @@ to come up.  1s is a fine default: docker-compose's own ``--wait``
 already gates on its container-level healthcheck (when present),
 so by the time we get here OneCLI is already serving requests in
 the typical case and the first poll succeeds."""
+
+_SANDBOX_PROXY_URL = "http://onecli:10255"
+"""Broker proxy URL as seen from containers on the compose broker network."""
 
 
 class BundledBrokerError(RuntimeError):
@@ -411,7 +415,12 @@ class BundledBrokerSupervisor:
             enabled=True,
             admin_url=f"http://{self._endpoints.admin_host}:{self._endpoints.admin_port}",
             admin_api_key_env_var=None,
-            proxy_url=f"http://{self._endpoints.proxy_host}:{self._endpoints.proxy_port}",
+            # The gateway's admin traffic uses the host-published
+            # endpoint above, but sandbox containers join the
+            # compose-scoped broker network where ``onecli:10255`` is
+            # the routable proxy address.  A host-loopback proxy URL
+            # would resolve to the sandbox container itself.
+            proxy_url=_SANDBOX_PROXY_URL,
             ca_certificate_path=None,
         )
         log.info(
