@@ -8,10 +8,9 @@ anything (no real subprocesses, no real containers).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
-
-import pytest
 
 from thorn.core._agent import Agent
 from thorn.gateway._config import AgentSandboxOverride, SandboxConfig
@@ -79,6 +78,46 @@ class TestSubprocessDefault:
         executor = runtime.get_or_create_sandbox_executor(agent)
         assert executor is not None
         assert isinstance(executor.host, SubprocessDaemonHost)
+
+    def test_subprocess_backend_shortens_long_socket_paths(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        long_workspace = (
+            tmp_path
+            / "workspace-with-a-very-long-name"
+            / "nested"
+            / "deeply"
+            / "under"
+            / "pytest"
+            / "so"
+            / "the"
+            / "native"
+            / "socket"
+            / "path"
+            / "would"
+            / "overflow"
+        )
+        paths = AgencyPaths(
+            home_root=tmp_path / "home",
+            workspace_root=long_workspace,
+        )
+        runtime = Runtime(
+            provider=_StubProvider(),  # type: ignore[arg-type]
+            workspace_root=paths.workspace_root,
+            paths=paths,
+            sandbox_executor_enabled=True,
+            sandbox_config=SandboxConfig(backend="subprocess"),
+        )
+        agent = _make_agent(aid="agent-with-a-long-enough-id")
+
+        executor = runtime.get_or_create_sandbox_executor(agent)
+
+        assert executor is not None
+        assert isinstance(executor.host, SubprocessDaemonHost)
+        assert executor.host.socket_path != paths.agent_toolhost_socket(agent.id)
+        assert len(os.fsencode(executor.host.socket_path)) <= 100
+        assert executor.host.socket_path.parent.is_dir()
 
 
 class TestContainerBackend:

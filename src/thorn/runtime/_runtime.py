@@ -19,7 +19,11 @@ just structured through a uniform abstraction.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
+import hashlib
+import os
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,8 +38,8 @@ from thorn.core._context import (
     set_context,
 )
 from thorn.core._provider import LLMProvider
-from thorn.core._session import Session
 from thorn.core._service import Service
+from thorn.core._session import Session
 from thorn.runtime._address import AddressBook
 from thorn.runtime._in_flight_index import InFlightIndex
 from thorn.runtime._paths import AgencyPaths
@@ -44,15 +48,52 @@ from thorn.runtime._store import SessionStore
 
 if TYPE_CHECKING:
     from thorn.core._context import StatusProvider
-    from thorn.core._file_access import FileAccessPolicy
     from thorn.core._executor import ToolExecutor
+    from thorn.core._file_access import FileAccessPolicy
     from thorn.core._validation_tracker import ValidationTracker
     from thorn.gateway._config import SandboxConfig
     from thorn.sandbox._runtime import OCIRuntimeAdapter
-    from thorn.toolhost._executor import DaemonExecutorConfig
     from thorn.toolhost._host import DaemonHost
 
 _S = TypeVar("_S", bound=Service)
+
+_UNIX_SOCKET_PATH_BUDGET_BYTES = 100
+"""Conservative budget for Unix-domain socket path strings.
+
+Linux's ``sockaddr_un.sun_path`` limit is typically 108 bytes including
+the trailing NUL, and other Unix-like systems have similarly small
+limits.  Keeping Thorn-generated fallback paths below 100 bytes leaves
+headroom for platform-specific accounting without making callers reason
+about the exact kernel ABI.
+"""
+
+
+def _toolhost_socket_path_for_subprocess(default_socket_path: Path) -> Path:
+    """Return a subprocess-safe socket path for the toolhost daemon.
+
+    The natural socket location lives under the agent control directory
+    so all per-agent runtime artifacts are easy to inspect together.
+    Deep gateway workspaces can exceed the Unix socket path limit,
+    though, causing the daemon to crash before it can even write logs.
+    For those cases, keep the log in the control dir but put the
+    rendezvous socket in a short, user-private temp directory.
+    """
+    if len(os.fsencode(default_socket_path)) <= _UNIX_SOCKET_PATH_BUDGET_BYTES:
+        return default_socket_path
+
+    digest = hashlib.sha256(
+        os.fsencode(default_socket_path),
+    ).hexdigest()[:24]
+    uid = getattr(os, "getuid", lambda: 0)()
+    temp_root = Path(tempfile.gettempdir()) / f"thorn-toolhost-{uid}"
+    temp_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(Exception):
+        temp_root.chmod(0o700)
+    socket_dir = temp_root / digest
+    socket_dir.mkdir(mode=0o700, exist_ok=True)
+    with contextlib.suppress(Exception):
+        socket_dir.chmod(0o700)
+    return socket_dir / "s.sock"
 
 
 @runtime_checkable
@@ -384,15 +425,21 @@ class Runtime:
                 "Cannot start a sandbox executor for an agent without an id"
             )
 
-        control_dir = self.paths.agent_control_dir(agent.id)
-        control_dir.mkdir(parents=True, exist_ok=True)
-        socket_path = self.paths.agent_toolhost_socket(agent.id)
-        log_path = control_dir / "toolhost.log"
-
         resolved = resolve_sandbox_config(
             self._sandbox_config,
             getattr(agent, "sandbox_override", None),
         )
+
+        control_dir = self.paths.agent_control_dir(agent.id)
+        control_dir.mkdir(parents=True, exist_ok=True)
+        default_socket_path = self.paths.agent_toolhost_socket(agent.id)
+        if resolved.backend == "subprocess":
+            socket_path = _toolhost_socket_path_for_subprocess(
+                default_socket_path,
+            )
+        else:
+            socket_path = default_socket_path
+        log_path = control_dir / "toolhost.log"
 
         config = DaemonExecutorConfig(
             socket_path=socket_path,

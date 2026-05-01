@@ -15,9 +15,10 @@ import asyncio
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
-from thorn.core._context import ExecutionContext, Scope
+from thorn.core._context import ExecutionContext
 from thorn.core._executor import (
     ExecutorRouter,
     ToolInvocation,
@@ -29,7 +30,6 @@ from thorn.core._executor import (
 )
 from thorn.core._history import (
     DEFAULT_HIGH_WATERMARK,
-    DEFAULT_LOW_WATERMARK,
     AdvisoryNode,
     HistoryTree,
     ToolCallNode,
@@ -40,14 +40,12 @@ from thorn.core._messages import (
     Message,
     ToolCall,
     ToolResultMessage,
-    UserMessage,
 )
 from thorn.core._provider import FinishChunk, TextChunk, ToolCallChunk, UsageChunk
 from thorn.core._retry import RetryPolicy
 from thorn.core._schema import (
     RAISE_ERROR_SCHEMA,
     make_return_result_schema,
-    serialize_for_tool_result,
     validate_result,
 )
 from thorn.core.errors import (
@@ -176,7 +174,6 @@ async def run_agent_loop(
     all_schemas.append(RAISE_ERROR_SCHEMA)
 
     # In structured mode, also inject the return_result tool.
-    structured_result: list[Any] = []  # mutable box for the captured value
     if structured:
         rr_schema = make_return_result_schema(result_type)
         all_schemas.append(rr_schema)
@@ -485,6 +482,48 @@ def _normalize_tool_name(name: str) -> str:
     return name.lower().replace("-", "_").replace(" ", "_")
 
 
+def _scope_session_key(context: ExecutionContext) -> str | None:
+    """Return the nearest ``session_key`` tag from the context scope chain."""
+    current = context.scope
+    while current is not None:
+        value = current.metadata.get("session_key")
+        if value:
+            return str(value)
+        current = current.outer
+    return None
+
+
+def _sandbox_per_call_context(context: ExecutionContext) -> dict[str, Any]:
+    """Build daemon-only context metadata for sandbox-venue tool calls."""
+    per_call: dict[str, Any] = {}
+    session_key = _scope_session_key(context)
+    if session_key is not None:
+        per_call["session_key"] = session_key
+
+    runtime = context.runtime
+    agent = context.agent
+    workspace_root = context.workspace_root
+    agent_id = getattr(agent, "id", None)
+    if runtime is None or agent_id is None or workspace_root is None:
+        return per_call
+
+    try:
+        agent_workspace = runtime.paths.agent_workspace_mount(agent_id)
+    except Exception:
+        return per_call
+
+    try:
+        rel = Path(workspace_root).resolve().relative_to(
+            Path(agent_workspace).resolve(),
+        )
+    except ValueError:
+        return per_call
+
+    if str(rel) != ".":
+        per_call["workspace_subdir"] = rel.as_posix()
+    return per_call
+
+
 async def _execute_tool_calls(
     *,
     tool_calls: list[ToolCall],
@@ -587,6 +626,11 @@ async def _execute_tool_calls(
             call_id=tc.call_id,
             tool_name=wire_tool_name,
             arguments=kwargs,
+            per_call_context=(
+                _sandbox_per_call_context(context)
+                if entry.venue is ToolVenue.SANDBOX
+                else {}
+            ),
             mcp_server_config=entry.mcp_server_config,
         )
 

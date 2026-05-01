@@ -50,9 +50,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import signal
-import dataclasses
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -779,7 +779,7 @@ class Gateway:
     # Routing
     # ------------------------------------------------------------------
 
-    def _resolve_agent(self, event: IncomingEvent) -> Agent:
+    def _resolve_agent(self, event: FormattedEvent) -> Agent:
         """Map an event to the agent instance that should handle it.
 
         Routing logic (in priority order):
@@ -795,13 +795,43 @@ class Gateway:
         coordinator.
         """
         if event.agent_id is not None:
-            return self._runtime.get_or_create_agent(event.agent_id)
+            return self._get_or_load_validated_agent(event.agent_id)
 
         persisted_ids = self._runtime.sessions.list_agent_ids()
         if persisted_ids:
-            return self._runtime.get_or_create_agent(persisted_ids[0])
+            return self._get_or_load_validated_agent(persisted_ids[0])
 
-        return self._runtime.get_or_create_agent(_DEFAULT_AGENT_ID)
+        return self._get_or_load_validated_agent(_DEFAULT_AGENT_ID)
+
+    def _get_or_load_validated_agent(self, agent_id: AgentID) -> Agent:
+        """Return the gateway-owned validated agent instance for *agent_id*.
+
+        ``SessionStore.load_agent`` intentionally deserializes accounts
+        as ``UntypedAccountConfig`` because service schemas are not known
+        at parse time.  Gateway startup validates persisted agents before
+        schedulers use them, so routing must prefer that in-memory
+        scheduler instance over a fresh store load.  Otherwise forge
+        tools can see untyped accounts even though startup validation
+        succeeded.
+        """
+        existing_scheduler = self._schedulers.get(agent_id)
+        if existing_scheduler is not None:
+            return existing_scheduler.agent
+
+        agent = self._runtime.get_or_create_agent(agent_id)
+        if not self._started and not self._schedulers:
+            # Unit tests and diagnostic callers sometimes ask the
+            # router what it *would* pick before gateway startup has
+            # registered services and validated accounts.  The real
+            # event path runs after startup, where either the scheduler
+            # branch above returns the validated instance or the
+            # validation below surfaces a configuration error.
+            return agent
+
+        from thorn.core._account import validate_agent_accounts
+
+        validate_agent_accounts(agent, self._runtime.get_service)
+        return agent
 
     async def _handle_event(self, event: RawIncomingEvent) -> None:
         """Apply the trigger-authorization policy and dispatch on success.
