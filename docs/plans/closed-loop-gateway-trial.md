@@ -155,6 +155,12 @@ agent's `run_shell("git clone ...")` path uses whatever the host git
 configuration and exported environment provide.  Do not put PATs in
 `gateway.json`, `MEMORY.md`, issue text, branch names, or clone URLs
 that the agent can later echo into logs or commits.
+In the `gitlab-master.nvidia.com` preflight, the subprocess-mode
+scaffold forces bot git authentication through a `GIT_ASKPASS` helper
+that reads `THORN_LOOP_GITLAB_TOKEN` and clears inherited credential
+helpers for the gateway process.  This keeps agent shell git operations
+on the bot identity instead of silently using the simulated user's saved
+git credentials.
 
 ## CLI for simulated user actions
 
@@ -162,6 +168,17 @@ Preferred tool: `glab`.
 
 Current local observation: `glab` was not on `PATH` when this plan was
 drafted.  Treat it as an environment dependency, not an assumption.
+On the Ubuntu 24.04 trial host, `glab` 1.36.0 was installed from the
+Ubuntu package repo.  It authenticated successfully, but path-based
+commands such as `glab repo view tfoley/tasknote` and
+`glab mr view <iid>` returned 404s for the nested project path even
+though direct API calls worked.  For this trial, prefer numeric project
+ID calls such as:
+
+```console
+$ glab api 'projects/307988/merge_requests/1' \
+    --hostname gitlab-master.nvidia.com
+```
 
 Useful setup shape:
 
@@ -186,6 +203,13 @@ If `glab` is unavailable or unreliable against
 `gitlab-master.nvidia.com`, use a small `python-gitlab` wrapper script
 for the simulated-user side.  Keep that wrapper outside Thorn's agent
 tool surface; it is the human/operator harness, not a Thorn feature.
+On this host, `python-gitlab` / `requests` also needed the system CA
+bundle exposed explicitly:
+
+```console
+$ export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+$ export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+```
 
 The fallback wrapper should support only the experiment operations:
 
