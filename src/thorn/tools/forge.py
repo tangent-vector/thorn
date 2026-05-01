@@ -17,6 +17,39 @@ Architecture:
 
     ForgeHostService (Service)  -- GitLabForgeService or GitHubForgeService
     ProjectService (Service)  -- represents a project on a forge
+
+In-process execution and untrusted-data hygiene
+-----------------------------------------------
+
+``FORGE_TOOLS`` are venue-tagged ``IN_PROCESS`` (see
+``thorn.tools._catalog``) because they need brain-side runtime
+state -- the service registry and the agency's credential broker --
+that the toolhost daemon's ``ExecutionContext`` does not have.  This
+means agent-supplied arguments reach this module's Python code
+directly, rather than being marshaled through the daemon's RPC
+boundary first.
+
+Argument-handling discipline reviewed against this venue choice:
+
+- No ``subprocess`` / ``os.system`` / ``shell=True`` usage; all
+  network access goes through ``pygithub`` / ``python-gitlab``,
+  which URL-quote their own parameters.
+- No ``eval`` / ``exec`` / ``compile``.
+- No local filesystem writes, and no local reads driven by
+  agent-supplied paths.  ``forge_read_file(file_path)`` sends
+  ``file_path`` to the *remote* forge API; it is a key into the
+  remote repository, not a local path.
+- No logging of agent-supplied values, so no risk of leaking
+  credentials or PII via log capture.
+- The ``project`` argument is resolved through
+  ``runtime.get_service(...)``, which raises if the operator has
+  not declared that name; agents cannot point a forge tool at an
+  arbitrary URL.
+
+Anything added to this module that does perform shell, filesystem,
+or eval-shaped work must either re-validate its inputs explicitly or
+convince itself that it can keep this discipline; the venue tag is
+not a substitute for the per-tool review.
 """
 
 from __future__ import annotations
@@ -39,6 +72,7 @@ from thorn.core._brokering import (
 )
 from thorn.core._context import get_context
 from thorn.core._credentials import ServiceCredential
+from thorn.core._executor import ToolVenue
 from thorn.core._func import tool
 from thorn.core._service import Service
 from thorn.tools._github_connection import (
@@ -770,9 +804,9 @@ class GitLabForgeService(ForgeHostService):
         Host pattern is the GitLab instance's hostname (the same
         host serves the API and the git endpoints, so a single
         registration covers both).  Path pattern is restricted to
-        ``/api/*`` because git HTTPS auth is handled separately via
-        ``GIT_CONFIG_*`` env vars (see :mod:`thorn.tools.git`); we
-        only want OneCLI substituting on REST calls.
+        ``/api/*`` because git HTTPS auth is handled separately by
+        the credential broker's git-helper integration; we only want
+        OneCLI substituting on REST calls here.
         """
         from urllib.parse import urlparse
 
@@ -894,8 +928,8 @@ class GitHubForgeService(ForgeHostService):
         GitHub.com, otherwise the host from ``base_url``).  GitHub
         Enterprise serves the API under ``/api/v3/`` on the bare
         host; we register the API host so OneCLI matches just the
-        REST traffic, with git HTTPS auth handled separately via
-        ``GIT_CONFIG_*`` env vars (see :mod:`thorn.tools.git`).
+        REST traffic, with git HTTPS auth handled separately by the
+        credential broker's git-helper integration.
         """
         from urllib.parse import urlparse
 
@@ -1350,7 +1384,7 @@ def _resolve(project: str) -> tuple[ForgeClient, str]:
     return client, native_id
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_read_issue(project: str, issue_id: int) -> str:
     """Read an issue from a project.
 
@@ -1386,7 +1420,7 @@ async def forge_read_issue(project: str, issue_id: int) -> str:
     return "\n".join(lines)
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_create_issue(
     project: str,
     title: str,
@@ -1420,7 +1454,7 @@ async def forge_create_issue(
     return "\n".join(lines)
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_list_issues(
     project: str,
     state: IssueState = "open",
@@ -1448,7 +1482,7 @@ async def forge_list_issues(
     return "\n".join([header, *lines])
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_update_issue(
     project: str,
     issue_id: int,
@@ -1504,7 +1538,7 @@ async def forge_update_issue(
     return "\n".join(lines)
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_post_comment(
     project: str,
     target_type: CommentTargetKind,
@@ -1526,7 +1560,7 @@ async def forge_post_comment(
     )
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_create_change_request(
     project: str,
     source_branch: str,
@@ -1555,7 +1589,7 @@ async def forge_create_change_request(
     )
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_get_change_request(project: str, cr_id: int) -> str:
     """Read details of a change request (merge request / pull request).
 
@@ -1587,7 +1621,7 @@ async def forge_get_change_request(project: str, cr_id: int) -> str:
     return "\n".join(lines)
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_list_change_requests(
     project: str,
     state: ChangeRequestState = "open",
@@ -1613,7 +1647,7 @@ async def forge_list_change_requests(
     return "\n".join([header, *lines])
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_list_comments(
     project: str,
     target_type: CommentTargetKind,
@@ -1661,7 +1695,7 @@ async def forge_list_comments(
     return "\n".join(lines).rstrip() + "\n"
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_get_project_info(project: str) -> str:
     """Get information about a project.
 
@@ -1683,7 +1717,7 @@ async def forge_get_project_info(project: str) -> str:
     return "\n".join(lines)
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_read_file(
     project: str,
     file_path: str,
@@ -1701,7 +1735,7 @@ async def forge_read_file(
     return f"--- {info['file_path']} (ref: {info['ref']}) ---\n{info['content']}"
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def forge_mark_notification_done(
     project: str,
     notification_id: str,

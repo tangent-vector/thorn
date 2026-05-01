@@ -4,9 +4,9 @@ This package provides both the built-in file/search tools (re-exported from
 ``thorn.core._tools``) and domain-specific toolsets as submodules:
 
 - ``thorn.tools.forge``  -- Unified forge abstraction (GitLab + GitHub)
-- ``thorn.tools.git``    -- Git subprocess operations
-- ``thorn.tools.github`` -- GitHub API operations (requires ``thorn[github]``)
-- ``thorn.tools.gitlab`` -- GitLab API operations (requires ``thorn[gitlab]``)
+- ``thorn.tools.github`` -- GitHub API client wrapper (requires ``thorn[github]``)
+- ``thorn.tools.gitlab`` -- GitLab API client wrapper (requires ``thorn[gitlab]``)
+- ``thorn.tools.peers``  -- Peer-registry lookup tools
 
 Built-in tools are available directly::
 
@@ -15,9 +15,17 @@ Built-in tools are available directly::
 Domain-specific toolsets are imported as submodules::
 
     from thorn.tools import forge    # unified forge abstraction
-    from thorn.tools import git
     from thorn.tools import github   # requires PyGithub
     from thorn.tools import gitlab   # requires python-gitlab
+    from thorn.tools import peers
+
+Git operations no longer have a dedicated tool surface: agents drive
+``git`` (and ``gh`` / ``glab``, where the operator has provisioned
+them) via :func:`thorn.core._tools.run_shell` inside the sandbox.
+Maintaining a parallel Python wrapper for ``git`` got us nothing
+beyond a second API to keep in sync with the real binary, and any
+operation an agent might want to do is already expressible as the
+same shell command a human collaborator would type.
 
 ``run_shell`` is intentionally omitted from the default exports.
 Import it explicitly from ``thorn.core._tools`` if you need it::

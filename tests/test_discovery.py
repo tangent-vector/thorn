@@ -16,6 +16,7 @@ import textwrap
 from pathlib import Path
 
 from thorn.core._discovery import discover_tools
+from thorn.core._executor import ToolVenue
 from thorn.core._func import tool
 
 
@@ -25,15 +26,35 @@ from thorn.core._func import tool
 
 class TestToolDecorator:
     def test_marks_function(self):
-        @tool
+        @tool(venue=ToolVenue.SANDBOX)
         def my_fn(x: int) -> int:
             """Double x."""
             return x * 2
 
         assert getattr(my_fn, "_thorn_tool", False) is True
 
+    def test_stamps_venue(self):
+        @tool(venue=ToolVenue.IN_PROCESS)
+        def my_fn(x: int) -> int:
+            """Double x."""
+            return x * 2
+
+        assert getattr(my_fn, "_thorn_venue", None) is ToolVenue.IN_PROCESS
+
+    def test_requires_venue_keyword(self):
+        # ``@tool`` (no parens) is no longer accepted -- every tool
+        # author must pick a venue, and a silent default is exactly
+        # the failure mode we are guarding against.
+        import pytest
+
+        with pytest.raises(TypeError):
+            @tool
+            def my_fn() -> str:
+                """No venue."""
+                return ""
+
     def test_preserves_behavior(self):
-        @tool
+        @tool(venue=ToolVenue.SANDBOX)
         def add(a: int, b: int) -> int:
             """Add two numbers."""
             return a + b
@@ -41,7 +62,7 @@ class TestToolDecorator:
         assert add(3, 4) == 7
 
     def test_preserves_metadata(self):
-        @tool
+        @tool(venue=ToolVenue.SANDBOX)
         def named_fn(x: str) -> str:
             """A docstring."""
             return x
@@ -50,7 +71,7 @@ class TestToolDecorator:
         assert named_fn.__doc__ == "A docstring."
 
     async def test_works_with_async(self):
-        @tool
+        @tool(venue=ToolVenue.SANDBOX)
         async def async_fn(x: int) -> int:
             """Async double."""
             return x * 2
@@ -77,8 +98,9 @@ class TestDiscoverTools:
         tool_dir.mkdir(parents=True)
         (tool_dir / "tools.py").write_text(textwrap.dedent("""\
             from thorn import tool
+            from thorn.core._executor import ToolVenue
 
-            @tool
+            @tool(venue=ToolVenue.SANDBOX)
             def ping() -> str:
                 \"\"\"Ping.\"\"\"
                 return "pong"
@@ -99,8 +121,9 @@ class TestDiscoverTools:
         for d in [parent_tools, child_tools]:
             (d / "tools.py").write_text(textwrap.dedent("""\
                 from thorn import tool
+                from thorn.core._executor import ToolVenue
 
-                @tool
+                @tool(venue=ToolVenue.SANDBOX)
                 def ping() -> str:
                     \"\"\"Ping.\"\"\"
                     return "pong"
@@ -116,16 +139,18 @@ class TestDiscoverTools:
 
         (tool_dir / "a.py").write_text(textwrap.dedent("""\
             from thorn import tool
+            from thorn.core._executor import ToolVenue
 
-            @tool
+            @tool(venue=ToolVenue.SANDBOX)
             def alpha() -> str:
                 \"\"\"Alpha.\"\"\"
                 return "a"
         """))
         (tool_dir / "b.py").write_text(textwrap.dedent("""\
             from thorn import tool
+            from thorn.core._executor import ToolVenue
 
-            @tool
+            @tool(venue=ToolVenue.SANDBOX)
             def beta() -> str:
                 \"\"\"Beta.\"\"\"
                 return "b"
@@ -142,8 +167,9 @@ class TestDiscoverTools:
 
         (tool_dir / "good.py").write_text(textwrap.dedent("""\
             from thorn import tool
+            from thorn.core._executor import ToolVenue
 
-            @tool
+            @tool(venue=ToolVenue.SANDBOX)
             def works() -> str:
                 \"\"\"Works.\"\"\"
                 return "yes"
@@ -168,17 +194,19 @@ class TestDiscoverTools:
 
         (tool_dir / "helpers.py").write_text(textwrap.dedent("""\
             from thorn import tool
+            from thorn.core._executor import ToolVenue
 
-            @tool
+            @tool(venue=ToolVenue.SANDBOX)
             def helper_add(a: int, b: int) -> int:
                 \"\"\"Add two numbers.\"\"\"
                 return a + b
         """))
         (tool_dir / "main_tools.py").write_text(textwrap.dedent("""\
             from thorn import tool
+            from thorn.core._executor import ToolVenue
             from .helpers import helper_add
 
-            @tool
+            @tool(venue=ToolVenue.SANDBOX)
             def add_and_double(a: int, b: int) -> int:
                 \"\"\"Add two numbers and double the result.\"\"\"
                 return helper_add(a, b) * 2
@@ -196,8 +224,9 @@ class TestDiscoverTools:
         thorn_dir.mkdir()
         (thorn_dir / "tools.py").write_text(textwrap.dedent("""\
             from thorn import tool
+            from thorn.core._executor import ToolVenue
 
-            @tool
+            @tool(venue=ToolVenue.SANDBOX)
             def old_tool() -> str:
                 \"\"\"Should not be found.\"\"\"
                 return "nope"

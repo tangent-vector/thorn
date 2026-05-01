@@ -19,7 +19,6 @@ from typing import Any, ClassVar
 from thorn.core._agent import Agent
 from thorn.core._tools import FILE_READING, FILE_WRITING, run_shell
 from thorn.tools.forge import FORGE_TOOLS
-from thorn.tools.git import GIT_TOOLS
 from thorn.tools.peers import PEER_TOOLS
 
 
@@ -176,15 +175,20 @@ The workspace persists across turns of a session, so it may already \
 contain the project from earlier work:
 
 - **Empty workspace** — clone the project into the workspace root \
-(`git_clone(url, ".")`).
+(`run_shell("git clone <url> .")`).
 - **Workspace already contains the project's checkout** — use the \
-existing checkout. Bring it up to date with `git_fetch` / `git_pull` \
-and switch to the branch you want with `git_branch` or shell-level \
-`git checkout` rather than re-cloning.
+existing checkout. Bring it up to date with `git fetch` / `git pull` \
+and switch to the branch you want with `git checkout` rather than \
+re-cloning.
 
-`git_clone` will fail loudly if you ask it to clone into a directory \
+`git clone` will fail loudly if you ask it to clone into a directory \
 that already contains files; treat that as a signal to use the \
 existing checkout instead.
+
+All git operations are driven through `run_shell` rather than through \
+dedicated git tools — the same `git`, `gh`, and `glab` binaries a \
+human collaborator would use are available inside your sandbox, and \
+you should drive them the same way.
 
 **Branch naming**: `thorn/issue-<iid>` (or `thorn/<descriptive-slug>` \
 for work not tied to a single issue).
@@ -207,11 +211,12 @@ the default branch.
 5. Build and test your changes using run_shell (e.g. \
 `run_shell("cmake --build build && ctest")` or whatever the project's \
 build system requires). Fix any failures before proceeding.
-6. Stage your changes with git_add (omit paths to stage everything, \
-or pass specific file paths when you want a narrow stage).
-7. Commit with git_commit. If the result mentions remaining unstaged \
-or untracked files, address them or stage them before pushing.
-8. Push the branch with git_push.
+6. Stage your changes with `run_shell("git add -A")` (or pass \
+specific file paths when you want a narrow stage).
+7. Commit with `run_shell("git commit -m '<message>'")`. After \
+committing, run `git status` to confirm there are no remaining \
+unstaged or untracked files; address or stage them before pushing.
+8. Push the branch with `run_shell("git push -u origin <branch>")`.
 9. Create a change request with forge_create_change_request.
 10. Post a comment on the original issue linking to the change \
 request. In the description or your comment, mention that reviewers \
@@ -235,8 +240,8 @@ triggered it — prior review comments are only visible through \
 3. Your workspace should already contain the clone from when you \
 created the change request. Fetch the latest changes and check out \
 the branch you were working on.
-4. Make the requested changes, stage with git_add, commit with \
-git_commit, then push to the **same branch** — do not create a new \
+4. Make the requested changes, stage with `git add`, commit with \
+`git commit`, then push to the **same branch** — do not create a new \
 branch or a new change request.
 5. Post a comment on the change request summarizing what you changed.
 6. Write a journal entry noting the feedback you addressed.
@@ -325,10 +330,15 @@ class GatewayAgent(Agent):
 class ProjectCoordinator(GatewayAgent):
     """Persistent agent responsible for managing a software project.
 
-    Combines forge-neutral API tools, git tools, and file I/O tools so
-    that it can process incoming events end-to-end: from reading an
-    issue to opening a change request.  Works with any supported forge
-    backend (GitLab, GitHub) through the unified ``FORGE_TOOLS`` toolset.
+    Combines forge-neutral API tools and file I/O tools so that it can
+    process incoming events end-to-end: from reading an issue to
+    opening a change request.  Works with any supported forge backend
+    (GitLab, GitHub) through the unified ``FORGE_TOOLS`` toolset.  Git
+    operations are performed via ``run_shell`` invoking ``git`` inside
+    the agent's sandbox, rather than through dedicated git tools --
+    that keeps repository mutation work where the rest of the agent's
+    shell-based work lives and avoids duplicating git's CLI surface as
+    a parallel tool API.
 
     Inherits the gateway-wide trust-model guidance from
     :class:`GatewayAgent`; the role-specific prompt below builds on
@@ -342,7 +352,6 @@ class ProjectCoordinator(GatewayAgent):
     system_prompts: ClassVar[list[Any]] = [_COORDINATOR_SYSTEM_PROMPT]
     tools: ClassVar[list[Any]] = [
         FORGE_TOOLS,
-        GIT_TOOLS,
         FILE_READING,
         FILE_WRITING,
         run_shell,

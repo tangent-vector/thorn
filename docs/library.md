@@ -12,15 +12,18 @@ that flexibly mix deterministic code with AI prompts.
 Defining Tools
 --------------
 
-Decorate an ordinary Python function with `@tool` to make it available to agents as a tool:
+Decorate an ordinary Python function with `@tool(venue=...)` to make it available to agents as a tool. The `venue` keyword tells Thorn whether the tool should execute inside the agent's sandbox (`ToolVenue.SANDBOX`, the conservative default for anything that takes untrusted arguments) or in the brain process (`ToolVenue.IN_PROCESS`, for tools that need access to runtime state like the agency's services or the credential broker). There is no default; every tool author must pick.
 
 ```python
-@tool
+from thorn import tool
+from thorn.core._executor import ToolVenue
+
+@tool(venue=ToolVenue.SANDBOX)
 def build_project() -> None:
     """Build the project. If the build fails, the response will include a summary of diagnostic messages."""
     ...
 
-@tool
+@tool(venue=ToolVenue.SANDBOX)
 def list_contributors_currently_active_on_slack() -> list[str]:
     """List the (human) project contributors who are currently online/active on Slack."""
     ...
@@ -183,12 +186,15 @@ Any `.py` files in a `.agents/thorn/` directory are automatically loaded, and an
 As an example, if you have defined a file `.agents/thorn/dev_tools.py` in your repository, and it contains:
 
 ```python
-@tool
+from thorn import tool
+from thorn.core._executor import ToolVenue
+
+@tool(venue=ToolVenue.SANDBOX)
 def build_project() -> None:
     """Build the project. ..."""
     ...
 
-@tool
+@tool(venue=ToolVenue.SANDBOX)
 def run_tests() -> None:
     """Run the test suite. ..."""
     ...

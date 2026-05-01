@@ -19,6 +19,7 @@ from thorn.core._provider import (
 )
 from thorn.core._retry import RetryPolicy
 from thorn.core._validation_tracker import ValidationTracker
+from thorn.core._executor import ToolVenue
 from thorn.core.errors import (
     AgentFailureError,
     LoopLimitError,
@@ -67,7 +68,7 @@ class TestTextMode:
             call_log.append((a, b))
             return a + b
 
-        tool = wrap_function(add)
+        tool = wrap_function(add, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "add", '{"a": 3, "b": 4}'),
             _text_response("The sum is 7"),
@@ -108,7 +109,7 @@ class TestTextMode:
             """Blow up."""
             raise ValueError("kaboom")
 
-        tool = wrap_function(boom)
+        tool = wrap_function(boom, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "boom", "{}"),
             _text_response("that failed"),
@@ -192,7 +193,7 @@ class TestStructuredMode:
             """Count words."""
             return len(text.split())
 
-        tool = wrap_function(count_words)
+        tool = wrap_function(count_words, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "count_words", '{"text": "one two three"}'),
             _tool_call_response("c2", "return_result", '{"value": 3}'),
@@ -240,7 +241,7 @@ class TestToolNameNormalization:
             """Read a file."""
             return "contents"
 
-        tool = wrap_function(read_file)
+        tool = wrap_function(read_file, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "read-file", '{"path": "x.txt"}'),
             _text_response("got it"),
@@ -279,7 +280,7 @@ class TestValidationFooter:
             """Say hello."""
             return f"Hello, {name}!"
 
-        wrapped = wrap_function(greet)
+        wrapped = wrap_function(greet, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "greet", '{"name": "world"}'),
             _text_response("done"),
@@ -309,7 +310,7 @@ class TestValidationFooter:
             """Say hello."""
             return f"Hello, {name}!"
 
-        wrapped = wrap_function(greet)
+        wrapped = wrap_function(greet, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "greet", '{"name": "world"}'),
             _text_response("done"),
@@ -343,7 +344,7 @@ class TestValidationFooter:
             """Do nothing."""
             return "ok"
 
-        wrapped = wrap_function(noop)
+        wrapped = wrap_function(noop, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "noop", "{}"),
             _text_response("done"),
@@ -377,8 +378,8 @@ class TestValidationFooter:
             """Tool two."""
             return "result2"
 
-        w1 = wrap_function(t1)
-        w2 = wrap_function(t2)
+        w1 = wrap_function(t1, venue=ToolVenue.SANDBOX)
+        w2 = wrap_function(t2, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             [
                 ToolCallChunk(call_id="c1", name="t1", arguments="{}"),
@@ -693,7 +694,7 @@ class TestMultiProvider:
             """Noop."""
             return "ok"
 
-        wrapped = wrap_function(noop)
+        wrapped = wrap_function(noop, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "noop", "{}"),
             _text_response("done"),
@@ -728,7 +729,7 @@ class TestMultiProvider:
             """Noop."""
             return "ok"
 
-        wrapped = wrap_function(noop)
+        wrapped = wrap_function(noop, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "noop", "{}"),
             _text_response("done"),

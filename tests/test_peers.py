@@ -655,7 +655,10 @@ class TestPeerByAccountTool:
         assert isinstance(result, Peer)
         assert result.id == "alice"
         assert result.name == "Alice Anders"
-        assert result.kind is PeerKind.HUMAN
+        # Public ``Peer.kind`` is a Literal["human", "bot"] string,
+        # not the internal ``PeerKind`` enum (see the import block in
+        # thorn.tools.peers for the cycle-breaking rationale).
+        assert result.kind == "human"
 
     async def test_textual_handle_match(self, peer_ctx: ExecutionContext) -> None:
         result = await peer_by_account("gitlab", "alice-gl")
@@ -720,7 +723,7 @@ class TestListPeersTool:
     ) -> None:
         results = await list_peers()
         bot = next(p for p in results if p.id == "dependabot")
-        assert bot.kind is PeerKind.BOT
+        assert bot.kind == "bot"
 
 
 class TestPeerCrossConfigValidation:

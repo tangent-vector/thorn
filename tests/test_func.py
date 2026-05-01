@@ -6,6 +6,7 @@ import pytest
 
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
+from thorn.core._executor import ToolVenue
 from thorn.core._func import _prepare_tools, prompt, skill, tool, wrap_function
 from thorn.core._history import DirectoryListCallNode, FileReadCallNode, ToolCallNode
 from thorn.core._loop import _WrappedTool
@@ -28,7 +29,7 @@ class TestWrapFunction:
             """Multiply two numbers."""
             return a * b
 
-        tool = wrap_function(multiply)
+        tool = wrap_function(multiply, venue=ToolVenue.SANDBOX)
         assert tool.schema["function"]["name"] == "multiply"
         assert "a" in tool.schema["function"]["parameters"]["properties"]
 
@@ -37,7 +38,7 @@ class TestWrapFunction:
             """Multiply two numbers."""
             return a * b
 
-        tool = wrap_function(multiply)
+        tool = wrap_function(multiply, venue=ToolVenue.SANDBOX)
         result = await tool.execute(a=3, b=7)
         assert result == "21"
 
@@ -46,7 +47,7 @@ class TestWrapFunction:
             """Fetch a URL."""
             return f"data from {url}"
 
-        tool = wrap_function(fetch)
+        tool = wrap_function(fetch, venue=ToolVenue.SANDBOX)
         result = await tool.execute(url="http://example.com")
         assert result == "data from http://example.com"
 
@@ -55,7 +56,7 @@ class TestWrapFunction:
             """Get info."""
             return {"status": "ok", "count": 3}
 
-        tool = wrap_function(info)
+        tool = wrap_function(info, venue=ToolVenue.SANDBOX)
         result = await tool.execute()
         import json
         assert json.loads(result) == {"status": "ok", "count": 3}
@@ -66,7 +67,7 @@ class TestWrapFunction:
             """Apply edits."""
             return ", ".join(f"{e.old}->{e.new}" for e in edits)
 
-        tool = wrap_function(apply_edits)
+        tool = wrap_function(apply_edits, venue=ToolVenue.SANDBOX)
         result = await tool.execute(
             edits=[{"old": "foo", "new": "bar"}, {"old": "a", "new": "b"}],
         )
@@ -105,7 +106,7 @@ class TestPrepareTools:
             """Greet someone."""
             return f"hi {name}"
 
-        wrapped = wrap_function(greet)
+        wrapped = wrap_function(greet, venue=ToolVenue.SANDBOX)
         result = _prepare_tools([wrapped])
         assert result == [wrapped]
 
@@ -114,7 +115,7 @@ class TestPrepareTools:
             """Nothing."""
             return ""
 
-        already = wrap_function(noop)
+        already = wrap_function(noop, venue=ToolVenue.SANDBOX)
         result = _prepare_tools([already])
         assert result[0] is already
 
@@ -123,8 +124,8 @@ class TestPrepareTools:
             """A."""
             return "a"
 
-        fn_b_wrapped = wrap_function(fn_a)
-        result = _prepare_tools([wrap_function(fn_a), fn_b_wrapped])
+        fn_b_wrapped = wrap_function(fn_a, venue=ToolVenue.SANDBOX)
+        result = _prepare_tools([wrap_function(fn_a, venue=ToolVenue.SANDBOX), fn_b_wrapped])
         assert len(result) == 2
 
     def test_non_callable_raises(self):
@@ -145,7 +146,7 @@ class TestPrepareTools:
             return "c"
 
         result = _prepare_tools(
-            [[wrap_function(fn_a), wrap_function(fn_b)], wrap_function(fn_c)],
+            [[wrap_function(fn_a, venue=ToolVenue.SANDBOX), wrap_function(fn_b, venue=ToolVenue.SANDBOX)], wrap_function(fn_c, venue=ToolVenue.SANDBOX)],
         )
         assert len(result) == 3
         names = [t.schema["function"]["name"] for t in result]
@@ -156,7 +157,7 @@ class TestPrepareTools:
             """A."""
             return "a"
 
-        result = _prepare_tools([[[wrap_function(fn_a)]]])
+        result = _prepare_tools([[[wrap_function(fn_a, venue=ToolVenue.SANDBOX)]]])
         assert len(result) == 1
         assert result[0].schema["function"]["name"] == "fn_a"
 
@@ -165,7 +166,7 @@ class TestPrepareTools:
             """A."""
             return "a"
 
-        result = _prepare_tools([[], wrap_function(fn_a), []])
+        result = _prepare_tools([[], wrap_function(fn_a, venue=ToolVenue.SANDBOX), []])
         assert len(result) == 1
 
     def test_tuple_flattened(self):
@@ -177,7 +178,7 @@ class TestPrepareTools:
             """B."""
             return "b"
 
-        result = _prepare_tools([(wrap_function(fn_a), wrap_function(fn_b))])
+        result = _prepare_tools([(wrap_function(fn_a, venue=ToolVenue.SANDBOX), wrap_function(fn_b, venue=ToolVenue.SANDBOX))])
         assert len(result) == 2
 
     def test_nested_non_callable_raises(self):
@@ -193,8 +194,8 @@ class TestPrepareTools:
             """B."""
             return "b"
 
-        wrapped_b = wrap_function(fn_b)
-        result = _prepare_tools([[wrap_function(fn_a)], wrapped_b])
+        wrapped_b = wrap_function(fn_b, venue=ToolVenue.SANDBOX)
+        result = _prepare_tools([[wrap_function(fn_a, venue=ToolVenue.SANDBOX)], wrapped_b])
         assert len(result) == 2
         assert result[1] is wrapped_b
 
@@ -204,16 +205,24 @@ class TestPrepareTools:
 # ---------------------------------------------------------------------------
 
 class TestToolDecorator:
-    def test_bare_decorator_sets_marker(self):
-        @tool
+    def test_decorator_sets_marker(self):
+        @tool(venue=ToolVenue.SANDBOX)
         def my_tool() -> str:
             """Do something."""
             return "done"
 
         assert my_tool._thorn_tool is True
 
-    def test_bare_decorator_no_call_node_class(self):
-        @tool
+    def test_decorator_stamps_venue(self):
+        @tool(venue=ToolVenue.IN_PROCESS)
+        def my_tool() -> str:
+            """Do something."""
+            return "done"
+
+        assert my_tool._thorn_venue is ToolVenue.IN_PROCESS
+
+    def test_decorator_no_call_node_class(self):
+        @tool(venue=ToolVenue.SANDBOX)
         def my_tool() -> str:
             """Do something."""
             return "done"
@@ -221,7 +230,7 @@ class TestToolDecorator:
         assert not hasattr(my_tool, "_thorn_call_node_class")
 
     def test_parameterized_sets_marker_and_class(self):
-        @tool(call_node_class=FileReadCallNode)
+        @tool(venue=ToolVenue.SANDBOX, call_node_class=FileReadCallNode)
         def my_reader(path: str) -> str:
             """Read something."""
             return "content"
@@ -229,17 +238,25 @@ class TestToolDecorator:
         assert my_reader._thorn_tool is True
         assert my_reader._thorn_call_node_class is FileReadCallNode
 
-    def test_parameterized_no_class_sets_marker_only(self):
-        @tool()
-        def my_tool() -> str:
-            """Do something."""
-            return "done"
+    def test_bare_decorator_rejected(self):
+        # @tool (no parens) is no longer accepted: every tool author
+        # must pick a venue, with no silent default.
+        with pytest.raises(TypeError):
+            @tool
+            def my_tool() -> str:
+                """No venue."""
+                return "x"
 
-        assert my_tool._thorn_tool is True
-        assert not hasattr(my_tool, "_thorn_call_node_class")
+    def test_decorator_without_venue_rejected(self):
+        # @tool() without a venue keyword is also rejected.
+        with pytest.raises(TypeError):
+            @tool()
+            def my_tool() -> str:
+                """No venue."""
+                return "x"
 
     def test_preserves_function_identity(self):
-        @tool(call_node_class=FileReadCallNode)
+        @tool(venue=ToolVenue.SANDBOX, call_node_class=FileReadCallNode)
         def my_fn() -> str:
             """Test."""
             return "x"
@@ -259,7 +276,7 @@ class TestWrapFunctionCallNodeClass:
             return "content"
         my_reader._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
 
-        wrapped = wrap_function(my_reader)
+        wrapped = wrap_function(my_reader, venue=ToolVenue.SANDBOX)
         assert wrapped.call_node_class is FileReadCallNode
 
     def test_no_attribute_defaults_to_none(self):
@@ -267,7 +284,7 @@ class TestWrapFunctionCallNodeClass:
             """Double."""
             return x * 2
 
-        wrapped = wrap_function(plain)
+        wrapped = wrap_function(plain, venue=ToolVenue.SANDBOX)
         assert wrapped.call_node_class is None
 
     def test_prepare_tools_preserves_call_node_class(self):
@@ -276,7 +293,7 @@ class TestWrapFunctionCallNodeClass:
             return "content"
         my_reader._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
 
-        result = _prepare_tools([wrap_function(my_reader)])
+        result = _prepare_tools([wrap_function(my_reader, venue=ToolVenue.SANDBOX)])
         assert len(result) == 1
         assert result[0].call_node_class is FileReadCallNode
 
@@ -286,7 +303,7 @@ class TestWrapFunctionCallNodeClass:
             return "content"
         my_reader._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
 
-        already_wrapped = wrap_function(my_reader)
+        already_wrapped = wrap_function(my_reader, venue=ToolVenue.SANDBOX)
         result = _prepare_tools([already_wrapped])
         assert result[0] is already_wrapped
         assert result[0].call_node_class is FileReadCallNode
@@ -312,7 +329,7 @@ class TestPromptTextMode:
             """Help."""
             return "helped"
 
-        result = await prompt("use helper", tools=[wrap_function(helper)])
+        result = await prompt("use helper", tools=[wrap_function(helper, venue=ToolVenue.SANDBOX)])
         assert isinstance(result, str)
 
 
@@ -402,7 +419,7 @@ class TestSkillDecorator:
             """Double."""
             return x * 2
 
-        @skill(tools=[wrap_function(helper)])
+        @skill(tools=[wrap_function(helper, venue=ToolVenue.SANDBOX)])
         async def compute(n: int) -> str:
             """Compute something with {n}."""
 
@@ -488,7 +505,7 @@ class TestPromptWithRole:
         class Helper(Agent):
             system_prompts = ["You are helpful."]
 
-        result = await prompt("do it", role=Helper, tools=[wrap_function(extra)])
+        result = await prompt("do it", role=Helper, tools=[wrap_function(extra, venue=ToolVenue.SANDBOX)])
         assert isinstance(result, str)
 
     async def test_role_with_extra_system(self, ctx):

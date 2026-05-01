@@ -1778,16 +1778,16 @@ class TestProjectCoordinator:
         assert "forge_mark_notification_done" in tool_names
         assert "forge_get_project_info" in tool_names
 
-    def test_has_git_tools(self):
+    def test_has_no_dedicated_git_tools(self):
+        # Git operations are driven via run_shell, not through dedicated
+        # @tool wrappers; this guards the design choice from accidental
+        # regression by a future agent who reflexively re-adds GIT_TOOLS.
         from thorn.gateway._agents import ProjectCoordinator
 
         tools = ProjectCoordinator._collect_tools()
         tool_names = {getattr(t, "__name__", str(t)) for t in tools}
-        assert "git_clone" in tool_names
-        assert "git_push" in tool_names
-        assert "git_worktree_add" in tool_names
-        assert "git_add" in tool_names
-        assert "git_commit" in tool_names
+        assert "run_shell" in tool_names
+        assert not any(name.startswith("git_") for name in tool_names)
 
     def test_has_file_tools(self):
         from thorn.gateway._agents import ProjectCoordinator
@@ -1878,7 +1878,7 @@ class TestEndToEndWiring:
             "forge_read_issue", "forge_post_comment",
             "forge_create_change_request", "forge_mark_notification_done",
             "forge_get_project_info",
-            "git_clone", "git_push", "git_add", "git_commit", "git_worktree_add",
+            "run_shell",
             "read_file", "edit_file", "create_file",
         }
         assert required.issubset(tool_names), (

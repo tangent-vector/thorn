@@ -17,6 +17,7 @@ from thorn.core._history import HistoryTree, TurnNode, UserPromptNode
 from thorn.core._loop import run_agent_loop
 from thorn.core._messages import AssistantMessage, Message, ToolResultMessage, UserMessage
 from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
+from thorn.core._executor import ToolVenue
 
 
 def _text_response(text: str):
@@ -91,7 +92,7 @@ class TestRunAgentLoopHistory:
             """Double."""
             return x * 2
 
-        tool = wrap_function(double)
+        tool = wrap_function(double, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "double", '{"x": 5}'),
             _text_response("result is 10"),
@@ -251,7 +252,7 @@ class TestAgentPromptMessages:
 
         class MyRole(Agent):
             system_prompts = ["Role for {module}."]
-            tools = [wrap_function(capture)]
+            tools = [wrap_function(capture, venue=ToolVenue.SANDBOX)]
 
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "capture", "{}"),

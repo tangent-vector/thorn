@@ -39,6 +39,7 @@ from thorn.core._provider import (
     UsageChunk,
 )
 from thorn.core._func import wrap_function
+from thorn.core._executor import ToolVenue
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +312,7 @@ class TestPerformHousekeeping:
             journal_calls.append({"content": content})
             return "Journal entry appended."
 
-        wj_tool = wrap_function(write_journal)
+        wj_tool = wrap_function(write_journal, venue=ToolVenue.SANDBOX)
 
         provider = MockProvider(
             canned_responses=[
@@ -456,7 +457,7 @@ class TestHousekeepingInLoop:
             """A dummy tool."""
             return "ok"
 
-        tool = wrap_function(dummy_tool)
+        tool = wrap_function(dummy_tool, venue=ToolVenue.SANDBOX)
 
         # Build a history that's already large (to ensure compaction
         # can't bring it under the high watermark).
@@ -514,7 +515,7 @@ class TestHousekeepingInLoop:
             """A dummy tool."""
             return "ok"
 
-        tool = wrap_function(dummy_tool)
+        tool = wrap_function(dummy_tool, venue=ToolVenue.SANDBOX)
 
         # Small history that compaction can handle
         tree = _make_history(3)

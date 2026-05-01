@@ -49,6 +49,7 @@ from thorn.core._provider import (
     UsageChunk,
 )
 from thorn.core._func import wrap_function
+from thorn.core._executor import ToolVenue
 
 
 # ---------------------------------------------------------------------------
@@ -1130,7 +1131,7 @@ class TestCompactionIntegration:
             """Return lots of content."""
             return "a" * 10000
 
-        tool = wrap_function(big_tool)
+        tool = wrap_function(big_tool, venue=ToolVenue.SANDBOX)
 
         # Simulate: first call returns tool call, second returns text.
         # The usage on the tool-call round reports high prompt_tokens.
@@ -1222,7 +1223,7 @@ class TestCompactionIntegration:
             return "z" * 8000
 
         class BigReader(Agent):
-            tools = [wrap_function(big_read)]
+            tools = [wrap_function(big_read, venue=ToolVenue.SANDBOX)]
 
         responses = []
         for i in range(12):
@@ -1274,7 +1275,7 @@ class TestCallNodeClassIntegration:
 
         my_reader._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
 
-        wrapped = wrap_function(my_reader)
+        wrapped = wrap_function(my_reader, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "my_reader", '{"path": "x.py"}'),
             _text_response("done reading"),
@@ -1302,7 +1303,7 @@ class TestCallNodeClassIntegration:
             """Do something."""
             return "result"
 
-        wrapped = wrap_function(plain_tool)
+        wrapped = wrap_function(plain_tool, venue=ToolVenue.SANDBOX)
         provider = MockProvider(canned_responses=[
             _tool_call_response("c1", "plain_tool", "{}"),
             _text_response("finished"),
@@ -1355,7 +1356,7 @@ class TestCallNodeClassIntegration:
         await run_agent_loop(
             context=ctx,
             user_prompt="explore",
-            tools=[wrap_function(reader), wrap_function(lister), wrap_function(plain)],
+            tools=[wrap_function(reader, venue=ToolVenue.SANDBOX), wrap_function(lister, venue=ToolVenue.SANDBOX), wrap_function(plain, venue=ToolVenue.SANDBOX)],
             history=history,
         )
 

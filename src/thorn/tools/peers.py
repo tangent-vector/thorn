@@ -24,11 +24,29 @@ behaviour for "no peers configured."
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Literal
+
 from pydantic import BaseModel, Field
 
 from thorn.core._context import get_context
+from thorn.core._executor import ToolVenue
 from thorn.core._func import tool
-from thorn.gateway._peer import PeerKind, PeerRegistry, PeerSpec
+
+# Importing ``thorn.gateway._peer`` at module load time creates a
+# circular import: ``thorn.gateway/__init__.py`` re-exports
+# ``GatewayAgent`` (which imports ``PEER_TOOLS`` from this module),
+# so any code path that loads ``thorn.tools.peers`` cold and then
+# tries to reach into the gateway package fails halfway through.
+# We dodge the cycle by deferring the gateway imports to the function
+# bodies that actually need them (the registry-lookup helpers below)
+# and by using ``Literal`` rather than ``PeerKind`` for the public
+# ``Peer.kind`` field so the pydantic model can be constructed
+# without the enum class loaded.
+if TYPE_CHECKING:
+    from thorn.gateway._peer import PeerRegistry, PeerSpec
+
+
+PeerKindLiteral = Literal["human", "bot"]
 
 
 class PeerAccountView(BaseModel):
@@ -53,14 +71,21 @@ class PeerAccountView(BaseModel):
 class Peer(BaseModel):
     """Public shape returned by peer-lookup tools.
 
-    Mirrors :class:`PeerSpec` minus the operator-only fields.
-    Returned from every tool in this module so the agent has a
-    single shape to reason about.
+    Mirrors :class:`thorn.gateway.PeerSpec` minus the operator-only
+    fields.  Returned from every tool in this module so the agent
+    has a single shape to reason about.
+
+    The ``kind`` field is typed as ``Literal["human", "bot"]`` rather
+    than the internal ``PeerKind`` enum so that this module can be
+    loaded without dragging in ``thorn.gateway`` (see the import
+    block above for context on the cycle).
     """
 
     id: str = Field(description="Stable, write-once peer id.")
     name: str = Field(description="Current human-readable display name.")
-    kind: PeerKind = Field(description="Whether this peer is a human or a bot.")
+    kind: PeerKindLiteral = Field(
+        description="Whether this peer is a human or a bot.",
+    )
     accounts: list[PeerAccountView] = Field(
         default_factory=list,
         description="Per-service identities for this peer.",
@@ -68,11 +93,13 @@ class Peer(BaseModel):
 
 
 def _peer_view(spec: PeerSpec) -> Peer:
-    """Convert an internal :class:`PeerSpec` to the public :class:`Peer` shape."""
+    """Convert an internal ``PeerSpec`` to the public :class:`Peer` shape."""
     return Peer(
         id=spec.id,
         name=spec.name,
-        kind=spec.kind,
+        # ``PeerKind`` is a StrEnum; ``.value`` gives the string form
+        # ("human" / "bot") that the public ``Literal`` field accepts.
+        kind=spec.kind.value,
         accounts=[
             PeerAccountView(service=a.service, account_id=a.account_id)
             for a in spec.accounts
@@ -98,7 +125,7 @@ def _registry() -> PeerRegistry:
 # ---------------------------------------------------------------------------
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def peer_by_account(service: str, account_id: str) -> Peer | None:
     """Look up a peer by their account on a specific service.
 
@@ -123,7 +150,7 @@ async def peer_by_account(service: str, account_id: str) -> Peer | None:
     return _peer_view(spec)
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def find_peers_by_name(query: str) -> list[Peer]:
     """Search peers by display name (case-insensitive substring match).
 
@@ -140,7 +167,7 @@ async def find_peers_by_name(query: str) -> list[Peer]:
     return [_peer_view(spec) for spec in registry.find_by_name(query)]
 
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def list_peers() -> list[Peer]:
     """Return every peer the gateway knows about, sorted by id.
 

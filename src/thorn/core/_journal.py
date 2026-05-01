@@ -19,6 +19,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from thorn.core._executor import ToolVenue
 from thorn.core._func import tool
 from thorn.core._history import estimate_tokens
 
@@ -320,7 +321,7 @@ def _resolve_journal_directory() -> Path | None:
 # ---------------------------------------------------------------------------
 
 
-@tool
+@tool(venue=ToolVenue.SANDBOX)
 async def write_journal(content: str) -> str:
     """Append a timestamped entry to your personal journal.
 
@@ -348,7 +349,7 @@ async def write_journal(content: str) -> str:
     return f"Journal entry appended to {file_path.stem}."
 
 
-@tool
+@tool(venue=ToolVenue.SANDBOX)
 async def read_journal(date: str | None = None, days: int = 1) -> str:
     """Read entries from your personal journal.
 
@@ -385,12 +386,6 @@ async def read_journal(date: str | None = None, days: int = 1) -> str:
         return "No journal entries found."
 
     return "\n\n---\n\n".join(parts)
-
-
-from thorn.core._executor import ToolVenue as _ToolVenue
-
-write_journal._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
-read_journal._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
 
 
 JOURNAL_TOOLS: list = [write_journal, read_journal]

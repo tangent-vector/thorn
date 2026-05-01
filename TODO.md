@@ -13,6 +13,10 @@
 
 - need basic web acces tools for the agent
 
+- **Credential brokering for shell `git` / `gh` / `glab` inside the agent sandbox.**  Now that the dedicated `GIT_TOOLS` are gone and agents drive `git` (and, where the operator wants it, `gh` / `glab`) through `run_shell`, the credential-broker path that used to be plumbed through the in-process git-tool wrappers no longer applies.  We need an in-sandbox equivalent that lets these binaries authenticate without leaking credentials to the agent: most likely a git credential helper script (or a daemon-mediated token-injection step) configured into the sandbox's environment so that `git push`, `gh auth status`, and `glab issue create` all just work without the agent ever seeing a token.  Required before agents can do real forge-side work via shell.  Tracks the same workstream that motivated removing the dedicated git tools.
+
+- **Operator opt-in for `gh` / `glab` availability inside the sandbox.**  `git` is universally available, but `gh` and `glab` are heavier dependencies and not every operator wants them inside their sandbox image.  When we land the credential-brokering work above, gate `gh` / `glab` availability on a gateway-side configuration flag (per-account or per-sandbox) so the operator opts in deliberately.  Default off until the operator decides they want their agent to drive a forge CLI.
+
 - Validation feedback is appended to tool results via `ValidationTracker`, but validation is only triggered when workflow tools explicitly record results. Consider whether validation should be triggered automatically in response to file writes (or other actions), rather than requiring explicit opt-in from each tool.
 
 - survey current built-in tools and make sure they are following industry best practices
@@ -105,7 +109,7 @@
 
 - **Data-driven persona/role definitions**: Allow agent roles to be loaded from configuration files rather than requiring Python `Agent` subclasses. The `Agent.role` property (returning `self._role` if set, else `type(self)`) is the seam where this plugs in. See also: Claude Code's `.claude/agents/` markdown-file-based agent definitions.
 
-- **Per-agent subprocess environment injection**: A mechanism on `Agent` or `Session` to declare environment variables that should be injected into all subprocesses spawned during tool execution (both `_run_git` and `run_shell`). Currently `_run_git` injects git identity from agent metadata, but `run_shell` inherits only the gateway process's ambient environment — so agents calling `git commit` via `run_shell` depend on OS-level `git config`. A unified injection layer would allow per-agent git identity, credentials, and other env customization without requiring global OS-level config.
+- **Per-agent subprocess environment injection**: A mechanism on `Agent` or `Session` to declare environment variables that should be injected into all subprocesses spawned during tool execution. Now that the dedicated git tools are gone and agents drive `git` through `run_shell`, the gateway no longer has a code path that injects per-agent git identity into the subprocess environment — `run_shell` inherits only the gateway process's ambient environment, so agents calling `git commit` via `run_shell` depend on OS-level `git config`. A unified injection layer would allow per-agent git identity, credentials, and other env customization without requiring global OS-level config.
 
 - **Credential store via `contextvars`**: Replace the current metadata/$ENV_VAR approach for git authentication with a gateway-level credential store accessible via `contextvars`. Decide whether to keep bundling ambient state into `ExecutionContext` or use separate `contextvars` for different concerns.
 

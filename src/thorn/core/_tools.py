@@ -22,6 +22,9 @@ from typing import Literal
 from pydantic import Field
 from pydantic.dataclasses import dataclass
 
+from thorn.core._executor import ToolVenue
+from thorn.core._func import tool
+
 
 def _resolve(path: str) -> Path:
     """Resolve a tool path argument against the active workspace.
@@ -130,6 +133,7 @@ def _format_lines(
     return "\n".join(parts)
 
 
+@tool(venue=ToolVenue.SANDBOX)
 async def read_file(
     path: str,
     offset: int = 1,
@@ -228,6 +232,7 @@ class FileEdit:
     )
 
 
+@tool(venue=ToolVenue.SANDBOX)
 async def edit_file(path: str, edits: list[FileEdit]) -> str:
     """Apply one or more find-and-replace edits to an existing file.
 
@@ -318,6 +323,7 @@ async def edit_file(path: str, edits: list[FileEdit]) -> str:
     return f"{header}\n{body}"
 
 
+@tool(venue=ToolVenue.SANDBOX)
 async def create_file(path: str, content: str) -> str:
     """Create a new file with the given content.
 
@@ -385,6 +391,7 @@ def _format_file_result(
     return format_outline(lines, spans, char_budget=MAX_READ_CHARS)
 
 
+@tool(venue=ToolVenue.SANDBOX)
 async def write_file(path: str, content: str) -> str:
     """Write content to a file, creating parent directories as needed.
 
@@ -401,6 +408,7 @@ async def write_file(path: str, content: str) -> str:
     return f"Wrote {len(content)} bytes to {path}"
 
 
+@tool(venue=ToolVenue.SANDBOX)
 async def delete_file(path: str) -> str:
     """Delete a file at the given path.
 
@@ -423,6 +431,7 @@ async def delete_file(path: str) -> str:
     return f"Deleted {path}."
 
 
+@tool(venue=ToolVenue.SANDBOX)
 async def move_file(source: str, destination: str) -> str:
     """Move or rename a file from *source* to *destination*.
 
@@ -516,6 +525,7 @@ def _list_recursive(
     return result
 
 
+@tool(venue=ToolVenue.SANDBOX)
 async def list_directory(
     path: str = ".",
     *,
@@ -568,6 +578,7 @@ async def list_directory(
     return "\n".join(formatted)
 
 
+@tool(venue=ToolVenue.SANDBOX)
 async def find_files(
     pattern: str,
     path: str = ".",
@@ -696,6 +707,7 @@ def _format_file_matches(
     return "\n".join(parts)
 
 
+@tool(venue=ToolVenue.SANDBOX)
 async def search_files(
     pattern: str,
     path: str = ".",
@@ -825,6 +837,7 @@ def _kill_process_tree(pid: int) -> None:
         pass
 
 
+@tool(venue=ToolVenue.SANDBOX)
 async def run_shell(
     command: str,
     working_directory: str | None = None,
@@ -889,23 +902,6 @@ from thorn.core._history import DirectoryListCallNode, FileReadCallNode
 
 read_file._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
 list_directory._thorn_call_node_class = DirectoryListCallNode  # type: ignore[attr-defined]
-
-
-# Phase A venue classification.  Most file / shell tools run inside the
-# sandbox-venue daemon.  See
-# docs/plans/sandbox_tool_execution_*.plan.md for the full rationale.
-from thorn.core._executor import ToolVenue as _ToolVenue
-
-read_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
-edit_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
-create_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
-delete_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
-move_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
-list_directory._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
-find_files._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
-search_files._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
-write_file._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
-run_shell._thorn_venue = _ToolVenue.SANDBOX  # type: ignore[attr-defined]
 
 
 ALL_BUILTIN_TOOLS = [

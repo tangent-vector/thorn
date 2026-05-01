@@ -137,30 +137,29 @@ class _NullProvider:
 def build_default_registry() -> tuple[ToolRegistry, dict[str, _WrappedTool]]:
     """Build the static daemon tool registry plus its execute table.
 
-    Loads every built-in tool that is *not* on the in-process
-    allow-list (currently empty -- the inbox tools live elsewhere).
+    Loads every tool from :data:`thorn.tools._catalog.SANDBOXED_TOOLS`,
+    which is the single source of truth for "tools the daemon
+    dispatches inside the agent's sandbox."  The brain's allowlist
+    consumes the same catalog (via :func:`thorn.core._func._known_builtin_tools`)
+    so the two views can never drift out of sync without a catalog
+    edit visible to both.
+
     Returns the registry used to schema-validate incoming requests
     and the parallel dict of executable callables consumed by
     :class:`InProcessToolExecutor`.
     """
     from thorn.core._func import wrap_function
-    from thorn.core._journal import JOURNAL_TOOLS
-    from thorn.core._tools import ALL_BUILTIN_TOOLS, run_shell
-
-    in_process_allowlist: set[str] = set()
-
-    callables: list[Callable[..., Any]] = []
-    for fn in ALL_BUILTIN_TOOLS:
-        if getattr(fn, "__name__", "") in in_process_allowlist:
-            continue
-        callables.append(fn)
-    callables.append(run_shell)
-    callables.extend(JOURNAL_TOOLS)
+    from thorn.tools._catalog import SANDBOXED_TOOLS
 
     entries: list[ToolRegistryEntry] = []
     table: dict[str, _WrappedTool] = {}
-    for fn in callables:
+    for fn in SANDBOXED_TOOLS:
         wrapped = wrap_function(fn)
+        # Force-pin venue: every entry the daemon dispatches is by
+        # definition sandbox-bound, regardless of whatever
+        # ``_thorn_venue`` annotation the source tool happens to
+        # carry.  This guards against an accidentally-mistagged
+        # SANDBOXED_TOOLS entry.
         wrapped.venue = ToolVenue.SANDBOX
         name = wrapped.schema.get("function", {}).get("name", "")
         if not name:

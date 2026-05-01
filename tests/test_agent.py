@@ -26,6 +26,7 @@ from thorn.core._messages import AssistantMessage
 from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
 from thorn.core._session import Session
 from thorn.runtime._session import AgentID
+from thorn.core._executor import ToolVenue
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +326,7 @@ class TestAgentPromptTextMode:
 
         class ToolAgent(Agent):
             system_prompts = ["Use tools."]
-            tools = [wrap_function(helper)]
+            tools = [wrap_function(helper, venue=ToolVenue.SANDBOX)]
 
         agent = ToolAgent()
         result = await agent.prompt("help me")
@@ -342,7 +343,7 @@ class TestAgentPromptTextMode:
         from thorn.core._func import wrap_function
 
         agent = SimpleAgent()
-        result = await agent.prompt("do it", tools=[wrap_function(extra_tool)])
+        result = await agent.prompt("do it", tools=[wrap_function(extra_tool, venue=ToolVenue.SANDBOX)])
         assert isinstance(result, str)
 
     async def test_prompt_with_extra_system(self, ctx):
@@ -500,7 +501,7 @@ class TestContextAgent:
 
             class TestRole(Agent):
                 system_prompts = ["Working on {module}."]
-                tools = [wrap_function(capture_agent)]
+                tools = [wrap_function(capture_agent, venue=ToolVenue.SANDBOX)]
 
             agent = TestRole(module="parser")
             await agent.prompt("do it")
@@ -548,7 +549,7 @@ class TestSkillWithRole:
 
         class TestRole(Agent):
             system_prompts = ["Working on {module}."]
-            tools = [wrap_function(capture_agent)]
+            tools = [wrap_function(capture_agent, venue=ToolVenue.SANDBOX)]
 
         provider = MockProvider(canned_responses=[
             [
@@ -592,7 +593,7 @@ class TestSkillWithRole:
         from thorn.core._func import wrap_function
 
         class ToolRole(Agent):
-            tools = [wrap_function(role_tool)]
+            tools = [wrap_function(role_tool, venue=ToolVenue.SANDBOX)]
 
         provider = MockProvider(canned_responses=[
             [
@@ -609,7 +610,7 @@ class TestSkillWithRole:
         ctx = ExecutionContext(provider=provider)
         token = set_context(ctx)
         try:
-            @skill(role=ToolRole, tools=[wrap_function(skill_tool)])
+            @skill(role=ToolRole, tools=[wrap_function(skill_tool, venue=ToolVenue.SANDBOX)])
             async def do_work(module: str) -> str:
                 """Work on {module}."""
 

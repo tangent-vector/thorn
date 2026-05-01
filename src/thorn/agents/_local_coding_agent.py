@@ -19,22 +19,28 @@ from typing import Any, ClassVar
 
 from thorn.core._agent import Agent
 from thorn.core._tools import FILE_WRITING, run_shell
-from thorn.tools.git import GIT_TOOLS
 
 
 class LocalCodingAgent(Agent):
     """Default agent role for interactive and one-shot CLI use.
 
-    Bundles the file-I/O, shell, and git tool sets that any useful
-    coding agent needs to operate against a workspace.  No system
-    prompts are declared on the role itself -- per-invocation steering
-    (one-shot vs. REPL chat vs. ...) is supplied by the caller via
-    the dispatcher's ``extra_system`` argument, since that is a
-    property of *how* the prompt is being driven rather than *who*
-    the agent is.
+    Bundles the file-I/O and shell tool sets that any useful coding
+    agent needs to operate against a workspace.  Git operations are
+    performed via ``run_shell`` invoking ``git`` directly, rather than
+    through a dedicated git tool API; this keeps the agent's surface
+    aligned with how a human collaborator would drive the same
+    repository (and avoids duplicating ``git``'s CLI as a parallel
+    tool API that we would have to keep in lockstep with the real
+    binary).
+
+    No system prompts are declared on the role itself -- per-invocation
+    steering (one-shot vs. REPL chat vs. ...) is supplied by the
+    caller via the dispatcher's ``extra_system`` argument, since that
+    is a property of *how* the prompt is being driven rather than
+    *who* the agent is.
     """
 
-    tools: ClassVar[list[Any]] = [FILE_WRITING, run_shell, GIT_TOOLS]
+    tools: ClassVar[list[Any]] = [FILE_WRITING, run_shell]
 
 
 __all__ = ["LocalCodingAgent"]

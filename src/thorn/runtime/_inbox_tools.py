@@ -38,6 +38,7 @@ import logging
 from typing import Literal
 
 from thorn.core._context import get_context
+from thorn.core._executor import ToolVenue
 from thorn.core._func import tool
 from thorn.runtime._address import SessionAddress
 from thorn.runtime._dispatch import (
@@ -132,7 +133,7 @@ def _summarize(notification: Notification) -> str:
 # Tool: list_inbox_items
 # ---------------------------------------------------------------------------
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def list_inbox_items() -> str:
     """List notifications currently awaiting your attention in this session.
 
@@ -166,7 +167,7 @@ async def list_inbox_items() -> str:
 # Tool: read_inbox_item
 # ---------------------------------------------------------------------------
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def read_inbox_item(item_id: str) -> str:
     """Read the full content and metadata of a single inbox item.
 
@@ -213,7 +214,7 @@ async def read_inbox_item(item_id: str) -> str:
 # Tool: update_inbox_item
 # ---------------------------------------------------------------------------
 
-@tool
+@tool(venue=ToolVenue.IN_PROCESS)
 async def update_inbox_item(
     item_id: str,
     status: _AgentStatus,
@@ -300,13 +301,6 @@ async def update_inbox_item(
         )
 
     return f"Item {updated.id} is now {updated.status.value}."
-
-
-from thorn.core._executor import ToolVenue as _ToolVenue
-
-list_inbox_items._thorn_venue = _ToolVenue.IN_PROCESS  # type: ignore[attr-defined]
-read_inbox_item._thorn_venue = _ToolVenue.IN_PROCESS  # type: ignore[attr-defined]
-update_inbox_item._thorn_venue = _ToolVenue.IN_PROCESS  # type: ignore[attr-defined]
 
 
 INBOX_TOOLS: list = [list_inbox_items, read_inbox_item, update_inbox_item]
