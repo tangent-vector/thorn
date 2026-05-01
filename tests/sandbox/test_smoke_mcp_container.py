@@ -113,13 +113,16 @@ async def _smoke(adapter) -> None:
     workspace.mkdir(parents=True)
     control.mkdir(parents=True)
 
-    # Match the runtime's ``--user`` default so the daemon writes the
-    # control dir's socket / log / mcp_state.json with the test's
-    # ownership; otherwise we'd hit a "permission denied" on cleanup.
-    # On rootless podman, the matching ``--userns=keep-id`` flag is
-    # required for ``--user $(host_uid)`` to actually map 1:1 to the
-    # operator's host uid; :class:`PodmanAdapter` defaults this in, so
-    # this test does not have to pass it explicitly.
+    # Target uid/gid for the in-container daemon's final identity.
+    # The entrypoint trampoline reads this from the
+    # ``THORN_SANDBOX_UID`` / ``THORN_SANDBOX_GID`` env vars
+    # (injected by :meth:`ContainerDaemonHost._build_container_spec`)
+    # and ``setpriv``-drops to it after the one-shot broker CA
+    # install -- so the daemon writes the control dir's socket /
+    # log / mcp_state.json with the test's ownership and cleanup
+    # succeeds.  On rootless podman, the container still needs to
+    # boot as the user-namespace root; :class:`PodmanAdapter`'s
+    # default ``--userns=keep-id`` suffices for that mapping.
     import os
     user = f"{os.getuid()}:{os.getgid()}"
 

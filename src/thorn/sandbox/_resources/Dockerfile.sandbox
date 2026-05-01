@@ -44,13 +44,27 @@ RUN uv venv /opt/thorn-venv \
 # ---- runtime: small image hosting a single per-agent toolhost daemon -----
 FROM python:3.12-slim
 
-# `git` is the only baseline tool we expect every agent to want; it is the
-# spine of the journal/workspace tools and is small enough that bundling
-# it here saves every derived image from re-installing it.  Anything
-# heavier (build toolchains, language runtimes) belongs to the operator's
-# derived image.
+# Baseline tools every agent is expected to use:
+#
+# * `git` is the spine of the journal/workspace tools and is small
+#   enough that bundling it here saves every derived image from
+#   re-installing it.
+# * `ca-certificates` ships the system trust bundle *and* the
+#   ``update-ca-certificates`` helper that the sandbox entrypoint
+#   uses to install the broker MITM CA into
+#   ``/etc/ssl/certs/ca-certificates.crt`` at container start.  That
+#   canonical bundle is what Go's ``crypto/x509`` reads on Debian, so
+#   installing through it is what makes Go-based CLIs (``gh``,
+#   ``glab``, etc.) trust the broker without per-tool env wiring.
+# * `util-linux` supplies ``setpriv``, which the entrypoint uses to
+#   drop to the operator's uid/gid and clear the capability bounding
+#   set after the one-shot CA install completes.
+#
+# Anything heavier (build toolchains, language runtimes) belongs to
+# the operator's derived image.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends \
+        git ca-certificates util-linux \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/thorn-venv /opt/thorn-venv
@@ -61,16 +75,19 @@ COPY --from=builder /opt/thorn-venv /opt/thorn-venv
 # binary is a single static blob; cost is negligible.
 COPY --from=uv /uv /usr/local/bin/uv
 
+# One-shot entrypoint trampoline.  The container boots as uid 0 long
+# enough for this script to install the broker MITM CA into the
+# system trust store and then ``setpriv`` down to the operator's
+# uid/gid (injected via ``THORN_SANDBOX_UID``/``THORN_SANDBOX_GID``)
+# before execing the toolhost daemon.  See the script's own header
+# for the full rationale.
+COPY src/thorn/sandbox/_resources/thorn-sandbox-entrypoint \
+     /usr/local/bin/thorn-sandbox-entrypoint
+RUN chmod 0755 /usr/local/bin/thorn-sandbox-entrypoint
+
 ENV PATH="/opt/thorn-venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
-
-# The container runs as whatever UID the gateway picks at `run --user ...`
-# time (defaults to the host UID/GID).  No `useradd` here on purpose: with
-# bind-mounted host directories, an in-image `thorn` user would land with
-# a different UID than the bind-mount owner and either need a chown on
-# entry or an explicit `--user` override anyway.  The current approach is
-# simpler: trust the run-time `--user` flag, no in-image user state.
 
 # Rendezvous directory; the gateway bind-mounts `<host control dir>` over
 # this so the in-container daemon can bind its socket here and the brain
@@ -78,6 +95,11 @@ ENV PATH="/opt/thorn-venv/bin:$PATH" \
 WORKDIR /agent
 RUN mkdir -p /agent/home /agent/workspace /agent/control
 
-# Default entrypoint: the daemon, which is given socket / agent-id / mount
-# paths via argv at `run` time (see thorn.sandbox.ContainerDaemonHost).
-ENTRYPOINT ["python", "-m", "thorn.toolhost"]
+# The entrypoint is a thin root-then-drop trampoline; the image
+# command is still the daemon invocation that the gateway overrides
+# at ``run`` time with per-agent argv (see
+# :class:`thorn.sandbox.ContainerDaemonHost`).  A derived image that
+# keeps the default command unchanged therefore still gets a
+# working daemon when launched without the gateway.
+ENTRYPOINT ["/usr/local/bin/thorn-sandbox-entrypoint"]
+CMD ["python", "-m", "thorn.toolhost"]

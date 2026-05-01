@@ -65,6 +65,8 @@ from thorn.core._account import (
     AccountConfig,
     require_credential,
 )
+import base64
+
 from thorn.core._brokering import (
     BrokerableService,
     BrokerCredentialPlan,
@@ -686,6 +688,28 @@ class GitLabAccountConfig(_ForgeAccountBase):
     """
 
 
+def _git_https_basic_transform(raw: str) -> str:
+    """Pre-encode a forge PAT for HTTP Basic against a git HTTPS endpoint.
+
+    Git's HTTPS wire protocol expects ``Authorization: Basic
+    <base64(user:password)>``.  Both GitHub and GitLab accept
+    ``x:<pat>`` in the user:password slot (the legacy-by-convention
+    "literal token in the password field" shape); we pick ``x`` as
+    a stable, meaningless username so OneCLI's registered secret
+    carries a byte-for-byte match for what ``git`` already sends.
+
+    Run at broker-registration time, not at sandbox launch, so the
+    base64 encoding is done once per agent load rather than per
+    request; the output is what gets stored in OneCLI's encrypted
+    secret store.  Exposed at module level (rather than inlined as
+    a lambda) because ``functools.partial``-style lambdas capture
+    closures awkwardly for the ``broker_credential_plans`` call
+    path and this shape is naturally shared between the two forge
+    implementations.
+    """
+    return base64.b64encode(f"x:{raw}".encode()).decode()
+
+
 class ForgeHostService(BrokerableService, ABC):
     """API client plus credentials for HTTPS git against this forge host.
 
@@ -799,14 +823,23 @@ class GitLabForgeService(ForgeHostService):
         self,
         account: AccountConfig,
     ) -> list[BrokerCredentialPlan]:
-        """Plan one broker registration per ``gitlab-pat`` credential.
+        """Plan broker registrations per ``gitlab-pat`` credential.
 
-        Host pattern is the GitLab instance's hostname (the same
-        host serves the API and the git endpoints, so a single
-        registration covers both).  Path pattern is restricted to
-        ``/api/*`` because git HTTPS auth is handled separately by
-        the credential broker's git-helper integration; we only want
-        OneCLI substituting on REST calls here.
+        Each credential contributes *two* plans:
+
+        * An API plan: ``Authorization: Bearer <pat>`` against
+          ``/api/*`` on the GitLab instance's host.  This covers
+          ``python-gitlab`` and direct REST consumers.
+        * A git HTTPS plan: ``Authorization: Basic <base64(x:pat)>``
+          against ``/*`` on the same host, with
+          ``git_extra_header_host`` set so the gateway renders a
+          matching ``http.https://<host>/.extraHeader`` line in the
+          per-agent gitconfig.  This is what wires
+          ``git clone`` / ``git fetch`` through the broker.
+
+        GitLab serves the API and git over the same host, so both
+        plans share the host pattern; path-narrowing is how they
+        stay distinct.
         """
         from urllib.parse import urlparse
 
@@ -827,6 +860,18 @@ class GitLabForgeService(ForgeHostService):
                     value_format="Bearer {value}",
                 ),
                 secret_name_suffix="gitlab-pat",
+            ))
+            plans.append(BrokerCredentialPlan(
+                env_var_name=cred.env_var_name,
+                host_pattern=host,
+                path_pattern="/*",
+                injection=HeaderInjection(
+                    header_name="Authorization",
+                    value_format="Basic {value}",
+                ),
+                secret_name_suffix="gitlab-git-https",
+                value_transform=_git_https_basic_transform,
+                git_extra_header_host=host,
             ))
         return plans
 
@@ -922,14 +967,25 @@ class GitHubForgeService(ForgeHostService):
         self,
         account: AccountConfig,
     ) -> list[BrokerCredentialPlan]:
-        """Plan one broker registration per ``pat`` credential.
+        """Plan broker registrations per ``pat`` credential.
 
-        Host pattern is the API host (``api.github.com`` for
-        GitHub.com, otherwise the host from ``base_url``).  GitHub
-        Enterprise serves the API under ``/api/v3/`` on the bare
-        host; we register the API host so OneCLI matches just the
-        REST traffic, with git HTTPS auth handled separately by the
-        credential broker's git-helper integration.
+        Each credential contributes *two* plans:
+
+        * An API plan: ``Authorization: Bearer <pat>`` against the
+          GitHub API host (``api.github.com`` for GitHub.com,
+          otherwise the bare host from ``base_url``).  Covers
+          ``pygithub`` and ``gh api`` / direct REST consumers.
+        * A git HTTPS plan: ``Authorization: Basic <base64(x:pat)>``
+          against ``/*`` on the *web* host (``github.com``, not the
+          API host), with ``git_extra_header_host`` set so the
+          gateway renders a matching ``http.https://<host>/.extraHeader``
+          line in the per-agent gitconfig.  This wires ``git clone``
+          / ``git fetch`` through the broker.
+
+        GitHub splits API and git onto different hosts
+        (``api.github.com`` vs ``github.com``), so the two plans
+        carry different ``host_pattern`` values.  GitHub Enterprise
+        collapses them back to a single host.
         """
         from urllib.parse import urlparse
 
@@ -940,6 +996,13 @@ class GitHubForgeService(ForgeHostService):
         )
         if not api_host:
             return []
+        # Git HTTPS goes against the bare web host, which differs
+        # from the API host on GitHub.com (``api.github.com`` vs
+        # ``github.com``).  GHE collapses the two onto a single host
+        # served under ``/api/v3/``.  We mirror the same ``api.``
+        # prefix strip that :meth:`clone_url_for` performs so both
+        # callers agree on the forge's "web" identity.
+        git_host = api_host[len("api."):] if api_host.startswith("api.") else api_host
         plans: list[BrokerCredentialPlan] = []
         for cred in gh_account.credentials:
             if cred.kind != self._CREDENTIAL_KIND:
@@ -953,6 +1016,18 @@ class GitHubForgeService(ForgeHostService):
                     value_format="Bearer {value}",
                 ),
                 secret_name_suffix="github-pat",
+            ))
+            plans.append(BrokerCredentialPlan(
+                env_var_name=cred.env_var_name,
+                host_pattern=git_host,
+                path_pattern="/*",
+                injection=HeaderInjection(
+                    header_name="Authorization",
+                    value_format="Basic {value}",
+                ),
+                secret_name_suffix="github-git-https",
+                value_transform=_git_https_basic_transform,
+                git_extra_header_host=git_host,
             ))
         return plans
 

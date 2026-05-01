@@ -20,7 +20,9 @@ stays neutral about how the daemon is launched.
 from __future__ import annotations
 
 from thorn.sandbox._container import (
+    CONTAINER_BROKER_CA_PATH,
     CONTAINER_CONTROL_DIR,
+    CONTAINER_GIT_CONFIG_PATH,
     CONTAINER_HOME_DIR,
     CONTAINER_LOG_PATH,
     CONTAINER_RUNTIME_DIR,
@@ -30,6 +32,7 @@ from thorn.sandbox._container import (
     ContainerHostConfig,
     ContainerNotReadyError,
     ContainerStartTimeoutError,
+    ENTRYPOINT_REQUIRED_CAPS,
     SandboxImageMissingError,
     derive_container_name,
 )
@@ -58,7 +61,9 @@ from thorn.sandbox._runtime import (
 )
 
 __all__ = [
+    "CONTAINER_BROKER_CA_PATH",
     "CONTAINER_CONTROL_DIR",
+    "CONTAINER_GIT_CONFIG_PATH",
     "CONTAINER_HOME_DIR",
     "CONTAINER_LOG_PATH",
     "CONTAINER_RUNTIME_DIR",
@@ -73,6 +78,7 @@ __all__ = [
     "DEFAULT_SANDBOX_DOCKERFILE",
     "DEFAULT_SANDBOX_IMAGE_NAME",
     "DockerAdapter",
+    "ENTRYPOINT_REQUIRED_CAPS",
     "FakeOCIRuntimeAdapter",
     "Mount",
     "OCIImageMissing",

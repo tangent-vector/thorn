@@ -52,6 +52,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+import dataclasses
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -140,6 +141,39 @@ def _default_broker_client_factory(
     return BrokerClient(
         config.broker, admin_api_key=admin_api_key_from_env(config.broker),
     )
+
+
+def _render_git_extra_headers(
+    extra_headers: tuple[tuple[str, str], ...],
+) -> str:
+    """Render ``(host, header_value)`` pairs as a minimal gitconfig file.
+
+    The resulting INI drives ``git``'s per-URL ``http.extraHeader``
+    mechanism: any ``git`` command hitting ``https://<host>/<anything>``
+    sends the configured header unconditionally (including on the
+    initial unauthenticated request, which is what we need so the
+    broker has a header to override before any credential
+    negotiation starts).  We emit one section per host rather than
+    a single catch-all ``[http]`` section so only the forges the
+    operator wired up receive the placeholder header; unrelated
+    ``https://...`` git traffic is untouched.
+
+    Hosts are deduplicated (first-occurrence-wins) in case two
+    services register git HTTPS routing for the same host.  The
+    output is newline-terminated so subsequent edits (should any
+    ever be made) don't leave the file without a trailing newline.
+    """
+    seen: set[str] = set()
+    lines: list[str] = []
+    for host, header_value in extra_headers:
+        if host in seen:
+            continue
+        seen.add(host)
+        lines.append(f'[http "https://{host}/"]')
+        lines.append(f"    extraHeader = {header_value}")
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
 
 
 _DEFAULT_AGENT_ID = AgentID("default")
@@ -1181,6 +1215,17 @@ class Gateway:
                     service_lookup=self._runtime.get_service,
                     ca_certificate_path=str(ca_path),
                 )
+                # Render a per-agent gitconfig file when the binding
+                # declares any ``http.<url>.extraHeader`` entries
+                # (e.g. GitHub / GitLab git HTTPS routing).  The file
+                # lives outside the agent's bind-mounted home so the
+                # agent can't edit it, and the sandbox runtime
+                # mounts it read-only at the fixed
+                # ``GIT_CONFIG_GLOBAL`` path.  The updated binding
+                # (with ``git_config_path`` populated) is what gets
+                # stashed in ``_broker_bindings`` so the
+                # sandbox-launch lookup sees the path too.
+                binding = self._render_agent_gitconfig(agent_id, binding)
                 self._broker_bindings[agent_id] = binding
                 log.info(
                     "Broker: registered agent %s as %s with %d secret(s)",
@@ -1229,6 +1274,36 @@ class Gateway:
         ca_path.write_bytes(ca_bytes)
         ca_path.chmod(0o644)
 
+    def _render_agent_gitconfig(
+        self,
+        agent_id: Any,
+        binding: BrokerBinding,
+    ) -> BrokerBinding:
+        """Write *binding*'s gitconfig file and return an updated binding.
+
+        Returns *binding* unchanged when it has no
+        ``git_extra_headers`` entries -- the runtime reads
+        ``git_config_path`` as ``None`` in that case and skips the
+        sandbox-side mount entirely.  Otherwise writes the rendered
+        INI to ``<agent_framework_dir>/sandbox/gitconfig`` (mode
+        ``0o644``; the file ships placeholders, not real credentials,
+        so loosened perms are fine).
+
+        The file is overwritten on every registration: gateway
+        startup always lands with a freshly-generated placeholder,
+        even if a stale file from a prior run is present.  Teardown
+        unlinks it so an operator auditing the tree sees no
+        ambient files between runs.
+        """
+        if not binding.git_extra_headers:
+            return binding
+        sandbox_dir = self._runtime.paths.agent_sandbox_dir(agent_id)
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
+        config_path = sandbox_dir / "gitconfig"
+        config_path.write_text(_render_git_extra_headers(binding.git_extra_headers))
+        config_path.chmod(0o644)
+        return dataclasses.replace(binding, git_config_path=str(config_path))
+
     async def _teardown_broker_bindings(
         self,
         *,
@@ -1243,6 +1318,21 @@ class Gateway:
         self._broker_bindings.clear()
 
         for agent_id, binding in bindings:
+            # Unlink the rendered gitconfig, if any, before we free
+            # the broker-side state.  The file is a one-shot
+            # per-startup artefact, not part of the agent's
+            # long-lived state, so leaving it behind would be
+            # misleading.  Best-effort: a race with a manual
+            # removal is a no-op, anything else gets logged.
+            if binding.git_config_path is not None:
+                try:
+                    Path(binding.git_config_path).unlink(missing_ok=True)
+                except OSError as exc:
+                    log.warning(
+                        "Broker: failed to unlink agent %s gitconfig "
+                        "at %s: %s",
+                        agent_id, binding.git_config_path, exc,
+                    )
             try:
                 await asyncio.to_thread(client.delete_agent, binding.agent_id)
                 for secret_id in binding.secret_ids:

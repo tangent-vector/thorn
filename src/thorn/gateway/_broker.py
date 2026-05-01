@@ -57,6 +57,7 @@ R1/R2 research notes (verified against OneCLI ``main`` at
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import secrets
@@ -506,6 +507,34 @@ class BrokerBinding:
     in-container tool's "have I been given a token?" check needs to
     see something."""
 
+    git_extra_headers: tuple[tuple[str, str], ...] = ()
+    """``(git_host, "Authorization: Basic <base64(x:<placeholder>)>")``
+    entries the sandbox should materialise as ``http.<url>.extraHeader``
+    gitconfig lines.
+
+    Each entry arises from a :class:`BrokerCredentialPlan` whose
+    :attr:`~thorn.core._brokering.BrokerCredentialPlan.git_extra_header_host`
+    is set.  The gateway renders a per-agent ephemeral gitconfig
+    from this list and bind-mounts it read-only at
+    :data:`~thorn.sandbox._container.CONTAINER_GIT_CONFIG_PATH`; the
+    in-sandbox ``git`` then sends the placeholder ``Authorization``
+    header on every request to the host, and the broker rewrites it
+    to the real credential on the wire.
+
+    Default empty tuple: bindings without any git-extra-header plans
+    don't force a gitconfig mount.
+    """
+
+    git_config_path: str | None = None
+    """Host filesystem path to the per-agent gitconfig file, if any.
+
+    Populated by the gateway after it renders the gitconfig
+    implied by :attr:`git_extra_headers`; ``None`` when the binding
+    has no git-extra-header entries (no file written, no mount
+    needed).  The sandbox runtime uses this to populate
+    :attr:`~thorn.sandbox._container.ContainerHostConfig.git_config_host_path`.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Registration orchestration
@@ -601,24 +630,65 @@ def register_agent_with_broker(
     # Phase 1: register each credential as a secret.  We resolve the
     # literal value from ``os.environ`` here and forward it to the
     # broker.  The literal does NOT enter agent state.
+    #
+    # A service may return several plans referencing the same env
+    # var (e.g. GitHub's forge service ships both an API-routing
+    # plan and a git-HTTPS plan for the same PAT).  We want the
+    # sandbox to see a single, consistent placeholder per env var
+    # so that in-container tools derive the same Basic-auth bytes
+    # for the Git extraHeader gitconfig line as they would see in
+    # ``GITHUB_TOKEN`` -- otherwise the gitconfig's literal payload
+    # wouldn't match what the running container believes its token
+    # to be.  ``env_var_to_placeholder`` enforces the sharing.
     secret_ids: list[str] = []
     placeholder_env: list[tuple[str, str]] = []
+    env_var_to_placeholder: dict[str, str] = {}
+    git_extra_headers: list[tuple[str, str]] = []
     for service_name, plan, credential in plans:
         try:
             value = credential.read_value()
         except CredentialMissingError as exc:
             raise BrokerError(str(exc)) from exc
+        registered_value = str(value)
+        if plan.value_transform is not None:
+            # The transform exists so the service can pre-encode
+            # the secret payload to match its injection config
+            # (e.g. base64(x:<pat>) for Git HTTPS Basic auth).  We
+            # run it exactly once per plan; OneCLI stores the
+            # returned string verbatim.
+            registered_value = plan.value_transform(registered_value)
         registration = client.register_secret(
             name=_broker_secret_name(agent.id, service_name, plan),
-            value=str(value),
+            value=registered_value,
             host_pattern=plan.host_pattern,
             path_pattern=plan.path_pattern,
             injection=plan.injection,
         )
         secret_ids.append(registration.secret_id)
-        placeholder_env.append(
-            (plan.env_var_name, _make_placeholder_value()),
-        )
+        placeholder = env_var_to_placeholder.get(plan.env_var_name)
+        if placeholder is None:
+            placeholder = _make_placeholder_value()
+            env_var_to_placeholder[plan.env_var_name] = placeholder
+            placeholder_env.append((plan.env_var_name, placeholder))
+
+        if plan.git_extra_header_host is not None:
+            # The gitconfig's ``extraHeader`` is injected verbatim
+            # by ``git`` into the initial request, so it needs to
+            # look like a real Basic auth header shape.  The
+            # broker overrides the *value* bytes, not the header
+            # name, so we pre-compute the placeholder-backed
+            # Basic-encoded form here and let OneCLI swap in the
+            # real ``base64(x:<pat>)`` value on the wire.  Using
+            # the shared placeholder keeps anything in the sandbox
+            # that might inspect the gitconfig + GITHUB_TOKEN pair
+            # mutually consistent.
+            encoded = base64.b64encode(
+                f"x:{placeholder}".encode(),
+            ).decode()
+            header_value = f"Authorization: Basic {encoded}"
+            git_extra_headers.append(
+                (plan.git_extra_header_host, header_value),
+            )
 
     # Phase 2: create the OneCLI agent and bind the secrets.
     agent_registration = client.register_agent(
@@ -639,6 +709,12 @@ def register_agent_with_broker(
         proxy_url=proxy_url,
         ca_certificate_path=ca_certificate_path,
         placeholder_env=tuple(placeholder_env),
+        git_extra_headers=tuple(git_extra_headers),
+        # Gateway fills this in after writing the gitconfig file
+        # to its per-agent sandbox dir; the registration step
+        # doesn't know the on-disk location.  See
+        # :meth:`Gateway._register_broker_bindings` for the fill.
+        git_config_path=None,
     )
 
 

@@ -1,0 +1,62 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# Thorn sandbox entrypoint.
+#
+# Runs as uid 0 on container start long enough to:
+#   1. install the gateway-mounted broker MITM CA into the container's
+#      system trust store (so Go/Rust/etc. TLS stacks that read
+#      /etc/ssl/certs/ca-certificates.crt accept the broker's cert
+#      without per-tool env-var wiring), and
+#   2. drop to the operator's uid/gid before executing the toolhost
+#      daemon, so bind-mount writes land with operator ownership and
+#      no in-container process retains root.
+#
+# The uid/gid to drop to arrives via the ``THORN_SANDBOX_UID`` /
+# ``THORN_SANDBOX_GID`` env vars (set by ``ContainerDaemonHost`` at
+# run time, synthesised from the gateway process's effective ids by
+# default).  Neither value is expected to be empty; if either is, we
+# bail out loudly so the failure surfaces at container start rather
+# than materialising as a silently-privileged daemon.
+#
+# The CA install step is idempotent and silent when the broker CA
+# mount is absent -- that covers the no-broker deployment case (e.g.
+# single-shot ``thorn run``, developer-mode ``subprocess`` backend)
+# where the container is still useful but has no MITM'd egress.
+#
+# Privilege drop uses ``setpriv`` from util-linux with
+# ``--inh-caps=-all --bounding-set=-all`` so the final daemon runs
+# with an empty capability bounding set.  That matches the Phase-E
+# intent (``capabilities_drop=("ALL",)``) while allowing the brief
+# root stage we need for CA install.
+# ---------------------------------------------------------------------------
+
+set -eu
+
+BROKER_CA_SRC=/etc/thorn/onecli-ca.pem
+BROKER_CA_DST=/usr/local/share/ca-certificates/thorn-broker.crt
+
+if [ -f "${BROKER_CA_SRC}" ]; then
+    # ``install`` rather than ``cp`` so we get a well-defined mode
+    # and a consistent behaviour across shells that subtly differ on
+    # ``cp -p`` semantics.  ``--fresh`` rebuilds
+    # ``/etc/ssl/certs/ca-certificates.crt`` from scratch so the
+    # broker cert is present in the canonical bundle path that Go's
+    # ``crypto/x509`` reads on Debian.
+    install -m 0644 "${BROKER_CA_SRC}" "${BROKER_CA_DST}"
+    update-ca-certificates --fresh >/dev/null
+fi
+
+if [ -z "${THORN_SANDBOX_UID:-}" ] || [ -z "${THORN_SANDBOX_GID:-}" ]; then
+    echo "thorn-sandbox-entrypoint: THORN_SANDBOX_UID and THORN_SANDBOX_GID" \
+         "must both be set (gateway injects them); refusing to run as root." \
+         >&2
+    exit 64
+fi
+
+exec setpriv \
+    --reuid="${THORN_SANDBOX_UID}" \
+    --regid="${THORN_SANDBOX_GID}" \
+    --clear-groups \
+    --inh-caps=-all \
+    --bounding-set=-all \
+    -- "$@"

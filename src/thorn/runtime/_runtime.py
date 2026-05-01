@@ -65,11 +65,13 @@ class SandboxBrokerBinding(Protocol):
     (which would create a layering inversion: the gateway depends on
     the runtime, not the other way around).
 
-    Carries exactly the three pieces of information the
+    Carries exactly the pieces the
     :class:`~thorn.sandbox._container.ContainerHostConfig` consumes:
     the proxy URL (with embedded Basic auth), the host-side path of
-    the broker's CA certificate, and the placeholder env entries
-    that replace literal credentials inside the sandbox.
+    the broker's CA certificate, the placeholder env entries that
+    replace literal credentials inside the sandbox, and (optional)
+    the host-side path to a per-agent gitconfig that routes git
+    HTTPS through the broker.
 
     Annotated as plain attributes (rather than ``@property``) so that
     a ``@dataclass(frozen=True)`` exposing the same field names is
@@ -82,6 +84,8 @@ class SandboxBrokerBinding(Protocol):
     proxy_url: str
     ca_certificate_path: str
     placeholder_env: tuple[tuple[str, str], ...]
+    git_extra_headers: tuple[tuple[str, str], ...]
+    git_config_path: str | None
 
 
 SandboxBrokerBindingLookup = Callable[
@@ -469,10 +473,13 @@ class Runtime:
         broker_proxy_url: str | None = None
         broker_ca_host_path: Path | None = None
         broker_placeholder_env: tuple[tuple[str, str], ...] = ()
+        git_config_host_path: Path | None = None
         if binding is not None:
             broker_proxy_url = binding.proxy_url
             broker_ca_host_path = Path(binding.ca_certificate_path)
             broker_placeholder_env = binding.placeholder_env
+            if binding.git_config_path is not None:
+                git_config_host_path = Path(binding.git_config_path)
 
         # Phase E: surface tmpfs scratch mounts whenever the rootfs
         # is read-only.  ``DEFAULT_TMPFS_MOUNTS`` covers ``/tmp`` and
@@ -498,6 +505,7 @@ class Runtime:
             broker_proxy_url=broker_proxy_url,
             broker_ca_host_path=broker_ca_host_path,
             broker_placeholder_env=broker_placeholder_env,
+            git_config_host_path=git_config_host_path,
             egress_network=resolved.egress_network,
             dev_mount_runtime=dev_mount,
             container_ready_timeout_s=resolved.container_ready_timeout_s,

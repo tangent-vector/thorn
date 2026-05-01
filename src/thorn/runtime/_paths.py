@@ -311,6 +311,23 @@ class AgencyPaths:
         """
         return self.agent_framework_dir(agent_id) / "sessions"
 
+    def agent_sandbox_dir(self, agent_id: AgentID) -> Path:
+        """Per-agent sandbox-artefact directory.
+
+        Returns ``<agent_framework_dir>/sandbox``.  Holds gateway-
+        rendered files the agent's sandbox container needs but that
+        should not live under a bind-mounted subtree (so they stay
+        invisible to the agent and can be mounted read-only at a
+        fixed in-container path without fighting the operator's
+        workspace layout).
+
+        Today's sole inhabitant is the per-agent ephemeral
+        ``gitconfig`` rendered for broker-routed git HTTPS; the
+        gateway writes it during broker registration and bind-mounts
+        it at :data:`~thorn.sandbox._container.CONTAINER_GIT_CONFIG_PATH`.
+        """
+        return self.agent_framework_dir(agent_id) / "sandbox"
+
     def session_state_root(
         self,
         agent_id: AgentID,

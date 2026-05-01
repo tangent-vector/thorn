@@ -275,6 +275,8 @@ class TestBrokerBindingLookup:
             proxy_url: str
             ca_certificate_path: str
             placeholder_env: tuple[tuple[str, str], ...]
+            git_extra_headers: tuple[tuple[str, str], ...] = ()
+            git_config_path: str | None = None
 
         return _Binding(
             proxy_url=proxy_url,

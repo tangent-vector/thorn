@@ -719,6 +719,179 @@ class TestRegisterAgentWithBroker:
         assert cred.env_var_name == "T"
         assert cred.kind == "pat"
 
+    def test_value_transform_rewrites_registered_secret_value(
+        self, monkeypatch,
+    ):
+        """When a plan carries a ``value_transform``, the broker driver
+        must pass the transform's output as the registered secret
+        value -- not the literal env var -- so the stored payload
+        matches what OneCLI will inject on the wire."""
+        monkeypatch.setenv("MY_TOKEN", "raw-pat-xyz")
+
+        class _TransformingService(_FakeBrokerableService):
+            def broker_credential_plans(
+                self, account: AccountConfig,
+            ) -> list[BrokerCredentialPlan]:
+                return [
+                    BrokerCredentialPlan(
+                        env_var_name="MY_TOKEN",
+                        host_pattern=self._host,
+                        path_pattern="/*",
+                        injection=HeaderInjection(
+                            header_name="Authorization",
+                            value_format="Basic {value}",
+                        ),
+                        secret_name_suffix="git-https",
+                        value_transform=lambda raw: f"encoded::{raw}",
+                    ),
+                ]
+
+        svc = _TransformingService(
+            service_name="github", host="github.com",
+        )
+        agent = _make_agent(
+            _FakeAccountConfig(
+                service="github",
+                credentials=[Credential(kind="pat", env_var_name="MY_TOKEN")],
+            ),
+        )
+        handler = _RegistrationHandler()
+        with _client_with_router(_broker_config(), handler) as client:
+            register_agent_with_broker(
+                client=client, agent=agent,
+                service_lookup=_service_lookup(svc),
+                ca_certificate_path="/var/lib/onecli/ca.pem",
+            )
+        assert len(handler.secrets) == 1
+        assert next(iter(handler.secrets.values()))["value"] == (
+            "encoded::raw-pat-xyz"
+        )
+
+    def test_git_extra_header_host_populates_binding(self, monkeypatch):
+        """Plans with ``git_extra_header_host`` contribute
+        ``(host, "Authorization: Basic <base64(x:placeholder)>")``
+        entries to :attr:`BrokerBinding.git_extra_headers`, matching
+        the shared placeholder the container env receives."""
+        import base64
+
+        monkeypatch.setenv("MY_TOKEN", "raw-pat-xyz")
+
+        class _GitRoutingService(_FakeBrokerableService):
+            def broker_credential_plans(
+                self, account: AccountConfig,
+            ) -> list[BrokerCredentialPlan]:
+                return [
+                    BrokerCredentialPlan(
+                        env_var_name="MY_TOKEN",
+                        host_pattern=self._host,
+                        path_pattern="/*",
+                        injection=HeaderInjection(
+                            header_name="Authorization",
+                            value_format="Basic {value}",
+                        ),
+                        secret_name_suffix="git-https",
+                        value_transform=lambda raw: "pre-encoded",
+                        git_extra_header_host=self._host,
+                    ),
+                ]
+
+        svc = _GitRoutingService(
+            service_name="github", host="github.com",
+        )
+        agent = _make_agent(
+            _FakeAccountConfig(
+                service="github",
+                credentials=[Credential(kind="pat", env_var_name="MY_TOKEN")],
+            ),
+        )
+        handler = _RegistrationHandler()
+        with _client_with_router(_broker_config(), handler) as client:
+            binding = register_agent_with_broker(
+                client=client, agent=agent,
+                service_lookup=_service_lookup(svc),
+                ca_certificate_path="/var/lib/onecli/ca.pem",
+            )
+        # One extra-header entry against the git host.
+        assert len(binding.git_extra_headers) == 1
+        host, header_value = binding.git_extra_headers[0]
+        assert host == "github.com"
+        # Value must be ``Authorization: Basic base64("x:<placeholder>")``
+        # where ``placeholder`` is the same string injected into the
+        # container's env.
+        placeholder = dict(binding.placeholder_env)["MY_TOKEN"]
+        expected = base64.b64encode(
+            f"x:{placeholder}".encode(),
+        ).decode()
+        assert header_value == f"Authorization: Basic {expected}"
+        # Gateway layer fills in ``git_config_path``; the broker
+        # driver leaves it None so the file-rendering step stays
+        # owned by a single place.
+        assert binding.git_config_path is None
+
+    def test_shared_placeholder_across_plans_for_same_env_var(
+        self, monkeypatch,
+    ):
+        """A service returning two plans referencing the same env var
+        (the real-world shape: one API plan, one git HTTPS plan)
+        must produce a single placeholder_env entry.  Otherwise the
+        in-container GITHUB_TOKEN and the gitconfig extraHeader's
+        encoded payload would disagree and the broker rewriting the
+        header value wouldn't line up with tools that also read the
+        raw env var."""
+        monkeypatch.setenv("MY_TOKEN", "raw-pat-xyz")
+
+        class _TwoPlanService(_FakeBrokerableService):
+            def broker_credential_plans(
+                self, account: AccountConfig,
+            ) -> list[BrokerCredentialPlan]:
+                return [
+                    BrokerCredentialPlan(
+                        env_var_name="MY_TOKEN",
+                        host_pattern="api.github.com",
+                        path_pattern="/*",
+                        injection=HeaderInjection(
+                            header_name="Authorization",
+                            value_format="Bearer {value}",
+                        ),
+                        secret_name_suffix="api",
+                    ),
+                    BrokerCredentialPlan(
+                        env_var_name="MY_TOKEN",
+                        host_pattern="github.com",
+                        path_pattern="/*",
+                        injection=HeaderInjection(
+                            header_name="Authorization",
+                            value_format="Basic {value}",
+                        ),
+                        secret_name_suffix="git-https",
+                        value_transform=lambda raw: "encoded",
+                        git_extra_header_host="github.com",
+                    ),
+                ]
+
+        svc = _TwoPlanService(service_name="github", host="github.com")
+        agent = _make_agent(
+            _FakeAccountConfig(
+                service="github",
+                credentials=[Credential(kind="pat", env_var_name="MY_TOKEN")],
+            ),
+        )
+        handler = _RegistrationHandler()
+        with _client_with_router(_broker_config(), handler) as client:
+            binding = register_agent_with_broker(
+                client=client, agent=agent,
+                service_lookup=_service_lookup(svc),
+                ca_certificate_path="/var/lib/onecli/ca.pem",
+            )
+        names = [n for n, _v in binding.placeholder_env]
+        assert names == ["MY_TOKEN"], (
+            f"expected a single placeholder_env entry for a shared "
+            f"env var across plans, got {binding.placeholder_env!r}"
+        )
+        # But both secrets ARE registered (one per plan).
+        assert len(binding.secret_ids) == 2
+        assert len(handler.secrets) == 2
+
 
 # ---------------------------------------------------------------------------
 # Regression: untyped account that maps to a brokerable service still works

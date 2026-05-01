@@ -41,6 +41,7 @@ the broker driver translates them to OneCLI's wire shape.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
@@ -125,6 +126,50 @@ class BrokerCredentialPlan:
     per-(agent, account) prefix to form the broker secret's
     operator-visible name.  Should be short and identify the
     credential's role (e.g. ``"github-pat"``)."""
+
+    value_transform: Callable[[str], str] | None = None
+    """Optional pre-encoding applied to the literal env-var value.
+
+    When ``None`` (the default), the broker driver registers the
+    literal ``os.environ[env_var_name]`` value with OneCLI
+    verbatim.  When a callable, the driver calls it with the raw
+    value and forwards the return value as the registered secret
+    instead.
+
+    The transform exists for injection shapes that require
+    server-side string composition OneCLI doesn't do itself --
+    most notably git HTTPS Basic auth, where the upstream expects
+    ``Authorization: Basic <base64(user:pat)>`` and we pre-compute
+    the ``base64(user:pat)`` half at registration time so a
+    standard ``HeaderInjection(value_format="Basic {value}")``
+    carries the right wire bytes.
+
+    The callable must be a pure function of the raw value: the
+    broker driver may call it once per registration and does not
+    retry.  The transform runs inside the agent-load path, in the
+    same process and trust zone as ``read_value()``, so it is safe
+    to encode PATs through it; the returned string is what enters
+    OneCLI's encrypted store.
+    """
+
+    git_extra_header_host: str | None = None
+    """Forge host this plan's credential also serves over git HTTPS.
+
+    When set, the broker driver records an entry on the
+    :class:`~thorn.gateway._broker.BrokerBinding` so the sandbox
+    launch path can mount a per-agent ephemeral gitconfig whose
+    ``http.https://<host>/.extraHeader`` forces every in-sandbox
+    ``git`` request to that host to emit a placeholder
+    ``Authorization: Basic ...`` header.  OneCLI then rewrites the
+    placeholder to the real credential on the wire (matching on
+    ``host_pattern`` + ``path_pattern``).
+
+    Unset (the default) means "no git HTTPS routing for this
+    plan" -- used by API-only plans that don't want to force git
+    to send credentials on every request.  Typically a forge
+    service returns two plans per credential: an API-only one and
+    a git-HTTPS-only one with this field set.
+    """
 
 
 class BrokerableService(Service, ABC):

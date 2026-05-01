@@ -21,6 +21,7 @@ import pytest
 
 from thorn.sandbox import (
     CONTAINER_CONTROL_DIR,
+    CONTAINER_GIT_CONFIG_PATH,
     CONTAINER_HOME_DIR,
     CONTAINER_RUNTIME_DIR,
     CONTAINER_SOCKET_PATH,
@@ -29,6 +30,7 @@ from thorn.sandbox import (
     ContainerHostConfig,
     ContainerNotReadyError,
     ContainerStartTimeoutError,
+    ENTRYPOINT_REQUIRED_CAPS,
     FakeOCIRuntimeAdapter,
     SandboxImageMissingError,
     derive_container_name,
@@ -271,17 +273,68 @@ class TestSpecConstruction:
             await host.stop()
 
     @pytest.mark.asyncio
-    async def test_default_user_is_current_uid_gid(
+    async def test_default_user_emits_current_uid_gid_env(
         self, tmp_path: Path,
     ) -> None:
+        """The container runs the root-then-drop entrypoint, so the
+        gateway forwards the target uid/gid via env vars rather than
+        ``--user``.  When no explicit user is configured, the
+        current process's effective uid/gid is used so bind-mount
+        writes land with the operator's ownership."""
+        if not hasattr(os, "geteuid"):
+            pytest.skip("no os.geteuid on this platform")
         cfg = _make_config(tmp_path, user=None)
         host = ContainerDaemonHost(cfg)
         await host.start()
         try:
             spec = cfg.adapter.container_spec("thorn-agent-agent-x")
-            if hasattr(os, "geteuid"):
-                expected = f"{os.geteuid()}:{os.getegid()}"
-                assert spec.user == expected
+            # ``--user`` must NOT be passed to the runtime; the
+            # container boots as root long enough for the entrypoint
+            # to install the broker CA.  The uid/gid the daemon
+            # ultimately runs as travels through env.
+            assert spec.user is None
+            env_dict = dict(spec.env)
+            assert env_dict.get("THORN_SANDBOX_UID") == str(os.geteuid())
+            assert env_dict.get("THORN_SANDBOX_GID") == str(os.getegid())
+        finally:
+            await host.stop()
+
+    @pytest.mark.asyncio
+    async def test_explicit_user_emits_configured_uid_gid_env(
+        self, tmp_path: Path,
+    ) -> None:
+        cfg = _make_config(tmp_path, user="4242:4343")
+        host = ContainerDaemonHost(cfg)
+        await host.start()
+        try:
+            spec = cfg.adapter.container_spec("thorn-agent-agent-x")
+            assert spec.user is None
+            env_dict = dict(spec.env)
+            assert env_dict["THORN_SANDBOX_UID"] == "4242"
+            assert env_dict["THORN_SANDBOX_GID"] == "4343"
+        finally:
+            await host.stop()
+
+    @pytest.mark.asyncio
+    async def test_entrypoint_required_caps_always_added(
+        self, tmp_path: Path,
+    ) -> None:
+        """The entrypoint trampoline's brief root stage needs a
+        small set of capabilities; they are always appended to the
+        operator's ``capabilities_add`` list so the CA install and
+        ``setpriv`` succeed regardless of operator policy.  The
+        trampoline clears the bounding set before execing the
+        daemon, so the long-running daemon itself has no caps."""
+        cfg = _make_config(tmp_path)
+        host = ContainerDaemonHost(cfg)
+        await host.start()
+        try:
+            spec = cfg.adapter.container_spec("thorn-agent-agent-x")
+            for cap in ENTRYPOINT_REQUIRED_CAPS:
+                assert cap in spec.capabilities_add, (
+                    f"missing entrypoint-required cap {cap!r} in "
+                    f"{spec.capabilities_add}"
+                )
         finally:
             await host.stop()
 
@@ -380,6 +433,83 @@ class TestBrokerBinding:
             assert ca_mounts[0].read_only is True
         finally:
             await host.stop()
+
+    @pytest.mark.asyncio
+    async def test_git_config_mount_and_env_emitted_when_set(
+        self, tmp_path: Path,
+    ) -> None:
+        """Setting ``git_config_host_path`` alongside the broker fields
+        bind-mounts the file at the fixed in-container gitconfig
+        path and points ``GIT_CONFIG_GLOBAL`` at it so every
+        in-sandbox ``git`` run picks up the placeholder extraHeader
+        entries."""
+        ca_pem = tmp_path / "broker-ca.pem"
+        ca_pem.write_text("-----BEGIN CERTIFICATE-----\n...\n")
+        gitcfg = tmp_path / "gitconfig"
+        gitcfg.write_text(
+            '[http "https://github.com/"]\n'
+            "    extraHeader = Authorization: Basic placeholder\n",
+        )
+
+        adapter = FakeOCIRuntimeAdapter(present_images=["img"])
+        base = _make_config(tmp_path, image="img", adapter=adapter)
+        cfg = ContainerHostConfig(
+            agent_id=base.agent_id,
+            container_name=base.container_name,
+            image=base.image,
+            adapter=base.adapter,
+            host_home_dir=base.host_home_dir,
+            host_workspace_dir=base.host_workspace_dir,
+            host_control_dir=base.host_control_dir,
+            broker_proxy_url="http://x:tok@broker:8443/",
+            broker_ca_host_path=ca_pem,
+            git_config_host_path=gitcfg,
+            user=base.user,
+            container_ready_timeout_s=base.container_ready_timeout_s,
+            container_ready_poll_s=base.container_ready_poll_s,
+        )
+        host = ContainerDaemonHost(cfg)
+        await host.start()
+        try:
+            spec = cfg.adapter.container_spec("thorn-agent-agent-x")
+            env_dict = dict(spec.env)
+            assert env_dict["GIT_CONFIG_GLOBAL"] == CONTAINER_GIT_CONFIG_PATH
+            gc_mounts = [
+                m for m in spec.mounts
+                if str(m.target) == CONTAINER_GIT_CONFIG_PATH
+            ]
+            assert len(gc_mounts) == 1
+            assert gc_mounts[0].source == gitcfg
+            assert gc_mounts[0].read_only is True
+        finally:
+            await host.stop()
+
+    @pytest.mark.asyncio
+    async def test_git_config_without_broker_raises(
+        self, tmp_path: Path,
+    ) -> None:
+        """Shipping a gitconfig with extraHeader placeholders but no
+        broker to rewrite them would leak the literal placeholder
+        value upstream.  The container spec builder refuses the
+        combination rather than making it an operator footgun."""
+        gitcfg = tmp_path / "gitconfig"
+        gitcfg.write_text("")
+
+        cfg = _make_config(tmp_path)
+        cfg = ContainerHostConfig(
+            agent_id=cfg.agent_id,
+            container_name=cfg.container_name,
+            image=cfg.image,
+            adapter=cfg.adapter,
+            host_home_dir=cfg.host_home_dir,
+            host_workspace_dir=cfg.host_workspace_dir,
+            host_control_dir=cfg.host_control_dir,
+            git_config_host_path=gitcfg,
+            user=cfg.user,
+        )
+        host = ContainerDaemonHost(cfg)
+        with pytest.raises(ValueError, match="git_config_host_path"):
+            await host.start()
 
     @pytest.mark.asyncio
     async def test_broker_proxy_without_ca_path_raises(
@@ -501,7 +631,12 @@ class TestPhaseEHardeningPassthrough:
         try:
             spec = cfg.adapter.container_spec("thorn-agent-agent-x")
             assert spec.capabilities_drop == ("ALL",)
-            assert spec.capabilities_add == ("NET_RAW",)
+            # The operator's caps come first, then the entrypoint's
+            # always-required set (de-duped).  That ordering makes
+            # operator policy easy to spot in rendered run args.
+            assert spec.capabilities_add[0] == "NET_RAW"
+            for cap in ENTRYPOINT_REQUIRED_CAPS:
+                assert cap in spec.capabilities_add
             assert spec.security_opts == ("no-new-privileges",)
             assert spec.read_only_root is True
             assert len(spec.tmpfs_mounts) == 1
@@ -516,18 +651,22 @@ class TestPhaseEHardeningPassthrough:
     async def test_default_unset_fields_pass_through_as_unset(
         self, tmp_path: Path,
     ) -> None:
-        # When a caller leaves the new fields at their dataclass
+        # When a caller leaves the Phase-E fields at their dataclass
         # defaults (no hardening), the resulting ``ContainerSpec``
-        # carries the same no-op defaults so the adapter doesn't
-        # emit any flags for them.  This is the "tests don't have to
-        # know about hardening" property.
+        # carries the same no-op defaults for everything except
+        # ``capabilities_add``: the entrypoint trampoline's brief
+        # root stage always needs ``SETUID``/``SETGID``/...``
+        # irrespective of operator policy, so those are appended
+        # unconditionally.  The trampoline clears the bounding set
+        # before execing the daemon, so the hardening intent is
+        # preserved from the daemon's perspective.
         cfg = _make_config(tmp_path)
         host = ContainerDaemonHost(cfg)
         await host.start()
         try:
             spec = cfg.adapter.container_spec("thorn-agent-agent-x")
             assert spec.capabilities_drop == ()
-            assert spec.capabilities_add == ()
+            assert spec.capabilities_add == ENTRYPOINT_REQUIRED_CAPS
             assert spec.security_opts == ()
             assert spec.read_only_root is False
             assert spec.tmpfs_mounts == ()

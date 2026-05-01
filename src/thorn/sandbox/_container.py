@@ -111,6 +111,20 @@ CONTAINER_SOCKET_PATH = f"{CONTAINER_CONTROL_DIR}/toolhost.sock"
 CONTAINER_LOG_PATH = f"{CONTAINER_CONTROL_DIR}/toolhost.log"
 
 CONTAINER_BROKER_CA_PATH = "/etc/thorn/onecli-ca.pem"
+CONTAINER_GIT_CONFIG_PATH = "/etc/thorn/gitconfig"
+"""Container-side path where a per-agent ephemeral gitconfig is mounted.
+
+The gateway renders a gitconfig for each agent whose broker binding
+carries any ``git_extra_headers`` entries, and mounts it read-only
+here.  The container env sets ``GIT_CONFIG_GLOBAL`` to this path so
+every in-sandbox ``git`` invocation picks up the generated
+``http.<url>.extraHeader`` entries without disturbing the agent's
+bind-mounted ``$HOME/.gitconfig`` (if any).
+
+Fixed at the container layer for the same reason as the other
+``CONTAINER_*`` paths: the daemon's environment is uniform across
+agents, and operators do not need to think about it.
+"""
 """Container-side path where the broker's CA certificate is mounted.
 
 Phase D: when the gateway is configured with a broker block and an
@@ -159,6 +173,44 @@ control-plane unix socket lives here, not over TCP, but defending
 against well-meaning HTTP clients that mistakenly resolve
 ``localhost`` through the proxy is cheap).  Exposed as a constant
 so tests can assert the precise value without duplicating it.
+"""
+
+
+ENTRYPOINT_REQUIRED_CAPS: tuple[str, ...] = (
+    "SETUID",
+    "SETGID",
+    "SETPCAP",
+    "DAC_OVERRIDE",
+    "CHOWN",
+)
+"""Capabilities the :file:`thorn-sandbox-entrypoint` trampoline needs.
+
+The container boots as root so the entrypoint can install the
+broker MITM CA into the system trust store and then ``setpriv``
+down to the operator uid/gid before execing the daemon.  That
+brief root stage requires:
+
+* ``SETUID`` / ``SETGID`` -- ``setpriv`` changes the effective
+  uid/gid before exec.
+* ``SETPCAP`` -- ``setpriv --bounding-set=-all`` clears the
+  bounding set, which itself requires :manpage:`CAP_SETPCAP`.
+* ``DAC_OVERRIDE`` -- ``update-ca-certificates`` rewrites
+  ``/etc/ssl/certs/ca-certificates.crt`` (and related files) that
+  were installed by the image as root; without this the overwrite
+  fails even when running as uid 0 against certain storage
+  drivers.
+* ``CHOWN`` -- ``install -m 0644`` touches the destination's
+  ownership; harmless on most runtimes but some overlay stores
+  require it.
+
+These are added on top of any operator-declared
+``capabilities_add`` at spec-build time.  The entrypoint's
+``setpriv --bounding-set=-all`` clears the bounding set before
+execing the daemon, so the long-running daemon still runs with an
+empty capability set; the additions apply only to the short
+root stage.  The net security posture matches Phase E's
+``capabilities_drop=("ALL",)`` invariant from the daemon's
+perspective.
 """
 
 
@@ -244,6 +296,23 @@ class ContainerHostConfig:
     operator-supplied env in logs and tests.
     """
 
+    git_config_host_path: Path | None = None
+    """Host-side path to a per-agent ephemeral ``gitconfig`` file.
+
+    Populated by the gateway when the agent's broker binding has
+    any ``git_extra_headers`` entries (e.g. GitHub / GitLab git
+    HTTPS auth).  When set, the container gets a read-only bind
+    mount of this file at :data:`CONTAINER_GIT_CONFIG_PATH` and
+    ``GIT_CONFIG_GLOBAL`` pointed at it so every in-sandbox ``git``
+    invocation sends a placeholder ``Authorization: Basic`` header
+    that the broker rewrites to the real credential.
+
+    Requires ``broker_proxy_url`` to also be set -- without the
+    broker, the extraHeader placeholder has nothing to substitute
+    against, so we refuse rather than silently ship a token-shaped
+    placeholder upstream.
+    """
+
     dev_mount_runtime: Path | None = None
     """Source path for a R/O bind-mount of the framework's source tree.
 
@@ -256,16 +325,26 @@ class ContainerHostConfig:
     """
 
     user: str | None = None
-    """``--user`` flag passed to the runtime (e.g. ``"1000:1000"``).
+    """Target ``uid:gid`` the in-container daemon ultimately runs as.
 
     When ``None``, defaults to the gateway process's effective UID/GID
     so files written through bind-mounts land with the operator's
     ownership and no ``chown`` is ever required.  Set to a literal
-    string to override (e.g. for tests or unusual setups).
+    ``"<uid>:<gid>"`` string to override (e.g. for tests or unusual
+    setups).
 
-    Identity-model notes (Phase E):
+    The value is *not* passed as ``--user`` to the OCI runtime.  The
+    container boots as root long enough for the entrypoint
+    trampoline (:file:`thorn-sandbox-entrypoint`) to install the
+    broker MITM CA into the system trust store and then ``setpriv``
+    down to this uid/gid before execing ``thorn.toolhost``.  The
+    gateway therefore forwards this value via the
+    ``THORN_SANDBOX_UID`` / ``THORN_SANDBOX_GID`` env entries; those
+    are what the entrypoint reads.
 
-    * In-container processes run as the gateway operator's uid, both
+    Identity-model notes:
+
+    * The final daemon runs as the gateway operator's uid, both
       inside and outside the container, by design.  See
       :doc:`/docs/plans/sandbox-threat-model` for the rationale; the
       short version is that the sandbox's load-bearing security
@@ -273,12 +352,14 @@ class ContainerHostConfig:
       come from filesystem mount selection and network policy, not
       from uid separation, and operator workflows depend on full
       read/write access to bind-mounted state.
-    * On rootless podman this UID claim is only true when the
-      runtime is also passed ``--userns=keep-id``, which
-      :class:`~thorn.sandbox._runtime.PodmanAdapter` defaults in
-      automatically.  Phase B's bind-mount-ownership claim quietly
-      assumed this; Phase E makes it true unconditionally on the
-      podman path.
+    * On rootless podman, "container boots as root" relies on the
+      default user-namespace mapping (root-in-container = host
+      rootless user) rather than ``--userns=keep-id``; operators
+      running rootless podman with a non-default mapping may need
+      to adjust ``extra_run_args`` so that the entrypoint's
+      ``setpriv`` + ``update-ca-certificates`` run in the expected
+      identity.  Rootful docker (the common case for the gateway)
+      is unaffected.
     """
 
     extra_run_args: tuple[str, ...] = ()
@@ -620,12 +701,47 @@ class ContainerDaemonHost:
                 ),
             )
 
+        # Git HTTPS routing is a separate opt-in.  The gateway writes
+        # a per-agent gitconfig that forces every git HTTPS request
+        # to the configured forge hosts to emit a placeholder
+        # ``Authorization: Basic ...`` header; the broker overrides
+        # the placeholder with the real credential on the wire.
+        # Requires the broker to be wired up: without it the
+        # placeholder would travel upstream unchanged.
+        if cfg.git_config_host_path is not None:
+            if cfg.broker_proxy_url is None:
+                raise ValueError(
+                    "ContainerHostConfig: git_config_host_path is set "
+                    "but broker_proxy_url is None; the gitconfig's "
+                    "extraHeader placeholders are only safe when a "
+                    "broker is in the path to rewrite them into real "
+                    "credentials.",
+                )
+            mounts.append(
+                Mount(
+                    source=cfg.git_config_host_path,
+                    target=Path(CONTAINER_GIT_CONFIG_PATH),
+                    read_only=True,
+                ),
+            )
+
         env: list[tuple[str, str]] = []
         if cfg.dev_mount_runtime is not None:
             env.append(("PYTHONPATH", CONTAINER_RUNTIME_DIR))
         # Force unbuffered stdout/stderr so the toolhost log surfaces
         # in real time when the operator is tail-ing it.
         env.append(("PYTHONUNBUFFERED", "1"))
+
+        # The root-then-drop entrypoint reads these to decide whom
+        # to ``setpriv`` down to before execing the daemon.  We emit
+        # them unconditionally (even on hosts where the operator
+        # passed an explicit ``user``) so the contract with the
+        # trampoline is uniform.  ``_resolve_target_user`` enforces
+        # the ``uid:gid`` shape and raises early on platforms where
+        # it cannot be computed.
+        uid, gid = _resolve_target_user(cfg.user)
+        env.append(("THORN_SANDBOX_UID", uid))
+        env.append(("THORN_SANDBOX_GID", gid))
 
         for name in cfg.env_passthrough:
             value = os.environ.get(name)
@@ -642,6 +758,9 @@ class ContainerDaemonHost:
             env.extend(_broker_env_entries(cfg.broker_proxy_url))
             env.extend(cfg.broker_placeholder_env)
 
+        if cfg.git_config_host_path is not None:
+            env.append(("GIT_CONFIG_GLOBAL", CONTAINER_GIT_CONFIG_PATH))
+
         command: list[str] = [
             "--socket",
             CONTAINER_SOCKET_PATH,
@@ -657,8 +776,6 @@ class ContainerDaemonHost:
             CONTAINER_LOG_PATH,
         ]
 
-        user = cfg.user if cfg.user is not None else _current_uid_gid()
-
         # Phase D: when an ``egress_network`` is configured, prepend
         # ``--network <name>`` so the runtime attaches the container
         # to that network instead of the default bridge.  Stays
@@ -669,17 +786,36 @@ class ContainerDaemonHost:
         if cfg.egress_network is not None:
             run_args = ("--network", cfg.egress_network) + run_args
 
+        # Always add the caps the entrypoint trampoline needs on top
+        # of whatever the operator configured.  The trampoline
+        # clears the bounding set with ``setpriv --bounding-set=-all``
+        # before execing the daemon, so the long-running daemon still
+        # has no capabilities; the additions apply only to the brief
+        # root stage.  We preserve operator ordering and append any
+        # of our required caps that aren't already present so that
+        # ``spec.capabilities_add`` remains a stable, de-duped view
+        # of "this container is permitted these caps".
+        capabilities_add = _merge_required_caps(
+            cfg.capabilities_add, ENTRYPOINT_REQUIRED_CAPS,
+        )
+
         return ContainerSpec(
             image=cfg.image,
             name=cfg.container_name,
             mounts=tuple(mounts),
             env=tuple(env),
-            user=user,
+            # Intentionally unset: the container boots as root so the
+            # entrypoint trampoline can install the broker CA and
+            # then drop to the operator uid/gid via ``setpriv``.  The
+            # daemon's target identity travels via
+            # ``THORN_SANDBOX_UID`` / ``THORN_SANDBOX_GID`` env
+            # instead.
+            user=None,
             entrypoint=cfg.entrypoint,
             command=tuple(command),
             extra_run_args=run_args,
             capabilities_drop=cfg.capabilities_drop,
-            capabilities_add=cfg.capabilities_add,
+            capabilities_add=capabilities_add,
             security_opts=cfg.security_opts,
             read_only_root=cfg.read_only_root,
             tmpfs_mounts=cfg.tmpfs_mounts,
@@ -729,6 +865,55 @@ def _current_uid_gid() -> str | None:
     return f"{os.geteuid()}:{os.getegid()}"
 
 
+def _resolve_target_user(user: str | None) -> tuple[str, str]:
+    """Return ``(uid, gid)`` strings for the entrypoint's ``setpriv`` drop.
+
+    Accepts the same ``"<uid>:<gid>"`` shape
+    :attr:`ContainerHostConfig.user` accepts, and falls back to the
+    current process's effective uid/gid when *user* is ``None``.
+
+    Raises :class:`RuntimeError` when *user* is ``None`` and the
+    host has no ``os.geteuid`` (Windows); raises :class:`ValueError`
+    when *user* is set but not ``"<uid>:<gid>"``-shaped.  Both are
+    fail-fast conditions: the entrypoint hard-requires both env
+    entries, and silently booting as root would defeat the
+    identity contract.
+    """
+    if user is None:
+        resolved = _current_uid_gid()
+        if resolved is None:  # pragma: no cover - Windows
+            raise RuntimeError(
+                "ContainerHostConfig.user is unset and the current host "
+                "has no os.geteuid; cannot synthesise "
+                "THORN_SANDBOX_UID/GID for the entrypoint.  Pass an "
+                "explicit user=<uid>:<gid> when constructing the host.",
+            )
+        user = resolved
+    uid, sep, gid = user.partition(":")
+    if not sep or not uid or not gid:
+        raise ValueError(
+            f"ContainerHostConfig.user must be '<uid>:<gid>', got {user!r}",
+        )
+    return uid, gid
+
+
+def _merge_required_caps(
+    operator_caps: tuple[str, ...],
+    required_caps: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Append *required_caps* to *operator_caps*, de-duplicating by value.
+
+    Operator ordering is preserved so the rendered ``--cap-add``
+    sequence reads "what the operator asked for first, then what
+    the framework needs for the entrypoint trampoline".  That order
+    makes the infrastructure adds visible at the end of ``docker
+    inspect`` output rather than mixed into operator policy.
+    """
+    seen = set(operator_caps)
+    appended = [cap for cap in required_caps if cap not in seen]
+    return tuple(operator_caps) + tuple(appended)
+
+
 def derive_container_name(agent_id: str, *, prefix: str = "thorn-agent-") -> str:
     """Synthesize a container name from an agent id.
 
@@ -747,6 +932,7 @@ def derive_container_name(agent_id: str, *, prefix: str = "thorn-agent-") -> str
 __all__ = [
     "CONTAINER_BROKER_CA_PATH",
     "CONTAINER_CONTROL_DIR",
+    "CONTAINER_GIT_CONFIG_PATH",
     "CONTAINER_HOME_DIR",
     "CONTAINER_LOG_PATH",
     "CONTAINER_RUNTIME_DIR",
@@ -757,6 +943,7 @@ __all__ = [
     "ContainerNotReadyError",
     "ContainerStartTimeoutError",
     "DEFAULT_TMPFS_MOUNTS",
+    "ENTRYPOINT_REQUIRED_CAPS",
     "NO_PROXY_DEFAULT",
     "SandboxImageMissingError",
     "derive_container_name",

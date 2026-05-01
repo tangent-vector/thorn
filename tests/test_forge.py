@@ -467,6 +467,96 @@ class TestGitLabForgeService:
         assert svc.clone_url_for("214768") == ""
 
 
+class TestForgeBrokerCredentialPlans:
+    """Each forge service emits *two* :class:`BrokerCredentialPlan`
+    entries per PAT credential: one for API routing (``Bearer <pat>``
+    against the API host) and one for git HTTPS routing
+    (``Basic <base64(x:pat)>`` against the web host with
+    ``git_extra_header_host`` set).  Pinning the shape here means a
+    future tweak to the forge services' routing story has to
+    acknowledge the git-HTTPS path, rather than silently dropping
+    it."""
+
+    def _gl_account(self) -> Any:
+        from thorn.core._credentials import Credential
+        from thorn.tools.forge import GitLabAccountConfig
+
+        return GitLabAccountConfig(
+            service="gl",
+            credentials=[
+                Credential(kind="gitlab-pat", env_var_name="GITLAB_TOKEN"),
+            ],
+        )
+
+    def _gh_account(self) -> Any:
+        from thorn.core._credentials import Credential
+        from thorn.tools.forge import GitHubAccountConfig
+
+        return GitHubAccountConfig(
+            service="gh",
+            credentials=[Credential(kind="pat", env_var_name="GITHUB_TOKEN")],
+        )
+
+    def test_gitlab_emits_api_and_git_plans(self) -> None:
+        svc = GitLabForgeService(
+            GitLabForgeServiceConfig(url="https://gitlab.com", token="t"),
+            service_name="gl",
+        )
+        plans = svc.broker_credential_plans(self._gl_account())
+        assert len(plans) == 2
+        api, git = plans
+        assert api.path_pattern == "/api/*"
+        assert api.host_pattern == "gitlab.com"
+        assert api.value_transform is None
+        assert api.git_extra_header_host is None
+
+        assert git.path_pattern == "/*"
+        assert git.host_pattern == "gitlab.com"
+        assert git.git_extra_header_host == "gitlab.com"
+        # The transform must produce ``base64("x:<raw>")`` so that a
+        # ``HeaderInjection(value_format="Basic {value}")`` yields
+        # the ``Authorization: Basic <...>`` git expects.
+        import base64
+        assert git.value_transform("hunter2") == (
+            base64.b64encode(b"x:hunter2").decode()
+        )
+
+    def test_github_splits_api_and_git_hosts(self) -> None:
+        svc = GitHubForgeService(
+            GitHubConnectionConfig(
+                base_url="https://api.github.com",
+                auth=GitHubPatAuth(token="t"),
+            ),
+            service_name="gh",
+        )
+        plans = svc.broker_credential_plans(self._gh_account())
+        assert len(plans) == 2
+        api, git = plans
+        # GitHub.com splits the two: API on api.github.com, git on github.com.
+        assert api.host_pattern == "api.github.com"
+        assert git.host_pattern == "github.com"
+        assert git.git_extra_header_host == "github.com"
+        import base64
+        assert git.value_transform("hunter2") == (
+            base64.b64encode(b"x:hunter2").decode()
+        )
+
+    def test_github_enterprise_collapses_api_and_git_hosts(self) -> None:
+        svc = GitHubForgeService(
+            GitHubConnectionConfig(
+                base_url="https://github.example.com/api/v3",
+                auth=GitHubPatAuth(token="t"),
+            ),
+            service_name="ghe",
+        )
+        plans = svc.broker_credential_plans(self._gh_account())
+        assert len(plans) == 2
+        api, git = plans
+        assert api.host_pattern == "github.example.com"
+        assert git.host_pattern == "github.example.com"
+        assert git.git_extra_header_host == "github.example.com"
+
+
 class TestGitHubForgeServiceCloneUrl:
     def test_derives_clone_url_from_api_url(self):
         cfg = GitHubConnectionConfig(
