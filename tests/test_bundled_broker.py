@@ -25,6 +25,7 @@ from thorn.gateway._bundled_broker import (
     _parse_api_key_response,
     _split_compose_port_output,
 )
+from thorn.gateway._resources_helper import read_bundled_broker_compose_text
 
 # ---------------------------------------------------------------------------
 # Helpers / fakes
@@ -88,6 +89,19 @@ class _ComposeRecorder:
             if token == "-f" and i + 2 < len(argv):
                 return argv[i + 2]
         return argv[-1]
+
+
+class TestBundledComposeResource:
+    def test_onecli_can_use_host_gateway_and_host_ca_bundle(self) -> None:
+        compose = read_bundled_broker_compose_text()
+        assert "ONECLI_HOST_GATEWAY_HOST" in compose
+        assert ":host-gateway" in compose
+        assert "ONECLI_HOST_CA_BUNDLE" in compose
+        assert "SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt" in compose
+        assert (
+            "NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt"
+            in compose
+        )
 
 
 def _http_factory(handler: httpx.MockTransport) -> Any:

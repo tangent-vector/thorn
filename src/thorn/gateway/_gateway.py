@@ -158,13 +158,23 @@ def _render_git_extra_headers(
     operator wired up receive the placeholder header; unrelated
     ``https://...`` git traffic is untouched.
 
+    The global ``http.proxyAuthMethod = basic`` entry makes libcurl
+    pre-send ``Proxy-Authorization`` for the broker proxy URL's
+    ``x:<aoc_token>`` userinfo.  Without it, Git waits for a 407
+    challenge and OneCLI falls back to tunnel mode, so it cannot MITM
+    HTTPS and rewrite the placeholder ``Authorization`` header.
+
     Hosts are deduplicated (first-occurrence-wins) in case two
     services register git HTTPS routing for the same host.  The
     output is newline-terminated so subsequent edits (should any
     ever be made) don't leave the file without a trailing newline.
     """
+    if not extra_headers:
+        return ""
     seen: set[str] = set()
     lines: list[str] = []
+    lines.append("[http]")
+    lines.append("    proxyAuthMethod = basic")
     for host, header_value in extra_headers:
         if host in seen:
             continue

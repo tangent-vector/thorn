@@ -24,12 +24,15 @@ class TestRenderGitExtraHeaders:
         """Each host gets a ``[http "https://<host>/"]`` section with
         a single ``extraHeader`` value.  Using the URL-scoped
         section shape (rather than a global ``[http]`` block) keeps
-        the header scoped to the host we meant to route, so
-        unrelated HTTPS git traffic in the sandbox is untouched."""
+        the header scoped to the host we meant to route, while the
+        global ``proxyAuthMethod`` entry only affects proxy
+        authentication."""
         rendered = _render_git_extra_headers(
             (("github.com", "Authorization: Basic placeholder"),),
         )
         assert rendered == (
+            "[http]\n"
+            "    proxyAuthMethod = basic\n"
             '[http "https://github.com/"]\n'
             "    extraHeader = Authorization: Basic placeholder\n"
         )
@@ -40,6 +43,8 @@ class TestRenderGitExtraHeaders:
             ("gitlab.com", "Authorization: Basic ph2"),
         ))
         assert rendered == (
+            "[http]\n"
+            "    proxyAuthMethod = basic\n"
             '[http "https://github.com/"]\n'
             "    extraHeader = Authorization: Basic ph1\n"
             '[http "https://gitlab.com/"]\n'
@@ -56,6 +61,6 @@ class TestRenderGitExtraHeaders:
             ("github.com", "Authorization: Basic first"),
             ("github.com", "Authorization: Basic second"),
         ))
-        assert rendered.count("[http") == 1
+        assert rendered.count('[http "https://github.com/"]') == 1
         assert "first" in rendered
         assert "second" not in rendered
