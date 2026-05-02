@@ -8,3 +8,5 @@ test-job:
     script:
       - uv sync --all-extras --locked
       - uv run pytest
+    tags:
+      - thorn-agent
