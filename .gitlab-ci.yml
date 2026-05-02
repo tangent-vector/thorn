@@ -5,8 +5,13 @@ stages:
 
 test-job:
     stage: test
+    variables:
+      GIT_STRATEGY: none
     script:
-      - uv sync --all-extras --locked
-      - uv run pytest
+      - apk add --no-cache curl bind-tools busybox-extras
+      - nslookup gitlab-master.nvidia.com
+      - nc -vz -w 10 gitlab-master.nvidia.com 443
+      - curl -vkI --connect-timeout 10 https://gitlab-master.nvidia.com/
+      - curl -vkI --connect-timeout 10 https://gitlab-master.nvidia.com:5005/v2/
     tags:
       - thorn-agent
