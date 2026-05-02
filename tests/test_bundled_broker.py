@@ -12,7 +12,6 @@ docker-actually-runs-the-stack side of the contract.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any
 
@@ -26,7 +25,7 @@ from thorn.gateway._bundled_broker import (
     _parse_api_key_response,
     _split_compose_port_output,
 )
-
+from thorn.gateway._resources_helper import read_bundled_broker_compose_text
 
 # ---------------------------------------------------------------------------
 # Helpers / fakes
@@ -90,6 +89,21 @@ class _ComposeRecorder:
             if token == "-f" and i + 2 < len(argv):
                 return argv[i + 2]
         return argv[-1]
+
+
+class TestBundledComposeResource:
+    def test_onecli_can_use_host_gateway_and_host_ca_bundle(self) -> None:
+        compose = read_bundled_broker_compose_text()
+        assert "ONECLI_HOST_GATEWAY_HOST" in compose
+        assert ":host-gateway" in compose
+        assert "ONECLI_HOST_CA_BUNDLE" in compose
+        assert "SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt" in compose
+        assert (
+            "NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt"
+            in compose
+        )
+        assert "ONECLI_SKIP_VERIFY_HOSTS" in compose
+        assert "GATEWAY_SKIP_VERIFY_HOSTS: ${ONECLI_SKIP_VERIFY_HOSTS:-}" in compose
 
 
 def _http_factory(handler: httpx.MockTransport) -> Any:
@@ -291,7 +305,7 @@ class TestSupervisorStart:
         assert config.mode == "bundled"
         assert config.enabled is True
         assert config.admin_url == "http://127.0.0.1:34567"
-        assert config.proxy_url == "http://127.0.0.1:34568"
+        assert config.proxy_url == "http://onecli:10255"
         assert config.admin_api_key_env_var is None
         # The literal admin key is held in process memory on the
         # supervisor, not on the config.

@@ -2588,6 +2588,54 @@ class TestProjectInferredForges:
         proj_svcs = [s for s in services if isinstance(s, ProjectService)]
         assert proj_svcs[0].native_id == "group/subgroup/project"
 
+    def test_single_fork_project_can_override_native_id(self):
+        """Operators can pin a forge API identifier separately from the URL."""
+        from thorn.gateway._config import (
+            ForgeSpec,
+            GatewayConfig,
+            ProjectSpec,
+            instantiate_services,
+        )
+        from thorn.tools.forge import ProjectService
+
+        config = GatewayConfig(
+            forges=[
+                ForgeSpec(
+                    name="gl",
+                    type="gitlab",
+                    url="https://gitlab.example.com",
+                )
+            ],
+            projects=[
+                ProjectSpec(
+                    name="proj",
+                    url="https://gitlab.example.com/group/project",
+                    native_id="307988",
+                )
+            ],
+        )
+
+        services = instantiate_services(config)
+        proj_svc = next(s for s in services if isinstance(s, ProjectService))
+
+        assert proj_svc.native_id == "307988"
+        assert proj_svc.clone_url == "https://gitlab.example.com/group/project.git"
+
+    def test_top_level_native_id_is_only_for_single_fork_shorthand(self):
+        """Multi-fork projects must put native_id on the specific fork."""
+        from pydantic import ValidationError
+
+        from thorn.gateway._config import ForkSpec, ProjectSpec
+
+        with pytest.raises(ValidationError, match="top-level `native_id`"):
+            ProjectSpec(
+                name="proj",
+                native_id="307988",
+                forks=[
+                    ForkSpec(url="https://gitlab.example.com/group/project"),
+                ],
+            )
+
     def test_default_fork_name_is_origin_for_single_fork(self):
         """When a project has exactly one fork its remote name is
         ``"origin"`` (matching git's own default)."""
@@ -4435,7 +4483,7 @@ class _FakeBundledSupervisor:
         project_name: str = "thorn-broker-fake",
         egress_network_name: str = "thorn-broker-fake_thorn-broker",
         admin_url: str = "http://127.0.0.1:54321",
-        proxy_url: str = "http://127.0.0.1:54322",
+        proxy_url: str = "http://onecli:10255",
         admin_api_key: str = "oc_fake",
         start_error: Exception | None = None,
     ) -> None:
@@ -4540,7 +4588,7 @@ class TestGatewayBundledBrokerWiring:
         supervisor = _FakeBundledSupervisor(
             egress_network_name="thorn-broker-xyz_thorn-broker",
             admin_url="http://127.0.0.1:11111",
-            proxy_url="http://127.0.0.1:22222",
+            proxy_url="http://onecli:10255",
             admin_api_key="oc_synthesized",
         )
         gateway = Gateway(
@@ -4557,7 +4605,7 @@ class TestGatewayBundledBrokerWiring:
         # supervisor's synthesized one.
         assert config.broker is not None
         assert config.broker.admin_url == "http://127.0.0.1:11111"
-        assert config.broker.proxy_url == "http://127.0.0.1:22222"
+        assert config.broker.proxy_url == "http://onecli:10255"
         # Sandbox egress_network is patched to the supervisor's network.
         assert runtime.sandbox_config is not None
         assert runtime.sandbox_config.egress_network == (

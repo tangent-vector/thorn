@@ -22,9 +22,9 @@ What we do verify here:
 
 from __future__ import annotations
 
-import pytest
-
 from pathlib import Path
+
+import pytest
 
 from thorn.sandbox._runtime import (
     ContainerSpec,
@@ -335,6 +335,27 @@ class TestEntrypointEmission:
         )
         with pytest.raises(ValueError, match="non-empty"):
             list(adapter._build_run_args(spec))
+
+
+class TestRuntimeLogging:
+    def test_env_values_are_redacted_from_debug_command(self) -> None:
+        from thorn.sandbox._runtime import _format_argv_for_log
+
+        logged = _format_argv_for_log(
+            (
+                "/usr/bin/docker",
+                "run",
+                "-e",
+                "HTTPS_PROXY=http://x:aoc_secret@onecli:10255",
+                "--env=GITHUB_TOKEN=thorn-broker-placeholder",
+                "image:1",
+            )
+        )
+
+        assert "aoc_secret" not in logged
+        assert "thorn-broker-placeholder" not in logged
+        assert "HTTPS_PROXY=<redacted>" in logged
+        assert "--env=GITHUB_TOKEN=<redacted>" in logged
 
 
 class TestRuntimeSpecificDefaults:

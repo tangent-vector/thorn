@@ -366,7 +366,7 @@ class _CLIRuntimeAdapter:
         capture_stderr: bool = True,
     ) -> tuple[int, str, str]:
         cmd = (self._binary_path, *args)
-        logger.debug("oci: running %s", " ".join(cmd))
+        logger.debug("oci: running %s", _format_argv_for_log(cmd))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -616,6 +616,42 @@ class _CLIRuntimeAdapter:
         runtime's "last value wins" rule would matter).
         """
         return ()
+
+
+def _format_argv_for_log(argv: tuple[str, ...]) -> str:
+    """Return a debug-log command line with env values redacted.
+
+    Container specs carry broker proxy URLs and placeholder credential
+    env vars through ``-e``/``--env`` entries.  The command line is
+    useful for diagnosing runtime flags, but the env values are not;
+    redact all env values uniformly so debug logging cannot leak a
+    freshly minted broker access token.
+    """
+    formatted: list[str] = []
+    redact_next_env = False
+    for arg in argv:
+        if redact_next_env:
+            formatted.append(_redact_env_assignment(arg))
+            redact_next_env = False
+            continue
+        if arg in {"-e", "--env"}:
+            formatted.append(arg)
+            redact_next_env = True
+            continue
+        if arg.startswith("--env="):
+            formatted.append(
+                f"--env={_redact_env_assignment(arg.removeprefix('--env='))}"
+            )
+            continue
+        formatted.append(arg)
+    return " ".join(formatted)
+
+
+def _redact_env_assignment(value: str) -> str:
+    key, sep, _raw_value = value.partition("=")
+    if not sep:
+        return value
+    return f"{key}=<redacted>"
 
 
 def _container_state_from_inspect(

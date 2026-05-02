@@ -49,9 +49,8 @@ import contextlib
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 from thorn.sandbox._runtime import (
     ContainerSpec,
@@ -109,6 +108,12 @@ CONTAINER_CONTROL_DIR = "/agent/control"
 CONTAINER_RUNTIME_DIR = "/opt/thorn-runtime"
 CONTAINER_SOCKET_PATH = f"{CONTAINER_CONTROL_DIR}/toolhost.sock"
 CONTAINER_LOG_PATH = f"{CONTAINER_CONTROL_DIR}/toolhost.log"
+CONTAINER_TOOLHOST_COMMAND: tuple[str, ...] = (
+    "python",
+    "-m",
+    "thorn.toolhost",
+)
+"""Daemon command passed through the image entrypoint."""
 
 CONTAINER_BROKER_CA_PATH = "/etc/thorn/onecli-ca.pem"
 CONTAINER_GIT_CONFIG_PATH = "/etc/thorn/gitconfig"
@@ -162,6 +167,22 @@ override via :attr:`ContainerHostConfig.tmpfs_mounts`.
 Mode ``1777`` matches the standard sticky-world-writable layout
 ``/tmp`` is expected to have, so user-mode software that checks
 permissions doesn't get surprised.
+"""
+
+
+BROKER_CA_TRUST_STORE_TMPFS_MOUNTS: tuple[Tmpfs, ...] = (
+    Tmpfs(target=Path("/usr/local/share/ca-certificates"), options="mode=0755"),
+    Tmpfs(target=Path("/etc/ssl/certs"), options="mode=0755"),
+)
+"""Writable trust-store overlays needed by the broker CA entrypoint path.
+
+The production sandbox defaults to a read-only rootfs.  When broker
+CA injection is active, the image entrypoint still needs to copy the
+gateway-fetched CA into Debian's local trust-anchor directory and run
+``update-ca-certificates --fresh`` so TLS stacks that ignore
+``SSL_CERT_FILE`` see the broker MITM cert.  These tmpfs mounts make
+that one-shot rebuild writable without making the whole rootfs
+mutable.
 """
 
 
@@ -458,15 +479,16 @@ class ContainerHostConfig:
     container_ready_poll_s: float = 0.1
     """Polling interval inside the stage-one readiness probe."""
 
-    entrypoint: tuple[str, ...] = field(
-        default_factory=lambda: (
-            "python",
-            "-m",
-            "thorn.toolhost",
-        )
-    )
-    """In-container entrypoint argv (excluding daemon-specific flags
-    that we add at start time)."""
+    entrypoint: tuple[str, ...] | None = None
+    """OCI entrypoint override.
+
+    Defaults to ``None`` so the sandbox image's
+    ``thorn-sandbox-entrypoint`` trampoline runs.  That trampoline
+    installs the broker CA if present, drops to
+    ``THORN_SANDBOX_UID``/``THORN_SANDBOX_GID``, and then execs
+    :data:`CONTAINER_TOOLHOST_COMMAND` plus the daemon-specific flags
+    passed as the container command.
+    """
 
     max_concurrency: int = 8
 
@@ -725,6 +747,13 @@ class ContainerDaemonHost:
                 ),
             )
 
+        tmpfs_mounts = tuple(cfg.tmpfs_mounts)
+        if cfg.broker_proxy_url is not None and cfg.read_only_root:
+            tmpfs_mounts = _merge_required_tmpfs_mounts(
+                tmpfs_mounts,
+                BROKER_CA_TRUST_STORE_TMPFS_MOUNTS,
+            )
+
         env: list[tuple[str, str]] = []
         if cfg.dev_mount_runtime is not None:
             env.append(("PYTHONPATH", CONTAINER_RUNTIME_DIR))
@@ -762,6 +791,7 @@ class ContainerDaemonHost:
             env.append(("GIT_CONFIG_GLOBAL", CONTAINER_GIT_CONFIG_PATH))
 
         command: list[str] = [
+            *CONTAINER_TOOLHOST_COMMAND,
             "--socket",
             CONTAINER_SOCKET_PATH,
             "--agent-id",
@@ -818,7 +848,7 @@ class ContainerDaemonHost:
             capabilities_add=capabilities_add,
             security_opts=cfg.security_opts,
             read_only_root=cfg.read_only_root,
-            tmpfs_mounts=cfg.tmpfs_mounts,
+            tmpfs_mounts=tmpfs_mounts,
             memory_limit=cfg.memory_limit,
             cpu_limit=cfg.cpu_limit,
             pid_limit=cfg.pid_limit,
@@ -912,6 +942,19 @@ def _merge_required_caps(
     seen = set(operator_caps)
     appended = [cap for cap in required_caps if cap not in seen]
     return tuple(operator_caps) + tuple(appended)
+
+
+def _merge_required_tmpfs_mounts(
+    operator_mounts: tuple[Tmpfs, ...],
+    required_mounts: tuple[Tmpfs, ...],
+) -> tuple[Tmpfs, ...]:
+    """Append required tmpfs mounts without overriding operator targets."""
+    seen_targets = {mount.target for mount in operator_mounts}
+    appended = [
+        mount for mount in required_mounts
+        if mount.target not in seen_targets
+    ]
+    return tuple(operator_mounts) + tuple(appended)
 
 
 def derive_container_name(agent_id: str, *, prefix: str = "thorn-agent-") -> str:

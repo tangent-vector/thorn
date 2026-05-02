@@ -65,6 +65,23 @@
 #                             supervisor relies on this).  Set with
 #                             ``openssl rand -hex 32`` only when
 #                             standing up a multi-user broker.
+#   ONECLI_HOST_CA_BUNDLE     Host CA bundle to mount into the OneCLI
+#                             container for outbound TLS (default
+#                             /etc/ssl/certs/ca-certificates.crt).
+#                             Useful on hosts whose egress policy is
+#                             enforced by a local TLS proxy trusted by
+#                             the host but not by the OneCLI image.
+#   ONECLI_HOST_GATEWAY_HOST  Optional hostname to resolve to Docker's
+#                             host gateway inside the OneCLI container
+#                             (default host.docker.internal).  Use this
+#                             when the host resolver maps an upstream
+#                             service name to a host-local egress proxy.
+#   ONECLI_SKIP_VERIFY_HOSTS  Optional comma-separated host patterns passed
+#                             to OneCLI's GATEWAY_SKIP_VERIFY_HOSTS. Use only
+#                             for operator-trusted hosts whose outbound TLS is
+#                             terminated by a local egress proxy not trusted by
+#                             OneCLI's Rust TLS client. Patterns may be exact
+#                             hosts or wildcard subdomains.
 
 services:
   postgres:
@@ -105,8 +122,15 @@ services:
       NEXTAUTH_SECRET: ${ONECLI_NEXTAUTH_SECRET:-}
       NEXT_PUBLIC_APP_URL: http://${ONECLI_BIND_HOST:-127.0.0.1}:${ONECLI_ADMIN_PORT:-10254}
       APP_URL: http://${ONECLI_BIND_HOST:-127.0.0.1}:${ONECLI_ADMIN_PORT:-10254}
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+      GATEWAY_SKIP_VERIFY_HOSTS: ${ONECLI_SKIP_VERIFY_HOSTS:-}
+    extra_hosts:
+      - "${ONECLI_HOST_GATEWAY_HOST:-host.docker.internal}:host-gateway"
     volumes:
       - onecli-app-data:/app/data
+      - ${ONECLI_HOST_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
     networks:
       # OneCLI must serve the broker network (so sandboxes can
       # reach it) AND have outbound to ``thorn-default`` so its

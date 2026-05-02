@@ -26,14 +26,18 @@ from thorn.sandbox import (
     CONTAINER_RUNTIME_DIR,
     CONTAINER_SOCKET_PATH,
     CONTAINER_WORKSPACE_DIR,
+    ENTRYPOINT_REQUIRED_CAPS,
     ContainerDaemonHost,
     ContainerHostConfig,
     ContainerNotReadyError,
     ContainerStartTimeoutError,
-    ENTRYPOINT_REQUIRED_CAPS,
     FakeOCIRuntimeAdapter,
     SandboxImageMissingError,
     derive_container_name,
+)
+from thorn.sandbox._container import (
+    BROKER_CA_TRUST_STORE_TMPFS_MOUNTS,
+    CONTAINER_TOOLHOST_COMMAND,
 )
 
 
@@ -260,7 +264,10 @@ class TestSpecConstruction:
         await host.start()
         try:
             spec = cfg.adapter.container_spec("thorn-agent-agent-x")
+            assert spec.entrypoint is None
+            assert spec.command[:3] == CONTAINER_TOOLHOST_COMMAND
             joined = " ".join(spec.command)
+            assert "python -m thorn.toolhost" in joined
             assert "--socket" in joined
             assert CONTAINER_SOCKET_PATH in joined
             assert "--home" in joined
@@ -431,6 +438,51 @@ class TestBrokerBinding:
             assert len(ca_mounts) == 1
             assert ca_mounts[0].source == ca_pem
             assert ca_mounts[0].read_only is True
+        finally:
+            await host.stop()
+
+    @pytest.mark.asyncio
+    async def test_broker_readonly_root_adds_trust_store_tmpfs(
+        self, tmp_path: Path,
+    ) -> None:
+        """Read-only rootfs still needs writable trust-store overlays
+        for the entrypoint's one-shot broker CA install."""
+        from thorn.sandbox import Tmpfs
+        from thorn.sandbox._container import (
+            CONTAINER_BROKER_CA_PATH,
+        )
+
+        ca_pem = tmp_path / "broker-ca.pem"
+        ca_pem.write_text("-----BEGIN CERTIFICATE-----\n...\n")
+
+        adapter = FakeOCIRuntimeAdapter(present_images=["img"])
+        base = _make_config(tmp_path, image="img", adapter=adapter)
+        cfg = ContainerHostConfig(
+            agent_id=base.agent_id,
+            container_name=base.container_name,
+            image=base.image,
+            adapter=base.adapter,
+            host_home_dir=base.host_home_dir,
+            host_workspace_dir=base.host_workspace_dir,
+            host_control_dir=base.host_control_dir,
+            broker_proxy_url="http://x:tok@broker:8443/",
+            broker_ca_host_path=ca_pem,
+            user=base.user,
+            read_only_root=True,
+            tmpfs_mounts=(Tmpfs(target=Path("/tmp"), options="size=1G"),),
+            container_ready_timeout_s=base.container_ready_timeout_s,
+            container_ready_poll_s=base.container_ready_poll_s,
+        )
+        host = ContainerDaemonHost(cfg)
+        await host.start()
+        try:
+            spec = cfg.adapter.container_spec("thorn-agent-agent-x")
+            tmpfs_by_target = {mount.target: mount for mount in spec.tmpfs_mounts}
+            assert Path("/tmp") in tmpfs_by_target
+            for required_mount in BROKER_CA_TRUST_STORE_TMPFS_MOUNTS:
+                assert tmpfs_by_target[required_mount.target] == required_mount
+            targets = {str(m.target) for m in spec.mounts}
+            assert CONTAINER_BROKER_CA_PATH in targets
         finally:
             await host.stop()
 
