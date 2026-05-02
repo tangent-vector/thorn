@@ -102,6 +102,8 @@ class TestBundledComposeResource:
             "NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt"
             in compose
         )
+        assert "ONECLI_SKIP_VERIFY_HOSTS" in compose
+        assert "GATEWAY_SKIP_VERIFY_HOSTS: ${ONECLI_SKIP_VERIFY_HOSTS:-}" in compose
 
 
 def _http_factory(handler: httpx.MockTransport) -> Any:

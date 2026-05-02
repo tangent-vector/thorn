@@ -76,6 +76,12 @@
 #                             (default host.docker.internal).  Use this
 #                             when the host resolver maps an upstream
 #                             service name to a host-local egress proxy.
+#   ONECLI_SKIP_VERIFY_HOSTS  Optional comma-separated host patterns passed
+#                             to OneCLI's GATEWAY_SKIP_VERIFY_HOSTS. Use only
+#                             for operator-trusted hosts whose outbound TLS is
+#                             terminated by a local egress proxy not trusted by
+#                             OneCLI's Rust TLS client. Patterns may be exact
+#                             hosts or wildcard subdomains.
 
 services:
   postgres:
@@ -119,6 +125,7 @@ services:
       SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
       REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
       NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+      GATEWAY_SKIP_VERIFY_HOSTS: ${ONECLI_SKIP_VERIFY_HOSTS:-}
     extra_hosts:
       - "${ONECLI_HOST_GATEWAY_HOST:-host.docker.internal}:host-gateway"
     volumes:
