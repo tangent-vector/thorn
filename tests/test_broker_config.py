@@ -23,7 +23,9 @@ from pydantic import ValidationError
 
 from thorn.gateway._config import (
     BrokerConfig,
+    BundledBrokerImageConfig,
     GatewayConfig,
+    OCIImageReference,
     SandboxConfig,
     load_gateway_config,
 )
@@ -87,6 +89,34 @@ class TestBrokerConfigBundledMode:
         assert cfg.mode == "bundled"
         assert cfg.enabled is False
 
+    def test_bundled_image_overrides_load(self):
+        cfg = BrokerConfig.model_validate({
+            "mode": "bundled",
+            "bundled_images": {
+                "onecli": "registry.example.com/mirror/onecli:trial",
+                "postgres": "registry.example.com/mirror/postgres:18-alpine",
+            },
+        })
+        assert cfg.bundled_images.onecli == (
+            "registry.example.com/mirror/onecli:trial"
+        )
+        assert cfg.bundled_images.postgres == (
+            "registry.example.com/mirror/postgres:18-alpine"
+        )
+        assert isinstance(cfg.bundled_images.onecli, OCIImageReference)
+
+    def test_bundled_empty_image_reference_rejected(self):
+        with pytest.raises(ValidationError) as exc:
+            BundledBrokerImageConfig.model_validate({"onecli": ""})
+        assert "must not be empty" in str(exc.value)
+
+    def test_bundled_whitespace_image_reference_rejected(self):
+        with pytest.raises(ValidationError) as exc:
+            BundledBrokerImageConfig.model_validate({
+                "postgres": "registry.example.com/postgres:18 alpine",
+            })
+        assert "must not contain whitespace" in str(exc.value)
+
 
 class TestBrokerConfigExternalMode:
     def test_minimal_required_fields(self):
@@ -137,6 +167,16 @@ class TestBrokerConfigExternalMode:
         with pytest.raises(ValidationError) as exc:
             BrokerConfig.model_validate(bad)
         assert "proxy_url" in str(exc.value)
+
+    def test_external_with_bundled_images_rejected(self):
+        bad = _make_external_broker_dict(
+            bundled_images={
+                "onecli": "registry.example.com/mirror/onecli:trial",
+            },
+        )
+        with pytest.raises(ValidationError) as exc:
+            BrokerConfig.model_validate(bad)
+        assert "bundled_images" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

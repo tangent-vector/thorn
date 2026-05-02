@@ -56,7 +56,7 @@ import signal
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from thorn.core._agent import Agent
 from thorn.core._session import Session
@@ -71,7 +71,11 @@ from thorn.gateway._bundled_broker import (
     BundledBrokerError,
     BundledBrokerSupervisor,
 )
-from thorn.gateway._config import BrokerConfig, GatewayConfig
+from thorn.gateway._config import (
+    BrokerConfig,
+    BundledBrokerImageConfig,
+    GatewayConfig,
+)
 from thorn.gateway._event import (
     EventSource,
     FormattedEvent,
@@ -141,6 +145,18 @@ def _default_broker_client_factory(
     return BrokerClient(
         config.broker, admin_api_key=admin_api_key_from_env(config.broker),
     )
+
+
+class BundledBrokerSupervisorFactory(Protocol):
+    """Factory seam for constructing the bundled-broker supervisor."""
+
+    def __call__(
+        self,
+        *,
+        images: BundledBrokerImageConfig,
+    ) -> BundledBrokerSupervisor:
+        """Return a supervisor configured for the given image overrides."""
+        ...
 
 
 def _render_git_extra_headers(
@@ -245,7 +261,7 @@ class Gateway:
             "Callable[[GatewayConfig, BundledBrokerSupervisor | None], BrokerClient] | None"
         ) = None,
         bundled_broker_supervisor_factory: (
-            "Callable[[], BundledBrokerSupervisor] | None"
+            BundledBrokerSupervisorFactory | None
         ) = None,
     ) -> None:
         self._runtime = runtime
@@ -282,7 +298,9 @@ class Gateway:
         # fake supervisor that doesn't shell out to ``docker compose``.
         # Production callers leave it ``None`` and the gateway
         # instantiates the real :class:`BundledBrokerSupervisor` on
-        # demand only when ``broker.mode == "bundled"``.
+        # demand only when ``broker.mode == "bundled"``.  The factory
+        # receives the resolved bundled-image config so tests can
+        # keep the supervisor fake while still checking propagation.
         self._bundled_broker_supervisor_factory = (
             bundled_broker_supervisor_factory or BundledBrokerSupervisor
         )
@@ -1146,7 +1164,10 @@ class Gateway:
             )
 
         log.info("Bringing up bundled OneCLI broker (this may take ~10s) ...")
-        supervisor = self._bundled_broker_supervisor_factory()
+        images = config.broker.bundled_images
+        if not isinstance(images, BundledBrokerImageConfig):
+            images = BundledBrokerImageConfig.model_validate(images)
+        supervisor = self._bundled_broker_supervisor_factory(images=images)
         self._bundled_broker_supervisor = supervisor
         synthesized = await supervisor.start()
 

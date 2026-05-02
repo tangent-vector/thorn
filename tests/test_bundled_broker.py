@@ -25,6 +25,11 @@ from thorn.gateway._bundled_broker import (
     _parse_api_key_response,
     _split_compose_port_output,
 )
+from thorn.gateway._config import (
+    THORN_BUNDLED_BROKER_ONECLI_IMAGE_ENV_VAR,
+    THORN_BUNDLED_BROKER_POSTGRES_IMAGE_ENV_VAR,
+    BundledBrokerImageConfig,
+)
 from thorn.gateway._resources_helper import read_bundled_broker_compose_text
 
 # ---------------------------------------------------------------------------
@@ -92,6 +97,17 @@ class _ComposeRecorder:
 
 
 class TestBundledComposeResource:
+    def test_onecli_and_postgres_images_are_env_overridable(self) -> None:
+        compose = read_bundled_broker_compose_text()
+        assert (
+            "image: "
+            "${THORN_BUNDLED_BROKER_ONECLI_IMAGE:-ghcr.io/onecli/onecli:latest}"
+        ) in compose
+        assert (
+            "image: "
+            "${THORN_BUNDLED_BROKER_POSTGRES_IMAGE:-postgres:18-alpine}"
+        ) in compose
+
     def test_onecli_can_use_host_gateway_and_host_ca_bundle(self) -> None:
         compose = read_bundled_broker_compose_text()
         assert "ONECLI_HOST_GATEWAY_HOST" in compose
@@ -169,8 +185,10 @@ def _make_supervisor(
     recorder: _ComposeRecorder,
     handler: httpx.MockTransport,
     runtime: str = "podman",
+    images: BundledBrokerImageConfig | None = None,
 ) -> BundledBrokerSupervisor:
     return BundledBrokerSupervisor(
+        images=images,
         bind_host="127.0.0.1",
         # Deliberately small timeouts: every test scripts the
         # responses, so the only way these would fire is if the
@@ -333,6 +351,75 @@ class TestSupervisorStart:
         assert env["ONECLI_PROXY_PORT"] == "0"
         assert env["ONECLI_BIND_HOST"] == "127.0.0.1"
         assert env["ONECLI_NEXTAUTH_SECRET"] == ""
+
+    @pytest.mark.asyncio
+    async def test_configured_images_override_compose_env(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(
+            THORN_BUNDLED_BROKER_ONECLI_IMAGE_ENV_VAR,
+            "registry.example.com/env/onecli:latest",
+        )
+        monkeypatch.setenv(
+            THORN_BUNDLED_BROKER_POSTGRES_IMAGE_ENV_VAR,
+            "registry.example.com/env/postgres:18-alpine",
+        )
+        recorder = _ComposeRecorder()
+        recorder.script("up")
+        recorder.script("port", stdout="127.0.0.1:34567\n")
+        recorder.script("port", stdout="127.0.0.1:34568\n")
+
+        handler = _ok_health_handler([(200, {"apiKey": "oc_existing"})])
+        supervisor = _make_supervisor(
+            recorder=recorder,
+            handler=handler,
+            images=BundledBrokerImageConfig.model_validate({
+                "onecli": "registry.example.com/team/mirror/onecli:trial",
+                "postgres": (
+                    "registry.example.com/team/mirror/postgres:18-alpine"
+                ),
+            }),
+        )
+
+        await supervisor.start()
+
+        env = recorder.calls[0][1]
+        assert env[THORN_BUNDLED_BROKER_ONECLI_IMAGE_ENV_VAR] == (
+            "registry.example.com/team/mirror/onecli:trial"
+        )
+        assert env[THORN_BUNDLED_BROKER_POSTGRES_IMAGE_ENV_VAR] == (
+            "registry.example.com/team/mirror/postgres:18-alpine"
+        )
+
+    @pytest.mark.asyncio
+    async def test_image_environment_vars_flow_through_without_config(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(
+            THORN_BUNDLED_BROKER_ONECLI_IMAGE_ENV_VAR,
+            "registry.example.com/mirror/onecli:latest",
+        )
+        monkeypatch.setenv(
+            THORN_BUNDLED_BROKER_POSTGRES_IMAGE_ENV_VAR,
+            "registry.example.com/mirror/postgres:18-alpine",
+        )
+        recorder = _ComposeRecorder()
+        recorder.script("up")
+        recorder.script("port", stdout="127.0.0.1:34567\n")
+        recorder.script("port", stdout="127.0.0.1:34568\n")
+
+        handler = _ok_health_handler([(200, {"apiKey": "oc_existing"})])
+        supervisor = _make_supervisor(recorder=recorder, handler=handler)
+
+        await supervisor.start()
+
+        env = recorder.calls[0][1]
+        assert env[THORN_BUNDLED_BROKER_ONECLI_IMAGE_ENV_VAR] == (
+            "registry.example.com/mirror/onecli:latest"
+        )
+        assert env[THORN_BUNDLED_BROKER_POSTGRES_IMAGE_ENV_VAR] == (
+            "registry.example.com/mirror/postgres:18-alpine"
+        )
 
     @pytest.mark.asyncio
     async def test_mints_key_when_get_returns_404(self) -> None:

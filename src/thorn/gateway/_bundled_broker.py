@@ -55,7 +55,7 @@ from typing import Literal
 import httpx
 
 from thorn.core._credentials import ServiceCredential
-from thorn.gateway._config import BrokerConfig
+from thorn.gateway._config import BrokerConfig, BundledBrokerImageConfig
 from thorn.gateway._resources_helper import (
     BUNDLED_BROKER_COMPOSE_FILENAME,
     materialize_bundled_broker_compose,
@@ -208,6 +208,7 @@ class BundledBrokerSupervisor:
     def __init__(
         self,
         *,
+        images: BundledBrokerImageConfig | None = None,
         bind_host: str = "127.0.0.1",
         health_timeout_s: float = _DEFAULT_HEALTH_TIMEOUT_S,
         health_poll_interval_s: float = _DEFAULT_HEALTH_POLL_INTERVAL_S,
@@ -232,6 +233,11 @@ class BundledBrokerSupervisor:
         flip this to ``0.0.0.0`` -- the supervisor itself does not
         impose a security boundary, but it picks the safer default.
 
+        *images* carries optional gateway-config image overrides for
+        the bundled OneCLI and Postgres services.  When a reference
+        is absent, the supervisor leaves the matching compose env var
+        to the host environment / compose default path.
+
         *compose_runtime_factory* is a test seam: production callers
         leave it ``None`` and the supervisor auto-detects podman /
         docker.  Tests inject a fake that returns a record-and-replay
@@ -242,6 +248,7 @@ class BundledBrokerSupervisor:
         supervisor uses a default :class:`httpx.Client`; tests pass
         a factory that returns a client with a mock transport.
         """
+        self._images = images or BundledBrokerImageConfig()
         self._bind_host = bind_host
         self._health_timeout_s = health_timeout_s
         self._health_poll_interval_s = health_poll_interval_s
@@ -422,6 +429,7 @@ class BundledBrokerSupervisor:
             # would resolve to the sandbox container itself.
             proxy_url=_SANDBOX_PROXY_URL,
             ca_certificate_path=None,
+            bundled_images=self._images,
         )
         log.info(
             "Bundled broker: ready (admin=%s, proxy=%s, network=%s)",
@@ -596,6 +604,7 @@ class BundledBrokerSupervisor:
         env["ONECLI_PROXY_PORT"] = "0"
         env["ONECLI_BIND_HOST"] = self._bind_host
         env["ONECLI_NEXTAUTH_SECRET"] = ""
+        env.update(self._images.compose_env_overrides())
         return env
 
     # ------------------------------------------------------------------
