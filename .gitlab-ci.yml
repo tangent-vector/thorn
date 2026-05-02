@@ -1,0 +1,10 @@
+# GitLab CI configuration for thorn
+
+stages:
+  - test
+
+test-job:
+    stage: test
+    script:
+      - uv sync --all-extras --locked
+      - uv run pytest
