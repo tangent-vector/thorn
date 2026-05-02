@@ -580,3 +580,30 @@ class TestSupervisorShutdown:
         await supervisor.start()
         # Should not raise even though down returned non-zero.
         await supervisor.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_logs_manual_cleanup_when_compose_down_fails(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # A non-zero compose-down exit means automatic cleanup did not
+        # complete.  Operators need a concrete remediation, not a
+        # misleading "torn down" success message.
+        recorder = _ComposeRecorder()
+        recorder.script("up")
+        recorder.script("port", stdout="127.0.0.1:1111\n")
+        recorder.script("port", stdout="127.0.0.1:2222\n")
+        recorder.script("down", rc=1, stderr="network still has endpoints")
+
+        handler = _ok_health_handler([(200, {"apiKey": "oc_x"})])
+        supervisor = _make_supervisor(recorder=recorder, handler=handler)
+
+        await supervisor.start()
+
+        with caplog.at_level("WARNING", logger="thorn.gateway._bundled_broker"):
+            await supervisor.shutdown()
+
+        messages = "\n".join(record.getMessage() for record in caplog.records)
+        assert "compose down failed" in messages
+        assert "thorn broker down" in messages
+        assert "network still has endpoints" in messages
+        assert "torn down" not in messages

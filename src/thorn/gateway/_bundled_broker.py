@@ -519,21 +519,36 @@ class BundledBrokerSupervisor:
         ):
             return
         try:
-            await self._run_compose_capturing(
+            rc, stdout, stderr = await self._run_compose_capturing(
                 ("down", "--volumes", "--remove-orphans"),
                 env=self._compose_env(),
                 timeout_s=60.0,
                 check=False,
             )
-            log.info(
-                "Bundled broker: compose project %r torn down",
-                self._project_name,
-            )
+            if rc == 0:
+                log.info(
+                    "Bundled broker: compose project %r torn down",
+                    self._project_name,
+                )
+            else:
+                details = _compose_failure_details(stdout=stdout, stderr=stderr)
+                log.warning(
+                    "Bundled broker: compose down failed for project %r "
+                    "(exit %d): %s.  Automatic cleanup did not complete; "
+                    "run `thorn broker down` or `%s compose -p %s down "
+                    "--volumes --remove-orphans` to clean it up.",
+                    self._project_name,
+                    rc,
+                    details,
+                    self._compose_runtime_name or "docker",
+                    self._project_name,
+                )
         except Exception:
             log.exception(
                 "Bundled broker: error tearing down compose project %r; "
-                "you may need to clean it up manually with `thorn broker "
-                "down` or `%s compose -p %s down --volumes`",
+                "automatic cleanup did not complete.  Run `thorn broker "
+                "down` or `%s compose -p %s down --volumes --remove-orphans` "
+                "to clean it up.",
                 self._project_name,
                 self._compose_runtime_name or "docker",
                 self._project_name,
@@ -809,6 +824,14 @@ def _split_compose_port_output(raw: str) -> tuple[str, int]:
             f"compose port emitted non-integer port in {line!r}",
         ) from exc
     return host, port
+
+
+def _compose_failure_details(*, stdout: str, stderr: str) -> str:
+    """Return the most useful short failure text from compose output."""
+    details = (stderr or stdout).strip()
+    if not details:
+        return "<no output>"
+    return details[:500]
 
 
 # ---------------------------------------------------------------------------

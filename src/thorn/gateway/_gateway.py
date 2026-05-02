@@ -1039,19 +1039,21 @@ class Gateway:
 
         # Phase D: tear down broker registrations after schedulers
         # have drained so any in-flight tool calls had their proxy
-        # routing intact for the duration.  Best-effort -- a broker
-        # outage at shutdown should not prevent the gateway from
-        # exiting cleanly.
-        await self._teardown_broker_bindings()
-
-        # Bundled broker tear-down runs *after* per-agent broker
-        # bindings have been unwound -- the DELETE calls in
-        # _teardown_broker_bindings still need the broker to be
-        # serving the admin API.  Best-effort: a hung ``compose
-        # down`` should not block exit; the supervisor logs a
-        # remediation hint when it cannot tear the stack down so
-        # operators know to run ``thorn broker down`` manually.
-        await self._maybe_shutdown_bundled_broker()
+        # routing intact for the duration.  Bundled compose teardown is
+        # in the ``finally`` because compose owns the actual stack
+        # lifecycle; a stale or dead admin endpoint must not leave the
+        # containers running.
+        try:
+            await self._teardown_broker_bindings()
+        finally:
+            # Bundled broker tear-down runs *after* per-agent broker
+            # bindings have been unwound -- the DELETE calls in
+            # _teardown_broker_bindings still need the broker to be
+            # serving the admin API.  Best-effort: a hung ``compose
+            # down`` should not block exit; the supervisor logs a
+            # remediation hint when it cannot tear the stack down so
+            # operators know to run ``thorn broker down`` manually.
+            await self._maybe_shutdown_bundled_broker()
 
         self._inboxes.clear()
         log.info("Gateway stopped.")
@@ -1398,7 +1400,7 @@ class Gateway:
                 await asyncio.to_thread(client.delete_agent, binding.agent_id)
                 for secret_id in binding.secret_ids:
                     await asyncio.to_thread(client.delete_secret, secret_id)
-            except BrokerError as exc:
+            except Exception as exc:
                 log.warning(
                     "Broker: teardown failed for agent %s: %s",
                     agent_id, exc,
