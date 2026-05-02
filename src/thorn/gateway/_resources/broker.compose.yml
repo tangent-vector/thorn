@@ -50,6 +50,12 @@
 #   ONECLI_BIND_HOST          IP to bind the published ports to
 #                             (default 127.0.0.1).  Set to 0.0.0.0
 #                             only on hosts behind separate auth.
+#   THORN_BUNDLED_BROKER_ONECLI_IMAGE
+#                             OneCLI image reference used by the bundled
+#                             stack (default ghcr.io/onecli/onecli:latest).
+#   THORN_BUNDLED_BROKER_POSTGRES_IMAGE
+#                             Postgres image reference used by the bundled
+#                             stack (default postgres:18-alpine).
 #   ONECLI_ADMIN_PORT         Host port for the admin API (default
 #                             10254; bundled supervisor uses 0 to
 #                             let docker pick a free port).
@@ -85,7 +91,7 @@
 
 services:
   postgres:
-    image: postgres:18-alpine
+    image: ${THORN_BUNDLED_BROKER_POSTGRES_IMAGE:-postgres:18-alpine}
     environment:
       POSTGRES_USER: ${ONECLI_POSTGRES_USER:-onecli}
       POSTGRES_PASSWORD: ${ONECLI_POSTGRES_PASSWORD:-onecli}
@@ -106,7 +112,7 @@ services:
     restart: unless-stopped
 
   onecli:
-    image: ghcr.io/onecli/onecli:latest
+    image: ${THORN_BUNDLED_BROKER_ONECLI_IMAGE:-ghcr.io/onecli/onecli:latest}
     depends_on:
       postgres:
         condition: service_healthy

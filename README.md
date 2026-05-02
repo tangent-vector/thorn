@@ -210,6 +210,29 @@ and left an orphaned broker stack behind, `thorn broker status`
 lists matching compose projects and `thorn broker down` cleans them
 up.
 
+Restricted-egress VMs can mirror the broker images into a reachable
+registry and point the bundled stack at those mirrors without local
+retagging:
+
+```jsonc
+{
+  "broker": {
+    "mode": "bundled",
+    "bundled_images": {
+      "onecli": "registry.example.com/mirror/onecli:latest",
+      "postgres": "registry.example.com/mirror/postgres:18-alpine"
+    }
+  }
+}
+```
+
+For host-wide overrides, set
+`THORN_BUNDLED_BROKER_ONECLI_IMAGE` and
+`THORN_BUNDLED_BROKER_POSTGRES_IMAGE` in the `thorn serve`
+environment.  Config values take precedence over those env vars.
+`thorn broker status` and `thorn broker down` still find these
+stacks by Thorn's compose project prefix, independent of image names.
+
 ### Mode A advanced: external (operator-managed) broker
 
 When you already run an OneCLI broker for other workloads, point

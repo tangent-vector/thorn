@@ -61,11 +61,45 @@ calls `start()` on it.  The supervisor:
   fails loudly when neither is on PATH).
 * Runs `<oci> compose -p <project> -f <yaml> up -d --wait` with
   `ONECLI_ADMIN_PORT=0` / `ONECLI_PROXY_PORT=0` so docker picks free
-  host ports.
+  host ports.  If `broker.bundled_images` is set in `gateway.json`,
+  the supervisor passes those OneCLI/Postgres image references into
+  compose; otherwise the compose file honors
+  `THORN_BUNDLED_BROKER_ONECLI_IMAGE` and
+  `THORN_BUNDLED_BROKER_POSTGRES_IMAGE` from the host environment
+  before falling back to its built-in defaults.
 
 Cold-start cost on the first run is dominated by image pulls
 (typically a couple of minutes); subsequent runs reuse cached
 images and complete in ~10 seconds.
+
+Restricted-egress hosts should mirror the default broker images into
+a registry the host can reach, then either set the `bundled_images`
+block:
+
+```jsonc
+{
+  "broker": {
+    "mode": "bundled",
+    "bundled_images": {
+      "onecli": "gitlab.example.com:5005/team/mirror/onecli:latest",
+      "postgres": "gitlab.example.com:5005/team/mirror/postgres:18-alpine"
+    }
+  }
+}
+```
+
+or export the corresponding env vars before `thorn serve`:
+
+```console
+$ export THORN_BUNDLED_BROKER_ONECLI_IMAGE=gitlab.example.com:5005/team/mirror/onecli:latest
+$ export THORN_BUNDLED_BROKER_POSTGRES_IMAGE=gitlab.example.com:5005/team/mirror/postgres:18-alpine
+$ uv run thorn serve
+```
+
+Config values win over env vars when both are present.  The compose
+project name still uses the `thorn-broker-<short-random>` prefix, so
+`thorn broker status` and `thorn broker down` find mirrored-image
+stacks the same way they find default-image stacks.
 
 You'll see something like:
 
@@ -175,8 +209,9 @@ Common failure modes and where to look:
   OneCLI image is taking unusually long to boot.  Check
   `<oci> logs <project>-onecli-1` (or similar) for the failure.
   If the image pull itself is slow, pre-pull
-  `ghcr.io/onecli/onecli:latest` and `postgres:18-alpine` and
-  retry.
+  `ghcr.io/onecli/onecli:latest` and `postgres:18-alpine`, or set
+  `broker.bundled_images` / the `THORN_BUNDLED_BROKER_*_IMAGE` env
+  vars to mirrored images, and retry.
 
 * **Bundled broker on a subprocess sandbox**: explicit
   `broker.mode = "bundled"` alongside

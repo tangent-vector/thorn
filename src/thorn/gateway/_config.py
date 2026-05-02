@@ -71,9 +71,9 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, GetCoreSchemaHandler, model_validator
+from pydantic_core import CoreSchema, core_schema
 
-from thorn.core._credentials import ServiceCredential
 from thorn.core._service import Service
 from thorn.gateway._event import EventSource
 from thorn.gateway._peer import PeerSpec
@@ -125,7 +125,7 @@ def derive_forge_name_from_url(url: str) -> str:
     SaaS hosts so that ``https://github.com`` becomes ``"github"`` and
     ``https://gitlab.com`` becomes ``"gitlab"``.  Other hosts get the
     full hostname with dots replaced by hyphens, e.g.
-    ``"gitlab-master-nvidia-com"``.
+    ``"gitlab-internal-example-com"``.
 
     Raises :class:`ValueError` when *url* has no hostname.
     """
@@ -927,6 +927,99 @@ BrokerMode = Literal["bundled", "external"]
 """
 
 
+THORN_BUNDLED_BROKER_ONECLI_IMAGE_ENV_VAR = "THORN_BUNDLED_BROKER_ONECLI_IMAGE"
+"""Environment variable used to override the bundled OneCLI image."""
+
+THORN_BUNDLED_BROKER_POSTGRES_IMAGE_ENV_VAR = (
+    "THORN_BUNDLED_BROKER_POSTGRES_IMAGE"
+)
+"""Environment variable used to override the bundled Postgres image."""
+
+
+class OCIImageReference(str):
+    """A concrete OCI image reference used by bundled broker config.
+
+    Thorn does not parse image references into registry/name/tag/digest
+    components because compose accepts the full OCI reference string
+    directly and registries have a broad grammar.  The explicit type
+    still gives image references a named boundary in the gateway schema
+    and rejects values that cannot be valid compose image references.
+    """
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> CoreSchema:
+        return core_schema.no_info_plain_validator_function(
+            cls._validate,
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                str.__str__,
+                return_schema=core_schema.str_schema(),
+                when_used="always",
+            ),
+        )
+
+    @classmethod
+    def _validate(cls, value: Any) -> "OCIImageReference":
+        if isinstance(value, OCIImageReference):
+            return value
+        if not isinstance(value, str):
+            raise TypeError(
+                f"OCIImageReference requires str input, "
+                f"got {type(value).__name__}"
+            )
+        if not value:
+            raise ValueError("OCI image reference must not be empty")
+        if value.strip() != value or any(char.isspace() for char in value):
+            raise ValueError(
+                "OCI image reference must not contain whitespace",
+            )
+        return cls(value)
+
+
+class BundledBrokerImageConfig(BaseModel):
+    """Optional image references for Thorn's bundled broker compose stack.
+
+    Each field is an override.  Omitted fields fall back to the host
+    environment variables consumed by the bundled compose file, and
+    then to the defaults baked into that compose resource.
+    """
+
+    onecli: OCIImageReference | None = Field(
+        default=None,
+        description=(
+            "Optional OCI image reference for the bundled OneCLI "
+            "service.  When omitted, the bundled compose file uses "
+            f"${THORN_BUNDLED_BROKER_ONECLI_IMAGE_ENV_VAR} if set, "
+            "otherwise its built-in default."
+        ),
+    )
+    postgres: OCIImageReference | None = Field(
+        default=None,
+        description=(
+            "Optional OCI image reference for the bundled Postgres "
+            "service.  When omitted, the bundled compose file uses "
+            f"${THORN_BUNDLED_BROKER_POSTGRES_IMAGE_ENV_VAR} if set, "
+            "otherwise its built-in default."
+        ),
+    )
+
+    def has_overrides(self) -> bool:
+        """Return true when at least one image reference is configured."""
+        return self.onecli is not None or self.postgres is not None
+
+    def compose_env_overrides(self) -> dict[str, str]:
+        """Return compose env entries represented by this config."""
+        env: dict[str, str] = {}
+        if self.onecli is not None:
+            env[THORN_BUNDLED_BROKER_ONECLI_IMAGE_ENV_VAR] = str(self.onecli)
+        if self.postgres is not None:
+            env[THORN_BUNDLED_BROKER_POSTGRES_IMAGE_ENV_VAR] = str(self.postgres)
+        return env
+
+
 class BrokerConfig(BaseModel):
     """Agency-wide configuration for the OneCLI credential broker.
 
@@ -946,7 +1039,8 @@ class BrokerConfig(BaseModel):
       OneCLI stack via ``BundledBrokerSupervisor``.  ``admin_url``,
       ``admin_api_key``, and ``proxy_url`` MUST be left unset --
       they are filled in at runtime from the supervisor-discovered
-      values.
+      values.  ``bundled_images`` may optionally pin the OneCLI and
+      Postgres image references used by that managed stack.
     * ``mode: "external"``: the operator points the gateway at an
       OneCLI deployment they manage themselves.  ``admin_url``,
       ``admin_api_key``, and ``proxy_url`` are all required.
@@ -1040,6 +1134,15 @@ class BrokerConfig(BaseModel):
             "shared volumes."
         ),
     )
+    bundled_images: BundledBrokerImageConfig = Field(
+        default_factory=BundledBrokerImageConfig,
+        description=(
+            "Optional OCI image references for the bundled OneCLI + "
+            "Postgres compose stack.  Applies only when mode is "
+            "'bundled'; external brokers are operator-managed and "
+            "must not set this."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_mode_invariants(self) -> BrokerConfig:
@@ -1085,6 +1188,13 @@ class BrokerConfig(BaseModel):
                     "broker.mode='bundled' (or omit the broker block "
                     "entirely) if you want `thorn serve` to manage the "
                     "broker for you."
+                )
+            if self.bundled_images.has_overrides():
+                raise ValueError(
+                    "broker.mode='external' must not carry bundled_images; "
+                    "image selection belongs to the operator-managed "
+                    "external broker deployment, not Thorn's bundled "
+                    "compose stack."
                 )
         return self
 
@@ -1953,17 +2063,21 @@ def _create_gitlab_source(
 __all__ = [
     "AgentSandboxOverride",
     "BrokerConfig",
+    "BundledBrokerImageConfig",
     "EgressAllowlistEntry",
     "ForgeSpec",
     "ForkLocation",
     "ForkSpec",
     "GATEWAY_CONFIG_FILENAME",
     "GatewayConfig",
+    "OCIImageReference",
     "ProjectSpec",
     "ResolvedFork",
     "ResolvedProject",
     "SandboxConfig",
     "ServiceTypeRegistry",
+    "THORN_BUNDLED_BROKER_ONECLI_IMAGE_ENV_VAR",
+    "THORN_BUNDLED_BROKER_POSTGRES_IMAGE_ENV_VAR",
     "derive_api_url",
     "derive_forge_name_from_url",
     "derive_forge_type_from_url",

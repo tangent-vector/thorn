@@ -25,7 +25,6 @@ from thorn.gateway._routing import NoteableKind
 from thorn.runtime import AgentID, Runtime, SessionKey
 from thorn.runtime._paths import AgencyPaths
 
-
 # ---------------------------------------------------------------------------
 # IncomingEvent
 # ---------------------------------------------------------------------------
@@ -182,7 +181,6 @@ class TestGateway:
         runtime = self._make_runtime(tmp_path)
 
         handled: list[IncomingEvent] = []
-        original_handle = Gateway._handle_event
 
         async def tracking_handle(self_gw: Gateway, evt: IncomingEvent) -> None:
             handled.append(evt)
@@ -202,8 +200,6 @@ class TestGateway:
             session_key=SessionKey("agent_key"),
             content="Do something",
         )
-
-        gateway = Gateway(runtime=runtime, sources=[])
 
         async with runtime:
             agent = runtime.get_or_create_agent(AgentID("default"))
@@ -466,8 +462,8 @@ class TestGateway:
 
         from thorn.runtime._address import SessionAddress
         from thorn.runtime._dispatch import apply_handling_transition
-        from thorn.runtime._notification import NotificationStatus
         from thorn.runtime._inbox import SessionInbox
+        from thorn.runtime._notification import NotificationStatus
 
         async def slow_prompt(self_accessor, text, **kwargs):
             # Mark the oldest inbox item handled so the driver makes
@@ -1227,9 +1223,9 @@ def _make_mock_todo(
     todo.project = {
         "id": project_id,
         "path_with_namespace": "org/repo",
-        "http_url_to_repo": f"https://gitlab.example.com/org/repo.git",
+        "http_url_to_repo": "https://gitlab.example.com/org/repo.git",
         "default_branch": "main",
-        "web_url": f"https://gitlab.example.com/org/repo",
+        "web_url": "https://gitlab.example.com/org/repo",
     }
     todo.target_type = noteable_type
     todo.target = {"iid": noteable_iid}
@@ -1711,6 +1707,7 @@ class TestSessionStoreSafeDirnames:
 class TestServeCliGroup:
     def test_serve_is_group(self):
         from click.testing import CliRunner
+
         from thorn._cli import main as cli_main
 
         runner = CliRunner()
@@ -1720,6 +1717,7 @@ class TestServeCliGroup:
 
     def test_serve_mcp_help(self):
         from click.testing import CliRunner
+
         from thorn._cli import main as cli_main
 
         runner = CliRunner()
@@ -1729,6 +1727,7 @@ class TestServeCliGroup:
 
     def test_serve_without_gateway_config_fails_gracefully(self, tmp_path: Path):
         from click.testing import CliRunner
+
         from thorn._cli import main as cli_main
 
         runner = CliRunner()
@@ -2030,12 +2029,13 @@ class TestSourceRegistry:
             get_registered_source("nonexistent")
 
     def test_register_and_retrieve(self):
+        from pydantic import BaseModel
+
         from thorn.gateway.sources import (
             _SOURCE_REGISTRY,
-            register_source,
             get_registered_source,
+            register_source,
         )
-        from pydantic import BaseModel
 
         class DummyConfig(BaseModel):
             value: str = "test"
@@ -2082,6 +2082,7 @@ class TestSourceRegistry:
 class TestGatewayConfigLoading:
     def test_load_valid_config(self, tmp_path: Path):
         import json
+
         from thorn.gateway._config import load_gateway_config
 
         thorn_dir = tmp_path / ".thorn"
@@ -2131,6 +2132,7 @@ class TestGatewayConfigLoading:
 
     def test_load_empty_arrays(self, tmp_path: Path):
         import json
+
         from thorn.gateway._config import load_gateway_config
 
         thorn_dir = tmp_path / ".thorn"
@@ -2145,6 +2147,7 @@ class TestGatewayConfigLoading:
 
     def test_load_defaults_to_empty_arrays(self, tmp_path: Path):
         import json
+
         from thorn.gateway._config import load_gateway_config
 
         thorn_dir = tmp_path / ".thorn"
@@ -2170,6 +2173,7 @@ class TestGatewayConfigLoading:
 
     def test_load_with_sandbox_block(self, tmp_path: Path):
         import json
+
         from thorn.gateway._config import load_gateway_config
 
         thorn_dir = tmp_path / ".thorn"
@@ -2198,6 +2202,7 @@ class TestGatewayConfigLoading:
 
     def test_load_sandbox_block_subprocess_backend(self, tmp_path: Path):
         import json
+
         from thorn.gateway._config import load_gateway_config
 
         thorn_dir = tmp_path / ".thorn"
@@ -2212,6 +2217,7 @@ class TestGatewayConfigLoading:
 
     def test_sandbox_invalid_backend_rejected(self, tmp_path: Path):
         import json
+
         from thorn.gateway._config import load_gateway_config
 
         thorn_dir = tmp_path / ".thorn"
@@ -2306,9 +2312,9 @@ class TestServiceTypeRegistry:
             assert services[0]._config.label == "hello-ff"
         finally:
             # Restore the built-in registrations so other tests are unaffected.
+            from thorn.gateway._config import _github_forge_spec_to_config
             from thorn.tools._github_connection import GitHubConnectionConfig
             from thorn.tools.forge import GitHubForgeService
-            from thorn.gateway._config import _github_forge_spec_to_config
 
             registry.register(
                 "forge", "github",
@@ -2873,7 +2879,11 @@ class TestInferEventSources:
             from thorn.core._account import AgentAccountsConfig
             from thorn.core._agent import Agent
             from thorn.core._credentials import Credential
-            from thorn.gateway._config import ForgeSpec, GatewayConfig, infer_event_sources
+            from thorn.gateway._config import (
+                ForgeSpec,
+                GatewayConfig,
+                infer_event_sources,
+            )
             from thorn.gateway.sources._gitlab import GitLabTODOsSource
             from thorn.tools.forge import GitLabAccountConfig
 
@@ -3142,6 +3152,7 @@ class TestBootstrapCoordinator:
 
     def test_bootstrap_appends_to_existing_gateway_config(self, tmp_path: Path):
         import json
+
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
@@ -3167,6 +3178,7 @@ class TestBootstrapCoordinator:
 
     def test_bootstrap_updates_existing_entry_by_name(self, tmp_path: Path):
         import json
+
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
@@ -3192,6 +3204,7 @@ class TestBootstrapCoordinator:
     def test_bootstrap_custom_token_env(self, tmp_path: Path):
         """Custom access_token_env is written into agent credentials."""
         import json
+
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
@@ -3265,6 +3278,7 @@ class TestBootstrapCoordinator:
 
     def test_cli_bootstrap_command(self, tmp_path: Path):
         from click.testing import CliRunner
+
         from thorn._cli import main as cli_main
 
         runner = CliRunner()
@@ -3293,6 +3307,7 @@ class TestBootstrapCoordinator:
         rather than producing a half-broken config.
         """
         from click.testing import CliRunner
+
         from thorn._cli import main as cli_main
 
         runner = CliRunner()
@@ -3310,6 +3325,7 @@ class TestBootstrapCoordinator:
     def test_github_bootstrap_pat_default(self, tmp_path: Path):
         """GitHub bootstrap uses PAT auth (App auth not supported)."""
         import json
+
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
@@ -3345,6 +3361,7 @@ class TestBootstrapCoordinator:
     def test_bootstrap_writes_git_identity(self, tmp_path: Path):
         """Bootstrap writes git identity into agent accounts."""
         import json
+
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
@@ -3366,6 +3383,7 @@ class TestBootstrapCoordinator:
     def test_bootstrap_custom_git_identity(self, tmp_path: Path):
         """Explicit git_user_name/email override the defaults."""
         import json
+
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         bootstrap_coordinator(
@@ -3389,6 +3407,7 @@ class TestBootstrapCoordinator:
     def test_cli_bootstrap_github(self, tmp_path: Path):
         """CLI GitHub bootstrap defaults to PAT auth."""
         from click.testing import CliRunner
+
         from thorn._cli import main as cli_main
 
         runner = CliRunner()
@@ -3475,6 +3494,7 @@ class TestBootstrapHomeWorkspaceSplit:
     ):
         """The absolute workspace path is recorded in ``gateway.json``."""
         import json
+
         from thorn.gateway._bootstrap import bootstrap_coordinator
 
         agency_home = tmp_path / "agency"
@@ -3586,6 +3606,7 @@ class TestGatewayConfigWorkspace:
     def test_load_gateway_config_round_trips_workspace(self, tmp_path: Path):
         """The ``workspace`` field survives a write/read cycle."""
         import json
+
         from thorn.gateway._config import load_gateway_config
 
         agency_home = tmp_path / "agency"
@@ -3650,6 +3671,7 @@ class TestServeWorkspaceResolution:
         instead of actually starting the gateway daemon.
         """
         from click.testing import CliRunner
+
         from thorn._cli import main as cli_main
 
         agency_home = tmp_path / "agency"
@@ -3690,6 +3712,7 @@ class TestServeWorkspaceResolution:
     ):
         """Without ``--workspace``, the config's ``workspace`` is used."""
         from click.testing import CliRunner
+
         from thorn._cli import main as cli_main
 
         agency_home = tmp_path / "agency"
@@ -3723,6 +3746,7 @@ class TestServeWorkspaceResolution:
     ):
         """No CLI ``--workspace`` and no config ``workspace`` → error."""
         from click.testing import CliRunner
+
         from thorn._cli import main as cli_main
 
         agency_home = tmp_path / "agency"
@@ -4488,7 +4512,7 @@ class _FakeBundledSupervisor:
         start_error: Exception | None = None,
     ) -> None:
         from thorn.core._credentials import ServiceCredential
-        from thorn.gateway._config import BrokerConfig
+        from thorn.gateway._config import BrokerConfig, BundledBrokerImageConfig
 
         self.project_name = project_name
         self.egress_network_name = egress_network_name
@@ -4508,6 +4532,7 @@ class _FakeBundledSupervisor:
             admin_api_key_env_var=None,
             proxy_url=proxy_url,
             ca_certificate_path=None,
+            bundled_images=BundledBrokerImageConfig(),
         )
         self._admin_api_key: ServiceCredential | None = ServiceCredential(
             admin_api_key,
@@ -4595,7 +4620,7 @@ class TestGatewayBundledBrokerWiring:
             runtime=runtime,
             sources=[],
             gateway_config=config,
-            bundled_broker_supervisor_factory=lambda: supervisor,
+            bundled_broker_supervisor_factory=lambda **_: supervisor,
         )
 
         await gateway._maybe_start_bundled_broker()
@@ -4610,6 +4635,48 @@ class TestGatewayBundledBrokerWiring:
         assert runtime.sandbox_config is not None
         assert runtime.sandbox_config.egress_network == (
             "thorn-broker-xyz_thorn-broker"
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_passes_bundled_image_config_to_supervisor(
+        self, tmp_path: Path,
+    ) -> None:
+        from thorn.gateway._config import (
+            BrokerConfig,
+            BundledBrokerImageConfig,
+        )
+
+        runtime = self._make_runtime_with_sandbox(tmp_path)
+        config = self._make_gateway_config()
+        config.broker = BrokerConfig.model_validate({
+            "mode": "bundled",
+            "bundled_images": {
+                "onecli": "registry.example.com/mirror/onecli:trial",
+                "postgres": "registry.example.com/mirror/postgres:18-alpine",
+            },
+        })
+        supervisor = _FakeBundledSupervisor()
+        captured_images: list[BundledBrokerImageConfig] = []
+
+        def _factory(*, images: BundledBrokerImageConfig):
+            captured_images.append(images)
+            return supervisor
+
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[],
+            gateway_config=config,
+            bundled_broker_supervisor_factory=_factory,
+        )
+
+        await gateway._maybe_start_bundled_broker()
+
+        assert captured_images
+        assert captured_images[0].onecli == (
+            "registry.example.com/mirror/onecli:trial"
+        )
+        assert captured_images[0].postgres == (
+            "registry.example.com/mirror/postgres:18-alpine"
         )
 
     @pytest.mark.asyncio
@@ -4638,7 +4705,7 @@ class TestGatewayBundledBrokerWiring:
             runtime=runtime,
             sources=[],
             gateway_config=config,
-            bundled_broker_supervisor_factory=lambda: supervisor,
+            bundled_broker_supervisor_factory=lambda **_: supervisor,
         )
 
         await gateway._maybe_start_bundled_broker()
@@ -4663,7 +4730,7 @@ class TestGatewayBundledBrokerWiring:
             runtime=runtime,
             sources=[],
             gateway_config=config,
-            bundled_broker_supervisor_factory=lambda: supervisor,
+            bundled_broker_supervisor_factory=lambda **_: supervisor,
         )
 
         await gateway._maybe_start_bundled_broker()
@@ -4698,7 +4765,7 @@ class TestGatewayBundledBrokerWiring:
             runtime=runtime,
             sources=[],
             gateway_config=config,
-            bundled_broker_supervisor_factory=lambda: supervisor,
+            bundled_broker_supervisor_factory=lambda **_: supervisor,
         )
 
         await gateway._maybe_start_bundled_broker()
@@ -4729,7 +4796,7 @@ class TestGatewayBundledBrokerWiring:
             runtime=runtime,
             sources=[],
             gateway_config=config,
-            bundled_broker_supervisor_factory=lambda: supervisor,
+            bundled_broker_supervisor_factory=lambda **_: supervisor,
         )
 
         with pytest.raises(BundledBrokerError, match="container"):
@@ -4752,7 +4819,7 @@ class TestGatewayBundledBrokerWiring:
             runtime=runtime,
             sources=[],
             gateway_config=config,
-            bundled_broker_supervisor_factory=lambda: supervisor,
+            bundled_broker_supervisor_factory=lambda **_: supervisor,
         )
 
         await gateway._maybe_start_bundled_broker()
@@ -4780,7 +4847,7 @@ class TestGatewayBundledBrokerWiring:
             runtime=runtime,
             sources=[],
             gateway_config=config,
-            bundled_broker_supervisor_factory=lambda: supervisor,
+            bundled_broker_supervisor_factory=lambda **_: supervisor,
         )
 
         await gateway._maybe_start_bundled_broker()
