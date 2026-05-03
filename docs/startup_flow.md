@@ -194,6 +194,8 @@ Tore down 1 stack.
 bundled-broker prefix so it never touches operator-managed stacks.
 `thorn broker down` runs `compose down --volumes --remove-orphans`
 against each match.
+`thorn broker logs --project thorn-broker-a1b2c3d4` prints redacted
+OneCLI/Postgres logs for a stack that is still running.
 
 ## When things go wrong
 
@@ -206,12 +208,27 @@ Common failure modes and where to look:
   out of both.
 
 * **"OneCLI /api/health did not return 200 within 60s"**: the
-  OneCLI image is taking unusually long to boot.  Check
-  `<oci> logs <project>-onecli-1` (or similar) for the failure.
-  If the image pull itself is slow, pre-pull
+  OneCLI image is taking unusually long to boot.  Startup failures
+  include a redacted tail of the OneCLI/Postgres compose logs before
+  Thorn tears the transient stack down.  For a stack that is still
+  running, use `thorn broker logs --project <project>` instead of
+  reading raw container logs.  If the image pull itself is slow, pre-pull
   `ghcr.io/onecli/onecli:latest` and `postgres:18-alpine`, or set
   `broker.bundled_images` / the `THORN_BUNDLED_BROKER_*_IMAGE` env
   vars to mirrored images, and retry.
+
+* **Brokered Git reaches OneCLI but fails in TLS/MITM handling**:
+  tunnel mode forwards HTTPS bytes without credential substitution;
+  MITM mode terminates TLS inside OneCLI so it can inject an upstream
+  `Authorization` header for hosts registered by Thorn.  Git HTTPS
+  through Thorn's broker should use MITM mode.  TLS or certificate
+  failures in the broker log usually mean OneCLI cannot verify the
+  upstream host from the VM's egress path; configure
+  `ONECLI_HOST_CA_BUNDLE` for the host CA bundle, or set
+  `ONECLI_SKIP_VERIFY_HOSTS` only for hosts where bypassing
+  verification is acceptable.  `Proxy-Authorization` / HTTP 407
+  messages point at missing broker credentials in the sandbox, while
+  connection-refused / no-route messages point at host egress or DNS.
 
 * **Bundled broker on a subprocess sandbox**: explicit
   `broker.mode = "bundled"` alongside
