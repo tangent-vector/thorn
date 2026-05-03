@@ -105,6 +105,44 @@ class SessionInbox(DurableQueue):
         """
         return self.list(status=NotificationStatus.CONFIRMED)
 
+    # ------------------------------------------------------------------
+    # Operator recovery
+
+    def errored_items(self) -> list[Notification]:
+        """Return items parked in this inbox's ``errored/`` directory.
+
+        These items reached ``errored`` without an RSVP target and are
+        no longer visible to the session prompt loop.  Operators use
+        this view for recovery tooling that needs to inspect or requeue
+        failed work without waiting for a new upstream event.
+        """
+        return self._errored_queue().list()
+
+    def requeue_errored(self, notification_id: str) -> Notification:
+        """Move a parked errored item back to this inbox as ``pending``.
+
+        The notification keeps its original content, metadata, target,
+        RSVP, external key, and timestamp.  The previous terminal
+        status and failure annotations are cleared so the scheduler
+        treats the item exactly like prompt-ready work on the next
+        gateway run.
+
+        Raises ``KeyError`` if *notification_id* is not parked in the
+        ``errored/`` directory.
+        """
+        errored_queue = self._errored_queue()
+        errored_queue.update_status(
+            notification_id,
+            NotificationStatus.PENDING,
+            notes=None,
+            error_reason=None,
+        )
+        return errored_queue.move_to(notification_id, self)
+
+    def _errored_queue(self) -> DurableQueue:
+        """Queue wrapper for the ``errored/`` sibling directory."""
+        return DurableQueue(self.root_dir / "errored")
+
 
 __all__ = [
     "SessionInbox",

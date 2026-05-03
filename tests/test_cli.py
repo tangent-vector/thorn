@@ -16,6 +16,17 @@ from thorn.core._provider import (
     ToolCallChunk,
     UsageChunk,
 )
+from thorn.runtime import (
+    AddressBook,
+    AgencyPaths,
+    AgentID,
+    NotificationSpec,
+    NotificationStatus,
+    SessionAddress,
+    SessionInbox,
+    SessionKey,
+    apply_handling_transition,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -84,6 +95,97 @@ def _find_session_state_dirs(
                 continue
         matches.append(state_dir)
     return matches
+
+
+def _park_errored_inbox_item(
+    *,
+    agency_home: Path,
+    workspace_root: Path,
+    agent_id: AgentID,
+    session_key: SessionKey,
+) -> tuple[SessionInbox, str]:
+    paths = AgencyPaths(home_root=agency_home, workspace_root=workspace_root)
+    address = SessionAddress(agent_id, session_key)
+    inbox = SessionInbox(paths.session_inbox_dir(agent_id, session_key), address)
+    posted = inbox.post(
+        NotificationSpec(
+            source="test",
+            content="please retry this notification",
+            target=address,
+            metadata={"todo_id": 123},
+            external_key="gitlab:https://gitlab.example.com:todo:123",
+        )
+    )
+    apply_handling_transition(
+        inbox,
+        posted.id,
+        NotificationStatus.ERRORED,
+        address_book=AddressBook(),
+        error_reason="provider key was invalid",
+    )
+    return inbox, posted.id
+
+
+class TestInboxRequeueCommand:
+    def test_requeues_errored_item(self, tmp_path: Path, monkeypatch) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        agent_id = AgentID("coordinator")
+        session_key = SessionKey("projects/thorn/issues/5")
+        workspace_root.mkdir()
+        inbox, item_id = _park_errored_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=agent_id,
+            session_key=session_key,
+        )
+        monkeypatch.chdir(workspace_root)
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "requeue", item_id,
+                "--agency", str(agency_home),
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert item_id in result.output
+        assert "coordinator" in result.output
+        assert "projects/thorn/issues/5" in result.output
+        assert inbox.errored_items() == []
+        requeued = inbox.get(item_id)
+        assert requeued.status is NotificationStatus.PENDING
+        assert requeued.error_reason is None
+        assert (
+            requeued.external_key
+            == "gitlab:https://gitlab.example.com:todo:123"
+        )
+
+    def test_reports_missing_item_without_error_reason(
+        self, tmp_path: Path
+    ) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        _park_errored_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "requeue", "missing-item",
+                "--agency", str(agency_home),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "missing-item" in result.output
+        assert "provider key was invalid" not in result.output
 
 
 class TestRunResultFile:
@@ -432,8 +534,8 @@ class TestRunEventBusWiring:
     def test_subscribed_listener_receives_session_events(
         self, tmp_path: Path, monkeypatch,
     ):
-        from thorn.core._event_bus import EventBus
         from thorn._cli import _build_runtime
+        from thorn.core._event_bus import EventBus
 
         # Wrap _build_runtime so the test can capture the runtime that
         # ``thorn run`` constructed and subscribe a listener to its
@@ -541,8 +643,8 @@ class TestRunEventBusWiring:
     def test_listener_filtered_to_other_session_sees_nothing(
         self, tmp_path: Path, monkeypatch,
     ):
-        from thorn.core._event_bus import EventBus, in_session
         from thorn._cli import _build_runtime
+        from thorn.core._event_bus import EventBus, in_session
 
         captured: list[str] = []
 
