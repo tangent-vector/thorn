@@ -83,6 +83,38 @@ host), pass `--forge-base-url https://ghe.example.com/api/v3`.  For
 GitLab, `--forge-base-url` is **required** since GitLab has no
 canonical default host.
 
+GitLab projects should normally be configured with their human project
+URL, not the numeric API ID:
+
+```json
+{
+  "projects": [
+    {
+      "name": "thorn",
+      "url": "https://gitlab.example.com/team/thorn"
+    }
+  ]
+}
+```
+
+Thorn derives `team/thorn` from that URL for clone paths and, when a
+self-hosted GitLab instance rejects path-based project API lookups,
+resolves it to the numeric project ID through GitLab project search.
+If that search cannot see the project, add `native_id` as an explicit
+fallback while keeping the human URL for clone links:
+
+```json
+{
+  "projects": [
+    {
+      "name": "thorn",
+      "url": "https://gitlab.example.com/team/thorn",
+      "native_id": "264873"
+    }
+  ]
+}
+```
+
 This writes three files under `.thorn/`:
 
 | File | Purpose |

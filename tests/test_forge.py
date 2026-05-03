@@ -30,7 +30,6 @@ from thorn.tools.forge import (
 if TYPE_CHECKING:
     from thorn.core._agent import Agent
 
-
 # ---------------------------------------------------------------------------
 # GitLabForgeClient
 # ---------------------------------------------------------------------------
@@ -156,11 +155,10 @@ class TestGitLabForgeClient:
         assert result["clone_url"] == "https://gl.example.com/org/repo.git"
 
     def test_path_native_id_forwarded_verbatim(self):
-        """A path-style native id (``group/project``) is passed through
-        unchanged.  ``python-gitlab`` accepts both numeric IDs and
-        URL-encoded ``namespace/path`` strings; the new gateway config
-        derives the latter from the fork URL so we no longer have to
-        force operators to write the numeric form."""
+        """A path-style native id (``group/project``) is passed to
+        the low-level GitLab client unchanged.  That client owns the
+        fallback from path lookups to numeric IDs for self-hosted
+        instances that need it."""
         client, mock_gl = self._make_client()
         mock_gl.get_issue.return_value = {
             "iid": 7,
@@ -462,8 +460,16 @@ class TestGitLabForgeService:
         svc = GitLabForgeService(config, service_name="my-gitlab")
         assert svc.name == "my-gitlab"
 
-    def test_clone_url_for_returns_empty(self):
-        """GitLab native IDs are numeric, so clone URLs can't be derived."""
+    def test_clone_url_for_path_native_id(self):
+        config = GitLabForgeServiceConfig(url="https://gl.example.com", token="t")
+        svc = GitLabForgeService(config, service_name="gl")
+        assert (
+            svc.clone_url_for("team/subgroup/project")
+            == "https://gl.example.com/team/subgroup/project.git"
+        )
+
+    def test_clone_url_for_numeric_native_id_returns_empty(self):
+        """Numeric GitLab IDs need live project info to recover clone URLs."""
         config = GitLabForgeServiceConfig(url="https://gl.example.com", token="t")
         svc = GitLabForgeService(config, service_name="gl")
         assert svc.clone_url_for("214768") == ""
