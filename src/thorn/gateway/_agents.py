@@ -223,7 +223,12 @@ specific file paths when you want a narrow stage).
 committing, run `git status` to confirm there are no remaining \
 unstaged or untracked files; address or stage them before pushing.
 8. Push the branch with `run_shell("git push -u origin <branch>")`.
-9. Create a change request with forge_create_change_request.
+9. Create a change request with forge_create_change_request. When the \
+change request is intended to fully resolve the source issue, include \
+a forge-compatible closing reference in the change-request description \
+(for example, `Closes #<issue-iid>`). Do not include a closing \
+reference for exploratory, draft, partial, or follow-up-only change \
+requests.
 10. Post a comment on the original issue linking to the change \
 request. In the description or your comment, mention that reviewers \
 should @-mention you in their review comments so you receive a \

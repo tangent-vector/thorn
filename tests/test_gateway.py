@@ -1767,6 +1767,9 @@ class TestProjectCoordinator:
         assert "project coordinator" in joined
         assert "do not fall back to ssh" in joined
         assert "brokered https" in joined
+        assert "closes #<issue-iid>" in joined
+        assert "exploratory" in joined
+        assert "partial" in joined
 
     def test_has_forge_tools(self):
         from thorn.gateway._agents import ProjectCoordinator
