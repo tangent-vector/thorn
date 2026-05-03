@@ -225,6 +225,20 @@ same ID.  This command only moves Thorn's local `inbox/errored/`
 file back to pending work; it does not contact GitLab/GitHub or
 re-create upstream TODOs.
 
+Before letting a live gateway consume forge notifications, run a
+safe Git connectivity preflight from the same agency config:
+
+```console
+$ uv run thorn serve preflight --agency ~/.thorn
+```
+
+The default preflight starts the configured sandbox and broker path,
+then runs `git ls-remote` against each configured project clone URL
+from inside the sandbox. It does not start event sources and does not
+read, mark done, or otherwise consume GitLab/GitHub notifications.
+Add `--write-check` only when you want to verify that the bot
+credential can push and delete a temporary branch.
+
 Restricted-egress VMs can mirror the broker images into a reachable
 registry and point the bundled stack at those mirrors without local
 retagging:
