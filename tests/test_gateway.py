@@ -1765,6 +1765,8 @@ class TestProjectCoordinator:
         assert len(prompts) >= 2
         joined = "\n".join(p for p in prompts if isinstance(p, str)).lower()
         assert "project coordinator" in joined
+        assert "do not fall back to ssh" in joined
+        assert "brokered https" in joined
 
     def test_has_forge_tools(self):
         from thorn.gateway._agents import ProjectCoordinator

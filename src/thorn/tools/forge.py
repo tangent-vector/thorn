@@ -55,6 +55,7 @@ not a substitute for the per-tool review.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Literal, Protocol
@@ -65,8 +66,6 @@ from thorn.core._account import (
     AccountConfig,
     require_credential,
 )
-import base64
-
 from thorn.core._brokering import (
     BrokerableService,
     BrokerCredentialPlan,
@@ -1774,7 +1773,7 @@ async def forge_list_comments(
 async def forge_get_project_info(project: str) -> str:
     """Get information about a project.
 
-    Returns the project's name, clone URLs, default branch, and
+    Returns the project's name, HTTPS clone URL, default branch, and
     description.
     """
     client, native_id = _resolve(project)
@@ -1783,7 +1782,9 @@ async def forge_get_project_info(project: str) -> str:
         f"Project: {info['name']}",
         f"Path: {info['path']}",
         f"Clone URL (HTTPS): {info['clone_url']}",
-        f"Clone URL (SSH): {info['ssh_url']}",
+        "Clone URL (SSH): unavailable in Thorn's default sandbox/broker "
+        "profile; use HTTPS unless explicit operator policy says SSH is "
+        "available.",
         f"Default branch: {info['default_branch']}",
         f"URL: {info['url']}",
     ]
