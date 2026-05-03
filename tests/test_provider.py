@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -31,7 +29,6 @@ from thorn.core.errors import (
     RateLimitError,
     TransientProviderError,
 )
-
 
 # ---------------------------------------------------------------------------
 # MockProvider
@@ -264,8 +261,6 @@ class TestOpenAIProviderMaxTokens:
         )
         provider = OpenAIProvider(config)
 
-        original_stream = provider._client.stream
-
         from contextlib import asynccontextmanager
 
         @asynccontextmanager
@@ -383,8 +378,8 @@ class TestParseRetryAfter:
         assert _parse_retry_after("-5") == 0.0
 
     def test_http_date_future(self):
-        from email.utils import format_datetime
         from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
 
         future = datetime.now(tz=timezone.utc) + timedelta(seconds=45)
         header = format_datetime(future, usegmt=True)
@@ -397,8 +392,8 @@ class TestParseRetryAfter:
         # Past HTTP-date: behavior of a server that happened to
         # pick a date whose value has already elapsed.  Zero means
         # "retry now"; we do not want to return a negative sleep.
-        from email.utils import format_datetime
         from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
 
         past = datetime.now(tz=timezone.utc) - timedelta(seconds=30)
         header = format_datetime(past, usegmt=True)
@@ -493,6 +488,25 @@ class TestOpenAIProviderErrorMapping:
             ):
                 pass
 
+    async def test_transport_error_redacts_credentials(self) -> None:
+        import httpx
+
+        provider_key = "sk-transport-provider-key-123456"
+        provider = _mock_streaming_provider(
+            raise_on_stream=httpx.ConnectError(
+                f"Authorization: Bearer {provider_key}",
+            ),
+        )
+        with pytest.raises(TransientProviderError) as exc_info:
+            async for _ in provider.complete(
+                ["sys"], [], [UserMessage(content="hi")],
+            ):
+                pass
+
+        message = str(exc_info.value)
+        assert provider_key not in message
+        assert "Authorization: <redacted>" in message
+
     async def test_429_becomes_rate_limit_with_retry_after(self):
         response = _FakeHttpResponse(
             429, [], text="slow down", headers={"retry-after": "12"},
@@ -559,3 +573,52 @@ class TestOpenAIProviderErrorMapping:
                 pass
         assert not isinstance(exc_info.value, TransientProviderError)
         assert not isinstance(exc_info.value, RateLimitError)
+
+    @pytest.mark.parametrize(
+        ("status", "error_type"),
+        [
+            (429, RateLimitError),
+            (503, TransientProviderError),
+            (401, ProviderError),
+        ],
+    )
+    async def test_http_error_bodies_redact_credentials(
+        self,
+        status: int,
+        error_type: type[ProviderError],
+    ) -> None:
+        provider_api_key = "sk-live-provider-key-123456"
+        bearer_token = "nvapi-provider-bearer-token-123456"
+        proxy_token = "aoc_proxy_token_for_provider_123456"
+        gitlab_pat = "glpat-provider-pat-123456"
+        response = _FakeHttpResponse(
+            status,
+            [],
+            text=(
+                f"Authorization: Bearer {bearer_token}\n"
+                f"Proxy-Authorization: Basic {proxy_token}\n"
+                f'{{"api_key": "{provider_api_key}", '
+                f'"accessToken": "{proxy_token}", '
+                f'"token": "{gitlab_pat}", '
+                f'"url": "https://x:{gitlab_pat}@gitlab.example.com/repo"}}'
+            ),
+        )
+        provider = _mock_streaming_provider(response)
+
+        with pytest.raises(error_type) as exc_info:
+            async for _ in provider.complete(
+                ["sys"], [], [UserMessage(content="hi")],
+            ):
+                pass
+
+        message = str(exc_info.value)
+        for secret in (
+            provider_api_key,
+            bearer_token,
+            proxy_token,
+            gitlab_pat,
+        ):
+            assert secret not in message
+        assert "Authorization: <redacted>" in message
+        assert "Proxy-Authorization: <redacted>" in message
+        assert "<redacted>" in message

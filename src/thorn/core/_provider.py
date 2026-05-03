@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from thorn._redaction import redact_secret_snippet
 from thorn.core._messages import (
     AssistantMessage,
     Message,
@@ -259,7 +260,8 @@ class OpenAIProvider(LLMProvider):
                 if response.status_code == 429:
                     await response.aread()
                     raise RateLimitError(
-                        f"rate limited (HTTP 429): {response.text}",
+                        f"rate limited (HTTP 429): "
+                        f"{_provider_error_snippet(response.text)}",
                         retry_after=_parse_retry_after(
                             response.headers.get("retry-after"),
                         ),
@@ -268,7 +270,8 @@ class OpenAIProvider(LLMProvider):
                     await response.aread()
                     raise TransientProviderError(
                         f"provider returned transient HTTP "
-                        f"{response.status_code}: {response.text}",
+                        f"{response.status_code}: "
+                        f"{_provider_error_snippet(response.text)}",
                         retry_after=_parse_retry_after(
                             response.headers.get("retry-after"),
                         ),
@@ -277,7 +280,7 @@ class OpenAIProvider(LLMProvider):
                     await response.aread()
                     raise ProviderError(
                         f"provider returned HTTP {response.status_code}: "
-                        f"{response.text}"
+                        f"{_provider_error_snippet(response.text)}"
                     )
 
                 # Stream parsing lives inside the ``try`` so that
@@ -299,7 +302,8 @@ class OpenAIProvider(LLMProvider):
             # industry practice for REST clients -- the caller
             # will decide whether to retry based on its policy.
             raise TransientProviderError(
-                f"transport error talking to provider: {exc}",
+                f"transport error talking to provider: "
+                f"{_provider_error_snippet(str(exc))}",
             ) from exc
 
 
@@ -312,6 +316,11 @@ class OpenAIProvider(LLMProvider):
 # four listed here are the ones spec'd (502/504) or widely
 # implemented (503) as transient gateway/overload conditions.
 _TRANSIENT_HTTP_STATUSES = frozenset({502, 503, 504})
+
+
+def _provider_error_snippet(response_text: str) -> str:
+    """Bound provider error bodies without leaking credential material."""
+    return redact_secret_snippet(response_text, max_chars=500)
 
 
 def _parse_retry_after(header: str | None) -> float | None:

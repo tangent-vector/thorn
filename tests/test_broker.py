@@ -107,6 +107,106 @@ class TestBrokerClientGuards:
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic redaction
+# ---------------------------------------------------------------------------
+
+
+class TestBrokerDiagnosticRedaction:
+    def test_admin_error_body_redacts_credentials(self) -> None:
+        admin_token = "oc_admin_error_token_123456"
+        proxy_token = "aoc_proxy_error_token_123456"
+        gitlab_pat = "glpat-error-body-token-123456"
+        github_pat = "ghp_errorbodytoken123456"
+        provider_key = "sk-provider-error-key-123456"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                500,
+                text=(
+                    f"Authorization: Bearer {admin_token}\n"
+                    f"Proxy-Authorization: Basic {proxy_token}\n"
+                    f'{{"apiKey": "{provider_key}", '
+                    f'"access_token": "{proxy_token}", '
+                    f'"token": "{gitlab_pat}", '
+                    f'"url": "https://x:{github_pat}@github.com/repo"}}'
+                ),
+            )
+
+        with _client_with_router(_broker_config(), handler) as client:
+            with pytest.raises(BrokerError) as exc_info:
+                client.fetch_ca_certificate()
+
+        message = str(exc_info.value)
+        for secret in (
+            admin_token,
+            proxy_token,
+            gitlab_pat,
+            github_pat,
+            provider_key,
+        ):
+            assert secret not in message
+        assert "Authorization: <redacted>" in message
+        assert "Proxy-Authorization: <redacted>" in message
+        assert "<redacted>" in message
+
+    def test_unexpected_response_shape_redacts_credentials(self) -> None:
+        proxy_token = "aoc_shape_error_token_123456"
+        gitlab_pat = "glpat-shape-error-token-123456"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "accessToken": proxy_token,
+                    "value": gitlab_pat,
+                },
+            )
+
+        with _client_with_router(_broker_config(), handler) as client:
+            with pytest.raises(BrokerError) as exc_info:
+                client.register_secret(
+                    name="agent-gitlab-pat",
+                    value=ServiceCredential(gitlab_pat),
+                    host_pattern="gitlab.example.com",
+                    path_pattern="/*",
+                    injection=HeaderInjection(
+                        header_name="Authorization",
+                        value_format="Bearer {value}",
+                    ),
+                )
+
+        message = str(exc_info.value)
+        assert proxy_token not in message
+        assert gitlab_pat not in message
+        assert "<redacted>" in message
+
+    def test_broker_binding_repr_redacts_runtime_credentials(self) -> None:
+        access_token = "aoc_binding_access_token_123456"
+        placeholder = "thorn-broker-placeholder-raw-value"
+        extra_header = "Authorization: Basic dDpnbHBhdC1yYXctcGF0LTEyMzQ1Ng=="
+
+        binding = BrokerBinding(
+            agent_id="agent-1",
+            secret_ids=("secret-1",),
+            access_token=ServiceCredential(access_token),
+            proxy_url=f"http://x:{access_token}@onecli:10255",
+            ca_certificate_path="/tmp/ca.pem",
+            placeholder_env=(("GITLAB_TOKEN", placeholder),),
+            git_extra_headers=(("gitlab.example.com", extra_header),),
+            git_config_path="/tmp/gitconfig",
+        )
+
+        rendered = repr(binding)
+        assert access_token not in rendered
+        assert placeholder not in rendered
+        assert extra_header not in rendered
+        assert "GITLAB_TOKEN" in rendered
+        assert "ServiceCredential(<redacted" in rendered
+        assert "proxy_url='http://<redacted>@onecli:10255'" in rendered
+        assert "<redacted>" in rendered
+
+
+# ---------------------------------------------------------------------------
 # Auth header (R2)
 # ---------------------------------------------------------------------------
 

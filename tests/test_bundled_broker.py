@@ -277,6 +277,22 @@ class TestParseApiKeyResponse:
         with pytest.raises(BundledBrokerError, match="non-JSON"):
             _parse_api_key_response("not json", source="GET")
 
+    def test_non_json_body_redacts_credentials(self) -> None:
+        admin_token = "oc_nonjson_admin_token_123456"
+        provider_key = "sk-nonjson-provider-key-123456"
+        body = (
+            f"apiKey={admin_token} "
+            f"Authorization: Bearer {provider_key}"
+        )
+
+        with pytest.raises(BundledBrokerError, match="non-JSON") as exc_info:
+            _parse_api_key_response(body, source="GET")
+
+        message = str(exc_info.value)
+        assert admin_token not in message
+        assert provider_key not in message
+        assert "<redacted>" in message
+
     def test_missing_field_raises(self) -> None:
         body = json.dumps({"otherField": "x"})
         with pytest.raises(BundledBrokerError, match="apiKey"):
@@ -296,6 +312,7 @@ class TestBrokerDiagnosticRedaction:
             "ONECLI_ACCESS_TOKEN=oc_envsecret",
             "DATABASE_URL=postgres://user:db-secret@postgres:5432/app",
             '{"apiKey": "oc_jsonsecret", "accessToken": "aoc_accesssecret"}',
+            "token: bare-secret-value",
             "proxy=http://x:proxy-secret@onecli:10255",
         ])
 
@@ -308,6 +325,7 @@ class TestBrokerDiagnosticRedaction:
             "db-secret",
             "oc_jsonsecret",
             "aoc_accesssecret",
+            "bare-secret-value",
             "proxy-secret",
         ):
             assert secret not in redacted
@@ -502,6 +520,33 @@ class TestSupervisorStart:
         # Verify rollback fired.
         verbs = [_ComposeRecorder._verb_of(call[0]) for call in recorder.calls]
         assert verbs[-2:] == ["logs", "down"]
+
+    @pytest.mark.asyncio
+    async def test_unexpected_status_on_get_redacts_response_body(self) -> None:
+        recorder = _ComposeRecorder()
+        recorder.script("up")
+        recorder.script("port", stdout="127.0.0.1:1111\n")
+        recorder.script("port", stdout="127.0.0.1:2222\n")
+        recorder.script("down")
+
+        admin_token = "oc_unexpected_status_admin_token_123456"
+        proxy_token = "aoc_unexpected_status_proxy_token_123456"
+        handler = _ok_health_handler([
+            (
+                500,
+                f"apiKey={admin_token} "
+                f"Proxy-Authorization: Basic {proxy_token}",
+            ),
+        ])
+        supervisor = _make_supervisor(recorder=recorder, handler=handler)
+
+        with pytest.raises(BundledBrokerError) as exc_info:
+            await supervisor.start()
+
+        message = str(exc_info.value)
+        assert admin_token not in message
+        assert proxy_token not in message
+        assert "<redacted>" in message
 
     @pytest.mark.asyncio
     async def test_health_timeout_rolls_back(self) -> None:
