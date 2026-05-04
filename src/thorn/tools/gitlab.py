@@ -81,6 +81,68 @@ class GitLabProjectLookupError(RuntimeError):
     """Raised when a path-style GitLab project ref cannot be resolved."""
 
 
+class GitLabProjectResolver:
+    """Resolve GitLab project refs against a python-gitlab projects manager."""
+
+    def __init__(self, projects_manager: Any) -> None:
+        self._projects_manager = projects_manager
+        self._project_path_id_cache: dict[str, int] = {}
+
+    def get_project(self, project_ref: GitLabProjectRef) -> Any:
+        """Return a python-gitlab project, resolving path refs if needed."""
+        direct_ref = _direct_project_ref(project_ref)
+        if isinstance(direct_ref, int):
+            return self._projects_manager.get(direct_ref)
+
+        cached_id = self._project_path_id_cache.get(direct_ref)
+        if cached_id is not None:
+            return self._projects_manager.get(cached_id)
+
+        try:
+            project = self._projects_manager.get(direct_ref)
+        except Exception as exc:
+            if not _is_gitlab_not_found(exc):
+                raise
+            resolved_id = self.resolve_project_id(direct_ref)
+            return self._projects_manager.get(resolved_id)
+
+        project_id = getattr(project, "id", None)
+        if isinstance(project_id, int):
+            self._project_path_id_cache[direct_ref] = project_id
+        return project
+
+    def resolve_project_id(self, project_path: str) -> int:
+        """Resolve ``path_with_namespace`` to GitLab's numeric project ID."""
+        normalized_path = _normalize_gitlab_project_path(project_path)
+        cached_id = self._project_path_id_cache.get(normalized_path)
+        if cached_id is not None:
+            return cached_id
+
+        search_term = normalized_path.rsplit("/", 1)[-1]
+        projects = self._projects_manager.list(
+            search=search_term,
+            simple=True,
+            iterator=True,
+        )
+        for project in projects:
+            candidate_path = str(
+                getattr(project, "path_with_namespace", "") or "",
+            ).strip("/")
+            if candidate_path != normalized_path:
+                continue
+            project_id = int(getattr(project, "id"))
+            self._project_path_id_cache[normalized_path] = project_id
+            return project_id
+
+        raise GitLabProjectLookupError(
+            f"GitLab project {normalized_path!r} could not be resolved "
+            "to a numeric project ID via project search.  If this is "
+            "a self-hosted GitLab instance that rejects path-based API "
+            "project lookups, set this fork's `native_id` in gateway.json "
+            "to the numeric GitLab project ID."
+        )
+
+
 class GitLabClient:
     """High-level GitLab client wrapping ``python-gitlab``.
 
@@ -94,7 +156,7 @@ class GitLabClient:
             url=config.url,
             private_token=config.token,
         )
-        self._project_path_id_cache: dict[str, int] = {}
+        self._project_resolver = GitLabProjectResolver(self._gl.projects)
 
     def check_connection(self) -> dict[str, Any]:
         """Authenticate and return info about the current user.
@@ -416,57 +478,11 @@ class GitLabClient:
 
     def _get_project(self, project_ref: GitLabProjectRef) -> Any:
         """Return a python-gitlab project, resolving path refs if needed."""
-        direct_ref = _direct_project_ref(project_ref)
-        if isinstance(direct_ref, int):
-            return self._gl.projects.get(direct_ref)
-
-        cached_id = self._project_path_id_cache.get(direct_ref)
-        if cached_id is not None:
-            return self._gl.projects.get(cached_id)
-
-        try:
-            project = self._gl.projects.get(direct_ref)
-        except Exception as exc:
-            if not _is_gitlab_not_found(exc):
-                raise
-            resolved_id = self.resolve_project_id(direct_ref)
-            return self._gl.projects.get(resolved_id)
-
-        project_id = getattr(project, "id", None)
-        if isinstance(project_id, int):
-            self._project_path_id_cache[direct_ref] = project_id
-        return project
+        return self._project_resolver.get_project(project_ref)
 
     def resolve_project_id(self, project_path: str) -> int:
         """Resolve ``path_with_namespace`` to GitLab's numeric project ID."""
-        normalized_path = _normalize_gitlab_project_path(project_path)
-        cached_id = self._project_path_id_cache.get(normalized_path)
-        if cached_id is not None:
-            return cached_id
-
-        search_term = normalized_path.rsplit("/", 1)[-1]
-        projects = self._gl.projects.list(
-            search=search_term,
-            simple=True,
-            iterator=True,
-        )
-        for project in projects:
-            candidate_path = str(
-                getattr(project, "path_with_namespace", "") or "",
-            ).strip("/")
-            if candidate_path != normalized_path:
-                continue
-            project_id = int(getattr(project, "id"))
-            self._project_path_id_cache[normalized_path] = project_id
-            return project_id
-
-        raise GitLabProjectLookupError(
-            f"GitLab project {normalized_path!r} could not be resolved "
-            "to a numeric project ID via project search.  If this is "
-            "a self-hosted GitLab instance that rejects path-based API "
-            "project lookups, set this fork's `native_id` in gateway.json "
-            "to the numeric GitLab project ID."
-        )
+        return self._project_resolver.resolve_project_id(project_path)
 
 
 def _direct_project_ref(project_ref: GitLabProjectRef) -> GitLabProjectRef:
@@ -499,6 +515,7 @@ def _is_gitlab_not_found(exc: BaseException) -> bool:
 __all__ = [
     "GitLabClient",
     "GitLabConfig",
+    "GitLabProjectResolver",
     "GitLabProjectLookupError",
     "GitLabProjectRef",
 ]

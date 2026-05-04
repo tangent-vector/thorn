@@ -37,6 +37,7 @@ from thorn.gateway._event import (
 )
 from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
 from thorn.runtime._session import SessionKey
+from thorn.tools.gitlab import GitLabProjectResolver
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class _ProjectEventRecord:
 
     project_name: str
     event: Any
+
 
 # ---------------------------------------------------------------------------
 # Optional dependency guard (same pattern as thorn.tools.gitlab)
@@ -487,7 +489,7 @@ class GitLabTODOsSource(EventSource):
         self._seen: set[int] = set()
         self._seen_project_events: set[int] = set()
         self._project_events_baselined = False
-        self._project_path_id_cache: dict[str, int] = {}
+        self._project_resolver = GitLabProjectResolver(self._gl.projects)
         self._stop_event: asyncio.Event | None = None
 
     @property
@@ -652,83 +654,11 @@ class GitLabTODOsSource(EventSource):
         return events
 
     def _get_project_for_events(self, project_ref: str) -> Any:
-        project_ref = _coerce_gitlab_project_ref(project_ref)
-        if isinstance(project_ref, int):
-            return self._gl.projects.get(project_ref)
-
-        cached_id = self._project_path_id_cache.get(project_ref)
-        if cached_id is not None:
-            return self._gl.projects.get(cached_id)
-
-        try:
-            project = self._gl.projects.get(project_ref)
-        except Exception as exc:
-            if not _is_gitlab_not_found(exc):
-                raise
-            resolved_id = self._resolve_project_id(project_ref)
-            return self._gl.projects.get(resolved_id)
-
-        project_id = _field_value(project, "id")
-        if project_id is not None:
-            self._project_path_id_cache[project_ref] = int(project_id)
-        return project
-
-    def _resolve_project_id(self, project_path: str) -> int:
-        normalized_path = _normalize_gitlab_project_path(project_path)
-        cached_id = self._project_path_id_cache.get(normalized_path)
-        if cached_id is not None:
-            return cached_id
-
-        search_term = normalized_path.rsplit("/", 1)[-1]
-        projects = self._gl.projects.list(
-            search=search_term,
-            simple=True,
-            iterator=True,
-        )
-        for project in projects:
-            candidate_path = str(
-                _field_value(project, "path_with_namespace", "") or "",
-            ).strip("/")
-            if candidate_path != normalized_path:
-                continue
-            project_id = int(_field_value(project, "id"))
-            self._project_path_id_cache[normalized_path] = project_id
-            return project_id
-
-        raise RuntimeError(
-            f"GitLab project {normalized_path!r} could not be resolved to "
-            "a numeric project ID via project search. Set this fork's "
-            "`native_id` in gateway.json to the numeric GitLab project ID."
-        )
+        return self._project_resolver.get_project(project_ref)
 
 
 def _project_event_id(project_event: Any) -> int:
     return int(_field_value(project_event, "id"))
-
-
-def _coerce_gitlab_project_ref(project_ref: str) -> int | str:
-    stripped_ref = project_ref.strip()
-    if stripped_ref.isdigit():
-        return int(stripped_ref)
-    return _normalize_gitlab_project_path(stripped_ref)
-
-
-def _normalize_gitlab_project_path(project_path: str) -> str:
-    normalized_path = project_path.strip().strip("/")
-    if normalized_path.endswith(".git"):
-        normalized_path = normalized_path[: -len(".git")]
-    if not normalized_path or "/" not in normalized_path:
-        raise RuntimeError(
-            f"GitLab project reference {project_path!r} is not a numeric "
-            "ID and does not look like a path_with_namespace value. Set "
-            "this fork's `native_id` in gateway.json to the numeric "
-            "GitLab project ID."
-        )
-    return normalized_path
-
-
-def _is_gitlab_not_found(exc: BaseException) -> bool:
-    return str(_field_value(exc, "response_code", "")) == "404"
 
 
 __all__ = [
