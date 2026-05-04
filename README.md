@@ -210,6 +210,21 @@ and left an orphaned broker stack behind, `thorn broker status`
 lists matching compose projects and `thorn broker down` cleans them
 up.
 
+If the gateway receives a forge notification and then cannot prompt
+the coordinator -- for example because the LLM provider key was bad
+or the provider was unavailable long enough for the item to be parked
+as errored -- fix the underlying operator-side problem and requeue
+the durable inbox item:
+
+```console
+$ uv run thorn inbox requeue <item-id> --agency ~/.thorn
+```
+
+Use `--agent` and `--session` when multiple parked items have the
+same ID.  This command only moves Thorn's local `inbox/errored/`
+file back to pending work; it does not contact GitLab/GitHub or
+re-create upstream TODOs.
+
 Restricted-egress VMs can mirror the broker images into a reachable
 registry and point the bundled stack at those mirrors without local
 retagging:

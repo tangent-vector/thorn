@@ -18,15 +18,16 @@ Covers the Phase 1 session-inbox and notification-queue contracts:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
 
 import pytest
 
 from thorn.runtime._address import (
     Address,
+    AddressBook,
     ServiceAddress,
     SessionAddress,
 )
+from thorn.runtime._dispatch import apply_handling_transition
 from thorn.runtime._inbox import SessionInbox
 from thorn.runtime._notification import (
     Notification,
@@ -35,12 +36,10 @@ from thorn.runtime._notification import (
 )
 from thorn.runtime._notification_queue import (
     ArrivalKind,
-    DrainOutcome,
     DrainResult,
     NotificationQueue,
 )
 from thorn.runtime._session import AgentID, SessionKey
-
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -125,12 +124,61 @@ class TestSessionInbox:
         addr = _session_addr()
         inbox = SessionInbox(tmp_path / "inbox", addr)
 
-        n1 = inbox.post(_fresh_spec(target=addr))
+        inbox.post(_fresh_spec(target=addr))
         n2 = inbox.post(_fresh_spec(target=addr))
         inbox.update_status(n2.id, NotificationStatus.CONFIRMED)
 
         cleanup = inbox.awaiting_cleanup()
         assert [n.id for n in cleanup] == [n2.id]
+
+    def test_requeue_errored_restores_prompt_pending_work(
+        self, tmp_path: Path
+    ) -> None:
+        addr = _session_addr()
+        inbox = SessionInbox(tmp_path / "inbox", addr)
+        posted = inbox.post(
+            _fresh_spec(
+                target=addr,
+                external_key="gitlab:https://gitlab.example.com:todo:123",
+                content="please handle this issue",
+            )
+        )
+
+        apply_handling_transition(
+            inbox,
+            posted.id,
+            NotificationStatus.ERRORED,
+            address_book=AddressBook(),
+            error_reason="provider key was invalid",
+        )
+
+        parked = inbox.errored_items()
+        assert [item.id for item in parked] == [posted.id]
+        assert parked[0].status is NotificationStatus.ERRORED
+        assert parked[0].error_reason == "provider key was invalid"
+        assert inbox.prompt_pending() == []
+
+        requeued = inbox.requeue_errored(posted.id)
+
+        assert requeued.id == posted.id
+        assert requeued.status is NotificationStatus.PENDING
+        assert requeued.content == "please handle this issue"
+        assert (
+            requeued.external_key
+            == "gitlab:https://gitlab.example.com:todo:123"
+        )
+        assert requeued.error_reason is None
+        assert requeued.notes is None
+        assert inbox.errored_items() == []
+        assert [item.id for item in inbox.prompt_pending()] == [posted.id]
+
+    def test_requeue_missing_errored_item_raises(
+        self, tmp_path: Path
+    ) -> None:
+        inbox = SessionInbox(tmp_path / "inbox", _session_addr())
+
+        with pytest.raises(KeyError):
+            inbox.requeue_errored("missing-item")
 
 
 # ---------------------------------------------------------------------------

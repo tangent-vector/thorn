@@ -7,8 +7,9 @@ import json
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 from rich.console import Console
@@ -42,6 +43,10 @@ from thorn.runtime._project_detection import (
 )
 
 console = Console()
+
+if TYPE_CHECKING:
+    from thorn.gateway._config import SandboxConfig
+    from thorn.runtime import AgencyPaths
 
 CLI_AGENT_ID = AgentID("local")
 """Well-known agent ID for the CLI local coding agent."""
@@ -237,6 +242,140 @@ def main() -> None:
         load_dotenv(find_dotenv(usecwd=True))
     except ImportError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# thorn inbox
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _ErroredInboxMatch:
+    agent_id: AgentID
+    session_key: SessionKey
+    inbox: SessionInbox
+
+
+def _resolve_inbox_agency_home(agency_path: str | None) -> Path:
+    if agency_path is not None:
+        agency_home = Path(agency_path).expanduser().resolve()
+    else:
+        agency_home = (Path.home() / ".thorn").resolve()
+    if not agency_home.is_dir():
+        raise click.ClickException(
+            f"Agency home directory does not exist: {agency_home}"
+        )
+    return agency_home
+
+
+def _find_errored_inbox_matches(
+    *,
+    agency_home: Path,
+    item_id: str,
+    agent_id_filter: AgentID | None,
+    session_key_filter: SessionKey | None,
+) -> list[_ErroredInboxMatch]:
+    from thorn.runtime._paths import AgencyPaths
+
+    paths = AgencyPaths(
+        home_root=agency_home,
+        workspace_root=Path.cwd().resolve(),
+    )
+    matches: list[_ErroredInboxMatch] = []
+    for agent_id, session_key, inbox_dir in paths.iter_session_inbox_locations():
+        if agent_id_filter is not None and agent_id != agent_id_filter:
+            continue
+        if session_key_filter is not None and session_key != session_key_filter:
+            continue
+        inbox = SessionInbox(
+            inbox_dir,
+            SessionAddress(agent_id, session_key),
+        )
+        if any(item.id == item_id for item in inbox.errored_items()):
+            matches.append(_ErroredInboxMatch(agent_id, session_key, inbox))
+    return matches
+
+
+@main.group()
+def inbox() -> None:
+    """Inspect and recover session inbox items."""
+
+
+@inbox.command("requeue")
+@click.argument("item_id")
+@click.option(
+    "--agency",
+    "agency_path",
+    type=click.Path(file_okay=False),
+    default=None,
+    help=(
+        "Agency home directory containing the agents/ tree. "
+        "Defaults to ~/.thorn."
+    ),
+)
+@click.option(
+    "--agent",
+    "agent_id_raw",
+    default=None,
+    help="Restrict lookup to one agent ID.",
+)
+@click.option(
+    "--session",
+    "session_key_raw",
+    default=None,
+    help="Restrict lookup to one session key.",
+)
+def inbox_requeue(
+    item_id: str,
+    agency_path: str | None,
+    agent_id_raw: str | None,
+    session_key_raw: str | None,
+) -> None:
+    """Move a parked errored inbox item back to pending work.
+
+    Use this after fixing an operator-side problem such as a bad
+    provider key.  The command does not contact upstream event sources
+    or re-create GitLab TODOs; it only moves Thorn's durable inbox
+    item from ``inbox/errored/`` back into the live session inbox so
+    the next gateway run can prompt the coordinator again.
+    """
+    agent_id_filter = AgentID(agent_id_raw) if agent_id_raw else None
+    try:
+        session_key_filter = (
+            SessionKey(session_key_raw) if session_key_raw else None
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    agency_home = _resolve_inbox_agency_home(agency_path)
+    matches = _find_errored_inbox_matches(
+        agency_home=agency_home,
+        item_id=item_id,
+        agent_id_filter=agent_id_filter,
+        session_key_filter=session_key_filter,
+    )
+    if not matches:
+        raise click.ClickException(
+            f"No parked errored inbox item {item_id!r} found under {agency_home}."
+        )
+    if len(matches) > 1:
+        lines = [
+            f"{match.agent_id}:{match.session_key}"
+            for match in matches
+        ]
+        raise click.ClickException(
+            "Multiple parked errored inbox items matched. Re-run with "
+            "--agent and --session to choose one:\n  "
+            + "\n  ".join(lines)
+        )
+
+    match = matches[0]
+    requeued = match.inbox.requeue_errored(item_id)
+    console.print(
+        "Requeued inbox item "
+        f"[bold]{requeued.id}[/bold] for agent "
+        f"[bold]{match.agent_id}[/bold], session "
+        f"[bold]{match.session_key}[/bold]."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +1001,7 @@ def _serve_gateway(
     override or the ``workspace`` field in the config.
     """
     import logging
+
     from rich.logging import RichHandler
 
     from thorn.gateway import (
@@ -1047,6 +1187,7 @@ def serve_bootstrap(
 ) -> None:
     """Bootstrap a ProjectCoordinator agent in an agency home directory."""
     from pathlib import Path
+
     from thorn.gateway._bootstrap import bootstrap_coordinator
 
     agency_home = Path(agency_home_path).expanduser().resolve()
