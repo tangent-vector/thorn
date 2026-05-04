@@ -229,7 +229,7 @@ Before letting a live gateway consume forge notifications, run a
 safe Git connectivity preflight from the same agency config:
 
 ```console
-$ uv run thorn serve preflight --agency ~/.thorn
+$ uv run thorn serve --agency ~/.thorn preflight
 ```
 
 The default preflight starts the configured sandbox and broker path,
