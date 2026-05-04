@@ -141,6 +141,22 @@ sees activity (an @-mention on an issue, a new assignment, etc.), it
 dispatches the event to the agent, which reads the issue, clones the
 repo, and does the requested work.
 
+For GitLab, the inferred source polls two surfaces:
+
+- GitLab TODOs for user-scoped notifications such as mentions, direct
+  addresses, review requests, assignments, and other TODO-producing
+  actions. These are marked done after Thorn has handed them to the
+  gateway. Thorn classifies `mentioned`, `directly_addressed`, and
+  `review_requested` TODO actions as conversational; other TODO
+  actions are structural. In TODO-only mode (no configured projects),
+  merges, auto-closes, and dependency transitions only wake Thorn if
+  GitLab also creates a pending TODO for the bot user.
+- Project events for configured projects, currently closed issues and
+  merged merge requests. The first project-event poll establishes a
+  baseline so a fresh gateway startup does not replay historical
+  closures; later polls wake the corresponding issue or change-request
+  session when a new closure or merge appears.
+
 ### 6. Talk to the agent
 
 Open an issue on the configured repository and @-mention the bot

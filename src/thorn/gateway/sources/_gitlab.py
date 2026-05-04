@@ -1,9 +1,15 @@
-"""GitLab TODOs polling event source.
+"""GitLab polling event source.
 
 Polls the GitLab Todos API for new notifications (e.g. @-mentions,
 assignments, review requests) and converts them into
 :class:`~thorn.gateway._event.RawIncomingEvent` objects for the
 gateway-side notification formatter to wrap and route.
+
+For configured projects, also polls GitLab project events for issue
+closures and merge-request merges.  GitLab does not create user TODOs
+for every structural transition Thorn cares about, so project-event
+polling fills the gap without requiring operators to expose a webhook
+endpoint.
 
 The source captures the TODO ``author`` (numeric ``id``, ``username``,
 and bot flag) into an :class:`~thorn.gateway._actor.ActorIdentity` so
@@ -16,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -30,8 +37,18 @@ from thorn.gateway._event import (
 )
 from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
 from thorn.runtime._session import SessionKey
+from thorn.tools.gitlab import GitLabProjectResolver
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ProjectEventRecord:
+    """A GitLab project event plus the Thorn project name it belongs to."""
+
+    project_name: str
+    event: Any
+
 
 # ---------------------------------------------------------------------------
 # Optional dependency guard (same pattern as thorn.tools.gitlab)
@@ -60,7 +77,7 @@ def _require_gitlab() -> None:
 
 
 class GitLabSourceConfig(BaseModel):
-    """Configuration for the GitLab TODOs event source.
+    """Configuration for the GitLab TODOs and project-events source.
 
     Built from a gateway forge entry plus an agent's GitLab credentials
     by :func:`~thorn.gateway._config.infer_event_sources`.
@@ -85,7 +102,9 @@ class GitLabSourceConfig(BaseModel):
             "such as 'group/project') to the logical project name "
             "used for session-key routing.  Both key forms are "
             "consulted at lookup time so the producer of this dict "
-            "can use whichever it has handy."
+            "can use whichever it has handy.  A non-empty mapping "
+            "also enables supplementary project-event polling for "
+            "closed issues and merged merge requests."
         ),
     )
     forge_name: str = Field(
@@ -309,6 +328,11 @@ def _make_external_key(gitlab_url: str, todo_id: int) -> str:
     return f"gitlab:{gitlab_url}:todo:{todo_id}"
 
 
+def _make_project_event_external_key(gitlab_url: str, event_id: int) -> str:
+    """Build a source-namespaced key for a GitLab project event."""
+    return f"gitlab:{gitlab_url}:project-event:{event_id}"
+
+
 def _make_raw_event(
     todo: Any,
     project_id_to_name: dict[str, str] | None = None,
@@ -370,6 +394,80 @@ def _make_raw_event(
     )
 
 
+_PROJECT_EVENT_NOTEABLE_KINDS: dict[str, NoteableKind] = {
+    "Issue": NoteableKind.ISSUE,
+    "MergeRequest": NoteableKind.CHANGE_REQUEST,
+}
+
+
+def _field_value(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _make_project_event_raw_event(
+    project_event: Any,
+    *,
+    project_name: str = "",
+    gitlab_url: str = "",
+    forge_name: str = "gitlab",
+) -> RawIncomingEvent:
+    """Convert a GitLab project event into a structural gateway event."""
+    target_type = str(_field_value(project_event, "target_type", ""))
+    noteable_kind = _PROJECT_EVENT_NOTEABLE_KINDS.get(target_type)
+    if noteable_kind is None:
+        raise ValueError(
+            f"Unsupported GitLab project event target_type: {target_type!r}"
+        )
+
+    event_id = int(_field_value(project_event, "id"))
+    project_id = int(_field_value(project_event, "project_id"))
+    noteable_iid = int(_field_value(project_event, "target_iid"))
+    action_name = str(_field_value(project_event, "action_name", ""))
+    target_title = str(_field_value(project_event, "target_title", ""))
+    created_at = str(_field_value(project_event, "created_at", "") or "")
+
+    actor = _actor_from_todo_author(
+        _field_value(project_event, "author"), service=forge_name,
+    )
+    noteable = Noteable(kind=noteable_kind, number=noteable_iid)
+    session_key = route_gitlab_todo(
+        project_id=project_id,
+        noteable=noteable,
+        project_name=project_name,
+    )
+    display_target = (
+        f"merge request !{noteable_iid}"
+        if noteable_kind is NoteableKind.CHANGE_REQUEST
+        else f"issue #{noteable_iid}"
+    )
+    summary = (
+        f"GitLab project event: {display_target} was {action_name} "
+        f"in project {project_name or project_id}."
+    )
+    if target_title:
+        summary = f"{summary}\nTitle: {target_title}"
+    return RawIncomingEvent(
+        source="gitlab",
+        session_key=session_key,
+        kind=EventKind.STRUCTURAL,
+        primary_actor=actor,
+        summary=summary,
+        metadata={
+            "project_event_id": event_id,
+            "project_id": project_id,
+            "project_name": project_name,
+            "noteable_type": target_type,
+            "noteable_iid": noteable_iid,
+            "action_name": action_name,
+            "target_title": target_title,
+            "created_at": created_at,
+        },
+        external_key=_make_project_event_external_key(gitlab_url, event_id),
+    )
+
+
 # ---------------------------------------------------------------------------
 # EventSource implementation
 # ---------------------------------------------------------------------------
@@ -389,6 +487,9 @@ class GitLabTODOsSource(EventSource):
             private_token=config.token,
         )
         self._seen: set[int] = set()
+        self._seen_project_events: set[int] = set()
+        self._project_events_baselined = False
+        self._project_resolver = GitLabProjectResolver(self._gl.projects)
         self._stop_event: asyncio.Event | None = None
 
     @property
@@ -490,8 +591,74 @@ class GitLabTODOsSource(EventSource):
                     "Failed to mark GitLab TODO %s as done", todo.id,
                 )
 
+        await self._poll_project_events_once(on_event)
+
+    async def _poll_project_events_once(
+        self,
+        on_event: Callable[[RawIncomingEvent], Awaitable[None]],
+    ) -> None:
+        project_events = await asyncio.to_thread(self._get_project_events)
+        if not self._project_events_baselined:
+            self._seen_project_events.update(
+                _project_event_id(record.event) for record in project_events
+            )
+            self._project_events_baselined = True
+            if project_events:
+                log.info(
+                    "Baselined %d GitLab project event(s); future "
+                    "closed-issue and merged-MR events will wake the gateway.",
+                    len(project_events),
+                )
+            return
+
+        new_events = [
+            record
+            for record in project_events
+            if _project_event_id(record.event) not in self._seen_project_events
+        ]
+        if new_events:
+            log.info("Found %d new GitLab project event(s)", len(new_events))
+        for record in new_events:
+            project_event = record.event
+            event_id = _project_event_id(project_event)
+            try:
+                raw_event = _make_project_event_raw_event(
+                    project_event,
+                    project_name=record.project_name,
+                    gitlab_url=self._config.url,
+                    forge_name=self._config.forge_name,
+                )
+                await on_event(raw_event)
+            except Exception:
+                log.exception(
+                    "Failed to post GitLab project event %s", event_id,
+                )
+                continue
+            self._seen_project_events.add(event_id)
+
     def _get_pending_todos(self) -> list[Any]:
         return list(self._gl.todos.list(state="pending", iterator=True))
+
+    def _get_project_events(self) -> list[_ProjectEventRecord]:
+        events: list[_ProjectEventRecord] = []
+        for project_ref, project_name in self._config.project_id_to_name.items():
+            project = self._get_project_for_events(project_ref)
+            for event in project.events.list(
+                target_type="issue", action="closed", per_page=50,
+            ):
+                events.append(_ProjectEventRecord(project_name, event))
+            for event in project.events.list(
+                target_type="merge_request", action="merged", per_page=50,
+            ):
+                events.append(_ProjectEventRecord(project_name, event))
+        return events
+
+    def _get_project_for_events(self, project_ref: str) -> Any:
+        return self._project_resolver.get_project(project_ref)
+
+
+def _project_event_id(project_event: Any) -> int:
+    return int(_field_value(project_event, "id"))
 
 
 __all__ = [

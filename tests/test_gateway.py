@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -1239,6 +1239,31 @@ def _make_mock_todo(
     return todo
 
 
+def _make_mock_gitlab_project_event(
+    event_id: int = 10,
+    project_id: int = 123,
+    target_type: str = "Issue",
+    target_iid: int = 42,
+    action_name: str = "closed",
+    target_title: str = "Fix bug",
+    author: dict | None = None,
+) -> MagicMock:
+    event = MagicMock()
+    event.id = event_id
+    event.project_id = project_id
+    event.target_type = target_type
+    event.target_iid = target_iid
+    event.action_name = action_name
+    event.target_title = target_title
+    event.created_at = "2026-05-01T20:34:31Z"
+    event.author = author
+    return event
+
+
+class _GitLabNotFound(Exception):
+    response_code = 404
+
+
 class TestGitLabTODOsSourceEventFormatting:
     def test_make_session_key(self):
         from thorn.gateway.sources._gitlab import _make_session_key
@@ -1379,6 +1404,55 @@ class TestGitLabTODOsSourceEventFormatting:
         assert event.external_key == (
             "gitlab:https://gitlab.example.com:todo:99"
         )
+
+    def test_make_project_event_for_closed_issue(self):
+        from thorn.gateway.sources._gitlab import _make_project_event_raw_event
+
+        project_event = _make_mock_gitlab_project_event(
+            event_id=101,
+            target_type="Issue",
+            target_iid=42,
+            action_name="closed",
+            author={"id": 7, "username": "alice", "name": "Alice"},
+        )
+
+        event = _make_project_event_raw_event(
+            project_event,
+            project_name="my-proj",
+            gitlab_url="https://gitlab.example.com",
+            forge_name="gl",
+        )
+
+        assert event.kind is EventKind.STRUCTURAL
+        assert event.session_key == SessionKey("my-proj/issue/42")
+        assert "issue #42 was closed" in event.summary
+        assert event.primary_actor is not None
+        assert event.primary_actor.service == "gl"
+        assert event.metadata["project_event_id"] == 101
+        assert event.external_key == (
+            "gitlab:https://gitlab.example.com:project-event:101"
+        )
+
+    def test_make_project_event_for_merged_merge_request(self):
+        from thorn.gateway.sources._gitlab import _make_project_event_raw_event
+
+        project_event = _make_mock_gitlab_project_event(
+            event_id=102,
+            target_type="MergeRequest",
+            target_iid=5,
+            action_name="accepted",
+            target_title="Add feature",
+        )
+
+        event = _make_project_event_raw_event(
+            project_event,
+            project_name="my-proj",
+        )
+
+        assert event.kind is EventKind.STRUCTURAL
+        assert event.session_key == SessionKey("my-proj/change-request/5")
+        assert "merge request !5 was accepted" in event.summary
+        assert event.metadata["noteable_type"] == "MergeRequest"
 
 
 class TestGitLabTODOsSourcePolling:
@@ -1587,6 +1661,188 @@ class TestGitLabTODOsSourcePolling:
             await source._poll_once(on_event)
 
             assert len(events) == 1
+
+    @pytest.mark.asyncio
+    async def test_project_events_baseline_without_emitting(self):
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib") as mock_gl_mod,
+        ):
+            mock_gl_instance = MagicMock()
+            mock_gl_mod.Gitlab.return_value = mock_gl_instance
+            mock_gl_instance.todos.list.return_value = []
+
+            closed_issue = _make_mock_gitlab_project_event(
+                event_id=201,
+                target_type="Issue",
+                target_iid=4,
+                action_name="closed",
+            )
+            project = MagicMock()
+            project.events.list.side_effect = lambda **kwargs: (
+                [closed_issue]
+                if kwargs["target_type"] == "issue"
+                else []
+            )
+            mock_gl_instance.projects.get.return_value = project
+
+            from thorn.gateway.sources._gitlab import (
+                GitLabSourceConfig,
+                GitLabTODOsSource,
+            )
+
+            source = GitLabTODOsSource(GitLabSourceConfig(
+                url="https://gitlab.example.com",
+                token="test-token",
+                poll_interval=5,
+                project_id_to_name={"123": "my-proj"},
+            ))
+            events: list[RawIncomingEvent] = []
+
+            async def on_event(event: RawIncomingEvent) -> None:
+                events.append(event)
+
+            await source._poll_once(on_event)
+            await source._poll_once(on_event)
+
+            assert events == []
+
+    @pytest.mark.asyncio
+    async def test_project_events_emit_after_baseline(self):
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib") as mock_gl_mod,
+        ):
+            mock_gl_instance = MagicMock()
+            mock_gl_mod.Gitlab.return_value = mock_gl_instance
+            mock_gl_instance.todos.list.return_value = []
+
+            closed_issue_events: list[MagicMock] = [
+                _make_mock_gitlab_project_event(
+                    event_id=301,
+                    target_type="Issue",
+                    target_iid=4,
+                    action_name="closed",
+                ),
+            ]
+            merged_mr_events: list[MagicMock] = []
+
+            def list_project_events(**kwargs: Any) -> list[MagicMock]:
+                if kwargs["target_type"] == "issue":
+                    return list(closed_issue_events)
+                if kwargs["target_type"] == "merge_request":
+                    return list(merged_mr_events)
+                raise AssertionError(f"unexpected event query: {kwargs!r}")
+
+            project = MagicMock()
+            project.events.list.side_effect = list_project_events
+            mock_gl_instance.projects.get.return_value = project
+
+            from thorn.gateway.sources._gitlab import (
+                GitLabSourceConfig,
+                GitLabTODOsSource,
+            )
+
+            source = GitLabTODOsSource(GitLabSourceConfig(
+                url="https://gitlab.example.com",
+                token="test-token",
+                poll_interval=5,
+                project_id_to_name={"123": "my-proj"},
+            ))
+            events: list[RawIncomingEvent] = []
+
+            async def on_event(event: RawIncomingEvent) -> None:
+                events.append(event)
+
+            await source._poll_once(on_event)
+            closed_issue_events[:] = [
+                _make_mock_gitlab_project_event(
+                    event_id=302,
+                    target_type="Issue",
+                    target_iid=5,
+                    action_name="closed",
+                ),
+            ]
+            merged_mr_events[:] = [
+                _make_mock_gitlab_project_event(
+                    event_id=303,
+                    target_type="MergeRequest",
+                    target_iid=6,
+                    action_name="accepted",
+                ),
+            ]
+
+            await source._poll_once(on_event)
+
+            assert [event.session_key for event in events] == [
+                SessionKey("my-proj/issue/5"),
+                SessionKey("my-proj/change-request/6"),
+            ]
+            assert all(event.kind is EventKind.STRUCTURAL for event in events)
+
+    @pytest.mark.asyncio
+    async def test_project_event_path_ref_resolves_to_numeric_id(self):
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib") as mock_gl_mod,
+        ):
+            mock_gl_instance = MagicMock()
+            mock_gl_mod.Gitlab.return_value = mock_gl_instance
+            mock_gl_instance.todos.list.return_value = []
+
+            closed_issue = _make_mock_gitlab_project_event(
+                event_id=401,
+                project_id=264873,
+                target_type="Issue",
+                target_iid=4,
+                action_name="closed",
+            )
+            project = MagicMock()
+            project.events.list.side_effect = lambda **kwargs: (
+                [closed_issue]
+                if kwargs["target_type"] == "issue"
+                else []
+            )
+            mock_gl_instance.projects.get.side_effect = [
+                _GitLabNotFound("not found"),
+                project,
+            ]
+            search_result = MagicMock()
+            search_result.id = 264873
+            search_result.path_with_namespace = "tfoley/thorn"
+            mock_gl_instance.projects.list.return_value = [search_result]
+
+            from thorn.gateway.sources._gitlab import (
+                GitLabSourceConfig,
+                GitLabTODOsSource,
+            )
+
+            source = GitLabTODOsSource(GitLabSourceConfig(
+                url="https://gitlab.example.com",
+                token="test-token",
+                poll_interval=5,
+                project_id_to_name={"tfoley/thorn": "thorn"},
+            ))
+            events: list[RawIncomingEvent] = []
+
+            async def on_event(event: RawIncomingEvent) -> None:
+                events.append(event)
+
+            await source._poll_once(on_event)
+
+            assert events == []
+            assert mock_gl_instance.projects.get.mock_calls == [
+                call("tfoley/thorn"),
+                call(264873),
+            ]
+            mock_gl_instance.projects.list.assert_called_once_with(
+                search="thorn",
+                simple=True,
+                iterator=True,
+            )
+            project.events.list.assert_any_call(
+                target_type="issue", action="closed", per_page=50,
+            )
 
 
 # ---------------------------------------------------------------------------
