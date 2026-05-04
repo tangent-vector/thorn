@@ -7,7 +7,7 @@ the FORGE_TOOLS toolset, and the runtime integration.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,7 +17,6 @@ from thorn.runtime import Runtime
 from thorn.tools._github_connection import GitHubConnectionConfig, GitHubPatAuth
 from thorn.tools.forge import (
     FORGE_TOOLS,
-    CommentTargetKind,
     ForkConfig,
     GitHubForgeClient,
     GitHubForgeService,
@@ -27,6 +26,9 @@ from thorn.tools.forge import (
     ProjectService,
     ProjectServiceConfig,
 )
+
+if TYPE_CHECKING:
+    from thorn.core._agent import Agent
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +903,32 @@ class TestForgeToolsIntegration:
         mock_client.mark_notification_done.assert_called_once_with("99")
 
     @pytest.mark.asyncio
+    async def test_forge_get_project_info_does_not_expose_ssh_clone_url(
+        self, tmp_path: Path,
+    ):
+        from thorn.tools.forge import forge_get_project_info
+
+        runtime, mock_client, agent = self._setup_runtime(tmp_path)
+        mock_client.get_project_info.return_value = {
+            "name": "Example",
+            "path": "group/example",
+            "clone_url": "https://gl.example.com/group/example.git",
+            "ssh_url": "git@gl.example.com:group/example.git",
+            "default_branch": "main",
+            "url": "https://gl.example.com/group/example",
+            "description": "",
+        }
+
+        async with runtime:
+            self._bind_agent(runtime, agent)
+            result = await forge_get_project_info("test-proj")
+
+        assert "Clone URL (HTTPS): https://gl.example.com/group/example.git" in result
+        assert "git@gl.example.com:group/example.git" not in result
+        assert "use HTTPS" in result
+        mock_client.get_project_info.assert_called_once_with("42")
+
+    @pytest.mark.asyncio
     async def test_forge_create_issue(self, tmp_path: Path):
         from thorn.tools.forge import forge_create_issue
 
@@ -1030,7 +1058,7 @@ class TestForgeToolsIntegration:
 
     @pytest.mark.asyncio
     async def test_tool_without_runtime_raises(self, tmp_path: Path):
-        from thorn.core._context import ExecutionContext, set_context, reset_context
+        from thorn.core._context import ExecutionContext, reset_context, set_context
 
         ctx = ExecutionContext(provider=MockProvider())
         token = set_context(ctx)

@@ -21,7 +21,6 @@ from thorn.core._tools import FILE_READING, FILE_WRITING, run_shell
 from thorn.tools.forge import FORGE_TOOLS
 from thorn.tools.peers import PEER_TOOLS
 
-
 _GATEWAY_AGENT_UNIVERSAL_PROMPT = """\
 ## Trust model: peers, data, and instructions
 
@@ -190,6 +189,13 @@ dedicated git tools — the same `git`, `gh`, and `glab` binaries a \
 human collaborator would use are available inside your sandbox, and \
 you should drive them the same way.
 
+Thorn's default sandbox + broker profile supports brokered HTTPS git \
+operations. Do not fall back to SSH clone/push URLs when HTTPS fails: \
+the sandbox may not have an `ssh` binary, and Thorn does not broker \
+SSH credentials. Diagnose the HTTPS/broker failure or report it as a \
+blocker. Use SSH only when explicit operator or agency policy says \
+this agent has SSH credentials and SSH tooling available.
+
 **Branch naming**: `thorn/issue-<iid>` (or `thorn/<descriptive-slug>` \
 for work not tied to a single issue).
 
@@ -292,8 +298,10 @@ to your home directory in either context).
 
 - The git clone URL should be taken from your ~/MEMORY.md or from \
 the notification metadata.
-- Credentials for git operations are handled transparently — just use \
-the URL as provided.
+- Use the HTTPS clone URL provided by Thorn. Credentials for HTTPS git \
+operations are handled transparently — just use the URL as provided. \
+Do not switch to SSH unless explicit operator or agency policy says \
+SSH credentials and tooling are available.
 - Keep commit messages and change-request descriptions clear and \
 concise.
 - Update ~/MEMORY.md when you learn important project-specific facts \
