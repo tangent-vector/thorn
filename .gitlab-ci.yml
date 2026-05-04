@@ -1,5 +1,9 @@
 # GitLab CI configuration for thorn
 
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
 stages:
   - test
 
