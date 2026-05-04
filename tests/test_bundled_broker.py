@@ -549,6 +549,32 @@ class TestSupervisorStart:
         assert "<redacted>" in message
 
     @pytest.mark.asyncio
+    async def test_compose_failure_redacts_stderr_before_raising(self) -> None:
+        recorder = _ComposeRecorder()
+        provider_key = "sk-compose-provider-key-123456"
+        admin_token = "oc_compose_admin_token_123456"
+        recorder.script(
+            "up",
+            rc=1,
+            stderr=(
+                f"Authorization: Bearer {provider_key}\n"
+                f"ONECLI_ADMIN_TOKEN={admin_token}"
+            ),
+        )
+        recorder.script("down")
+
+        handler = _ok_health_handler([(200, {"apiKey": "oc_unused"})])
+        supervisor = _make_supervisor(recorder=recorder, handler=handler)
+
+        with pytest.raises(BundledBrokerError) as exc_info:
+            await supervisor.start()
+
+        message = str(exc_info.value)
+        assert provider_key not in message
+        assert admin_token not in message
+        assert "<redacted>" in message
+
+    @pytest.mark.asyncio
     async def test_health_timeout_rolls_back(self) -> None:
         recorder = _ComposeRecorder()
         recorder.script("up")
