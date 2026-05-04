@@ -1157,3 +1157,38 @@ class TestChat:
         assert "Agent error" in result.output
         assert "bad" in result.output
         assert "recovered" in result.output
+
+
+class TestServePreflightCommand:
+    def test_agency_option_is_a_serve_group_option(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_serve_preflight(**kwargs: object) -> int:
+            captured.update(kwargs)
+            return 0
+
+        monkeypatch.setattr("thorn._cli._serve_preflight", fake_serve_preflight)
+
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "serve",
+                "--agency", str(agency_home),
+                "--workspace", str(workspace),
+                "preflight",
+                "--agent", "coord",
+                "--timeout", "7",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert captured["agency_path"] == str(agency_home)
+        assert captured["workspace_path"] == str(workspace)
+        assert captured["agent_id_raw"] == "coord"
+        assert captured["timeout_s"] == 7

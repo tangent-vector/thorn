@@ -45,7 +45,9 @@ from thorn.runtime._project_detection import (
 console = Console()
 
 if TYPE_CHECKING:
+    from thorn.core import Agent
     from thorn.gateway._config import SandboxConfig
+    from thorn.gateway._preflight import GitPreflightTarget
     from thorn.runtime import AgencyPaths
 
 CLI_AGENT_ID = AgentID("local")
@@ -1126,6 +1128,282 @@ def _serve_gateway(
     finally:
         if trace_file:
             trace_file.close()
+
+
+@serve.command("preflight")
+@click.option(
+    "--agent",
+    "agent_id_raw",
+    default=None,
+    help="Restrict the probe to one persisted agent ID.",
+)
+@click.option(
+    "--project",
+    "project_name",
+    default=None,
+    help="Restrict the probe to one gateway.json project name.",
+)
+@click.option(
+    "--fork",
+    "fork_name",
+    default=None,
+    help="Restrict the probe to one fork/remote name within the project.",
+)
+@click.option(
+    "--write-check",
+    is_flag=True,
+    default=False,
+    help=(
+        "Also push and delete a temporary branch through the broker. "
+        "The default is read-only git ls-remote."
+    ),
+)
+@click.option(
+    "--timeout",
+    "timeout_s",
+    type=click.IntRange(min=1),
+    default=60,
+    show_default=True,
+    help="Per-git-operation timeout in seconds inside the sandbox.",
+)
+@click.pass_context
+def serve_preflight(
+    ctx: click.Context,
+    agent_id_raw: str | None,
+    project_name: str | None,
+    fork_name: str | None,
+    write_check: bool,
+    timeout_s: int,
+) -> None:
+    """Preflight sandboxed git connectivity through the broker.
+
+    This starts the configured sandbox and broker path, invokes git
+    from inside the sandbox, and does not start event sources or touch
+    forge TODO/notification state.
+    """
+    verbose = ctx.obj.get("verbose", 0)
+    quiet = ctx.obj.get("quiet", False)
+    trace_path = ctx.obj.get("trace_path")
+    agency_path = ctx.obj.get("agency_path")
+    workspace_path = ctx.obj.get("workspace_path")
+
+    exit_code = _serve_preflight(
+        verbose=verbose,
+        quiet=quiet,
+        trace_path=trace_path,
+        agency_path=agency_path,
+        workspace_path=workspace_path,
+        agent_id_raw=agent_id_raw,
+        project_name=project_name,
+        fork_name=fork_name,
+        write_check=write_check,
+        timeout_s=timeout_s,
+    )
+    sys.exit(exit_code)
+
+
+def _serve_preflight(
+    *,
+    verbose: int,
+    quiet: bool,
+    trace_path: str | None,
+    agency_path: str | None,
+    workspace_path: str | None,
+    agent_id_raw: str | None,
+    project_name: str | None,
+    fork_name: str | None,
+    write_check: bool,
+    timeout_s: int,
+) -> int:
+    from thorn.core._account import validate_agent_accounts
+    from thorn.gateway import (
+        Gateway,
+        instantiate_services,
+        load_gateway_config,
+    )
+    from thorn.gateway._preflight import collect_git_preflight_targets
+    from thorn.runtime._paths import AgencyPaths
+
+    verbosity = _resolve_verbosity(verbose, quiet)
+    agency_home = _resolve_agency_home(agency_path)
+    try:
+        gateway_config = load_gateway_config(agency_home)
+        all_services = instantiate_services(gateway_config)
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        return 1
+
+    ws_root = _resolve_serve_workspace(
+        cli_workspace=workspace_path,
+        config_workspace=gateway_config.resolve_workspace(agency_home),
+        agency_home=agency_home,
+    )
+    targets = collect_git_preflight_targets(
+        gateway_config,
+        project_filter=project_name,
+        fork_filter=fork_name,
+    )
+    if not targets:
+        console.print(
+            "[red]Error:[/red] No configured project clone URLs matched "
+            "the requested preflight filters."
+        )
+        return 1
+
+    paths = AgencyPaths.for_gateway(
+        agency_dir=agency_home,
+        workspace_dir=ws_root,
+    )
+    trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
+    try:
+        runtime = _build_runtime(
+            trace_file=trace_file,
+            workspace=str(ws_root),
+            paths=paths,
+            sandbox_executor_enabled=True,
+            sandbox_config=gateway_config.sandbox,
+        )
+    except ThornError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        if trace_file:
+            trace_file.close()
+        return 1
+
+    _runtime_event_bus(runtime).subscribe(
+        ConsoleEventSink(verbosity=verbosity),
+    )
+    for service in all_services:
+        runtime.register_service(service)
+
+    selected_agent_id = AgentID(agent_id_raw) if agent_id_raw else None
+    agents = []
+    for agent_id in runtime.sessions.list_agent_ids():
+        if selected_agent_id is not None and agent_id != selected_agent_id:
+            continue
+        agent = runtime.get_or_create_agent(agent_id)
+        try:
+            validate_agent_accounts(agent, runtime.get_service)
+        except ValueError as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            if trace_file:
+                trace_file.close()
+            return 1
+        agents.append(agent)
+    if not agents:
+        console.print("[red]Error:[/red] No persisted agents matched preflight.")
+        if trace_file:
+            trace_file.close()
+        return 1
+
+    async def _run() -> int:
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[],
+            gateway_config=gateway_config,
+        )
+        failures = 0
+        async with runtime:
+            try:
+                for agent in agents:
+                    gateway._ensure_scheduler_for_agent(agent)
+                gateway._warn_if_egress_allowlist_unenforced()
+                await gateway._maybe_start_bundled_broker()
+                await gateway._register_broker_bindings()
+                runtime.set_sandbox_broker_binding_lookup(
+                    gateway.broker_binding_for,
+                )
+                for agent in agents:
+                    failures += await _preflight_agent_git_targets(
+                        agent=agent,
+                        runtime=runtime,
+                        targets=targets,
+                        write_check=write_check,
+                        timeout_s=timeout_s,
+                    )
+            finally:
+                await gateway.shutdown()
+        return 1 if failures else 0
+
+    try:
+        return asyncio.run(_run())
+    except ThornError as exc:
+        console.print(f"\n[red]Error:[/red] {exc}")
+        return 1
+    except Exception as exc:
+        console.print(f"\n[red]Error:[/red] {exc}")
+        return 1
+    finally:
+        if trace_file:
+            trace_file.close()
+
+
+async def _preflight_agent_git_targets(
+    *,
+    agent: "Agent",
+    runtime: Runtime,
+    targets: list["GitPreflightTarget"],
+    write_check: bool,
+    timeout_s: int,
+) -> int:
+    from thorn.core import ToolInvocation
+    from thorn.gateway._preflight import (
+        build_git_preflight_command,
+        git_preflight_failure_hint,
+        redact_git_preflight_output,
+    )
+
+    if agent.id is None:
+        console.print("[red]FAILED[/red] agent without an ID cannot preflight")
+        return 1
+    executor = runtime.get_or_create_sandbox_executor(agent)
+    if executor is None:
+        console.print(
+            f"[red]FAILED[/red] agent {agent.id}: sandbox executor disabled"
+        )
+        return 1
+    await executor.start()
+    failures = 0
+    for target in targets:
+        branch_name = None
+        if write_check:
+            branch_name = f"thorn-preflight/{uuid.uuid4().hex[:12]}"
+        console.print(
+            f"[bold]preflight[/bold] agent={agent.id} "
+            f"project={target.project_name} fork={target.fork_name} "
+            f"mode={'push/delete' if write_check else 'ls-remote'}"
+        )
+        command = build_git_preflight_command(
+            clone_url=target.clone_url,
+            timeout_s=timeout_s,
+            write_check_branch=branch_name,
+        )
+        result = await executor.invoke(
+            ToolInvocation(
+                call_id=f"git-preflight-{uuid.uuid4().hex}",
+                tool_name="run_shell",
+                arguments={
+                    "command": command,
+                    "timeout": float(timeout_s + 30),
+                },
+            )
+        )
+        output = redact_git_preflight_output(result.content)
+        failed = (
+            result.is_error
+            or output.startswith("[exit code")
+            or output.startswith("[timed out")
+        )
+        if not failed:
+            console.print("  [green]OK[/green]")
+            continue
+        failures += 1
+        console.print("  [red]FAILED[/red]")
+        if output:
+            console.print(output)
+        hint = git_preflight_failure_hint(output)
+        if hint is not None:
+            console.print(f"  [yellow]Hint:[/yellow] {hint}")
+    return failures
 
 
 @serve.command("bootstrap")
