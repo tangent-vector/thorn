@@ -179,15 +179,13 @@ class GitLabForgeClient:
 
     @staticmethod
     def _pid(native_project_id: str) -> int | str:
-        """Coerce a config-supplied native ID into the form python-gitlab expects.
+        """Coerce a config-supplied native ID for ``GitLabClient``.
 
-        ``python-gitlab``'s ``projects.get(...)`` accepts either a
-        numeric ID or a URL-encoded ``namespace/project/path`` string.
-        Configurations historically required the numeric form; the new
-        gateway config shape derives the path-based form from the
-        fork's URL, so pass either through unchanged (numeric digits
-        get parsed as ``int`` for parity with the legacy behaviour;
-        anything else is forwarded verbatim).
+        Numeric strings become ``int`` for parity with the legacy
+        config shape.  Human-readable ``namespace/project`` paths are
+        passed through; the lower-level GitLab client resolves them to
+        numeric IDs when a self-hosted instance rejects path-based API
+        project lookups.
         """
         if native_project_id.isdigit():
             return int(native_project_id)
@@ -877,10 +875,10 @@ class GitLabForgeService(ForgeHostService):
     def clone_url_for(self, native_id: str) -> str:
         """Derive an HTTPS clone URL for a GitLab project.
 
-        With the path-based ``native_id`` shape used by the new
-        gateway config (e.g. ``"group/subgroup/project"``), the clone
-        URL is just the GitLab instance URL with that path appended
-        and a ``.git`` suffix.
+        With the path-based ``native_id`` shape used by gateway
+        config (e.g. ``"group/subgroup/project"``), the clone URL is
+        just the GitLab instance URL with that path appended and a
+        ``.git`` suffix.
 
         Returns an empty string when the native_id is purely numeric
         (legacy callers): we don't have enough information to

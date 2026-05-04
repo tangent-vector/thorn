@@ -417,10 +417,12 @@ class ForkSpec(BaseModel):
     - ``forge``: the name of the :class:`ForgeSpec` entry that hosts
       this fork.  Inferred from the URL host when omitted.
     - ``native_id``: optional forge-native project identifier override.
-      Normally this is parsed from ``url``.  Set it when a forge
-      requires a different API identifier than its human URL path, such
-      as GitLab instances where a bot can access a project by numeric
-      ID but not by ``path_with_namespace``.
+      Normally this is parsed from ``url``.  For GitLab, Thorn first
+      uses the human-readable project path and can resolve it to a
+      numeric project ID at runtime if a self-hosted instance rejects
+      path-based API project lookups.  Set ``native_id`` only when that
+      resolution is unavailable and the operator already knows the
+      numeric project ID.
     - ``default_branch``: per-fork override for the default branch.
       When omitted, falls back to :attr:`ProjectSpec.default_branch`,
       and ultimately to a live lookup against the forge.
@@ -447,7 +449,8 @@ class ForkSpec(BaseModel):
         default="",
         description=(
             "Forge-native project identifier override.  When empty, "
-            "derived from `url`."
+            "derived from `url`; for GitLab, path-derived IDs may be "
+            "resolved to numeric IDs at API-call time."
         ),
     )
     default_branch: str = Field(
