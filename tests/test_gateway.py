@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -1260,6 +1260,10 @@ def _make_mock_gitlab_project_event(
     return event
 
 
+class _GitLabNotFound(Exception):
+    response_code = 404
+
+
 class TestGitLabTODOsSourceEventFormatting:
     def test_make_session_key(self):
         from thorn.gateway.sources._gitlab import _make_session_key
@@ -1775,6 +1779,70 @@ class TestGitLabTODOsSourcePolling:
                 SessionKey("my-proj/change-request/6"),
             ]
             assert all(event.kind is EventKind.STRUCTURAL for event in events)
+
+    @pytest.mark.asyncio
+    async def test_project_event_path_ref_resolves_to_numeric_id(self):
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib") as mock_gl_mod,
+        ):
+            mock_gl_instance = MagicMock()
+            mock_gl_mod.Gitlab.return_value = mock_gl_instance
+            mock_gl_instance.todos.list.return_value = []
+
+            closed_issue = _make_mock_gitlab_project_event(
+                event_id=401,
+                project_id=264873,
+                target_type="Issue",
+                target_iid=4,
+                action_name="closed",
+            )
+            project = MagicMock()
+            project.events.list.side_effect = lambda **kwargs: (
+                [closed_issue]
+                if kwargs["target_type"] == "issue"
+                else []
+            )
+            mock_gl_instance.projects.get.side_effect = [
+                _GitLabNotFound("not found"),
+                project,
+            ]
+            search_result = MagicMock()
+            search_result.id = 264873
+            search_result.path_with_namespace = "tfoley/thorn"
+            mock_gl_instance.projects.list.return_value = [search_result]
+
+            from thorn.gateway.sources._gitlab import (
+                GitLabSourceConfig,
+                GitLabTODOsSource,
+            )
+
+            source = GitLabTODOsSource(GitLabSourceConfig(
+                url="https://gitlab.example.com",
+                token="test-token",
+                poll_interval=5,
+                project_id_to_name={"tfoley/thorn": "thorn"},
+            ))
+            events: list[RawIncomingEvent] = []
+
+            async def on_event(event: RawIncomingEvent) -> None:
+                events.append(event)
+
+            await source._poll_once(on_event)
+
+            assert events == []
+            assert mock_gl_instance.projects.get.mock_calls == [
+                call("tfoley/thorn"),
+                call(264873),
+            ]
+            mock_gl_instance.projects.list.assert_called_once_with(
+                search="thorn",
+                simple=True,
+                iterator=True,
+            )
+            project.events.list.assert_any_call(
+                target_type="issue", action="closed", per_page=50,
+            )
 
 
 # ---------------------------------------------------------------------------
