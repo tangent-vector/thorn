@@ -44,6 +44,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import time
@@ -86,6 +87,41 @@ the typical case and the first poll succeeds."""
 
 _SANDBOX_PROXY_URL = "http://onecli:10255"
 """Broker proxy URL as seen from containers on the compose broker network."""
+
+_DIAGNOSTIC_SECRET = "<redacted>"
+_DIAGNOSTIC_TEXT_LIMIT = 4_000
+_STARTUP_LOG_TAIL = 80
+
+_AUTH_HEADER_RE = re.compile(
+    r"(?im)\b(?P<header>Authorization|Proxy-Authorization)\s*:\s*[^\r\n]+",
+)
+_JSON_SECRET_DOUBLE_RE = re.compile(
+    r"(?P<prefix>[\"']?(?:apiKey|api_key|accessToken|access_token|"
+    r"refreshToken|refresh_token|token|password|secret)[\"']?\s*:\s*)"
+    r'"[^"]*"',
+    re.IGNORECASE,
+)
+_JSON_SECRET_SINGLE_RE = re.compile(
+    r"(?P<prefix>[\"']?(?:apiKey|api_key|accessToken|access_token|"
+    r"refreshToken|refresh_token|token|password|secret)[\"']?\s*:\s*)"
+    r"'[^']*'",
+    re.IGNORECASE,
+)
+_ASSIGNMENT_SECRET_RE = re.compile(
+    r"(?im)\b(?P<key>[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)[A-Z0-9_]*=)"
+    r"(?P<value>[^\s]+)",
+)
+_BARE_SECRET_FIELD_RE = re.compile(
+    r"(?i)\b(?P<key>apiKey|api_key|accessToken|access_token|"
+    r"refreshToken|refresh_token|token|password|secret)\b"
+    r"(?P<separator>\s*[:=]\s*)(?P<value>[^\s,;}]+)",
+)
+_URL_USERINFO_RE = re.compile(
+    r"(?P<scheme>[a-z][a-z0-9+.-]*://)"
+    r"(?P<userinfo>[^/\s:@]+(?::[^/\s@]*)?@)",
+    re.IGNORECASE,
+)
+_ONECLI_TOKEN_RE = re.compile(r"\b(?:a?oc)_[A-Za-z0-9._~+/=-]{3,}\b")
 
 
 class BundledBrokerError(RuntimeError):
@@ -398,8 +434,13 @@ class BundledBrokerSupervisor:
             self._endpoints = await self._discover_endpoints()
             await self._wait_for_health()
             admin_key = await self._acquire_admin_api_key()
-        except BaseException:
+        except BaseException as exc:
+            diagnostics = ""
+            if isinstance(exc, Exception):
+                diagnostics = await self._startup_failure_diagnostics()
             await self._safe_compose_down()
+            if diagnostics and isinstance(exc, BundledBrokerError):
+                raise BundledBrokerError(f"{exc}\n\n{diagnostics}") from exc
             raise
 
         # The synthesised config is presented to the rest of the
@@ -507,7 +548,8 @@ class BundledBrokerSupervisor:
         if rc != 0:
             raise BundledBrokerError(
                 f"compose port {service}/{container_port} failed "
-                f"(exit {rc}): {stderr.strip()[:300]}",
+                f"(exit {rc}): "
+                f"{_redacted_diagnostic_excerpt(stderr, limit=300)}",
             )
         return stdout.strip()
 
@@ -595,9 +637,40 @@ class BundledBrokerSupervisor:
         if check and rc != 0:
             raise BundledBrokerError(
                 f"compose {' '.join(verbs)} failed (exit {rc}): "
-                f"{stderr.strip()[:500]}",
+                f"{_redacted_diagnostic_excerpt(stderr, limit=500)}",
             )
         return rc, stdout, stderr
+
+    async def _startup_failure_diagnostics(self) -> str:
+        """Return redacted compose logs for a failed startup, if available."""
+        if self._compose_argv_prefix is None:
+            return ""
+        try:
+            return await self._collect_recent_broker_logs(tail=_STARTUP_LOG_TAIL)
+        except Exception as exc:
+            return (
+                "Recent bundled-broker logs unavailable: "
+                f"{_redacted_diagnostic_excerpt(str(exc))}"
+            )
+
+    async def _collect_recent_broker_logs(self, *, tail: int) -> str:
+        rc, stdout, stderr = await self._run_compose_capturing(
+            ("logs", "--no-color", "--tail", str(tail), "onecli", "postgres"),
+            env=self._compose_env(),
+            timeout_s=15.0,
+            check=False,
+        )
+        if rc != 0:
+            details = _compose_failure_details(stdout=stdout, stderr=stderr)
+            return (
+                "Recent bundled-broker logs unavailable "
+                f"(compose logs exited {rc}: {details})"
+            )
+        return _format_broker_log_diagnostics(
+            stdout=stdout,
+            stderr=stderr,
+            tail=tail,
+        )
 
     def _compose_env(self) -> dict[str, str]:
         """Build the env dict passed to every compose subprocess.
@@ -656,7 +729,8 @@ class BundledBrokerSupervisor:
                     )
                     return
                 last_error = (
-                    f"HTTP {response.status_code}: {response.text[:200]}"
+                    f"HTTP {response.status_code}: "
+                    f"{_redacted_diagnostic_excerpt(response.text, limit=200)}"
                 )
             await asyncio.sleep(self._health_poll_interval_s)
         raise BundledBrokerError(
@@ -703,7 +777,7 @@ class BundledBrokerSupervisor:
             raise BundledBrokerError(
                 f"OneCLI GET /api/user/api-key returned unexpected "
                 f"HTTP {get_response.status_code}: "
-                f"{get_response.text[:300]}",
+                f"{_redacted_diagnostic_excerpt(get_response.text, limit=300)}",
             )
 
         log.info(
@@ -715,7 +789,7 @@ class BundledBrokerSupervisor:
             raise BundledBrokerError(
                 f"OneCLI POST /api/user/api-key/regenerate returned "
                 f"HTTP {post_response.status_code}: "
-                f"{post_response.text[:300]}",
+                f"{_redacted_diagnostic_excerpt(post_response.text, limit=300)}",
             )
         return _parse_api_key_response(post_response.text, source="POST")
 
@@ -750,6 +824,115 @@ class BundledBrokerSupervisor:
 # ---------------------------------------------------------------------------
 
 
+def _redact_diagnostic_text(text: str) -> str:
+    """Redact credentials from broker diagnostics before surfacing them.
+
+    Broker diagnostics come from unstructured sources: compose stderr,
+    OneCLI logs, HTTP response snippets, and operator-provided env
+    assignments. Keep this deliberately pattern-based and conservative
+    so a new OneCLI log shape does not need a Thorn code change before
+    it is safe to show to operators.
+    """
+    redacted = _AUTH_HEADER_RE.sub(
+        lambda match: f"{match.group('header')}: {_DIAGNOSTIC_SECRET}",
+        text,
+    )
+    redacted = _URL_USERINFO_RE.sub(
+        lambda match: f"{match.group('scheme')}{_DIAGNOSTIC_SECRET}@",
+        redacted,
+    )
+    redacted = _ASSIGNMENT_SECRET_RE.sub(
+        lambda match: f"{match.group('key')}{_DIAGNOSTIC_SECRET}",
+        redacted,
+    )
+    redacted = _JSON_SECRET_DOUBLE_RE.sub(
+        lambda match: f"{match.group('prefix')}\"{_DIAGNOSTIC_SECRET}\"",
+        redacted,
+    )
+    redacted = _JSON_SECRET_SINGLE_RE.sub(
+        lambda match: f"{match.group('prefix')}'{_DIAGNOSTIC_SECRET}'",
+        redacted,
+    )
+    redacted = _BARE_SECRET_FIELD_RE.sub(
+        lambda match: (
+            f"{match.group('key')}{match.group('separator')}"
+            f"{_DIAGNOSTIC_SECRET}"
+        ),
+        redacted,
+    )
+    return _ONECLI_TOKEN_RE.sub(_DIAGNOSTIC_SECRET, redacted)
+
+
+def _redacted_diagnostic_excerpt(
+    text: str,
+    *,
+    limit: int = _DIAGNOSTIC_TEXT_LIMIT,
+) -> str:
+    """Return a bounded, redacted diagnostic snippet."""
+    redacted = _redact_diagnostic_text(text).strip()
+    if not redacted:
+        return "<no output>"
+    if len(redacted) <= limit:
+        return redacted
+    return redacted[:limit].rstrip() + "\n... <truncated>"
+
+
+def _format_broker_log_diagnostics(
+    *,
+    stdout: str,
+    stderr: str,
+    tail: int,
+) -> str:
+    parts = [part.strip() for part in (stdout, stderr) if part.strip()]
+    if not parts:
+        excerpt = "<no output>"
+    else:
+        excerpt = _redacted_diagnostic_excerpt("\n".join(parts))
+    diagnostics = [
+        f"Recent bundled-broker logs (redacted, tail {tail}):",
+        excerpt,
+    ]
+    hint = _broker_diagnostic_hint(excerpt)
+    if hint is not None:
+        diagnostics.append("")
+        diagnostics.append(hint)
+    return "\n".join(diagnostics)
+
+
+def _broker_diagnostic_hint(redacted_text: str) -> str | None:
+    lowered = redacted_text.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "certificate",
+            "gnutls",
+            "tls",
+            "x509",
+            "unknown authority",
+            "self-signed",
+        )
+    ):
+        return (
+            "Hint: TLS/certificate failures in broker MITM mode usually "
+            "mean OneCLI cannot verify the upstream host. Configure "
+            "ONECLI_HOST_CA_BUNDLE for the host CA bundle, or use "
+            "ONECLI_SKIP_VERIFY_HOSTS only for hosts where bypassing "
+            "verification is acceptable."
+        )
+    if "proxy-authorization" in lowered or "407" in lowered:
+        return (
+            "Hint: Proxy-Authorization failures usually mean the sandbox "
+            "did not receive broker credentials or is bypassing Thorn's "
+            "broker proxy configuration."
+        )
+    if "connection refused" in lowered or "no route to host" in lowered:
+        return (
+            "Hint: upstream connection failures usually point at host "
+            "egress or DNS, not at the sandbox credential placeholder."
+        )
+    return None
+
+
 def _parse_api_key_response(body_text: str, *, source: Literal["GET", "POST"]) -> str:
     """Pull the ``apiKey`` field out of an OneCLI admin-API response.
 
@@ -763,7 +946,7 @@ def _parse_api_key_response(body_text: str, *, source: Literal["GET", "POST"]) -
     except json.JSONDecodeError as exc:
         raise BundledBrokerError(
             f"OneCLI {source} /api/user/api-key returned non-JSON body "
-            f"(prefix: {body_text[:100]!r})",
+            f"(prefix: {_redacted_diagnostic_excerpt(body_text, limit=100)!r})",
         ) from exc
     if not isinstance(body, dict) or "apiKey" not in body:
         raise BundledBrokerError(
@@ -828,10 +1011,7 @@ def _split_compose_port_output(raw: str) -> tuple[str, int]:
 
 def _compose_failure_details(*, stdout: str, stderr: str) -> str:
     """Return the most useful short failure text from compose output."""
-    details = (stderr or stdout).strip()
-    if not details:
-        return "<no output>"
-    return details[:500]
+    return _redacted_diagnostic_excerpt(stderr or stdout, limit=500)
 
 
 # ---------------------------------------------------------------------------
@@ -902,9 +1082,13 @@ async def _list_stacks_for_runtime(
     )
     stdout_b, stderr_b = await proc.communicate()
     if proc.returncode != 0:
+        details = _redacted_diagnostic_excerpt(
+            stderr_b.decode("utf-8", errors="replace"),
+            limit=200,
+        )
         raise BundledBrokerError(
             f"{binary_name} compose ls failed (exit {proc.returncode}): "
-            f"{stderr_b.decode('utf-8', errors='replace').strip()[:200]}",
+            f"{details}",
         )
     try:
         rows = json.loads(stdout_b.decode("utf-8", errors="replace"))
@@ -953,11 +1137,46 @@ async def shutdown_bundled_broker_stack(stack: BundledBrokerStackInfo) -> None:
     )
     stdout_b, stderr_b = await proc.communicate()
     if proc.returncode != 0:
+        details = _redacted_diagnostic_excerpt(
+            stderr_b.decode("utf-8", errors="replace"),
+            limit=300,
+        )
         raise BundledBrokerError(
             f"{stack.runtime_name} compose -p {stack.project_name} down "
-            f"failed (exit {proc.returncode}): "
-            f"{stderr_b.decode('utf-8', errors='replace').strip()[:300]}",
+            f"failed (exit {proc.returncode}): {details}",
         )
+
+
+async def collect_bundled_broker_stack_logs(
+    stack: BundledBrokerStackInfo,
+    *,
+    tail: int = 100,
+) -> str:
+    """Return redacted OneCLI/Postgres logs for a bundled-broker stack."""
+    if tail < 1:
+        raise BundledBrokerError("Log tail must be at least 1 line")
+    binary_path = shutil.which(stack.runtime_name)
+    if binary_path is None:
+        raise BundledBrokerError(
+            f"Cannot collect logs for {stack.project_name!r}: runtime "
+            f"{stack.runtime_name!r} is no longer on PATH",
+        )
+    proc = await asyncio.create_subprocess_exec(
+        binary_path, "compose", "-p", stack.project_name,
+        "logs", "--no-color", "--tail", str(tail), "onecli", "postgres",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    stdout = stdout_b.decode("utf-8", errors="replace")
+    stderr = stderr_b.decode("utf-8", errors="replace")
+    if proc.returncode != 0:
+        details = _compose_failure_details(stdout=stdout, stderr=stderr)
+        raise BundledBrokerError(
+            f"{stack.runtime_name} compose -p {stack.project_name} logs "
+            f"failed (exit {proc.returncode}): {details}",
+        )
+    return _format_broker_log_diagnostics(stdout=stdout, stderr=stderr, tail=tail)
 
 
 @contextmanager
@@ -979,6 +1198,7 @@ __all__ = [
     "BundledBrokerError",
     "BundledBrokerStackInfo",
     "BundledBrokerSupervisor",
+    "collect_bundled_broker_stack_logs",
     "list_bundled_broker_stacks",
     "shutdown_bundled_broker_stack",
 ]

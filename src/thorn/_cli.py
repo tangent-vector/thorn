@@ -1635,5 +1635,76 @@ def broker_down(project_name: str | None) -> None:
     sys.exit(asyncio.run(_run()))
 
 
+@broker.command("logs")
+@click.option(
+    "--project",
+    "project_name",
+    default=None,
+    help=(
+        "Collect logs only for the named compose project (must begin with "
+        "'thorn-broker-').  When omitted, exactly one matching stack must "
+        "be present."
+    ),
+)
+@click.option(
+    "--tail",
+    type=click.IntRange(min=1),
+    default=100,
+    show_default=True,
+    help="Number of log lines to collect from each broker service.",
+)
+def broker_logs(project_name: str | None, tail: int) -> None:
+    """Print redacted OneCLI/Postgres logs for a bundled broker stack."""
+    from thorn.gateway._bundled_broker import (
+        BundledBrokerError,
+        collect_bundled_broker_stack_logs,
+        list_bundled_broker_stacks,
+    )
+
+    async def _run() -> int:
+        stacks = await list_bundled_broker_stacks()
+        if project_name is not None:
+            stacks = [s for s in stacks if s.project_name == project_name]
+            if not stacks:
+                console.print(
+                    f"[yellow]No matching stack {project_name!r} "
+                    "(did you mean a different project?)[/yellow]"
+                )
+                return 1
+        if not stacks:
+            console.print(
+                "[dim]No bundled-broker compose stacks found.[/dim]"
+            )
+            return 1
+        if len(stacks) > 1:
+            console.print(
+                "[yellow]Multiple bundled-broker stacks found; re-run "
+                "with --project:[/yellow]"
+            )
+            for stack in stacks:
+                console.print(
+                    f"  {stack.project_name}  ({stack.runtime_name})  "
+                    f"[dim]{stack.status}[/dim]"
+                )
+            return 1
+        stack = stacks[0]
+        try:
+            diagnostics = await collect_bundled_broker_stack_logs(
+                stack,
+                tail=tail,
+            )
+        except BundledBrokerError as exc:
+            console.print(f"[red]FAILED[/red] {exc}")
+            return 1
+        console.print(
+            f"[bold]Bundled-broker logs for {stack.project_name}[/bold] "
+            f"({stack.runtime_name})"
+        )
+        console.print(diagnostics)
+        return 0
+
+    sys.exit(asyncio.run(_run()))
+
+
 if __name__ == "__main__":
     main()

@@ -16,6 +16,7 @@ from thorn.core._provider import (
     ToolCallChunk,
     UsageChunk,
 )
+from thorn.gateway._bundled_broker import BundledBrokerStackInfo
 from thorn.runtime import (
     AddressBook,
     AgencyPaths,
@@ -186,6 +187,77 @@ class TestInboxRequeueCommand:
         assert result.exit_code != 0
         assert "missing-item" in result.output
         assert "provider key was invalid" not in result.output
+
+
+class TestBrokerLogsCommand:
+    def test_prints_redacted_logs_for_single_stack(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        stack = BundledBrokerStackInfo(
+            project_name="thorn-broker-test",
+            runtime_name="podman",
+            status="running(2)",
+        )
+
+        async def _list_stacks() -> list[BundledBrokerStackInfo]:
+            return [stack]
+
+        async def _collect_logs(
+            selected_stack: BundledBrokerStackInfo,
+            *,
+            tail: int,
+        ) -> str:
+            assert selected_stack == stack
+            assert tail == 7
+            return "Recent bundled-broker logs (redacted, tail 7):\nclean"
+
+        monkeypatch.setattr(
+            "thorn.gateway._bundled_broker.list_bundled_broker_stacks",
+            _list_stacks,
+        )
+        monkeypatch.setattr(
+            "thorn.gateway._bundled_broker.collect_bundled_broker_stack_logs",
+            _collect_logs,
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["broker", "logs", "--tail", "7"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "thorn-broker-test" in result.output
+        assert "clean" in result.output
+
+    def test_requires_project_when_multiple_stacks(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def _list_stacks() -> list[BundledBrokerStackInfo]:
+            return [
+                BundledBrokerStackInfo(
+                    project_name="thorn-broker-a",
+                    runtime_name="podman",
+                    status="running(2)",
+                ),
+                BundledBrokerStackInfo(
+                    project_name="thorn-broker-b",
+                    runtime_name="docker",
+                    status="running(2)",
+                ),
+            ]
+
+        monkeypatch.setattr(
+            "thorn.gateway._bundled_broker.list_bundled_broker_stacks",
+            _list_stacks,
+        )
+
+        result = CliRunner().invoke(cli_main, ["broker", "logs"])
+
+        assert result.exit_code != 0
+        assert "Multiple bundled-broker stacks" in result.output
+        assert "thorn-broker-a" in result.output
+        assert "thorn-broker-b" in result.output
 
 
 class TestRunResultFile:

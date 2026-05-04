@@ -23,6 +23,7 @@ from thorn.gateway._bundled_broker import (
     BundledBrokerSupervisor,
     _generate_compose_project_name,
     _parse_api_key_response,
+    _redact_diagnostic_text,
     _split_compose_port_output,
 )
 from thorn.gateway._config import (
@@ -287,6 +288,35 @@ class TestParseApiKeyResponse:
             _parse_api_key_response(body, source="GET")
 
 
+class TestBrokerDiagnosticRedaction:
+    def test_redacts_common_broker_secret_shapes(self) -> None:
+        raw = "\n".join([
+            "Authorization: Bearer provider-secret",
+            "Proxy-Authorization: Basic broker-secret",
+            "ONECLI_ACCESS_TOKEN=oc_envsecret",
+            "DATABASE_URL=postgres://user:db-secret@postgres:5432/app",
+            '{"apiKey": "oc_jsonsecret", "accessToken": "aoc_accesssecret"}',
+            "proxy=http://x:proxy-secret@onecli:10255",
+        ])
+
+        redacted = _redact_diagnostic_text(raw)
+
+        for secret in (
+            "provider-secret",
+            "broker-secret",
+            "oc_envsecret",
+            "db-secret",
+            "oc_jsonsecret",
+            "aoc_accesssecret",
+            "proxy-secret",
+        ):
+            assert secret not in redacted
+        assert "Authorization: <redacted>" in redacted
+        assert "Proxy-Authorization: <redacted>" in redacted
+        assert "ONECLI_ACCESS_TOKEN=<redacted>" in redacted
+        assert "postgres://<redacted>@postgres:5432/app" in redacted
+
+
 # ---------------------------------------------------------------------------
 # Supervisor lifecycle
 # ---------------------------------------------------------------------------
@@ -450,17 +480,28 @@ class TestSupervisorStart:
         recorder.script("port", stdout="127.0.0.1:2222\n")
         # On unexpected status, the supervisor must roll back the
         # stack so we don't leak compose state.
+        recorder.script(
+            "logs",
+            stdout="onecli | Authorization: Bearer provider-secret\n",
+        )
         recorder.script("down")
 
-        handler = _ok_health_handler([(500, "internal error")])
+        handler = _ok_health_handler([
+            (500, '{"apiKey": "oc_should_not_leak", "error": "internal"}'),
+        ])
         supervisor = _make_supervisor(recorder=recorder, handler=handler)
 
-        with pytest.raises(BundledBrokerError, match="HTTP 500"):
+        with pytest.raises(BundledBrokerError, match="HTTP 500") as exc_info:
             await supervisor.start()
+        message = str(exc_info.value)
+        assert "Recent bundled-broker logs" in message
+        assert "Authorization: <redacted>" in message
+        assert "provider-secret" not in message
+        assert "oc_should_not_leak" not in message
 
         # Verify rollback fired.
         verbs = [_ComposeRecorder._verb_of(call[0]) for call in recorder.calls]
-        assert verbs[-1] == "down"
+        assert verbs[-2:] == ["logs", "down"]
 
     @pytest.mark.asyncio
     async def test_health_timeout_rolls_back(self) -> None:
@@ -468,6 +509,14 @@ class TestSupervisorStart:
         recorder.script("up")
         recorder.script("port", stdout="127.0.0.1:1111\n")
         recorder.script("port", stdout="127.0.0.1:2222\n")
+        recorder.script(
+            "logs",
+            stdout=(
+                "onecli | error=serving MITM connection: "
+                "GnuTLS recv error (-110): certificate verify failed\n"
+                "postgres | ready\n"
+            ),
+        )
         recorder.script("down")
 
         # Health check that always fails so the supervisor exhausts
@@ -484,11 +533,36 @@ class TestSupervisorStart:
             handler=httpx.MockTransport(_handler),
         )
 
-        with pytest.raises(BundledBrokerError, match="/api/health"):
+        with pytest.raises(BundledBrokerError, match="/api/health") as exc_info:
             await supervisor.start()
+        message = str(exc_info.value)
+        assert "Recent bundled-broker logs (redacted, tail 80)" in message
+        assert "serving MITM connection" in message
+        assert "ONECLI_HOST_CA_BUNDLE" in message
+        assert "ONECLI_SKIP_VERIFY_HOSTS" in message
 
         verbs = [_ComposeRecorder._verb_of(call[0]) for call in recorder.calls]
-        assert verbs[-1] == "down"
+        assert verbs[-2:] == ["logs", "down"]
+
+    @pytest.mark.asyncio
+    async def test_compose_log_failure_does_not_mask_startup_error(self) -> None:
+        recorder = _ComposeRecorder()
+        recorder.script("up")
+        recorder.script("port", stdout="127.0.0.1:1111\n")
+        recorder.script("port", stdout="127.0.0.1:2222\n")
+        recorder.script("logs", rc=1, stderr="Authorization: Bearer secret")
+        recorder.script("down")
+
+        handler = _ok_health_handler([(500, "internal error")])
+        supervisor = _make_supervisor(recorder=recorder, handler=handler)
+
+        with pytest.raises(BundledBrokerError, match="HTTP 500") as exc_info:
+            await supervisor.start()
+
+        message = str(exc_info.value)
+        assert "compose logs exited 1" in message
+        assert "Authorization: <redacted>" in message
+        assert "secret" not in message
 
     @pytest.mark.asyncio
     async def test_start_is_single_use(self) -> None:
