@@ -69,6 +69,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import httpx
 from pydantic import BaseModel
 
+from thorn._redaction import REDACTED_SECRET, redact_secret_snippet, redact_secrets
 from thorn.core._brokering import (
     BrokerableService,
     BrokerCredentialPlan,
@@ -84,7 +85,6 @@ from thorn.core._credentials import (
 from thorn.gateway._config import BrokerConfig
 
 if TYPE_CHECKING:
-    from thorn.core._account import AccountConfig
     from thorn.core._agent import Agent
     from thorn.core._service import Service
 
@@ -262,7 +262,8 @@ class BrokerClient:
             return str(body["id"])
         except (KeyError, TypeError) as e:
             raise BrokerError(
-                f"create_agent: unexpected response shape: {body!r}"
+                "create_agent: unexpected response shape: "
+                f"{redact_secrets(repr(body))}"
             ) from e
 
     def _regenerate_agent_token(self, agent_id: str) -> ServiceCredential:
@@ -275,7 +276,8 @@ class BrokerClient:
             token = str(body["accessToken"])
         except (KeyError, TypeError) as e:
             raise BrokerError(
-                f"regenerate_agent_token: unexpected response shape: {body!r}"
+                "regenerate_agent_token: unexpected response shape: "
+                f"{redact_secrets(repr(body))}"
             ) from e
         return ServiceCredential(token)
 
@@ -321,7 +323,8 @@ class BrokerClient:
             return SecretRegistration(secret_id=str(result["id"]))
         except (KeyError, TypeError) as e:
             raise BrokerError(
-                f"register_secret: unexpected response shape: {result!r}"
+                "register_secret: unexpected response shape: "
+                f"{redact_secrets(repr(result))}"
             ) from e
 
     def delete_secret(self, secret_id: str) -> None:
@@ -394,7 +397,7 @@ class BrokerClient:
         # request echoes; including the full body unbounded here would
         # risk leaking credential material in logs in pathological
         # cases.
-        snippet = response.text[:200]
+        snippet = redact_secret_snippet(response.text, max_chars=200)
         raise BrokerError(
             f"OneCLI {operation} failed: HTTP {response.status_code}: {snippet}"
         )
@@ -534,6 +537,28 @@ class BrokerBinding:
     needed).  The sandbox runtime uses this to populate
     :attr:`~thorn.sandbox._container.ContainerHostConfig.git_config_host_path`.
     """
+
+    def __repr__(self) -> str:
+        """Render a diagnostic-safe binding summary."""
+        placeholder_env = tuple(
+            (name, REDACTED_SECRET) for name, _value in self.placeholder_env
+        )
+        git_extra_headers = tuple(
+            (host, redact_secrets(header_value))
+            for host, header_value in self.git_extra_headers
+        )
+        return (
+            "BrokerBinding("
+            f"agent_id={self.agent_id!r}, "
+            f"secret_ids={self.secret_ids!r}, "
+            f"access_token={self.access_token!r}, "
+            f"proxy_url={redact_secrets(self.proxy_url)!r}, "
+            f"ca_certificate_path={self.ca_certificate_path!r}, "
+            f"placeholder_env={placeholder_env!r}, "
+            f"git_extra_headers={git_extra_headers!r}, "
+            f"git_config_path={self.git_config_path!r}"
+            ")"
+        )
 
 
 # ---------------------------------------------------------------------------

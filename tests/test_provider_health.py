@@ -256,8 +256,10 @@ class TestProbeCoordination(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(snapshot.seconds_until_probe, 2.0 + 1e-6)
 
     async def test_jitter_does_not_exceed_bound(self) -> None:
+        clock = _FakeClock()
         m, _ = _quick_monitor(
             failure_threshold=1, base=0.1, cap=0.1, jitter=0.05,
+            clock=clock,
         )
         # Trip and inspect cooldown across several attempts.
         for _ in range(20):

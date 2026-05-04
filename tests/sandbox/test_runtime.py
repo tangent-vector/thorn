@@ -348,14 +348,24 @@ class TestRuntimeLogging:
                 "-e",
                 "HTTPS_PROXY=http://x:aoc_secret@onecli:10255",
                 "--env=GITHUB_TOKEN=thorn-broker-placeholder",
+                "-e",
+                "OPENAI_API_KEY=sk-live-secret-123456",
+                "--env=GITLAB_TOKEN=glpat-secret-123456",
+                "--env=PROXY_AUTHORIZATION=Basic c2VjcmV0LXZhbHVl",
                 "image:1",
             )
         )
 
         assert "aoc_secret" not in logged
         assert "thorn-broker-placeholder" not in logged
+        assert "sk-live-secret-123456" not in logged
+        assert "glpat-secret-123456" not in logged
+        assert "c2VjcmV0LXZhbHVl" not in logged
         assert "HTTPS_PROXY=<redacted>" in logged
         assert "--env=GITHUB_TOKEN=<redacted>" in logged
+        assert "OPENAI_API_KEY=<redacted>" in logged
+        assert "--env=GITLAB_TOKEN=<redacted>" in logged
+        assert "--env=PROXY_AUTHORIZATION=<redacted>" in logged
 
 
 class TestRuntimeSpecificDefaults:

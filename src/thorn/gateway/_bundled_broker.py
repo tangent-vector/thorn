@@ -44,7 +44,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import secrets
 import shutil
 import time
@@ -55,6 +54,7 @@ from typing import Literal
 
 import httpx
 
+from thorn._redaction import redact_secret_snippet, redact_secrets
 from thorn.core._credentials import ServiceCredential
 from thorn.gateway._config import BrokerConfig, BundledBrokerImageConfig
 from thorn.gateway._resources_helper import (
@@ -88,40 +88,8 @@ the typical case and the first poll succeeds."""
 _SANDBOX_PROXY_URL = "http://onecli:10255"
 """Broker proxy URL as seen from containers on the compose broker network."""
 
-_DIAGNOSTIC_SECRET = "<redacted>"
 _DIAGNOSTIC_TEXT_LIMIT = 4_000
 _STARTUP_LOG_TAIL = 80
-
-_AUTH_HEADER_RE = re.compile(
-    r"(?im)\b(?P<header>Authorization|Proxy-Authorization)\s*:\s*[^\r\n]+",
-)
-_JSON_SECRET_DOUBLE_RE = re.compile(
-    r"(?P<prefix>[\"']?(?:apiKey|api_key|accessToken|access_token|"
-    r"refreshToken|refresh_token|token|password|secret)[\"']?\s*:\s*)"
-    r'"[^"]*"',
-    re.IGNORECASE,
-)
-_JSON_SECRET_SINGLE_RE = re.compile(
-    r"(?P<prefix>[\"']?(?:apiKey|api_key|accessToken|access_token|"
-    r"refreshToken|refresh_token|token|password|secret)[\"']?\s*:\s*)"
-    r"'[^']*'",
-    re.IGNORECASE,
-)
-_ASSIGNMENT_SECRET_RE = re.compile(
-    r"(?im)\b(?P<key>[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)[A-Z0-9_]*=)"
-    r"(?P<value>[^\s]+)",
-)
-_BARE_SECRET_FIELD_RE = re.compile(
-    r"(?i)\b(?P<key>apiKey|api_key|accessToken|access_token|"
-    r"refreshToken|refresh_token|token|password|secret)\b"
-    r"(?P<separator>\s*[:=]\s*)(?P<value>[^\s,;}]+)",
-)
-_URL_USERINFO_RE = re.compile(
-    r"(?P<scheme>[a-z][a-z0-9+.-]*://)"
-    r"(?P<userinfo>[^/\s:@]+(?::[^/\s@]*)?@)",
-    re.IGNORECASE,
-)
-_ONECLI_TOKEN_RE = re.compile(r"\b(?:a?oc)_[A-Za-z0-9._~+/=-]{3,}\b")
 
 
 class BundledBrokerError(RuntimeError):
@@ -546,10 +514,12 @@ class BundledBrokerSupervisor:
             check=False,
         )
         if rc != 0:
+            details = _compose_failure_details(
+                stdout=stdout, stderr=stderr, max_chars=300,
+            )
             raise BundledBrokerError(
                 f"compose port {service}/{container_port} failed "
-                f"(exit {rc}): "
-                f"{_redacted_diagnostic_excerpt(stderr, limit=300)}",
+                f"(exit {rc}): {details}",
             )
         return stdout.strip()
 
@@ -635,9 +605,10 @@ class BundledBrokerSupervisor:
                 f"compose {' '.join(verbs)} timed out after {timeout_s}s",
             ) from None
         if check and rc != 0:
+            details = _compose_failure_details(stdout=stdout, stderr=stderr)
             raise BundledBrokerError(
                 f"compose {' '.join(verbs)} failed (exit {rc}): "
-                f"{_redacted_diagnostic_excerpt(stderr, limit=500)}",
+                f"{details}",
             )
         return rc, stdout, stderr
 
@@ -833,34 +804,7 @@ def _redact_diagnostic_text(text: str) -> str:
     so a new OneCLI log shape does not need a Thorn code change before
     it is safe to show to operators.
     """
-    redacted = _AUTH_HEADER_RE.sub(
-        lambda match: f"{match.group('header')}: {_DIAGNOSTIC_SECRET}",
-        text,
-    )
-    redacted = _URL_USERINFO_RE.sub(
-        lambda match: f"{match.group('scheme')}{_DIAGNOSTIC_SECRET}@",
-        redacted,
-    )
-    redacted = _ASSIGNMENT_SECRET_RE.sub(
-        lambda match: f"{match.group('key')}{_DIAGNOSTIC_SECRET}",
-        redacted,
-    )
-    redacted = _JSON_SECRET_DOUBLE_RE.sub(
-        lambda match: f"{match.group('prefix')}\"{_DIAGNOSTIC_SECRET}\"",
-        redacted,
-    )
-    redacted = _JSON_SECRET_SINGLE_RE.sub(
-        lambda match: f"{match.group('prefix')}'{_DIAGNOSTIC_SECRET}'",
-        redacted,
-    )
-    redacted = _BARE_SECRET_FIELD_RE.sub(
-        lambda match: (
-            f"{match.group('key')}{match.group('separator')}"
-            f"{_DIAGNOSTIC_SECRET}"
-        ),
-        redacted,
-    )
-    return _ONECLI_TOKEN_RE.sub(_DIAGNOSTIC_SECRET, redacted)
+    return redact_secrets(text)
 
 
 def _redacted_diagnostic_excerpt(
@@ -1009,9 +953,14 @@ def _split_compose_port_output(raw: str) -> tuple[str, int]:
     return host, port
 
 
-def _compose_failure_details(*, stdout: str, stderr: str) -> str:
+def _compose_failure_details(
+    *, stdout: str, stderr: str, max_chars: int = 500,
+) -> str:
     """Return the most useful short failure text from compose output."""
-    return _redacted_diagnostic_excerpt(stderr or stdout, limit=500)
+    details = (stderr or stdout).strip()
+    if not details:
+        return "<no output>"
+    return redact_secret_snippet(details, max_chars=max_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -1136,10 +1085,11 @@ async def shutdown_bundled_broker_stack(stack: BundledBrokerStackInfo) -> None:
         stderr=asyncio.subprocess.PIPE,
     )
     stdout_b, stderr_b = await proc.communicate()
+    stdout = stdout_b.decode("utf-8", errors="replace")
+    stderr = stderr_b.decode("utf-8", errors="replace")
     if proc.returncode != 0:
-        details = _redacted_diagnostic_excerpt(
-            stderr_b.decode("utf-8", errors="replace"),
-            limit=300,
+        details = _compose_failure_details(
+            stdout=stdout, stderr=stderr, max_chars=300,
         )
         raise BundledBrokerError(
             f"{stack.runtime_name} compose -p {stack.project_name} down "
