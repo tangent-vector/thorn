@@ -6,24 +6,28 @@ repositories, responds to @-mentions and assignments, and carries out
 development tasks: reading issues, cloning repos, making changes,
 pushing branches, and opening pull requests.
 
-It runs as a long-lived **gateway** daemon -- typically inside a Docker
-container -- that polls a forge for activity and dispatches work to an
-LLM-powered agent.
+It runs as a long-lived **gateway** daemon.  The recommended first-run
+shape is a host-side `uv run thorn serve` process that manages the
+default container sandbox and bundled credential broker for agent
+work.
 
-Quick Start (Docker)
---------------------
+Quick Start
+-----------
 
 ### Prerequisites
 
-- Docker (and optionally Docker Compose)
+- `uv`
+- Python 3.11 or newer
+- Docker or Podman for the default sandbox and bundled broker
 - An LLM provider exposing an OpenAI-compatible API
-- A GitHub personal access token (PAT), or a GitHub App installation
+- A GitHub or GitLab personal access token (PAT)
 
-### 1. Clone the repository
+### 1. Clone and sync the repository
 
 ```console
 $ git clone https://github.com/tangent-vector/thorn.git
 $ cd thorn
+$ uv sync --all-extras
 ```
 
 ### 2. Create a `.env` file
@@ -31,8 +35,9 @@ $ cd thorn
 The gateway only reads **secrets** from environment variables; all
 other configuration (forge base URL, project metadata, polling cadence,
 etc.) lives in `gateway.json` and the per-agent identity JSON files
-that `thorn serve bootstrap` writes for you.  Create a `.env` file at
-the repository root with just the secrets:
+that `thorn serve bootstrap` writes for you. The CLI loads a `.env`
+file from the working tree, so create one at the repository root with
+just the secrets:
 
 ```dotenv
 # LLM provider (any OpenAI-compatible API)
@@ -44,44 +49,89 @@ OPENAI_API_MODEL_NAME=gpt-4o
 GITHUB_TOKEN=ghp_...
 ```
 
-For GitLab, set `GITLAB_TOKEN` instead (and pass `--forge-type gitlab
---forge-base-url https://your-gitlab.example.com/api/v4` to bootstrap
-in step 4).
+For GitLab, set `GITLAB_TOKEN` instead:
+
+```dotenv
+GITLAB_TOKEN=glpat-...
+```
 
 > **Do not commit `.env` to version control.** It contains secrets.
 
-### 3. Build the Docker image
-
-```console
-$ docker build -t thorn-gateway .
-```
-
-The image includes development toolchains for C/C++ (gcc, cmake),
-Rust (rustup), Python, and Node.js/TypeScript so the agent can build
-and test code in these languages.
-
-### 4. Bootstrap the agent
+### 3. Bootstrap the agency
 
 Before the gateway can run, it needs an agent identity and service
-configuration. The `thorn serve bootstrap` command creates these inside
-a `.thorn/` directory:
+configuration. The `thorn serve bootstrap` command creates an agency
+home, records a separate workspace root for agent sessions, and writes
+a project-url-based `gateway.json`:
 
 ```console
-$ docker run --rm --env-file .env \
-    -v "$(pwd)/.thorn:/workspace/.thorn" \
-    thorn-gateway \
-    thorn serve bootstrap \
-      --agent-id my-coordinator \
-      --project-name my-repo \
-      --clone-url https://github.com/owner/repo.git \
-      --native-project-id owner/repo \
-      --forge-type github
+$ uv run thorn serve bootstrap \
+    --agent-id my-coordinator \
+    --project-name my-repo \
+    --project-url https://github.com/owner/repo \
+    --agency-home ~/.thorn \
+    --agency-workspace ~/thorn-workspace
 ```
 
-For a self-hosted GitHub Enterprise instance (or any non-default
-host), pass `--forge-base-url https://ghe.example.com/api/v3`.  For
-GitLab, `--forge-base-url` is **required** since GitLab has no
-canonical default host.
+For a public GitLab project, use its human project URL:
+
+```console
+$ uv run thorn serve bootstrap \
+    --agent-id my-coordinator \
+    --project-name my-repo \
+    --project-url https://gitlab.com/group/my-repo \
+    --agency-home ~/.thorn \
+    --agency-workspace ~/thorn-workspace
+```
+
+Pass `--token-env MY_TOKEN_VAR` only when you do not want the default
+`GITHUB_TOKEN` or `GITLAB_TOKEN` env var name recorded in the agent
+identity.
+
+This writes these files and directories:
+
+| Path | Purpose |
+|------|---------|
+| `~/.thorn/agents/my-coordinator/agent.json` | Agent identity, including the forge account and a `credentials[*].env_var_name` reference naming the env var that holds the literal token. |
+| `~/.thorn/agents/my-coordinator/home/MEMORY.md` | Persistent memory mounted into the agent sandbox. |
+| `~/.thorn/gateway.json` | Workspace path and project metadata. No secrets live here. |
+| `~/thorn-workspace/my-coordinator/` | Agent workspace prefix where sessions clone repositories and make changes. |
+
+### 4. Run the first-readiness preflight
+
+Before letting a live gateway consume forge notifications, run the
+safe Git connectivity preflight from the same agency config:
+
+```console
+$ uv run thorn serve --agency ~/.thorn preflight
+```
+
+The default preflight starts the configured sandbox and broker path,
+then runs `git ls-remote` against each configured project clone URL
+from inside the sandbox. It does not start event sources and does not
+read, mark done, or otherwise consume GitLab/GitHub notifications.
+Add `--write-check` only when you want to verify that the bot
+credential can push and delete a temporary branch.
+
+### 5. Start the gateway
+
+```console
+$ uv run thorn serve --agency ~/.thorn
+```
+
+The gateway will poll the configured repository for events. When it
+sees activity (an @-mention on an issue, a new assignment, etc.), it
+dispatches the event to the agent, which reads the issue, clones the
+repo, and does the requested work.
+
+### 6. Talk to the agent
+
+Open an issue on the configured repository and @-mention the bot
+account (the GitHub or GitLab user whose PAT you provided). The agent
+will pick up the event on its next poll cycle, read the issue, and
+respond.
+
+### Advanced project configuration
 
 GitLab projects should normally be configured with their human project
 URL, not the numeric API ID:
@@ -115,31 +165,30 @@ fallback while keeping the human URL for clone links:
 }
 ```
 
-This writes three files under `.thorn/`:
+For self-hosted GitLab or GitHub Enterprise, declare an explicit forge
+entry in `gateway.json` because `thorn serve bootstrap` only infers
+the public `github.com` and `gitlab.com` hosts. The agent account's
+`service` field must match `forges[].name`.
 
-| File | Purpose |
-|------|---------|
-| `agents/my-coordinator.json` | Agent identity, including the forge account and a `credentials[*].env_var_name` reference (e.g. `"GITHUB_TOKEN"`) naming the env var the operator put the literal token into. |
-| `agents/my-coordinator/MEMORY.md` | Persistent memory (project facts, active work) |
-| `gateway.json` | Forge entries (with literal `base_url`) and project metadata.  No secrets live here -- the agent identity names env vars from which the gateway reads the literal at use time. |
-
-### 5. Start the gateway
-
-```console
-$ docker run --env-file .env \
-    -v "$(pwd)/.thorn:/workspace/.thorn" \
-    thorn-gateway
+```json
+{
+  "workspace": "/home/me/thorn-workspace",
+  "forges": [
+    {
+      "name": "gitlab",
+      "type": "gitlab",
+      "url": "https://gitlab.example.com"
+    }
+  ],
+  "projects": [
+    {
+      "name": "thorn",
+      "url": "https://gitlab.example.com/team/thorn",
+      "native_id": "264873"
+    }
+  ]
+}
 ```
-
-For sandboxed multi-agent deployments with the credential broker
-(Phase D), see [Deployment modes](#deployment-modes) below -- with
-the new defaults this is just `thorn serve` against an unpopulated
-`broker` / `sandbox` block.
-
-The gateway will poll the configured repository for events. When it
-sees activity (an @-mention on an issue, a new assignment, etc.), it
-dispatches the event to the agent, which reads the issue, clones the
-repo, and does the requested work.
 
 For GitLab, the inferred source polls two surfaces:
 
@@ -157,13 +206,6 @@ For GitLab, the inferred source polls two surfaces:
   closures; later polls wake the corresponding issue or change-request
   session when a new closure or merge appears.
 
-### 6. Talk to the agent
-
-Open an issue on the configured repository and @-mention the bot
-account (the GitHub user whose PAT you provided, or the GitHub App).
-The agent will pick up the event on its next poll cycle, read the
-issue, and respond.
-
 Configuration
 -------------
 
@@ -171,15 +213,17 @@ Configuration
 
 Thorn distinguishes **secrets** (held only in environment variables)
 from all other configuration (held in JSON on disk).  The on-disk
-files live under `.thorn/`:
+files live under the agency home you pass with `--agency-home`
+(`~/.thorn` in the quick start):
 
-- `gateway.json` -- forge entries (name, type, literal `base_url`) and
-  project metadata.  Contains *no* secrets.
-- `agents/<agent-id>.json` -- the agent identity, including an
-  `accounts` list whose `credentials[*].env_var_name` field names
-  the env var the operator put the literal secret into (e.g.
-  `"GITHUB_TOKEN"`).  The literal value lives only in the
-  environment; the agent state never carries it.
+- `gateway.json` -- workspace path, optional forge entries (`name`,
+  `type`, `url`, optional `api_url`), and project metadata. Contains
+  *no* secrets.
+- `agents/<agent-id>/agent.json` -- the agent identity, including an
+  `accounts` list whose `credentials[*].env_var_name` field names the
+  env var the operator put the literal secret into (e.g.
+  `"GITHUB_TOKEN"`). The literal value lives only in the environment;
+  the agent state never carries it.
 
 To change a forge URL, edit `gateway.json` (no env-var indirection
 needed).  To rotate a secret, change the env var the agent identity
