@@ -1,0 +1,4 @@
+interface:
+  display_name: "Thorn Development Loop"
+  short_description: "Use Thorn's uv workflow and quality bar"
+  default_prompt: "Use $thorn-development-loop while making this Thorn repository change."
