@@ -1,12 +1,20 @@
-"""Preflight helpers for gateway sandbox/broker git connectivity."""
+"""Preflight helpers for gateway readiness checks."""
 
 from __future__ import annotations
 
 import re
 import shlex
 from dataclasses import dataclass
+from typing import Any
 
-from thorn.gateway._config import GatewayConfig, _resolve_forges_and_projects
+from thorn.core._account import AccountConfig, find_credential
+from thorn.core._credentials import CredentialMissingError
+from thorn.gateway._config import (
+    ForgeSpec,
+    GatewayConfig,
+    _resolve_forges_and_projects,
+)
+from thorn.runtime import AgentID
 
 _SECRET = "<redacted>"
 _AUTH_HEADER_RE = re.compile(
@@ -28,6 +36,23 @@ class GitPreflightTarget:
     project_name: str
     fork_name: str
     clone_url: str
+
+
+@dataclass(frozen=True)
+class EventSourcePreflightProblem:
+    agent_id: AgentID
+    forge_name: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ForgeAPIPreflightTarget:
+    agent_id: AgentID
+    account: AccountConfig
+    forge_name: str
+    project_name: str
+    fork_name: str
+    native_project_id: str
 
 
 def collect_git_preflight_targets(
@@ -52,6 +77,134 @@ def collect_git_preflight_targets(
                     clone_url=fork.clone_url,
                 )
             )
+    return targets
+
+
+def collect_event_source_preflight_problems(
+    config: GatewayConfig,
+    agents: list[Any],
+    *,
+    project_filter: str | None = None,
+    fork_filter: str | None = None,
+) -> list[EventSourcePreflightProblem]:
+    """Return static problems that would prevent source inference.
+
+    The gateway's source inference path intentionally does not poll
+    upstream services.  These checks keep ``thorn serve preflight`` just
+    as non-destructive while still catching the common first-run
+    failures: no matching forge account, wrong credential kind, or a
+    credential env var missing from the gateway process.
+    """
+    selected_forges = _selected_forge_specs_by_name(
+        config,
+        project_filter=project_filter,
+        fork_filter=fork_filter,
+    )
+    if not selected_forges:
+        return []
+
+    problems: list[EventSourcePreflightProblem] = []
+    for agent in agents:
+        agent_id = _agent_id_for_preflight(agent)
+        matching_accounts = _matching_forge_accounts(agent, selected_forges)
+        if not matching_accounts:
+            forge_names = ", ".join(sorted(selected_forges))
+            problems.append(EventSourcePreflightProblem(
+                agent_id=agent_id,
+                forge_name=forge_names,
+                reason=(
+                    "agent has no account for the selected forge services "
+                    f"({forge_names})"
+                ),
+            ))
+            continue
+
+        for account, forge_spec in matching_accounts:
+            credential_kind = _event_source_credential_kind(forge_spec.type)
+            if credential_kind is None:
+                problems.append(EventSourcePreflightProblem(
+                    agent_id=agent_id,
+                    forge_name=forge_spec.name,
+                    reason=(
+                        "no event-source inference strategy exists for "
+                        f"forge type {forge_spec.type!r}"
+                    ),
+                ))
+                continue
+
+            credential = find_credential(account, kind=credential_kind)
+            if credential is None:
+                available = sorted({c.kind for c in account.credentials})
+                problems.append(EventSourcePreflightProblem(
+                    agent_id=agent_id,
+                    forge_name=forge_spec.name,
+                    reason=(
+                        f"account has no {credential_kind!r} credential "
+                        "needed for event-source polling; available kinds: "
+                        f"{', '.join(available) if available else '(none)'}"
+                    ),
+                ))
+                continue
+
+            try:
+                credential.read_value()
+            except CredentialMissingError as exc:
+                problems.append(EventSourcePreflightProblem(
+                    agent_id=agent_id,
+                    forge_name=forge_spec.name,
+                    reason=str(exc),
+                ))
+
+    return problems
+
+
+def collect_forge_api_preflight_targets(
+    config: GatewayConfig,
+    agents: list[Any],
+    *,
+    project_filter: str | None = None,
+    fork_filter: str | None = None,
+) -> list[ForgeAPIPreflightTarget]:
+    """Return direct forge API probes selected by the preflight filters."""
+    forge_specs_by_name = _selected_forge_specs_by_name(
+        config,
+        project_filter=project_filter,
+        fork_filter=fork_filter,
+    )
+    if not forge_specs_by_name:
+        return []
+
+    _resolved_forges, resolved_projects = _resolve_forges_and_projects(config)
+    targets: list[ForgeAPIPreflightTarget] = []
+    seen: set[tuple[AgentID, str, str]] = set()
+    for project in resolved_projects:
+        if project_filter is not None and project.name != project_filter:
+            continue
+        for fork in project.forks:
+            if fork_filter is not None and fork.name != fork_filter:
+                continue
+            if fork.forge_name not in forge_specs_by_name:
+                continue
+            for agent in agents:
+                agent_id = _agent_id_for_preflight(agent)
+                for account, _forge_spec in _matching_forge_accounts(
+                    agent,
+                    forge_specs_by_name,
+                ):
+                    if account.service != fork.forge_name:
+                        continue
+                    key = (agent_id, fork.forge_name, fork.native_id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    targets.append(ForgeAPIPreflightTarget(
+                        agent_id=agent_id,
+                        account=account,
+                        forge_name=fork.forge_name,
+                        project_name=project.name,
+                        fork_name=fork.name,
+                        native_project_id=fork.native_id,
+                    ))
     return targets
 
 
@@ -138,9 +291,70 @@ def git_preflight_failure_hint(output: str) -> str | None:
     return None
 
 
+def _agent_id_for_preflight(agent: Any) -> AgentID:
+    agent_id = getattr(agent, "id", None)
+    if isinstance(agent_id, AgentID):
+        return agent_id
+    if agent_id is not None:
+        return AgentID(str(agent_id))
+    name = getattr(agent, "name", None) or "unknown"
+    return AgentID(str(name))
+
+
+def _selected_forge_specs_by_name(
+    config: GatewayConfig,
+    *,
+    project_filter: str | None,
+    fork_filter: str | None,
+) -> dict[str, ForgeSpec]:
+    forge_specs, resolved_projects = _resolve_forges_and_projects(config)
+    selected_forge_names: set[str] = set()
+    for project in resolved_projects:
+        if project_filter is not None and project.name != project_filter:
+            continue
+        for fork in project.forks:
+            if fork_filter is not None and fork.name != fork_filter:
+                continue
+            selected_forge_names.add(fork.forge_name)
+    return {
+        forge_spec.name: forge_spec
+        for forge_spec in forge_specs
+        if forge_spec.name in selected_forge_names
+    }
+
+
+def _matching_forge_accounts(
+    agent: Any,
+    forge_specs_by_name: dict[str, ForgeSpec],
+) -> list[tuple[AccountConfig, ForgeSpec]]:
+    accounts = getattr(agent, "accounts", None)
+    if accounts is None:
+        return []
+
+    matches: list[tuple[AccountConfig, ForgeSpec]] = []
+    for account in accounts.accounts:
+        forge_spec = forge_specs_by_name.get(account.service)
+        if forge_spec is None:
+            continue
+        matches.append((account, forge_spec))
+    return matches
+
+
+def _event_source_credential_kind(forge_type: str) -> str | None:
+    if forge_type == "github":
+        return "pat"
+    if forge_type == "gitlab":
+        return "gitlab-pat"
+    return None
+
+
 __all__ = [
+    "EventSourcePreflightProblem",
+    "ForgeAPIPreflightTarget",
     "GitPreflightTarget",
     "build_git_preflight_command",
+    "collect_event_source_preflight_problems",
+    "collect_forge_api_preflight_targets",
     "collect_git_preflight_targets",
     "git_preflight_failure_hint",
     "redact_git_preflight_output",

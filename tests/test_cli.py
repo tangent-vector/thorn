@@ -1415,3 +1415,103 @@ class TestServePreflightCommand:
         assert captured["workspace_path"] == str(workspace)
         assert captured["agent_id_raw"] == "coord"
         assert captured["timeout_s"] == 7
+
+    def test_preflight_reports_missing_source_token_before_live_polling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_URL", "https://llm.example/v1")
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        monkeypatch.setenv("OPENAI_API_MODEL_NAME", "test-model")
+        monkeypatch.delenv("THORN_TEST_MISSING_GL_TOKEN", raising=False)
+
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        runner = CliRunner()
+        bootstrap_result = runner.invoke(
+            cli_main,
+            [
+                "serve",
+                "bootstrap",
+                "--agent-id", "coord",
+                "--project-name", "thorn",
+                "--project-url", "https://gitlab.com/group/project",
+                "--token-env", "THORN_TEST_MISSING_GL_TOKEN",
+                "--agency-home", str(agency_home),
+                "--agency-workspace", str(workspace),
+            ],
+            catch_exceptions=False,
+        )
+        assert bootstrap_result.exit_code == 0
+
+        result = runner.invoke(
+            cli_main,
+            [
+                "serve",
+                "--agency", str(agency_home),
+                "preflight",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 1
+        assert "event-source readiness" in result.output
+        assert "THORN_TEST_MISSING_GL_TOKEN" in result.output
+
+    def test_forge_api_preflight_checks_configured_project(
+        self,
+    ) -> None:
+        from thorn._cli import _preflight_forge_api_targets
+        from thorn.core._account import AccountConfig
+        from thorn.core._brokering import BrokerCredentialPlan
+        from thorn.gateway._preflight import ForgeAPIPreflightTarget
+        from thorn.runtime import AgentID
+        from thorn.tools.forge import ForgeHostService
+
+        checked_project_ids: list[str] = []
+
+        class FakeForgeClient:
+            def get_project_info(self, native_project_id: str) -> dict[str, str]:
+                checked_project_ids.append(native_project_id)
+                return {"name": "thorn"}
+
+        class FakeForgeService(ForgeHostService):
+            @property
+            def name(self) -> str:
+                return "gitlab"
+
+            def authenticated_client(self, account: AccountConfig) -> FakeForgeClient:
+                return FakeForgeClient()
+
+            def git_https_password_for(self, account: AccountConfig) -> str:
+                return ""
+
+            def broker_credential_plans(
+                self,
+                account: AccountConfig,
+            ) -> list[BrokerCredentialPlan]:
+                return []
+
+            def clone_url_for(self, native_id: str) -> str:
+                return f"https://gitlab.example.com/{native_id}.git"
+
+        class FakeRuntime:
+            def get_service(self, service_name: str) -> FakeForgeService:
+                assert service_name == "gitlab"
+                return FakeForgeService()
+
+        target = ForgeAPIPreflightTarget(
+            agent_id=AgentID("coord"),
+            account=AccountConfig(service="gitlab"),
+            forge_name="gitlab",
+            project_name="thorn",
+            fork_name="origin",
+            native_project_id="group/thorn",
+        )
+
+        failures = _preflight_forge_api_targets(
+            runtime=FakeRuntime(),  # type: ignore[arg-type]
+            targets=[target],
+        )
+
+        assert failures == 0
+        assert checked_project_ids == ["group/thorn"]

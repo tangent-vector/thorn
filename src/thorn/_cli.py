@@ -53,7 +53,7 @@ def _emit_json(payload: Any) -> None:
 if TYPE_CHECKING:
     from thorn.core import Agent
     from thorn.gateway._config import SandboxConfig
-    from thorn.gateway._preflight import GitPreflightTarget
+    from thorn.gateway._preflight import ForgeAPIPreflightTarget, GitPreflightTarget
     from thorn.runtime import AgencyPaths
 
 CLI_AGENT_ID = AgentID("local")
@@ -1534,11 +1534,12 @@ def serve_preflight(
     write_check: bool,
     timeout_s: int,
 ) -> None:
-    """Preflight sandboxed git connectivity through the broker.
+    """Run first-run gateway readiness checks before live polling.
 
-    This starts the configured sandbox and broker path, invokes git
-    from inside the sandbox, and does not start event sources or touch
-    forge TODO/notification state.
+    This validates event-source inference and forge API access, then
+    starts the configured sandbox and broker path and invokes git from
+    inside the sandbox. It does not start event sources or touch forge
+    TODO/notification state.
     """
     verbose = ctx.obj.get("verbose", 0)
     quiet = ctx.obj.get("quiet", False)
@@ -1577,10 +1578,15 @@ def _serve_preflight(
     from thorn.core._account import validate_agent_accounts
     from thorn.gateway import (
         Gateway,
+        infer_event_sources,
         instantiate_services,
         load_gateway_config,
     )
-    from thorn.gateway._preflight import collect_git_preflight_targets
+    from thorn.gateway._preflight import (
+        collect_event_source_preflight_problems,
+        collect_forge_api_preflight_targets,
+        collect_git_preflight_targets,
+    )
     from thorn.runtime._paths import AgencyPaths
 
     verbosity = _resolve_verbosity(verbose, quiet)
@@ -1654,6 +1660,59 @@ def _serve_preflight(
             trace_file.close()
         return 1
 
+    source_problems = collect_event_source_preflight_problems(
+        gateway_config,
+        agents,
+        project_filter=project_name,
+        fork_filter=fork_name,
+    )
+    if source_problems:
+        console.print("[red]FAILED[/red] event-source readiness")
+        for problem in source_problems:
+            console.print(
+                f"  agent={problem.agent_id} forge={problem.forge_name}: "
+                f"{problem.reason}",
+            )
+        if trace_file:
+            trace_file.close()
+        return 1
+
+    try:
+        inferred_sources = infer_event_sources(gateway_config, agents)
+    except Exception as exc:
+        console.print(
+            "[red]FAILED[/red] event-source inference: "
+            f"{_preflight_redacted_error(exc)}",
+        )
+        if trace_file:
+            trace_file.close()
+        return 1
+
+    if not inferred_sources:
+        console.print(
+            "[red]FAILED[/red] No event sources could be inferred from "
+            f"{agency_home / 'gateway.json'} and the selected agent accounts.",
+        )
+        if trace_file:
+            trace_file.close()
+        return 1
+
+    console.print("[bold]preflight[/bold] event sources")
+    for source in inferred_sources:
+        source_name = source.name or type(source).__name__
+        console.print(f"  [green]OK[/green] {source_name}")
+
+    api_targets = collect_forge_api_preflight_targets(
+        gateway_config,
+        agents,
+        project_filter=project_name,
+        fork_filter=fork_name,
+    )
+    if _preflight_forge_api_targets(runtime=runtime, targets=api_targets):
+        if trace_file:
+            trace_file.close()
+        return 1
+
     async def _run() -> int:
         gateway = Gateway(
             runtime=runtime,
@@ -1694,6 +1753,61 @@ def _serve_preflight(
     finally:
         if trace_file:
             trace_file.close()
+
+
+def _preflight_forge_api_targets(
+    *,
+    runtime: Runtime,
+    targets: list["ForgeAPIPreflightTarget"],
+) -> int:
+    from thorn.tools.forge import ForgeHostService
+
+    failures = 0
+    for target in targets:
+        console.print(
+            f"[bold]preflight[/bold] agent={target.agent_id} "
+            f"project={target.project_name} fork={target.fork_name} "
+            f"mode=forge-api",
+        )
+        try:
+            service = runtime.get_service(target.forge_name)
+            if not isinstance(service, ForgeHostService):
+                raise TypeError(
+                    f"service {target.forge_name!r} is not a forge host service"
+                )
+            client = service.authenticated_client(target.account)
+            client.get_project_info(target.native_project_id)
+        except Exception as exc:
+            failures += 1
+            console.print(f"  [red]FAILED[/red] {_preflight_redacted_error(exc)}")
+            hint = _forge_api_preflight_hint(exc)
+            if hint is not None:
+                console.print(f"  [yellow]Hint:[/yellow] {hint}")
+            continue
+        console.print("  [green]OK[/green]")
+    return failures
+
+
+def _preflight_redacted_error(exc: Exception) -> str:
+    from thorn.gateway._preflight import redact_git_preflight_output
+
+    return redact_git_preflight_output(str(exc))
+
+
+def _forge_api_preflight_hint(exc: Exception) -> str | None:
+    from thorn.core._credentials import CredentialMissingError
+
+    if isinstance(exc, CredentialMissingError):
+        return (
+            "Export the referenced credential env var before starting "
+            "`thorn serve`."
+        )
+    if isinstance(exc, ImportError):
+        return (
+            "Run `uv sync --all-extras` so the GitHub/GitLab API "
+            "dependencies are installed."
+        )
+    return None
 
 
 async def _preflight_agent_git_targets(

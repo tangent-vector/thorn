@@ -100,18 +100,20 @@ This writes these files and directories:
 ### 4. Run the first-readiness preflight
 
 Before letting a live gateway consume forge notifications, run the
-safe Git connectivity preflight from the same agency config:
+non-destructive readiness gate from the same agency config:
 
 ```console
 $ uv run thorn serve --agency ~/.thorn preflight
 ```
 
-The default preflight starts the configured sandbox and broker path,
-then runs `git ls-remote` against each configured project clone URL
-from inside the sandbox. It does not start event sources and does not
-read, mark done, or otherwise consume GitLab/GitHub notifications.
-Add `--write-check` only when you want to verify that the bot
-credential can push and delete a temporary branch.
+The default preflight validates provider environment, gateway/agent
+account config, event-source inference, and direct forge API access.
+It then starts the configured sandbox and broker path and runs
+`git ls-remote` against each configured project clone URL from inside
+the sandbox. It does not start event sources and does not read, mark
+done, or otherwise consume GitLab/GitHub notifications. Add
+`--write-check` only when you want to verify that the bot credential
+can push and delete a temporary branch.
 
 ### 5. Start the gateway
 
@@ -338,18 +340,20 @@ file back to pending work; it does not contact GitLab/GitHub or
 re-create upstream TODOs.
 
 Before letting a live gateway consume forge notifications, run a
-safe Git connectivity preflight from the same agency config:
+non-destructive readiness gate from the same agency config:
 
 ```console
 $ uv run thorn serve --agency ~/.thorn preflight
 ```
 
-The default preflight starts the configured sandbox and broker path,
-then runs `git ls-remote` against each configured project clone URL
-from inside the sandbox. It does not start event sources and does not
-read, mark done, or otherwise consume GitLab/GitHub notifications.
-Add `--write-check` only when you want to verify that the bot
-credential can push and delete a temporary branch.
+The default preflight validates provider environment, gateway/agent
+account config, event-source inference, and direct forge API access.
+It then starts the configured sandbox and broker path and runs
+`git ls-remote` against each configured project clone URL from inside
+the sandbox. It does not start event sources and does not read, mark
+done, or otherwise consume GitLab/GitHub notifications. Add
+`--write-check` only when you want to verify that the bot credential
+can push and delete a temporary branch.
 
 Sandbox egress is controlled today by `sandbox.egress_network` and
 the OCI network topology behind it. The bundled broker uses an
