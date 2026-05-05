@@ -52,6 +52,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import os
 import signal
 import sys
 from collections.abc import Callable
@@ -85,6 +86,11 @@ from thorn.gateway._formatter import (
     FormatterDelivery,
     FormatterDrop,
     NotificationFormatter,
+)
+from thorn.gateway._heartbeat import (
+    gateway_heartbeat_path,
+    gateway_heartbeat_timestamp,
+    write_gateway_heartbeat,
 )
 from thorn.gateway._peer import PeerRegistry
 from thorn.gateway._trigger_policy import (
@@ -245,6 +251,8 @@ class Gateway:
             :meth:`ProviderHealthMonitor.from_env`; pass an
             explicit instance for tests or to share a monitor
             across multiple gateways in the same process.
+        heartbeat_interval_s: Seconds between writes to the
+            operator-facing gateway heartbeat file.
     """
 
     def __init__(
@@ -263,6 +271,7 @@ class Gateway:
         bundled_broker_supervisor_factory: (
             BundledBrokerSupervisorFactory | None
         ) = None,
+        heartbeat_interval_s: float = 5.0,
     ) -> None:
         self._runtime = runtime
         self._sources = sources
@@ -310,6 +319,9 @@ class Gateway:
 
         self._stop_event: asyncio.Event | None = None
         self._source_tasks: list[asyncio.Task[None]] = []
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._heartbeat_interval_s = heartbeat_interval_s
+        self._heartbeat_started_at: str | None = None
         self._schedulers: dict[AgentID, AgentScheduler] = {}
         self._inboxes: dict[SessionAddress, SessionInbox] = {}
         self._started = False
@@ -421,6 +433,8 @@ class Gateway:
                     asyncio.create_task(
                         self._stop_when_sources_done(),
                     )
+
+                self._start_heartbeat()
 
                 log.info(
                     "Gateway started with %d source(s)", len(self._sources),
@@ -981,6 +995,104 @@ class Gateway:
         await scheduler.submit(session, inbox)
 
     # ------------------------------------------------------------------
+    # Operator heartbeat
+    # ------------------------------------------------------------------
+
+    def _start_heartbeat(self) -> None:
+        if self._heartbeat_task is not None:
+            return
+        self._heartbeat_started_at = gateway_heartbeat_timestamp()
+        self._write_heartbeat(status="running")
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(),
+            name="thorn-gateway-heartbeat",
+        )
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(max(1.0, self._heartbeat_interval_s))
+            self._write_heartbeat(status="running")
+
+    async def _stop_heartbeat(self) -> None:
+        task = self._heartbeat_task
+        self._heartbeat_task = None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if self._heartbeat_started_at is not None:
+            self._write_heartbeat(status="stopped")
+
+    def _write_heartbeat(self, *, status: str) -> None:
+        try:
+            write_gateway_heartbeat(
+                gateway_heartbeat_path(self._runtime.paths.home_root),
+                self._heartbeat_payload(status=status),
+            )
+        except Exception:
+            log.exception("Failed to write gateway heartbeat")
+
+    def _heartbeat_payload(self, *, status: str) -> dict[str, Any]:
+        updated_at = gateway_heartbeat_timestamp()
+        payload: dict[str, Any] = {
+            "status": status,
+            "pid": os.getpid(),
+            "started_at": self._heartbeat_started_at,
+            "updated_at": updated_at,
+            "heartbeat_interval_s": self._heartbeat_interval_s,
+            "provider_health": self._provider_health_payload(),
+            "sources": [
+                source.status_snapshot().to_json()
+                for source in self._sources
+            ],
+            "broker": self._broker_status_payload(),
+            "sandbox": self._sandbox_status_payload(),
+        }
+        if status == "stopped":
+            payload["stopped_at"] = updated_at
+        return payload
+
+    def _provider_health_payload(self) -> dict[str, Any]:
+        snapshot = self.health_snapshot()
+        return {
+            "state": snapshot.state.value,
+            "recent_failure_count": snapshot.recent_failure_count,
+            "seconds_until_probe": snapshot.seconds_until_probe,
+            "probe_in_flight": snapshot.probe_in_flight,
+            "consecutive_probe_failures": (
+                snapshot.consecutive_probe_failures
+            ),
+        }
+
+    def _broker_status_payload(self) -> dict[str, Any]:
+        config = self._gateway_config
+        broker = config.broker if config is not None else None
+        supervisor = self._bundled_broker_supervisor
+        return {
+            "enabled": broker.enabled if broker is not None else False,
+            "mode": broker.mode if broker is not None else None,
+            "binding_count": len(self._broker_bindings),
+            "bundled_project": (
+                supervisor.project_name if supervisor is not None else None
+            ),
+            "bundled_network": (
+                supervisor.egress_network_name
+                if supervisor is not None
+                else None
+            ),
+        }
+
+    def _sandbox_status_payload(self) -> dict[str, Any]:
+        config = self._runtime.sandbox_config
+        return {
+            "executor_enabled": self._runtime.sandbox_executor_enabled,
+            "backend": config.backend if config is not None else None,
+            "egress_network": (
+                config.egress_network if config is not None else None
+            ),
+        }
+
+    # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
 
@@ -1056,6 +1168,7 @@ class Gateway:
             await self._maybe_shutdown_bundled_broker()
 
         self._inboxes.clear()
+        await self._stop_heartbeat()
         log.info("Gateway stopped.")
 
     # ------------------------------------------------------------------

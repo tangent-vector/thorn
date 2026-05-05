@@ -35,6 +35,7 @@ from __future__ import annotations
 from abc import abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 
@@ -88,6 +89,48 @@ class ContextItemKind(StrEnum):
     PR_BODY = "pr_body"
     REVIEW = "review"
     HARNESS_NOTE = "harness_note"
+
+
+class EventSourceStatusState(StrEnum):
+    """Operator-facing health state for a gateway event source."""
+
+    UNKNOWN = "unknown"
+    STARTING = "starting"
+    OK = "ok"
+    ERROR = "error"
+    STOPPED = "stopped"
+
+
+@dataclass(frozen=True)
+class EventSourceStatusSnapshot:
+    """Immutable status snapshot exposed to operator diagnostics."""
+
+    name: str
+    source_type: str
+    state: EventSourceStatusState
+    last_poll_started_at: str | None = None
+    last_poll_finished_at: str | None = None
+    last_error: str | None = None
+    last_event_count: int | None = None
+    poll_count: int = 0
+
+    def to_json(self) -> dict[str, Any]:
+        """Return a JSON-serializable representation."""
+        return {
+            "name": self.name,
+            "source_type": self.source_type,
+            "state": self.state.value,
+            "last_poll_started_at": self.last_poll_started_at,
+            "last_poll_finished_at": self.last_poll_finished_at,
+            "last_error": self.last_error,
+            "last_event_count": self.last_event_count,
+            "poll_count": self.poll_count,
+        }
+
+
+def event_source_status_timestamp() -> str:
+    """Return the canonical UTC timestamp for source status records."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass(frozen=True)
@@ -244,6 +287,15 @@ class EventSource(Service):
         should be made.
         """
 
+    def status_snapshot(self) -> EventSourceStatusSnapshot:
+        """Return the latest operator-facing status snapshot."""
+        name = self.name or type(self).__name__
+        return EventSourceStatusSnapshot(
+            name=name,
+            source_type=type(self).__name__,
+            state=EventSourceStatusState.UNKNOWN,
+        )
+
 
 # Back-compat alias.  The pre-refactor type was named ``IncomingEvent``
 # and many tests / callers still spell it that way; ``FormattedEvent``
@@ -260,7 +312,10 @@ __all__ = [
     "ContextItemKind",
     "EventKind",
     "EventSource",
+    "EventSourceStatusSnapshot",
+    "EventSourceStatusState",
     "FormattedEvent",
     "IncomingEvent",
     "RawIncomingEvent",
+    "event_source_status_timestamp",
 ]
