@@ -279,12 +279,13 @@ failure rather than a silent secret-handling regression. See
 
 Two Phase D items are deliberately deferred to follow-ups:
 
-* **Allow-list enforcement.** `sandbox.egress_allowlist` parses
-  but the firewall mechanism (per-agent network + iptables vs.
-  netns vs. OCI-runtime hooks) is open question R3 and pending.
-  The gateway logs a warning at startup when the list is
-  non-empty so operators are not surprised by the enforcement
-  gap.
+* **Allow-list enforcement.** `sandbox.planned_egress_allowlist`
+  parses as future intent, but the firewall mechanism (per-agent
+  network + iptables vs. netns vs. OCI-runtime hooks) is open
+  question R3 and pending. The gateway logs a warning at startup
+  when the list is non-empty so operators are not surprised by the
+  enforcement gap; the active-sounding `sandbox.egress_allowlist`
+  key is rejected.
 * **Real-runtime broker smoke.** Phase B's
   `requires_podman` / `requires_docker` smoke covers the OCI
   adapter; an end-to-end smoke that brings up the bundled

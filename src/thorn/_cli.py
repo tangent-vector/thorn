@@ -1665,7 +1665,7 @@ def _serve_preflight(
             try:
                 for agent in agents:
                     gateway._ensure_scheduler_for_agent(agent)
-                gateway._warn_if_egress_allowlist_unenforced()
+                gateway._warn_if_planned_egress_allowlist_configured()
                 await gateway._maybe_start_bundled_broker()
                 await gateway._register_broker_bindings()
                 runtime.set_sandbox_broker_binding_lookup(

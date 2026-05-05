@@ -532,33 +532,25 @@ class ProjectSpec(BaseModel):
         return [ForkSpec(url=self.url, native_id=self.native_id)]
 
 
-class EgressAllowlistEntry(BaseModel):
-    """A single ``(host, port)`` pair the sandbox may reach directly.
+class PlannedEgressAllowlistEntry(BaseModel):
+    """A future direct-egress exception for sandbox containers.
 
-    Phase D's egress policy is "broker-only by default": the
-    container's network is restricted so the only reachable
-    destination is the broker (per :attr:`SandboxConfig.egress_network`).
-    The allow-list is the operator's escape hatch for genuinely
-    direct upstreams that should *not* go through the broker -- for
-    example, an internal observability endpoint with no auth that
-    publishing through the broker would only complicate.
+    Thorn does not enforce per-host direct egress today.  The active
+    boundary is :attr:`SandboxConfig.egress_network`: when the bundled
+    broker provides an internal OCI network, containers can reach the
+    broker and nothing else directly.  This entry records operator
+    intent for a future allow-list implementation without presenting
+    that intent as an active security control.
 
     Both fields are explicit:
 
     * ``host`` -- DNS name or IP literal.  No wildcard / pattern
-      support: each upstream that needs direct access gets its own
-      entry, so an audit of the allow-list is a literal enumeration
-      rather than a regex review.
+      support: each upstream that might need direct access gets its
+      own entry, so a future audit of the allow-list is a literal
+      enumeration rather than a regex review.
     * ``port`` -- TCP port.  Always required; we deliberately do
-      not default to 443 because "an exception to the broker-only
-      policy" warrants explicit attention to the port the
-      operator is opening up.
-
-    This file is the on-disk shape; enforcement (the firewall /
-    network mechanism) is the responsibility of the OCI-runtime
-    integration and is documented as an open question in the Phase D
-    plan (``R3``).  Schema is in place so operators can declare their
-    intended allow-list ahead of enforcement landing.
+      not default to 443 because "a planned exception to the
+      broker-only policy" warrants explicit attention to the port.
     """
 
     host: str = Field(
@@ -660,19 +652,30 @@ class SandboxConfig(BaseModel):
             "behavior (default OCI bridge, full host network access)."
         ),
     )
-    egress_allowlist: list[EgressAllowlistEntry] = Field(
+    planned_egress_allowlist: list[PlannedEgressAllowlistEntry] = Field(
         default_factory=list,
         description=(
-            "Phase D: ``(host, port)`` pairs the sandbox container "
-            "is permitted to reach directly, *in addition to* the "
-            "broker on :attr:`egress_network`.  Schema parses today; "
-            "enforcement (the firewall / OCI-runtime mechanism) is "
-            "tracked as Phase D open question R3 and not yet wired "
-            "in.  When the gateway sees a non-empty list it logs a "
-            "warning at startup so operators are not surprised by "
-            "the enforcement gap."
+            "Future direct-egress exceptions as ``(host, port)`` "
+            "pairs.  This field has no runtime effect today: sandbox "
+            "outbound traffic is controlled only by "
+            ":attr:`egress_network` and the network topology behind "
+            "it.  When the gateway sees a non-empty planned list it "
+            "logs a startup warning so the inactive security posture "
+            "is visible to operators."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_active_egress_allowlist_name(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "egress_allowlist" in data:
+            raise ValueError(
+                "sandbox.egress_allowlist was removed because Thorn "
+                "does not enforce per-host direct egress yet. Use "
+                "sandbox.planned_egress_allowlist to record future "
+                "exceptions; it has no runtime effect today.",
+            )
+        return data
 
     # ------------------------------------------------------------------
     # Phase E hardening fields
@@ -2067,13 +2070,13 @@ __all__ = [
     "AgentSandboxOverride",
     "BrokerConfig",
     "BundledBrokerImageConfig",
-    "EgressAllowlistEntry",
     "ForgeSpec",
     "ForkLocation",
     "ForkSpec",
     "GATEWAY_CONFIG_FILENAME",
     "GatewayConfig",
     "OCIImageReference",
+    "PlannedEgressAllowlistEntry",
     "ProjectSpec",
     "ResolvedFork",
     "ResolvedProject",

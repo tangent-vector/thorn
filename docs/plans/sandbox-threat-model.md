@@ -271,10 +271,10 @@ revisited:
   potentially breaks G1 or G2.
 * **Loosens the network policy** — joins the container to a
   non-internal network, or punches direct egress to upstreams
-  outside the broker. Phase D's `egress_allowlist` schema
-  is in place but enforcement is deferred; if/when it lands,
-  the threat model revision needs to record what the
-  allow-list does to the broker-only invariant.
+  outside the broker. Phase D's `planned_egress_allowlist`
+  schema records future intent but is not enforced; if/when
+  enforcement lands, the threat model revision needs to record
+  what the allow-list does to the broker-only invariant.
 * **Grants any capability** to the container (`--cap-add`).
   Each cap should be justified in the agent or agency
   configuration's documentation.

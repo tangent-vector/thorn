@@ -247,6 +247,33 @@ class TestGatewayConfigSandboxDefault:
 
         assert _DEFAULT_AGENCY_SANDBOX.backend == "subprocess"
 
+    def test_active_egress_allowlist_key_is_rejected(self):
+        with pytest.raises(ValidationError) as exc:
+            GatewayConfig.model_validate({
+                "sandbox": {
+                    "egress_allowlist": [
+                        {"host": "status.internal", "port": 443},
+                    ],
+                },
+            })
+        message = str(exc.value)
+        assert "sandbox.egress_allowlist was removed" in message
+        assert "planned_egress_allowlist" in message
+
+    def test_planned_egress_allowlist_loads_as_inactive_intent(self):
+        config = GatewayConfig.model_validate({
+            "sandbox": {
+                "planned_egress_allowlist": [
+                    {"host": "status.internal", "port": 443},
+                ],
+            },
+        })
+        assert config.sandbox is not None
+        assert [
+            (entry.host, entry.port)
+            for entry in config.sandbox.planned_egress_allowlist
+        ] == [("status.internal", 443)]
+
 
 # ---------------------------------------------------------------------------
 # load_gateway_config (file-based)

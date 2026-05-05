@@ -384,14 +384,13 @@ the Phase E plan.
 
 ### Allow-list enforcement (R3 from Phase D)
 
-Schema is parsed (Phase D) and the gateway warns at startup
-when the list is non-empty.  Enforcement is open question
-R3 in the Phase D retro and **not** in scope for Phase E
-per the *Non-goals* section above.  The broker-only
-baseline (Phase D's `internal: true` network) already
-delivers "no internet except via broker" enforcement; R3 is
-for niche direct-egress exceptions that don't have a known
-use case yet.
+The planned schema is parsed (Phase D) and the gateway warns at
+startup when the list is non-empty. Enforcement is open question R3
+in the Phase D retro and **not** in scope for Phase E per the
+*Non-goals* section above. The broker-only baseline (Phase D's
+`internal: true` network) already delivers "no internet except via
+broker" enforcement; R3 is for niche direct-egress exceptions that
+don't have a known use case yet.
 
 ### Operator runbook documentation
 

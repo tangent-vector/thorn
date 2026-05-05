@@ -307,6 +307,14 @@ read, mark done, or otherwise consume GitLab/GitHub notifications.
 Add `--write-check` only when you want to verify that the bot
 credential can push and delete a temporary branch.
 
+Sandbox egress is controlled today by `sandbox.egress_network` and
+the OCI network topology behind it. The bundled broker uses an
+internal network so sandbox containers reach the broker but have no
+direct internet egress. `sandbox.planned_egress_allowlist` is only a
+record of future direct-egress exceptions; it has no runtime effect
+and logs a warning when non-empty. The old active-sounding
+`sandbox.egress_allowlist` key is rejected during config loading.
+
 Restricted-egress VMs can mirror the broker images into a reachable
 registry and point the bundled stack at those mirrors without local
 retagging:

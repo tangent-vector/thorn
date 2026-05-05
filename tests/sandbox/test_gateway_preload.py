@@ -140,15 +140,18 @@ async def test_preload_with_no_agents_is_a_noop(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_egress_allowlist_warning_when_set(
+async def test_planned_egress_allowlist_warning_when_set(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Phase D: the gateway emits a single warning at startup when
-    ``sandbox.egress_allowlist`` is non-empty, since enforcement is
-    not yet wired (open question R3 in the Phase D plan)."""
+    ``sandbox.planned_egress_allowlist`` is non-empty, since the
+    entries are only future operator intent."""
     import logging
 
-    from thorn.gateway._config import EgressAllowlistEntry, SandboxConfig
+    from thorn.gateway._config import (
+        PlannedEgressAllowlistEntry,
+        SandboxConfig,
+    )
 
     paths = AgencyPaths(
         home_root=tmp_path / "home",
@@ -163,8 +166,10 @@ async def test_egress_allowlist_warning_when_set(
         sandbox_executor_enabled=True,
         sandbox_config=SandboxConfig(
             backend="subprocess",
-            egress_allowlist=[
-                EgressAllowlistEntry(host="status.internal", port=443),
+            planned_egress_allowlist=[
+                PlannedEgressAllowlistEntry(
+                    host="status.internal", port=443,
+                ),
             ],
         ),
     )
@@ -176,21 +181,22 @@ async def test_egress_allowlist_warning_when_set(
 
     matching = [
         rec for rec in caplog.records
-        if "egress_allowlist" in rec.getMessage()
+        if "planned_egress_allowlist" in rec.getMessage()
     ]
     assert len(matching) == 1, (
-        f"expected exactly one egress_allowlist warning, got "
+        f"expected exactly one planned_egress_allowlist warning, got "
         f"{[r.getMessage() for r in matching]}"
     )
     assert "status.internal:443" in matching[0].getMessage()
     assert "R3" in matching[0].getMessage()
+    assert "no runtime effect" in matching[0].getMessage()
 
 
 @pytest.mark.asyncio
-async def test_egress_allowlist_silent_when_empty(
+async def test_planned_egress_allowlist_silent_when_empty(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Empty allow-list (the default) emits no warning."""
+    """Empty planned allow-list (the default) emits no warning."""
     import logging
 
     from thorn.gateway._config import SandboxConfig
@@ -216,5 +222,5 @@ async def test_egress_allowlist_silent_when_empty(
 
     assert not [
         rec for rec in caplog.records
-        if "egress_allowlist" in rec.getMessage()
+        if "planned_egress_allowlist" in rec.getMessage()
     ]
