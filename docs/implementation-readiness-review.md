@@ -1,11 +1,13 @@
 # Thorn Implementation Readiness Review
 
-Date: 2026-04-30
+Original review date: 2026-04-30
+Reassessed: 2026-05-05
 
-Update: the body below preserves the original review findings from this
-checkout. Follow-up work on branch `golden-path-smoke-test` landed the first P0
-tool-routing fix, implemented the second P0 smoke test, and added an initial
-Ruff configuration for branch-scoped linting.
+Update: this document has been revised after an extended closed-loop gateway
+trial and the follow-up work that landed on `main`. The original review's
+framing still holds -- Thorn's main risk is integration readiness, not missing
+isolated subsystems -- but several original P0 blockers are now closed or
+materially reduced.
 
 This review is based on a source-level deep dive through the CLI, runtime,
 gateway, sandbox/toolhost, forge integrations, tests, and project docs in this
@@ -19,28 +21,29 @@ Thorn has moved well past a sketch. The implementation contains a real runtime
 substrate, persistent agents and sessions, an inbox-backed gateway, event-source
 pollers for GitHub/GitLab, a peer-aware trigger policy, contextual prompt
 assembly, a daemon toolhost, and an OCI container sandbox with bundled broker
-support. The test suite is also substantial: pytest collected 2,399 items in
-this checkout, with 2,378 selected under the default marker configuration. The
-suite has focused coverage for the runtime, queues, gateway routing, forge
-clients, git tools, MCP/toolhost protocols, sandbox wiring, and provider retry
-behavior.
+support. The test suite is also substantial and now includes direct regression
+coverage for the original coordinator tool-venue bug plus a golden-path gateway
+smoke test.
 
-The project is still not ready to share with people who expect a smooth
-feedback experience. The core issue is integration readiness, not the absence of
-individual pieces. Several key paths are either under-validated end to end or
-contradict each other across docs, config, and execution venues. The most
-important example is the gateway coordinator's tool execution path. A targeted
-diagnostic confirmed that `ProjectCoordinator._collect_tools()` currently fails
-`_prepare_tools()` because `PEER_TOOLS` are not in the built-in allowlist. Even
-after bypassing that allowlist for inspection, the coordinator has 27
-sandbox-venue tools missing from the toolhost daemon registry, including all
-peer, forge, and git tools.
+The closed-loop trial changed the readiness picture in an important way:
+Thorn has now completed real issue-to-MR-to-review loops against a test GitLab
+project in both subprocess mode and the default container sandbox plus
+bundled OneCLI broker mode. That means the core gateway path is no longer just
+plausible from unit tests; it has worked under live forge conditions, including
+review feedback, MR creation, push/merge, cross-session memory, and brokered
+Git in a restricted-egress environment.
 
-My recommendation is to treat the current state as strong internal dogfood
-software, not yet a public-alpha candidate. It is suitable for maintainers who
-can read logs, patch config, and debug toolhost/gateway behavior. Before sharing
-with outside reviewers, the P0 list below should be closed or explicitly scoped
-out with a known-good "golden path".
+The remaining blocker is now productization of the first evaluator experience.
+The project is close to being reasonable for maintainer-led friendly feedback,
+but not yet ready for self-service users. The biggest risks are stale or
+contradictory quick-start docs, incomplete operator visibility/recovery
+surfaces, and event-source acknowledgement semantics that can still make work
+appear to vanish unless the operator understands the inbox model.
+
+My recommendation is to share aggressively only through a constrained,
+maintainer-led path: one project, one coordinator, known-good provider/forge
+tokens, `thorn serve preflight` passing, and a human operator watching logs.
+Before broader self-service feedback, close the current P0 list below.
 
 ## What Looks Solid
 
@@ -89,113 +92,15 @@ subsystems, not in local code quality. Large files such as
 `src/thorn/sandbox/_runtime.py` also make it harder to see the actual contracts
 between pieces.
 
-There is no configured lint/type-check command in `pyproject.toml` beyond pytest
-settings. For a project with this many typed data models and security-sensitive
-execution paths, adding an explicit `ruff` and static typing posture would be a
-high-leverage cleanup before wider collaboration.
+Ruff is now configured in `pyproject.toml`, and `uv run ruff --version` works in
+this checkout. CI still runs only `uv run pytest`, and there is not yet a static
+typing posture. For a project with this many typed data models and
+security-sensitive execution paths, enforcing Ruff in CI and deciding whether
+to add a type checker remain high-leverage cleanup.
 
-## P0: Blockers Before Outside Feedback
+## P0: Current Blockers Before Self-Service Feedback
 
-### 1. Fix the gateway coordinator tool preparation and execution path
-
-This is the top risk I found, and the validation pass confirmed it
-mechanically.
-
-`GatewayAgent` contributes `PEER_TOOLS`, and `ProjectCoordinator` adds
-`FORGE_TOOLS`, `GIT_TOOLS`, file tools, and `run_shell`
-(`src/thorn/gateway/_agents.py`). `Agent._run_session_prompt()` calls
-`_prepare_tools()` before entering the agent loop. In this checkout,
-`_prepare_tools(GatewayAgent._collect_tools())` and
-`_prepare_tools(ProjectCoordinator._collect_tools())` both raise:
-
-```text
-TypeError: 'peer_by_account' is not a registered Thorn tool.
-```
-
-The immediate cause is that `_known_builtin_tools()` includes core, journal,
-inbox, git, and forge tools, but not `thorn.tools.peers.PEER_TOOLS`.
-
-There is a second issue after that allowlist failure. `wrap_function()` defaults
-unannotated tools to `ToolVenue.SANDBOX`, and tests explicitly assert that both
-git and forge tools default to `SANDBOX` (`tests/test_tool_venues.py`). When a
-sandbox executor is present, `run_agent_loop()` uses `build_split_router()` and
-sends every non-`IN_PROCESS` tool to the sandbox executor. However,
-`thorn.toolhost._server.build_default_registry()` registers only
-`ALL_BUILTIN_TOOLS`, `run_shell`, and `JOURNAL_TOOLS`. It does not register
-`GIT_TOOLS`, `FORGE_TOOLS`, or `PEER_TOOLS`.
-
-The diagnostic comparison found 38 sandbox-venue tools on `ProjectCoordinator`,
-with these 27 absent from the daemon registry:
-
-```text
-find_peers_by_name
-forge_create_change_request
-forge_create_issue
-forge_get_change_request
-forge_get_project_info
-forge_list_change_requests
-forge_list_comments
-forge_list_issues
-forge_mark_notification_done
-forge_post_comment
-forge_read_file
-forge_read_issue
-forge_update_issue
-git_add
-git_branch
-git_clone
-git_commit
-git_diff
-git_fetch
-git_log
-git_pull
-git_push
-git_status
-git_worktree_add
-git_worktree_remove
-list_peers
-peer_by_account
-```
-
-Forge and peer tools also need `ExecutionContext.runtime`; the toolhost context
-does not set `runtime`. Git auth is degraded without runtime-backed project and
-account lookup. This needs a clear design decision:
-
-- Keep runtime/forge/peer tools brain-side by marking them `IN_PROCESS`, while
-  leaving file/shell/git subprocess operations sandboxed where appropriate.
-- Or extend the daemon protocol/context so the sandbox can safely invoke those
-  tools with the needed service graph and credentials.
-- Or split forge API calls, peer lookup, and git filesystem operations into
-  separate explicit tool venues.
-
-Do not share the gateway path for feedback until a real coordinator prompt can
-prepare its tools and execute representative peer, forge, git, file, and shell
-calls through the actual router used by `thorn serve`.
-
-### 2. Create a real golden-path end-to-end smoke test
-
-The repository has a section named "End-to-end wiring verification" in
-`tests/test_gateway.py`, but those tests mainly verify that the coordinator is
-resolved, has expected tools, has memory, and renders prompts. The gateway inbox
-tests exercise scheduler/queue behavior, often with a patched dispatcher. The
-forge and git tools are tested in isolation.
-
-Before outside feedback, add at least one smoke path that drives the real
-vertical slice through the current production-ish wiring:
-
-1. Bootstrap an agency with a fake or local forge service.
-2. Start a runtime/gateway with sandbox executor enabled.
-3. Deliver a synthetic GitHub/GitLab event through the formatter and inbox.
-4. Let a mock provider call representative tools (`forge_read_issue`,
-   `git_clone`, `edit_file`, `git_commit`, `forge_create_change_request`,
-   `forge_post_comment`).
-5. Assert the forge-side effects, git-side effects, session state, and outgoing
-   notification behavior.
-
-The current tests make the pieces look individually credible. They do not yet
-prove the path a new evaluator will try.
-
-### 3. Bring README and CLI bootstrap back into alignment
+### 1. Bring README and CLI bootstrap back into alignment
 
 The user-facing README quick start is materially stale. It documents bootstrap
 flags such as `--clone-url`, `--native-project-id`, `--forge-type`, and
@@ -203,17 +108,32 @@ container-mounted `.thorn/` paths. The actual CLI now requires `--project-url`,
 `--agency-home`, and `--agency-workspace`, and the bootstrap source writes a
 newer project-url-based `gateway.json` with inferred forges.
 
-This is the sort of mismatch that makes a first evaluator fail before reaching
-the interesting parts of the system. Update README, `docs/startup_flow.md` if
-needed, and any examples to match current commands exactly.
+Later sections of the README do document newer realities such as Mode A
+host-side `thorn serve`, `thorn serve preflight`, requeue, mirrored broker
+images, and self-hosted GitLab `native_id`. The problem is that the first
+quick-start path still sends evaluators down the old route before they reach
+those details.
 
-### 4. Make first-run preflight explicit
+This is the highest embarrassment risk: a first evaluator can fail before
+reaching the interesting parts of the system. Update the README and examples so
+the supported path is explicit:
+
+1. `uv sync --all-extras`
+2. create `.env` with provider and forge token env vars
+3. `uv run thorn serve bootstrap --project-url ... --agency-home ... --agency-workspace ...`
+4. `uv run thorn serve --agency ... preflight`
+5. `uv run thorn serve --agency ...`
+
+Containerized gateway instructions should be secondary and clearly labelled as
+optional, with the Docker-socket tradeoff called out.
+
+### 2. Turn preflight into a first-run readiness gate
 
 The gateway config schema now fills absent sandbox config with a container
 backend and bundled broker default for `thorn serve`. The runtime fallback still
 uses subprocess when no gateway config is involved. The code does have
-`thorn sandbox build` and `thorn sandbox status`, and missing sandbox images
-produce helpful errors, but the first-run path is still demanding:
+`thorn serve preflight`, `thorn sandbox build`, `thorn sandbox status`, and
+broker status/log cleanup commands, but the first-run path is still demanding:
 
 - an LLM provider,
 - Docker or Podman,
@@ -223,43 +143,77 @@ produce helpful errors, but the first-run path is still demanding:
 - a valid agency home/workspace split,
 - and correct gateway/agent account config.
 
-Before feedback, provide a `thorn doctor` or equivalent preflight that checks
-these items and gives a single actionable report. At minimum, the README should
-put `thorn sandbox build`/`thorn sandbox status` in the golden path before
-`thorn serve`.
+`thorn serve preflight` now proves sandboxed Git connectivity through the
+configured sandbox/broker path without consuming live notifications. That is
+the right core check, but the evaluator path still needs either a `thorn doctor`
+wrapper or a documented runbook that also verifies provider config, image
+availability, forge API access, source inference, and the selected agent's
+account validation before live polling starts.
 
-### 5. Fix peer validation with inferred forges
+### 3. Add enough observability that operators are not spelunking JSON
 
-`GatewayConfig._validate_peers()` checks `peers[].accounts[].service` against
-`self.forges`. Bootstrap intentionally writes no `forges` block for well-known
-GitHub/GitLab project URLs, relying on later forge inference. That means a user
-who starts from bootstrap output and then adds a peer account on `"github"` or
-`"gitlab"` can hit validation failure unless they also add an explicit forge
-entry.
+The trial's recovery moments were manageable because a maintainer was watching
+logs and knew where to look. Friendly feedback users need a small operator
+surface for "what is happening right now?":
 
-Either validate peers against resolved/inferred forges, or make the bootstrap
-write explicit forge entries when peer config is present. This is central to the
-trust model, so it needs to be smooth.
+- active agents and sessions,
+- pending/in-progress/errored inbox items,
+- source poller health,
+- sandbox executor status,
+- broker status and active bindings,
+- provider health breaker state,
+- recent source events and external keys,
+- and safe ways to requeue or clear stuck work.
 
-### 6. Decide the source acknowledgement semantics
+Pieces exist: `thorn inbox requeue`, `thorn broker status`, `thorn broker logs`,
+`thorn broker down`, provider health internals, and durable inbox files. They
+are not yet one coherent status surface. Before self-service feedback, add a
+minimal `thorn status` / `thorn inbox list` / runbook combination that lets an
+operator distinguish provider failure, broker failure, source silence,
+dedup/drop, and agent-in-progress states quickly.
 
-Both GitHub and GitLab sources intentionally mark/dismiss external notifications
-after handing them to the gateway, regardless of whether the formatter delivered,
-deduplicated, or dropped them. GitHub additionally drains all existing unread
-notifications on startup so they are never delivered.
+### 4. Decide and document source acknowledgement and recovery semantics
 
-That may be the right production default, but it is risky for early users:
-events can disappear from the external platform before the agent has actually
-done useful work, and GitHub downtime/backlog behavior is especially surprising.
+The trial confirmed the original concern: a provider authentication failure
+could leave the GitLab TODO marked done while Thorn parked the local inbox item
+as errored, requiring an operator nudge. Follow-up work added
+`thorn inbox requeue`, and GitLab/GitHub sources now skip mark-done/read if
+posting to the gateway raises. That is a meaningful improvement.
 
-For initial users, consider a conservative mode:
+The remaining semantic issue is after successful handoff: sources still mark
+external notifications done/read before the agent has actually completed the
+work, and GitHub still drains all existing unread notifications at startup. That
+may be a defensible daemon default, but early users need either:
 
-- no startup drain by default, or a prompted/explicit drain flag;
-- mark external items read/done only after session handling reaches a terminal
-  state, or record an internal durable audit of every dismissed event;
-- surface dropped/deduped events in a status command.
+- a conservative mode that delays external acknowledgement until local handling
+  reaches a terminal state;
+- or a clearly documented contract: after handoff, recovery is through Thorn's
+  durable inbox, not the forge notification list;
+- plus operator commands to inspect and requeue those local items.
 
-### 7. Close or clearly label the egress allowlist gap
+This should be settled before telling users they can rely on Thorn for anything
+more than throwaway feedback tasks.
+
+### 5. Keep the closed-loop path proven on current `main`
+
+The original tool-routing blocker is closed. Built-in tools now flow through a
+single catalog: runtime-dependent forge, peer, and inbox tools execute
+`IN_PROCESS`, sandboxed file/shell/journal tools execute in the toolhost, and
+dedicated `git_*` tools are gone from the coordinator path in favor of
+`run_shell`. `tests/test_tool_venues.py` locks down the catalog/registry
+contract and `tests/test_gateway_golden_path.py` drives a bootstrapped
+coordinator through issue -> edit -> commit -> push -> change request -> comment
+-> inbox update using the composed gateway path.
+
+The live trial also proved default container sandbox plus bundled broker mode
+against GitLab after fixes. What is still missing is a cheap release-candidate
+rehearsal that starts from a fresh agency on current `main`, runs the documented
+quick start, passes `thorn serve preflight`, completes one small issue/MR in
+container/broker mode, exercises `thorn inbox requeue` once, and exits with
+`thorn broker status` clean. That trial should happen after the README/runbook
+cleanup, not before.
+
+### 6. Close or clearly label the egress allowlist gap
 
 `SandboxConfig.egress_allowlist` is parsed, but enforcement is explicitly not
 wired. The gateway logs a warning when it is non-empty. That is acceptable for
@@ -268,6 +222,23 @@ control.
 
 Before sharing, either implement enforcement or rename/document it as planned
 configuration that currently has no effect.
+
+### Closed Original P0 Items
+
+- **Coordinator tool preparation and venue routing:** fixed by the tool catalog,
+  explicit tool venues, in-process runtime tools, and regression tests.
+- **Golden-path end-to-end smoke test:** fixed for the subprocess toolhost path
+  by `tests/test_gateway_golden_path.py`; live closed-loop evidence covers the
+  container/broker path.
+- **Peer validation with inferred forges:** fixed by validating peers against
+  the resolved service-name set after forge synthesis.
+- **Trial follow-ups 1-5:** first-class bundled broker image references,
+  robust bundled broker shutdown, broker diagnostics, sandbox/broker Git
+  preflight, and inbox requeue have all landed on `main`.
+- **Trial follow-ups 6-10:** GitLab project-event polling, coordinator closing
+  reference guidance, no-SSH sandbox guidance, self-hosted GitLab native-ID
+  resolution, and broader secret redaction have also landed or materially
+  improved.
 
 ## P1: Important Before Initial Users
 
@@ -281,19 +252,9 @@ for multiple repos.
 
 ### Observability and operator control
 
-The project needs a small operator surface for "what is happening right now?":
-
-- active agents and sessions,
-- pending/in-progress/errored inbox items,
-- source poller health,
-- sandbox executor status,
-- broker status and active bindings,
-- provider health breaker state,
-- last handled external keys,
-- and a way to inspect/clear stuck work safely.
-
-The TODO already calls out observability; for early users this is not optional.
-Without it, every failure becomes filesystem spelunking.
+Promoted to P0 for self-service feedback. It can be scoped down for a
+maintainer-led friendly trial if the runbook says exactly which commands and
+files to inspect, but it should not remain a vague future TODO.
 
 ### Public API and documentation consolidation
 
@@ -344,8 +305,8 @@ when `thorn serve resolve-peers` is not yet available.
   abstractions vs. tools; gateway startup vs. routing; and history data
   structures vs. compaction.
 - Add lint and format commands to `pyproject.toml`, then enforce them locally
-  and in CI. The project currently has pytest config but no visible CI config or
-  lint/type config.
+  and in CI. Ruff is configured, but CI currently runs only pytest and there is
+  no type-check command.
 - Introduce explicit domain types where the code still leans on strings:
   `ForgeName`, `ProjectName`, `ToolName`, `ExternalKey`, `NotificationID`,
   `PeerID`, `ServiceName`, and similar. This aligns with the repository's own
@@ -367,17 +328,18 @@ when `thorn serve resolve-peers` is not yet available.
 
 ### Stage 0: Maintainer Dogfood
 
-Use the current code only with maintainers who can debug it. Prefer one repo,
-one coordinator, explicit config, and either a known-good subprocess mode or a
-known-good sandbox image. Keep forge permissions narrow and use throwaway test
-repositories.
+This stage has succeeded for the GitLab gateway path. Keep dogfooding on one
+repo, one coordinator, narrow forge permissions, and a human operator watching
+logs while the remaining P0 productization work lands.
 
 Exit criteria:
 
-- P0 item 1 has a fix or an explicit known-good workaround.
-- README commands are correct.
-- A smoke test proves the golden path.
-- `thorn sandbox status` and broker status are clean on the target machine.
+- Current README quick start matches the CLI and the recommended host-side
+  gateway topology.
+- `thorn serve preflight` is documented as mandatory before live polling.
+- A short operator runbook covers provider failure, broker failure, source
+  silence, and inbox requeue.
+- `thorn broker status` is clean after shutdown on the target machine.
 
 ### Stage 1: Friendly Internal Feedback
 
@@ -387,10 +349,12 @@ non-critical tasks.
 
 Exit criteria:
 
-- Preflight/doctor exists or equivalent scripted checks are documented.
-- Source acknowledgement behavior is conservative or clearly explained.
-- Operators can inspect pending/in-progress/errored work without reading raw
-  JSON by hand.
+- A fresh-agency rehearsal on current `main` follows the public quick start,
+  passes preflight, completes one issue/MR loop in container/broker mode, tests
+  `thorn inbox requeue`, and exits with no orphaned broker stack.
+- Source acknowledgement behavior is conservative or clearly documented.
+- Operators can inspect pending/in-progress/errored work through CLI/status
+  commands or an explicit runbook.
 
 ### Stage 2: Initial Users
 
@@ -402,24 +366,33 @@ expected to patch Thorn itself.
 
 Commands attempted from this checkout:
 
-- Installed missing local tooling with permission: `python3.12-venv` and
-  `python3-pip` via apt, then `uv 0.11.8` in a local bootstrap virtualenv
-  symlinked at `~/.local/bin/uv`.
-- `uv sync --all-extras`: passed, creating `.venv`.
-- `uv run pytest`: passed, `2378 passed, 21 deselected, 764 warnings in 76.87s`.
-- `uv build`: passed, producing both sdist and wheel. The generated `dist/`
-  artifacts were removed after the check.
-- `uv run python -m compileall -q src tests`: passed.
-- Targeted coordinator tool-preparation diagnostic: failed as described in P0
-  item 1; this was an intentional probe outside the pytest suite.
-- No project lint/type-check command is configured in `pyproject.toml`; no
-  project linter was run. Adding one is a P2 recommendation above.
+- Original 2026-04-30 validation: `uv sync --all-extras`, `uv run pytest`,
+  `uv build`, and `uv run python -m compileall -q src tests` passed in that
+  checkout; the original coordinator tool-preparation diagnostic failed and
+  motivated the now-fixed tool catalog work.
+- Reassessment inspection confirmed current CLI help for
+  `uv run thorn serve bootstrap --help`, `uv run thorn serve preflight --help`,
+  and `uv run thorn inbox requeue --help`.
+- Reassessment inspection confirmed `uv run ruff --version` works with the
+  configured dev dependency.
+- Reassessment source/test inspection found current regression coverage in
+  `tests/test_tool_venues.py`, `tests/test_gateway_golden_path.py`,
+  `tests/test_gateway_preflight.py`, `tests/test_gateway_bundled_broker_shutdown.py`,
+  `tests/test_gitlab.py`, `tests/test_bundled_broker.py`, and sandbox runtime
+  redaction tests.
+- `uv run pytest tests/test_tool_venues.py tests/test_gateway_golden_path.py tests/test_gateway_preflight.py tests/test_gateway_bundled_broker_shutdown.py tests/test_gitlab.py tests/test_bundled_broker.py tests/sandbox/test_runtime.py`:
+  passed, `123 passed, 8 warnings in 2.85s`.
+
+The reassessment did not run the full pytest suite or a live gateway trial.
+Those should be run before calling a release-candidate rehearsal complete.
 
 ## Bottom Line
 
-The implementation has a strong foundation and a passing default test suite. The
-next step is not to add more surface area; it is to prove and polish the one
-path a new person will actually try. Fix the coordinator tool-preparation and
-sandbox/tool venue mismatch, add a real gateway golden-path smoke test, update
-the README, and add preflight plus basic observability. After that, Thorn should
-be in a much better position for targeted feedback.
+The implementation has a strong foundation, a real live-gateway success story,
+and regression coverage for the original integration blockers. The next step is
+not to add more surface area; it is to make the one path a new person will try
+boringly correct. Update the quick start, make preflight and recovery part of
+the official runbook, add minimal status/observability, settle acknowledgement
+semantics, and then run one fresh closed-loop rehearsal on current `main`.
+After that, Thorn should be ready for targeted friendly feedback without
+looking more fragile than the implementation actually is.
