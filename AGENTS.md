@@ -43,6 +43,17 @@ This project uses **`uv`** as its package manager. Do not use `pip install`, `py
 - Make sure to add adequate test coverage for code you introduce or change.
   Ensure that you are testing the functionality a user of your code/API would actually care about, rather than just adding fluff.
 
+- Do not add unit tests whose primary purpose is to police exact wording,
+  headings, examples, or narrative coverage in `README.md`, files under
+  `docs/`, comments, or docstrings. Documentation correctness is handled
+  through development review, release rehearsals, and tests of the executable
+  behavior the docs describe.
+
+  Tests may use documentation-shaped files as inputs when that file handling is
+  product behavior, such as Markdown outline parsing, project-root detection, or
+  `AGENTS.md` loading. Those tests should assert the behavior of the code, not
+  freeze prose that humans need to edit freely.
+
 - When working on code, follow this general sequence, and perform a self-review of your work after each step:
   - Make any necessary changes to the architecture and decomposition of modules
   - Make any necessary changes the public API surface area of modules.
