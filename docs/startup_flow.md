@@ -204,6 +204,33 @@ against each match.
 `thorn broker logs --project thorn-broker-a1b2c3d4` prints redacted
 OneCLI/Postgres logs for a stack that is still running.
 
+## Source acknowledgement contract
+
+Forge sources acknowledge external notifications after successful
+handoff to the gateway, not after the agent finishes local inbox work.
+The gateway handoff is the call from the source into the gateway's
+event handler; if that call raises, the source skips external
+acknowledgement so the upstream notification can resurface on a later
+poll.
+
+The current source-specific behavior is:
+
+* GitLab TODOs are marked done after the gateway accepts the event.
+  GitLab project-event polling is read-only and does not acknowledge
+  or mutate upstream project events.
+* GitHub notification threads are marked read after the gateway
+  accepts the event. On startup, the GitHub source also marks the
+  existing unread set as read before steady-state polling so a fresh
+  daemon does not flood the agent with historical notifications.
+* `thorn serve preflight` is non-destructive: it does not start event
+  sources and does not read, mark, or drain GitHub/GitLab
+  notifications.
+
+After handoff succeeds, recovery is local. The durable inbox records
+the accepted work item, and operator commands inspect or requeue that
+local item rather than recreating a GitLab TODO or GitHub
+notification.
+
 ## Operator status and inbox recovery
 
 Use `thorn status --agency ~/.thorn` as the first read-only check
@@ -228,9 +255,9 @@ $ thorn inbox requeue <item-id> --agency ~/.thorn
 ```
 
 Requeueing does not touch GitLab/GitHub and does not recreate an
-upstream TODO or notification; it moves Thorn's `inbox/errored/`
-record back to pending work so the next gateway run can prompt the
-session again.
+upstream TODO or GitHub notification; it moves Thorn's
+`inbox/errored/` record back to pending work so the next gateway run
+can prompt the session again.
 
 ## When things go wrong
 

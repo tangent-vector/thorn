@@ -208,6 +208,30 @@ For GitLab, the inferred source polls two surfaces:
   closures; later polls wake the corresponding issue or change-request
   session when a new closure or merge appears.
 
+### Source acknowledgement and recovery
+
+Thorn's forge sources use a handoff-based acknowledgement contract.
+Once the source has handed a notification to the gateway without an
+exception, the source may acknowledge it on the external service even
+though the agent has not finished the corresponding inbox work yet.
+
+For GitLab TODOs, that means the TODO is marked done after the gateway
+accepts the event. For GitHub notification threads, that means the
+thread is marked read after the gateway accepts the event; at startup,
+the GitHub source also marks already-unread threads as read so a fresh
+daemon does not replay old notifications. If gateway handoff raises,
+the source skips acknowledgement so the forge notification can be
+seen again on a later poll. Project-event polling does not mutate
+upstream GitLab project events.
+
+After a successful handoff, Thorn's durable inbox is the source of
+truth for recovery, not the GitHub or GitLab notification list. Use
+`thorn status`, `thorn inbox list`, and `thorn inbox show` to inspect
+local pending, in-progress, and errored work. After fixing the local
+cause of an errored item, use `thorn inbox requeue`; requeueing moves
+the local `inbox/errored/` file back to pending work and does not
+recreate an upstream TODO or GitHub notification.
+
 Configuration
 -------------
 
@@ -327,8 +351,9 @@ as stopped, stale, or unknown from the last heartbeat file.
 If the gateway receives a forge notification and then cannot prompt
 the coordinator -- for example because the LLM provider key was bad
 or the provider was unavailable long enough for the item to be parked
-as errored -- fix the underlying operator-side problem and requeue
-the durable inbox item:
+as errored -- the external forge notification may already be marked
+done or read because handoff to the gateway succeeded. Fix the
+underlying operator-side problem and requeue the durable inbox item:
 
 ```console
 $ uv run thorn inbox requeue <item-id> --agency ~/.thorn
@@ -337,7 +362,7 @@ $ uv run thorn inbox requeue <item-id> --agency ~/.thorn
 Use `--agent` and `--session` when multiple parked items have the
 same ID.  This command only moves Thorn's local `inbox/errored/`
 file back to pending work; it does not contact GitLab/GitHub or
-re-create upstream TODOs.
+re-create upstream TODOs or GitHub notifications.
 
 Before letting a live gateway consume forge notifications, run a
 non-destructive readiness gate from the same agency config:
