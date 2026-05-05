@@ -8,10 +8,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from thorn.gateway._event import EventKind, RawIncomingEvent
+from thorn.gateway._event import (
+    EventKind,
+    EventSourceStatusState,
+    RawIncomingEvent,
+)
 from thorn.gateway._routing import NoteableKind
 from thorn.runtime import SessionKey
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -658,6 +661,69 @@ class TestGitHubNotificationsSourcePollOnce:
             await source._poll_once(on_event)
 
         assert patch_calls == []
+
+    @pytest.mark.asyncio
+    async def test_successful_poll_updates_status_snapshot(self) -> None:
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        source = GitHubNotificationsSource(
+            GitHubNotificationsSourceConfig(token="ghp_test"),
+        )
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(source, "_fetch_new_notifications", lambda: [])
+
+        async def on_event(_event: RawIncomingEvent) -> None:
+            raise AssertionError("empty poll should not emit")
+
+        try:
+            await source._poll_once(on_event)
+        finally:
+            monkeypatch.undo()
+
+        snapshot = source.status_snapshot()
+        assert snapshot.state is EventSourceStatusState.OK
+        assert snapshot.poll_count == 1
+        assert snapshot.last_event_count == 0
+        assert snapshot.last_error is None
+        assert snapshot.last_poll_started_at is not None
+        assert snapshot.last_poll_finished_at is not None
+
+    @pytest.mark.asyncio
+    async def test_failed_poll_updates_status_snapshot(self) -> None:
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        source = GitHubNotificationsSource(
+            GitHubNotificationsSourceConfig(token="ghp_test"),
+        )
+        monkeypatch = pytest.MonkeyPatch()
+
+        def fail_fetch() -> list[RawIncomingEvent]:
+            raise RuntimeError("github unavailable")
+
+        monkeypatch.setattr(source, "_fetch_new_notifications", fail_fetch)
+
+        async def on_event(_event: RawIncomingEvent) -> None:
+            raise AssertionError("failed poll should not emit")
+
+        try:
+            with pytest.raises(RuntimeError, match="github unavailable"):
+                await source._poll_once(on_event)
+        finally:
+            monkeypatch.undo()
+
+        snapshot = source.status_snapshot()
+        assert snapshot.state is EventSourceStatusState.ERROR
+        assert snapshot.poll_count == 1
+        assert snapshot.last_event_count is None
+        assert snapshot.last_error == "github unavailable"
+        assert snapshot.last_poll_started_at is not None
+        assert snapshot.last_poll_finished_at is not None
 
 
 class TestGitHubNotificationsSourceStart:

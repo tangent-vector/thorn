@@ -44,6 +44,12 @@ from thorn.runtime._project_detection import (
 
 console = Console()
 
+
+def _emit_json(payload: Any) -> None:
+    """Write JSON without Rich wrapping or markup interpretation."""
+    click.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
 if TYPE_CHECKING:
     from thorn.core import Agent
     from thorn.gateway._config import SandboxConfig
@@ -269,6 +275,32 @@ def _resolve_inbox_agency_home(agency_path: str | None) -> Path:
     return agency_home
 
 
+def _inbox_agency_paths(
+    agency_home: Path,
+    *,
+    workspace_root: Path | None = None,
+) -> "AgencyPaths":
+    from thorn.runtime._paths import AgencyPaths
+
+    return AgencyPaths.for_gateway(
+        agency_dir=agency_home,
+        workspace_dir=workspace_root or Path.cwd().resolve(),
+    )
+
+
+def _parse_agent_id_filter(agent_id_raw: str | None) -> AgentID | None:
+    return AgentID(agent_id_raw) if agent_id_raw else None
+
+
+def _parse_session_key_filter(session_key_raw: str | None) -> SessionKey | None:
+    if session_key_raw is None:
+        return None
+    try:
+        return SessionKey(session_key_raw)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _find_errored_inbox_matches(
     *,
     agency_home: Path,
@@ -300,6 +332,186 @@ def _find_errored_inbox_matches(
 @main.group()
 def inbox() -> None:
     """Inspect and recover session inbox items."""
+
+
+@inbox.command("list")
+@click.option(
+    "--agency",
+    "agency_path",
+    type=click.Path(file_okay=False),
+    default=None,
+    help=(
+        "Agency home directory containing the agents/ tree. "
+        "Defaults to ~/.thorn."
+    ),
+)
+@click.option(
+    "--agent",
+    "agent_id_raw",
+    default=None,
+    help="Restrict lookup to one agent ID.",
+)
+@click.option(
+    "--session",
+    "session_key_raw",
+    default=None,
+    help="Restrict lookup to one session key.",
+)
+@click.option(
+    "--status",
+    "status_filter",
+    type=click.Choice([
+        "pending",
+        "in_progress",
+        "handled",
+        "errored",
+        "confirmed",
+        "parked_errored",
+    ]),
+    default=None,
+    help="Restrict output to one inbox status.",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    default=False,
+    help="Print machine-readable JSON.",
+)
+def inbox_list(
+    agency_path: str | None,
+    agent_id_raw: str | None,
+    session_key_raw: str | None,
+    status_filter: str | None,
+    json_output: bool,
+) -> None:
+    """List session inbox items without reading raw JSON files."""
+    from thorn.gateway._operator_status import collect_inbox_items
+
+    agency_home = _resolve_inbox_agency_home(agency_path)
+    paths = _inbox_agency_paths(agency_home)
+    records = collect_inbox_items(
+        paths,
+        agent_id_filter=_parse_agent_id_filter(agent_id_raw),
+        session_key_filter=_parse_session_key_filter(session_key_raw),
+        status_filter=status_filter,
+    )
+    if json_output:
+        _emit_json([record.to_json() for record in records])
+        return
+    if not records:
+        console.print("[dim]No inbox items found.[/dim]")
+        return
+
+    console.print(f"[bold]Inbox items ({len(records)}):[/bold]")
+    for record in records:
+        console.print(
+            f"  {record.item_id}  {record.status.value}  "
+            f"{record.location.value}  agent={record.agent_id}  "
+            f"session={record.session_key}  source={record.notification.source}  "
+            f"{record.summary}"
+        )
+
+
+@inbox.command("show")
+@click.argument("item_id")
+@click.option(
+    "--agency",
+    "agency_path",
+    type=click.Path(file_okay=False),
+    default=None,
+    help=(
+        "Agency home directory containing the agents/ tree. "
+        "Defaults to ~/.thorn."
+    ),
+)
+@click.option(
+    "--agent",
+    "agent_id_raw",
+    default=None,
+    help="Restrict lookup to one agent ID.",
+)
+@click.option(
+    "--session",
+    "session_key_raw",
+    default=None,
+    help="Restrict lookup to one session key.",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    default=False,
+    help="Print machine-readable JSON.",
+)
+def inbox_show(
+    item_id: str,
+    agency_path: str | None,
+    agent_id_raw: str | None,
+    session_key_raw: str | None,
+    json_output: bool,
+) -> None:
+    """Show one session inbox item and its operator recovery context."""
+    from thorn.gateway._operator_status import (
+        InboxItemLocation,
+        collect_inbox_items,
+    )
+
+    agency_home = _resolve_inbox_agency_home(agency_path)
+    paths = _inbox_agency_paths(agency_home)
+    records = collect_inbox_items(
+        paths,
+        agent_id_filter=_parse_agent_id_filter(agent_id_raw),
+        session_key_filter=_parse_session_key_filter(session_key_raw),
+        item_id_filter=item_id,
+    )
+    if not records:
+        raise click.ClickException(
+            f"No inbox item {item_id!r} found under {agency_home}."
+        )
+    if len(records) > 1:
+        choices = [
+            f"{record.agent_id}:{record.session_key}:{record.location.value}"
+            for record in records
+        ]
+        raise click.ClickException(
+            "Multiple inbox items matched. Re-run with --agent and "
+            "--session to choose one:\n  "
+            + "\n  ".join(choices)
+        )
+
+    record = records[0]
+    if json_output:
+        _emit_json(record.to_json(include_content=True))
+        return
+
+    notification = record.notification
+    console.print(f"[bold]Inbox item:[/bold] {record.item_id}")
+    console.print(f"Agent: {record.agent_id}")
+    console.print(f"Session: {record.session_key}")
+    console.print(f"Location: {record.location.value}")
+    console.print(f"Status: {record.status.value}")
+    console.print(f"Source: {notification.source}")
+    console.print(f"Posted: {notification.posted_at.isoformat()}")
+    if notification.external_key:
+        console.print(f"External key: {notification.external_key}")
+    if notification.attempt_count:
+        console.print(f"Attempts: {notification.attempt_count}")
+    if notification.notes:
+        console.print(f"Notes: {notification.notes}")
+    if notification.error_reason:
+        console.print(f"Error reason: {notification.error_reason}")
+    if notification.metadata:
+        console.print(f"Metadata: {dict(notification.metadata)!r}")
+    if record.location is InboxItemLocation.PARKED_ERRORED:
+        console.print(
+            "Requeue: "
+            f"uv run thorn inbox requeue {record.item_id} "
+            f"--agency {agency_home} "
+            f"--agent {record.agent_id} --session {record.session_key}"
+        )
+    console.print("\n[bold]Content:[/bold]")
+    console.print(notification.content)
 
 
 @inbox.command("requeue")
@@ -378,6 +590,153 @@ def inbox_requeue(
         f"[bold]{match.agent_id}[/bold], session "
         f"[bold]{match.session_key}[/bold]."
     )
+
+
+# ---------------------------------------------------------------------------
+# thorn status
+# ---------------------------------------------------------------------------
+
+@main.command("status")
+@click.option(
+    "--agency",
+    "agency_path",
+    type=click.Path(file_okay=False),
+    default=None,
+    help=(
+        "Agency home directory containing gateway.json and agents/. "
+        "Defaults to ~/.thorn."
+    ),
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    default=False,
+    help="Print machine-readable JSON.",
+)
+def operator_status(agency_path: str | None, json_output: bool) -> None:
+    """Summarize gateway, inbox, broker, sandbox, and source health."""
+    from thorn.gateway import load_gateway_config
+    from thorn.gateway._operator_status import collect_operator_status
+
+    agency_home = _resolve_inbox_agency_home(agency_path)
+    gateway_config = None
+    config_error: str | None = None
+    try:
+        gateway_config = load_gateway_config(agency_home)
+    except Exception as exc:
+        config_error = str(exc)
+
+    workspace_root = Path.cwd().resolve()
+    if gateway_config is not None:
+        resolved_workspace = gateway_config.resolve_workspace(agency_home)
+        if resolved_workspace is not None:
+            workspace_root = resolved_workspace
+
+    summary = asyncio.run(collect_operator_status(
+        agency_home=agency_home,
+        workspace_root=workspace_root,
+        gateway_config=gateway_config,
+        config_error=config_error,
+    ))
+    if json_output:
+        _emit_json(summary.to_json())
+        return
+
+    _print_operator_status(summary)
+
+
+def _print_operator_status(summary: Any) -> None:
+    console.print(f"[bold]Agency:[/bold] {summary.agency_home}")
+    console.print(f"[bold]Workspace:[/bold] {summary.workspace_root}")
+    if summary.config_error:
+        console.print(f"[yellow]Config:[/yellow] {summary.config_error}")
+
+    heartbeat = summary.heartbeat
+    console.print(
+        f"[bold]Gateway:[/bold] {heartbeat.liveness.value} "
+        f"[dim]({heartbeat.path})[/dim]"
+    )
+    payload = heartbeat.payload or {}
+    updated_at = payload.get("updated_at")
+    if updated_at:
+        console.print(f"  updated_at={updated_at}")
+    provider = payload.get("provider_health")
+    if isinstance(provider, dict):
+        console.print(
+            "  provider="
+            f"{provider.get('state', 'unknown')} "
+            f"failures={provider.get('recent_failure_count', '?')} "
+            f"probe_in_flight={provider.get('probe_in_flight', '?')}"
+        )
+
+    sources = payload.get("sources")
+    if isinstance(sources, list):
+        console.print(f"[bold]Sources:[/bold] {len(sources)}")
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            console.print(
+                f"  {source.get('name') or source.get('source_type')}  "
+                f"{source.get('state', 'unknown')}  "
+                f"last_poll={source.get('last_poll_finished_at') or 'never'}  "
+                f"events={source.get('last_event_count')}"
+            )
+            if source.get("last_error"):
+                console.print(f"    error={source['last_error']}")
+    else:
+        console.print("[bold]Sources:[/bold] unknown")
+
+    console.print(
+        f"[bold]Agents:[/bold] {len(summary.agent_ids)}  "
+        f"[bold]Sessions:[/bold] {summary.session_count}"
+    )
+    counts = summary.inbox_counts
+    console.print(
+        "[bold]Inbox:[/bold] "
+        f"pending={counts.pending} "
+        f"in_progress={counts.in_progress} "
+        f"handled={counts.handled} "
+        f"errored={counts.errored} "
+        f"confirmed={counts.confirmed} "
+        f"parked_errored={counts.parked_errored}"
+    )
+    if counts.parked_errored:
+        console.print(
+            "  [yellow]Use 'thorn inbox list --status parked_errored' "
+            "and 'thorn inbox requeue <item-id>' after fixing the cause.[/yellow]"
+        )
+    console.print(
+        f"[bold]In-flight external keys:[/bold] "
+        f"{len(summary.in_flight_external_keys)}"
+    )
+
+    broker = summary.broker
+    if broker.error:
+        console.print(f"[bold]Broker:[/bold] unknown ({broker.error})")
+    elif broker.stacks:
+        console.print(f"[bold]Broker stacks:[/bold] {len(broker.stacks)}")
+        for stack in broker.stacks:
+            console.print(
+                f"  {stack.project_name}  ({stack.runtime_name})  "
+                f"{stack.status}"
+            )
+    else:
+        console.print("[bold]Broker stacks:[/bold] none")
+
+    sandbox = summary.sandbox
+    if sandbox.error:
+        console.print(f"[bold]Sandbox:[/bold] unknown ({sandbox.error})")
+    elif sandbox.backend == "subprocess":
+        console.print("[bold]Sandbox:[/bold] backend=subprocess")
+    else:
+        image_state = "present" if sandbox.image_present else "missing"
+        console.print(
+            f"[bold]Sandbox:[/bold] backend={sandbox.backend} "
+            f"runtime={sandbox.runtime_name} "
+            f"image={sandbox.image} ({image_state}) "
+            f"containers={len(sandbox.containers)}"
+        )
 
 
 # ---------------------------------------------------------------------------

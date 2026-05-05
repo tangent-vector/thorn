@@ -48,7 +48,10 @@ from thorn.gateway._event import (
     ContextItemKind,
     EventKind,
     EventSource,
+    EventSourceStatusSnapshot,
+    EventSourceStatusState,
     RawIncomingEvent,
+    event_source_status_timestamp,
 )
 from thorn.gateway._routing import Noteable, NoteableKind, route_github_event
 
@@ -450,10 +453,29 @@ class GitHubNotificationsSource(EventSource):
         # server-side via the Notifications API's read/unread state.
         self._last_modified: str | None = None
         self._stop_event: asyncio.Event | None = None
+        self._last_poll_started_at: str | None = None
+        self._last_poll_finished_at: str | None = None
+        self._last_error: str | None = None
+        self._last_event_count: int | None = None
+        self._poll_count = 0
+        self._status_state = EventSourceStatusState.STARTING
 
     @property
     def name(self) -> str:
         return self._service_name
+
+    def status_snapshot(self) -> EventSourceStatusSnapshot:
+        name = self.name or type(self).__name__
+        return EventSourceStatusSnapshot(
+            name=name,
+            source_type=type(self).__name__,
+            state=self._status_state,
+            last_poll_started_at=self._last_poll_started_at,
+            last_poll_finished_at=self._last_poll_finished_at,
+            last_error=self._last_error,
+            last_event_count=self._last_event_count,
+            poll_count=self._poll_count,
+        )
 
     async def start(
         self,
@@ -497,6 +519,7 @@ class GitHubNotificationsSource(EventSource):
     async def stop(self) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
+        self._status_state = EventSourceStatusState.STOPPED
 
     def _check_connection(self) -> dict[str, Any]:
         """Verify the PAT by calling ``GET /user``."""
@@ -513,33 +536,58 @@ class GitHubNotificationsSource(EventSource):
         self,
         on_event: Callable[[RawIncomingEvent], Awaitable[None]],
     ) -> None:
-        new_events = await asyncio.to_thread(self._fetch_new_notifications)
-        if new_events:
-            log.info("Found %d new notification(s)", len(new_events))
-        for ev in new_events:
-            try:
-                await on_event(ev)
-            except Exception:
-                # One bad event shouldn't poison the whole poll; skip
-                # mark-as-read so the thread resurfaces on the next
-                # poll and we get another shot at posting it.
-                log.exception(
-                    "Failed to post event for GitHub thread %s",
-                    ev.metadata.get("notification_id", "?"),
-                )
-                continue
+        started_at = event_source_status_timestamp()
+        self._last_poll_started_at = started_at
+        delivered_count = 0
+        try:
+            new_events = await asyncio.to_thread(self._fetch_new_notifications)
+            if new_events:
+                log.info("Found %d new notification(s)", len(new_events))
+            for ev in new_events:
+                try:
+                    await on_event(ev)
+                except Exception:
+                    # One bad event shouldn't poison the whole poll; skip
+                    # mark-as-read so the thread resurfaces on the next
+                    # poll and we get another shot at posting it.
+                    log.exception(
+                        "Failed to post event for GitHub thread %s",
+                        ev.metadata.get("notification_id", "?"),
+                    )
+                    continue
 
-            # Mark the thread read so GitHub doesn't resurface the
-            # same notification on every poll.  Runs regardless of
-            # whether the gateway delivered, deduplicated, or *dropped*
-            # the event -- drops are terminal in the formatter's
-            # contract, and we want the *platform* to stop resurfacing
-            # the entity in all three cases.
-            thread_id = ev.metadata.get("notification_id")
-            if thread_id:
-                await asyncio.to_thread(
-                    self._mark_thread_read, str(thread_id),
-                )
+                delivered_count += 1
+                # Mark the thread read so GitHub doesn't resurface the
+                # same notification on every poll.  Runs regardless of
+                # whether the gateway delivered, deduplicated, or *dropped*
+                # the event -- drops are terminal in the formatter's
+                # contract, and we want the *platform* to stop resurfacing
+                # the entity in all three cases.
+                thread_id = ev.metadata.get("notification_id")
+                if thread_id:
+                    await asyncio.to_thread(
+                        self._mark_thread_read, str(thread_id),
+                    )
+        except Exception as exc:
+            self._record_poll_error(started_at, exc)
+            raise
+        self._record_poll_success(started_at, delivered_count)
+
+    def _record_poll_success(self, started_at: str, event_count: int) -> None:
+        self._poll_count += 1
+        self._last_poll_started_at = started_at
+        self._last_poll_finished_at = event_source_status_timestamp()
+        self._last_event_count = event_count
+        self._last_error = None
+        self._status_state = EventSourceStatusState.OK
+
+    def _record_poll_error(self, started_at: str, exc: Exception) -> None:
+        self._poll_count += 1
+        self._last_poll_started_at = started_at
+        self._last_poll_finished_at = event_source_status_timestamp()
+        self._last_event_count = None
+        self._last_error = str(exc) or type(exc).__name__
+        self._status_state = EventSourceStatusState.ERROR
 
     def _drain_existing_unread(self) -> int:
         """Mark every currently-unread notification as read without emitting events.

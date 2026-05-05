@@ -197,6 +197,34 @@ against each match.
 `thorn broker logs --project thorn-broker-a1b2c3d4` prints redacted
 OneCLI/Postgres logs for a stack that is still running.
 
+## Operator status and inbox recovery
+
+Use `thorn status --agency ~/.thorn` as the first read-only check
+when a gateway looks idle, stuck, or unhealthy.  It summarizes the
+agency path, gateway heartbeat, provider health, source poll
+snapshots, inbox counts, parked errors, in-flight external keys,
+broker stacks, and sandbox containers.  `thorn status --json` prints
+the same data without Rich formatting.
+
+When the problem is local queued work, inspect the durable inbox
+before mutating it:
+
+```console
+$ thorn inbox list --agency ~/.thorn
+$ thorn inbox show <item-id> --agency ~/.thorn
+```
+
+After fixing the underlying cause, requeue only the local parked item:
+
+```console
+$ thorn inbox requeue <item-id> --agency ~/.thorn
+```
+
+Requeueing does not touch GitLab/GitHub and does not recreate an
+upstream TODO or notification; it moves Thorn's `inbox/errored/`
+record back to pending work so the next gateway run can prompt the
+session again.
+
 ## When things go wrong
 
 Common failure modes and where to look:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from thorn.core._session import Session, _SessionPromptAccessor
 from thorn.gateway._event import (
     EventKind,
     EventSource,
+    EventSourceStatusState,
     FormattedEvent,
     IncomingEvent,
     RawIncomingEvent,
@@ -229,6 +232,36 @@ class TestGateway:
 
         await run_and_stop()
         assert source._stop.is_set()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_reports_running_then_stopped(self, tmp_path: Path):
+        source = SlowSource()
+        runtime = self._make_runtime(tmp_path)
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[source],
+            heartbeat_interval_s=1.0,
+        )
+
+        task = asyncio.create_task(gateway.run())
+        heartbeat_path = runtime.paths.home_root / "gateway-status.json"
+        for _ in range(50):
+            if heartbeat_path.is_file():
+                break
+            await asyncio.sleep(0.01)
+
+        running = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        assert running["status"] == "running"
+        assert running["provider_health"]["state"] == "healthy"
+
+        await gateway.shutdown()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        stopped = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        assert stopped["status"] == "stopped"
+        assert stopped["stopped_at"]
 
     @pytest.mark.asyncio
     async def test_error_in_session_prompt_does_not_crash(self, tmp_path: Path):
@@ -1843,6 +1876,77 @@ class TestGitLabTODOsSourcePolling:
             project.events.list.assert_any_call(
                 target_type="issue", action="closed", per_page=50,
             )
+
+    @pytest.mark.asyncio
+    async def test_successful_poll_updates_status_snapshot(self):
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib") as mock_gl_mod,
+        ):
+            mock_gl_instance = MagicMock()
+            mock_gl_mod.Gitlab.return_value = mock_gl_instance
+            mock_gl_instance.todos.list.return_value = []
+
+            from thorn.gateway.sources._gitlab import (
+                GitLabSourceConfig,
+                GitLabTODOsSource,
+            )
+
+            source = GitLabTODOsSource(GitLabSourceConfig(
+                url="https://gitlab.example.com",
+                token="test-token",
+                poll_interval=5,
+            ))
+
+            async def on_event(_event: RawIncomingEvent) -> None:
+                raise AssertionError("empty poll should not emit")
+
+            await source._poll_once(on_event)
+
+            snapshot = source.status_snapshot()
+            assert snapshot.state is EventSourceStatusState.OK
+            assert snapshot.poll_count == 1
+            assert snapshot.last_event_count == 0
+            assert snapshot.last_error is None
+            assert snapshot.last_poll_started_at is not None
+            assert snapshot.last_poll_finished_at is not None
+
+    @pytest.mark.asyncio
+    async def test_failed_poll_updates_status_snapshot(self):
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib") as mock_gl_mod,
+        ):
+            mock_gl_instance = MagicMock()
+            mock_gl_mod.Gitlab.return_value = mock_gl_instance
+            mock_gl_instance.todos.list.side_effect = RuntimeError(
+                "gitlab unavailable",
+            )
+
+            from thorn.gateway.sources._gitlab import (
+                GitLabSourceConfig,
+                GitLabTODOsSource,
+            )
+
+            source = GitLabTODOsSource(GitLabSourceConfig(
+                url="https://gitlab.example.com",
+                token="test-token",
+                poll_interval=5,
+            ))
+
+            async def on_event(_event: RawIncomingEvent) -> None:
+                raise AssertionError("failed poll should not emit")
+
+            with pytest.raises(RuntimeError, match="gitlab unavailable"):
+                await source._poll_once(on_event)
+
+            snapshot = source.status_snapshot()
+            assert snapshot.state is EventSourceStatusState.ERROR
+            assert snapshot.poll_count == 1
+            assert snapshot.last_event_count is None
+            assert snapshot.last_error == "gitlab unavailable"
+            assert snapshot.last_poll_started_at is not None
+            assert snapshot.last_poll_finished_at is not None
 
 
 # ---------------------------------------------------------------------------

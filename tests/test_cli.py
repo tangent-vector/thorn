@@ -17,6 +17,7 @@ from thorn.core._provider import (
     UsageChunk,
 )
 from thorn.gateway._bundled_broker import BundledBrokerStackInfo
+from thorn.gateway._heartbeat import write_gateway_heartbeat
 from thorn.runtime import (
     AddressBook,
     AgencyPaths,
@@ -127,6 +128,28 @@ def _park_errored_inbox_item(
     return inbox, posted.id
 
 
+def _post_pending_inbox_item(
+    *,
+    agency_home: Path,
+    workspace_root: Path,
+    agent_id: AgentID,
+    session_key: SessionKey,
+) -> tuple[SessionInbox, str]:
+    paths = AgencyPaths(home_root=agency_home, workspace_root=workspace_root)
+    address = SessionAddress(agent_id, session_key)
+    inbox = SessionInbox(paths.session_inbox_dir(agent_id, session_key), address)
+    posted = inbox.post(
+        NotificationSpec(
+            source="test",
+            content="please handle this notification",
+            target=address,
+            metadata={"todo_id": 456},
+            external_key="github:https://github.example.com:thread:456",
+        )
+    )
+    return inbox, posted.id
+
+
 class TestInboxRequeueCommand:
     def test_requeues_errored_item(self, tmp_path: Path, monkeypatch) -> None:
         agency_home = tmp_path / ".thorn"
@@ -187,6 +210,206 @@ class TestInboxRequeueCommand:
         assert result.exit_code != 0
         assert "missing-item" in result.output
         assert "provider key was invalid" not in result.output
+
+
+class TestInboxInspectionCommands:
+    def test_list_shows_live_and_parked_items(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+        _park_errored_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+        monkeypatch.chdir(workspace_root)
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["inbox", "list", "--agency", str(agency_home)],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "pending" in result.output
+        assert "parked_errored" in result.output
+        assert "projects/thorn/issues/5" in result.output
+
+    def test_show_parked_item_prints_requeue_hint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        _inbox, item_id = _park_errored_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+        monkeypatch.chdir(workspace_root)
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "show", item_id,
+                "--agency", str(agency_home),
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "provider key was invalid" in result.output
+        assert "thorn inbox requeue" in result.output
+        assert item_id in result.output
+
+    def test_list_json_is_machine_readable(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        _inbox, item_id = _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "list",
+                "--agency", str(agency_home),
+                "--json",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload[0]["id"] == item_id
+        assert payload[0]["status"] == "pending"
+
+    def test_list_filters_by_agent_session_and_status(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        included_agent_id = AgentID("coordinator")
+        included_session_key = SessionKey("projects/thorn/issues/5")
+        _inbox, included_item_id = _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=included_agent_id,
+            session_key=included_session_key,
+        )
+        _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("other-agent"),
+            session_key=SessionKey("projects/other/issues/9"),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "list",
+                "--agency", str(agency_home),
+                "--agent", str(included_agent_id),
+                "--session", str(included_session_key),
+                "--status", "pending",
+                "--json",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert [item["id"] for item in payload] == [included_item_id]
+
+    def test_show_json_includes_content(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        _inbox, item_id = _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "show", item_id,
+                "--agency", str(agency_home),
+                "--json",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["id"] == item_id
+        assert payload["content"] == "please handle this notification"
+
+    def test_status_json_counts_parked_errors(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        _park_errored_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["status", "--agency", str(agency_home), "--json"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["inbox_counts"]["parked_errored"] == 1
+        assert payload["heartbeat"]["liveness"] == "unknown"
+
+    def test_status_json_reports_stale_heartbeat(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / ".thorn"
+        agency_home.mkdir()
+        write_gateway_heartbeat(
+            agency_home / "gateway-status.json",
+            {
+                "status": "running",
+                "updated_at": "2020-01-01T00:00:00+00:00",
+                "heartbeat_interval_s": 1,
+            },
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["status", "--agency", str(agency_home), "--json"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["heartbeat"]["liveness"] == "stale"
 
 
 class TestBrokerLogsCommand:

@@ -258,6 +258,26 @@ and left an orphaned broker stack behind, `thorn broker status`
 lists matching compose projects and `thorn broker down` cleans them
 up.
 
+For a single operator view across gateway liveness, source polling,
+provider health, broker/sandbox state, in-flight external keys, and
+durable inbox counts:
+
+```console
+$ uv run thorn status --agency ~/.thorn
+```
+
+Add `--json` for scripts and dashboards.  To inspect the local work
+queue before requeueing anything:
+
+```console
+$ uv run thorn inbox list --agency ~/.thorn
+$ uv run thorn inbox show <item-id> --agency ~/.thorn
+```
+
+`thorn status` remains useful while the gateway is stopped; live-only
+signals such as heartbeat freshness and source polling are reported
+as stopped, stale, or unknown from the last heartbeat file.
+
 If the gateway receives a forge notification and then cannot prompt
 the coordinator -- for example because the LLM provider key was bad
 or the provider was unavailable long enough for the item to be parked

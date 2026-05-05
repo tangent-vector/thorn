@@ -33,7 +33,10 @@ from thorn.gateway._event import (
     ContextItemKind,
     EventKind,
     EventSource,
+    EventSourceStatusSnapshot,
+    EventSourceStatusState,
     RawIncomingEvent,
+    event_source_status_timestamp,
 )
 from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
 from thorn.runtime._session import SessionKey
@@ -491,10 +494,29 @@ class GitLabTODOsSource(EventSource):
         self._project_events_baselined = False
         self._project_resolver = GitLabProjectResolver(self._gl.projects)
         self._stop_event: asyncio.Event | None = None
+        self._last_poll_started_at: str | None = None
+        self._last_poll_finished_at: str | None = None
+        self._last_error: str | None = None
+        self._last_event_count: int | None = None
+        self._poll_count = 0
+        self._status_state = EventSourceStatusState.STARTING
 
     @property
     def name(self) -> str:
         return self._service_name
+
+    def status_snapshot(self) -> EventSourceStatusSnapshot:
+        name = self.name or type(self).__name__
+        return EventSourceStatusSnapshot(
+            name=name,
+            source_type=type(self).__name__,
+            state=self._status_state,
+            last_poll_started_at=self._last_poll_started_at,
+            last_poll_finished_at=self._last_poll_finished_at,
+            last_error=self._last_error,
+            last_event_count=self._last_event_count,
+            poll_count=self._poll_count,
+        )
 
     async def start(
         self,
@@ -529,6 +551,7 @@ class GitLabTODOsSource(EventSource):
     async def stop(self) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
+        self._status_state = EventSourceStatusState.STOPPED
 
     def _check_connection(self) -> dict[str, Any]:
         self._gl.auth()
@@ -545,58 +568,83 @@ class GitLabTODOsSource(EventSource):
         self,
         on_event: Callable[[RawIncomingEvent], Awaitable[None]],
     ) -> None:
-        todos = await asyncio.to_thread(self._get_pending_todos)
-        new_todos = [t for t in todos if t.id not in self._seen]
-        if new_todos:
-            log.info(
-                "Found %d new TODO(s) out of %d pending",
-                len(new_todos), len(todos),
-            )
-        id_to_name = self._config.project_id_to_name
-        for todo in new_todos:
-            self._seen.add(todo.id)
-            event = _make_raw_event(
-                todo,
-                project_id_to_name=id_to_name,
-                gitlab_url=self._config.url,
-                forge_name=self._config.forge_name,
-            )
-            try:
-                await on_event(event)
-            except Exception:
-                # Intentionally swallow per-TODO errors so one bad
-                # TODO doesn't poison the whole poll cycle.  Skip
-                # mark-done: without a confirmed post we want the
-                # TODO to reappear on the next poll so we can retry.
-                log.exception(
-                    "Failed to post event for GitLab TODO %s", todo.id,
+        started_at = event_source_status_timestamp()
+        self._last_poll_started_at = started_at
+        delivered_count = 0
+        try:
+            todos = await asyncio.to_thread(self._get_pending_todos)
+            new_todos = [t for t in todos if t.id not in self._seen]
+            if new_todos:
+                log.info(
+                    "Found %d new TODO(s) out of %d pending",
+                    len(new_todos), len(todos),
                 )
-                continue
-
-            # Proactively mark the TODO as done on GitLab's side once
-            # it has been safely handed off to the gateway.  This
-            # happens regardless of whether the gateway delivered,
-            # deduplicated, or *dropped* the event: drops are
-            # terminal in the formatter's contract, so we want the
-            # platform to stop resurfacing the entity in all three
-            # cases.  If an earlier copy is already in flight (dedup
-            # path) the agent will still handle it; if mark_as_done
-            # itself fails we just log and move on -- the ``_seen``
-            # cache prevents a re-emit within this process, and a
-            # restart will retry via the normal pending-TODOs path.
-            try:
-                await asyncio.to_thread(todo.mark_as_done)
-            except Exception:
-                log.exception(
-                    "Failed to mark GitLab TODO %s as done", todo.id,
+            id_to_name = self._config.project_id_to_name
+            for todo in new_todos:
+                self._seen.add(todo.id)
+                event = _make_raw_event(
+                    todo,
+                    project_id_to_name=id_to_name,
+                    gitlab_url=self._config.url,
+                    forge_name=self._config.forge_name,
                 )
+                try:
+                    await on_event(event)
+                except Exception:
+                    # Intentionally swallow per-TODO errors so one bad
+                    # TODO doesn't poison the whole poll cycle.  Skip
+                    # mark-done: without a confirmed post we want the
+                    # TODO to reappear on the next poll so we can retry.
+                    log.exception(
+                        "Failed to post event for GitLab TODO %s", todo.id,
+                    )
+                    continue
 
-        await self._poll_project_events_once(on_event)
+                delivered_count += 1
+                # Proactively mark the TODO as done on GitLab's side once
+                # it has been safely handed off to the gateway.  This
+                # happens regardless of whether the gateway delivered,
+                # deduplicated, or *dropped* the event: drops are
+                # terminal in the formatter's contract, so we want the
+                # platform to stop resurfacing the entity in all three
+                # cases.  If an earlier copy is already in flight (dedup
+                # path) the agent will still handle it; if mark_as_done
+                # itself fails we just log and move on -- the ``_seen``
+                # cache prevents a re-emit within this process, and a
+                # restart will retry via the normal pending-TODOs path.
+                try:
+                    await asyncio.to_thread(todo.mark_as_done)
+                except Exception:
+                    log.exception(
+                        "Failed to mark GitLab TODO %s as done", todo.id,
+                    )
+
+            delivered_count += await self._poll_project_events_once(on_event)
+        except Exception as exc:
+            self._record_poll_error(started_at, exc)
+            raise
+        self._record_poll_success(started_at, delivered_count)
+
+    def _record_poll_success(self, started_at: str, event_count: int) -> None:
+        self._poll_count += 1
+        self._last_poll_started_at = started_at
+        self._last_poll_finished_at = event_source_status_timestamp()
+        self._last_event_count = event_count
+        self._last_error = None
+        self._status_state = EventSourceStatusState.OK
+
+    def _record_poll_error(self, started_at: str, exc: Exception) -> None:
+        self._poll_count += 1
+        self._last_poll_started_at = started_at
+        self._last_poll_finished_at = event_source_status_timestamp()
+        self._last_event_count = None
+        self._last_error = str(exc) or type(exc).__name__
+        self._status_state = EventSourceStatusState.ERROR
 
     async def _poll_project_events_once(
         self,
         on_event: Callable[[RawIncomingEvent], Awaitable[None]],
-    ) -> None:
+    ) -> int:
         project_events = await asyncio.to_thread(self._get_project_events)
         if not self._project_events_baselined:
             self._seen_project_events.update(
@@ -609,7 +657,7 @@ class GitLabTODOsSource(EventSource):
                     "closed-issue and merged-MR events will wake the gateway.",
                     len(project_events),
                 )
-            return
+            return 0
 
         new_events = [
             record
@@ -618,6 +666,7 @@ class GitLabTODOsSource(EventSource):
         ]
         if new_events:
             log.info("Found %d new GitLab project event(s)", len(new_events))
+        delivered_count = 0
         for record in new_events:
             project_event = record.event
             event_id = _project_event_id(project_event)
@@ -635,6 +684,8 @@ class GitLabTODOsSource(EventSource):
                 )
                 continue
             self._seen_project_events.add(event_id)
+            delivered_count += 1
+        return delivered_count
 
     def _get_pending_todos(self) -> list[Any]:
         return list(self._gl.todos.list(state="pending", iterator=True))
