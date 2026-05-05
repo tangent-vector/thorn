@@ -24,6 +24,14 @@ def test_quick_start_uses_current_host_side_gateway_flow() -> None:
     )
 
     assert "uv sync --all-extras" in quick_start
+    assert (
+        "git clone https://gitlab-master.nvidia.com/tfoley/thorn.git"
+        in quick_start
+    )
+    assert (
+        "git clone https://github.com/tangent-vector/thorn.git"
+        not in quick_start
+    )
     assert "$ uv run thorn serve bootstrap \\" in quick_start
     assert "--project-url https://github.com/owner/repo" in quick_start
     assert "--agency-home ~/.thorn" in quick_start

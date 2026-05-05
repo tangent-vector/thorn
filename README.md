@@ -25,7 +25,7 @@ Quick Start
 ### 1. Clone and sync the repository
 
 ```console
-$ git clone https://github.com/tangent-vector/thorn.git
+$ git clone https://gitlab-master.nvidia.com/tfoley/thorn.git
 $ cd thorn
 $ uv sync --all-extras
 ```
