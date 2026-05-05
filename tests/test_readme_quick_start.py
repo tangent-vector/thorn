@@ -41,6 +41,8 @@ def test_quick_start_uses_current_host_side_gateway_flow() -> None:
     preflight_command = "$ uv run thorn serve --agency ~/.thorn preflight"
     serve_command = "$ uv run thorn serve --agency ~/.thorn\n"
     assert quick_start.index(preflight_command) < quick_start.index(serve_command)
+    assert "event-source inference" in quick_start
+    assert "direct forge API access" in quick_start
 
 
 def test_quick_start_does_not_reintroduce_stale_bootstrap_flags() -> None:
