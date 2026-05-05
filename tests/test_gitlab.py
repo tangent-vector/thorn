@@ -52,7 +52,7 @@ def _project_info(project_id: int) -> SimpleNamespace:
     return SimpleNamespace(
         id=project_id,
         name="thorn",
-        name_with_namespace="Tim Foley / thorn",
+        name_with_namespace="Theresa Foley / thorn",
         path_with_namespace="tfoley/thorn",
         http_url_to_repo="https://gitlab.example.com/tfoley/thorn.git",
         ssh_url_to_repo="git@gitlab.example.com:tfoley/thorn.git",
