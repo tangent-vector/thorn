@@ -41,10 +41,10 @@ out-of-scope):**
   a follow-up resolves the JWT-minting story (the broker currently
   can substitute a static value but not produce a per-request
   JWT).
-* Allow-list **enforcement**. The schema lands in this phase
-  (`sandbox.egress_allowlist` parses, the gateway logs a warning
-  when non-empty), but the firewall mechanism is open question
-  R3 and ships in a follow-up.
+* Allow-list **enforcement**. The planned-intent schema lands in
+  this phase (`sandbox.planned_egress_allowlist` parses, the gateway
+  logs a warning when non-empty), but the firewall mechanism is open
+  question R3 and ships in a follow-up.
 * Per-agent admin-event-driven broker registration. The startup
   registration loop covers every agent that the agency has
   persisted; agents that are created post-startup via admin events
@@ -126,8 +126,8 @@ proxy to substitute against.
 | `SandboxBrokerBinding` (Protocol)        | `thorn/runtime/_runtime.py`              | Layering seam: runtime reads three fields, gateway's binding satisfies it.    |
 | Container broker fields                  | `thorn/sandbox/_container.py`            | `broker_proxy_url`, `broker_ca_host_path`, `broker_placeholder_env`, `egress_network`. |
 | `_broker_env_entries`                    | `thorn/sandbox/_container.py`            | Emits HTTP[S]_PROXY (both cases), NO_PROXY, SSL_CERT_FILE / REQUESTS_CA_BUNDLE / NODE_EXTRA_CA_CERTS / GIT_SSL_CAINFO. |
-| `EgressAllowlistEntry`                   | `thorn/gateway/_config.py`               | Typed `(host, port)` entry for `sandbox.egress_allowlist`.                    |
-| `Gateway._warn_if_egress_allowlist_unenforced` | `thorn/gateway/_gateway.py`        | Startup warning when allow-list is non-empty (R3 enforcement gap).             |
+| `PlannedEgressAllowlistEntry`            | `thorn/gateway/_config.py`               | Typed `(host, port)` entry for inactive `sandbox.planned_egress_allowlist`.   |
+| `Gateway._warn_if_planned_egress_allowlist_configured` | `thorn/gateway/_gateway.py` | Startup warning when the planned allow-list is non-empty (R3 enforcement gap). |
 | Compose bundling                         | `deploy/broker.compose.yml`, `deploy/all-in-container.compose.yml` | Broker stack (OneCLI + Postgres + `thorn-broker` / `thorn-default` networks) is deployment-mode-agnostic; the all-in-container variant `include:`s it and adds a gateway service. |
 
 ### Configuration surface
@@ -174,7 +174,7 @@ proxy to substitute against.
     "backend": "container",
     "image": "thorn-sandbox:0.1.0",
     "egress_network": "thorn-broker",
-    "egress_allowlist": [
+    "planned_egress_allowlist": [
       {"host": "status.internal", "port": 8080}
     ]
   }
@@ -187,11 +187,12 @@ proxy to substitute against.
   implements the broker-only egress policy without Thorn touching
   iptables. The bundled `deploy/broker.compose.yml` ships exactly
   this shape under the (pinned) name `thorn-broker`.
-* `egress_allowlist`: typed `(host, port)` entries the operator
-  declares as direct-egress exceptions. **Schema-only** in this
-  phase — the gateway logs a warning at startup when the list is
-  non-empty so operators are not surprised. Enforcement is
-  open question R3 and ships in a follow-up.
+* `planned_egress_allowlist`: typed `(host, port)` entries the
+  operator records as future direct-egress exceptions. **Inactive
+  schema-only** in this phase — the gateway logs a warning at startup
+  when the list is non-empty so operators are not surprised.
+  Enforcement is open question R3 and ships in a follow-up. The
+  active-sounding `egress_allowlist` key is rejected.
 
 `agent.json`'s sandbox override surface deliberately does **not**
 include `egress_*` fields: the broker-only invariant is operator
@@ -377,7 +378,7 @@ resolved by reading OneCLI source ahead of implementation:
   OneCLI agent and tears it down on shutdown.
 
 `R3` (egress mechanism) remains open at the time of writing;
-the broker-only baseline above is in place, and the allow-list
+the broker-only baseline above is in place, and the planned allow-list
 schema parses without enforcement.
 
 ### Testing strategy
@@ -407,7 +408,7 @@ implementation as worth a dedicated follow-up.
 
 ### Allow-list enforcement (R3)
 
-Schema is in place; enforcement is the open question. Three
+The planned schema is in place; enforcement is the open question. Three
 candidate mechanisms surfaced in the plan:
 
 1. Per-agent OCI network with iptables rules added at container
@@ -415,9 +416,10 @@ candidate mechanisms surfaced in the plan:
 2. Separate network namespace with explicit forwarding rules.
 3. OCI-runtime egress hooks (podman / docker custom networks).
 
-The mechanism likely differs between podman and docker. The
-contract — broker-only plus `(host, port)` allow-list — is
-fixed; the implementation choice is open.
+The mechanism likely differs between podman and docker. The future
+contract — broker-only plus `(host, port)` allow-list — is intended,
+but the implementation choice remains open and the current field is
+deliberately named as planned configuration.
 
 ### Admin-event broker registration
 
@@ -463,9 +465,9 @@ follow-up.
   * `src/thorn/core/_credentials.py`
   * `src/thorn/gateway/_broker.py`
   * `src/thorn/gateway/_config.py` (`BrokerConfig`,
-    `EgressAllowlistEntry`, `SandboxConfig` egress fields)
+    `PlannedEgressAllowlistEntry`, `SandboxConfig` egress fields)
   * `src/thorn/gateway/_gateway.py` (registration / teardown
-    hooks, lookup install, allow-list warning)
+    hooks, lookup install, planned allow-list warning)
   * `src/thorn/runtime/_runtime.py` (lookup install / consume,
     Protocol)
   * `src/thorn/sandbox/_container.py` (broker fields, env

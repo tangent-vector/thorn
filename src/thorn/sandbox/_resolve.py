@@ -16,12 +16,11 @@ the call sites.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 from thorn.gateway._config import (
     AgentSandboxOverride,
-    EgressAllowlistEntry,
     SandboxConfig,
 )
 from thorn.sandbox._image import default_sandbox_image_tag
@@ -51,7 +50,6 @@ class ResolvedSandboxConfig:
     dev_mount_runtime: bool
     container_ready_timeout_s: float
     egress_network: str | None
-    egress_allowlist: tuple[EgressAllowlistEntry, ...]
 
     # Phase E hardening, all populated.
     capabilities_drop: tuple[str, ...]
@@ -129,8 +127,10 @@ def resolve_sandbox_config(
       that should apply uniformly across an agency).
     * ``container_ready_timeout_s``: agent overrides agency overrides
       30s default.
-    * ``egress_network``, ``egress_allowlist``: agency-only at
-      this writing.  See the Phase D retro for rationale.
+    * ``egress_network``: agency-only at this writing.  See the
+      Phase D retro for rationale.  ``planned_egress_allowlist`` is
+      deliberately not projected into this runtime config because it
+      records future operator intent, not current executable policy.
     * Phase E hardening lists (``capabilities_drop``,
       ``capabilities_add``, ``security_opts``): *additive*, same
       semantics as ``env_passthrough``.  An empty per-agent list
@@ -204,15 +204,13 @@ def resolve_sandbox_config(
         extra_env=extra_env,
         dev_mount_runtime=a.dev_mount_runtime,
         container_ready_timeout_s=timeout,
-        # Phase D: egress fields are agency-only.  No per-agent
-        # override surface today: the network and allow-list are
-        # operator-controlled because letting an agent narrow or
-        # widen them would defeat the broker-only invariant.  If a
-        # specialised agent ever needs different egress, the right
-        # mechanism is a separate agency, not a per-agent escape
-        # hatch.
+        # Phase D: egress_network is agency-only.  No per-agent
+        # override surface today: the network is operator-controlled
+        # because letting an agent choose direct egress would defeat
+        # the broker-only invariant.  If a specialised agent ever
+        # needs different egress, the right mechanism is a separate
+        # agency, not a per-agent escape hatch.
         egress_network=a.egress_network,
-        egress_allowlist=tuple(a.egress_allowlist),
         capabilities_drop=capabilities_drop,
         capabilities_add=capabilities_add,
         security_opts=security_opts,

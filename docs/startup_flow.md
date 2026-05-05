@@ -155,6 +155,13 @@ DNS (`onecli:10255`) and have no direct internet egress.  All
 upstream HTTP requests flow through the substitution proxy, which
 injects the broker-issued credentials and forwards the call.
 
+`sandbox.egress_network` is the only active egress control Thorn
+applies today.  `sandbox.planned_egress_allowlist` can record future
+direct-egress exceptions, but it is not enforced and the gateway logs
+a startup warning when it is non-empty.  The removed
+`sandbox.egress_allowlist` key is rejected so operators do not mistake
+planned intent for an active allow-list.
+
 ### 7. Steady state
 
 After all of the above, the gateway hands over to its event-source

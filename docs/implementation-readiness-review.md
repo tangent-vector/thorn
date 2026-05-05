@@ -215,13 +215,14 @@ cleanup, not before.
 
 ### 6. Close or clearly label the egress allowlist gap
 
-`SandboxConfig.egress_allowlist` is parsed, but enforcement is explicitly not
-wired. The gateway logs a warning when it is non-empty. That is acceptable for
-internal dogfooding, but not for users who may read "allowlist" as a security
-control.
+Resolution: `SandboxConfig.planned_egress_allowlist` is parsed as future
+operator intent, but enforcement is explicitly not wired. The gateway logs a
+warning when it is non-empty, and the removed `sandbox.egress_allowlist` key is
+rejected so users cannot read "allowlist" as an active security control.
 
-Before sharing, either implement enforcement or rename/document it as planned
-configuration that currently has no effect.
+Full enforcement remains Phase D R3 follow-up work; until then the active
+egress boundary is `sandbox.egress_network` plus the attached OCI network
+topology.
 
 ### Closed Original P0 Items
 

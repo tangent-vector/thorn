@@ -523,7 +523,7 @@ class Gateway:
             validate_agent_accounts(agent, self._runtime.get_service)
             self._ensure_scheduler_for_agent(agent)
 
-        self._warn_if_egress_allowlist_unenforced()
+        self._warn_if_planned_egress_allowlist_configured()
 
         # Bundled-broker bring-up runs *before* broker registration
         # and *before* sandbox-executor preload.  The supervisor
@@ -1175,36 +1175,30 @@ class Gateway:
     # Phase D: broker registration / teardown
     # ------------------------------------------------------------------
 
-    def _warn_if_egress_allowlist_unenforced(self) -> None:
-        """Log a warning when ``sandbox.egress_allowlist`` is non-empty.
+    def _warn_if_planned_egress_allowlist_configured(self) -> None:
+        """Log when ``planned_egress_allowlist`` is non-empty.
 
-        Phase D ships the schema for the operator-configurable
-        allow-list (``EgressAllowlistEntry`` list under
-        ``gateway.json`` ``sandbox.egress_allowlist``) so deployments
-        can declare their intended exceptions ahead of enforcement
-        landing.  The actual firewall mechanism is the open question
-        ``R3`` in the Phase D plan -- per-agent network with iptables
-        rules vs. separate netns vs. OCI-runtime hooks.  We surface
-        the gap loudly at startup so an operator who declares
-        ``[{host: foo, port: 443}]`` and expects direct access to
-        work does not silently observe broker-only egress.
+        Direct per-host allow-list enforcement remains Phase D R3.
+        The active security boundary is only the sandbox's OCI
+        network membership, so planned exceptions need to be noisy at
+        startup rather than silently masquerading as an enforced
+        policy.
         """
         config = self._runtime.sandbox_config
         if config is None:
             return
-        if not config.egress_allowlist:
+        if not config.planned_egress_allowlist:
             return
         rendered = ", ".join(
-            f"{e.host}:{e.port}" for e in config.egress_allowlist
+            f"{e.host}:{e.port}" for e in config.planned_egress_allowlist
         )
         log.warning(
-            "sandbox.egress_allowlist is configured (%s) but enforcement "
-            "is not yet implemented (Phase D plan, open question R3); "
-            "the entries are parsed and visible in config but the "
-            "container's outbound is restricted only by "
-            "sandbox.egress_network membership.  "
-            "Operators relying on the allow-list should treat this "
-            "release as broker-only egress until R3 is resolved.",
+            "sandbox.planned_egress_allowlist is configured (%s), but "
+            "it has no runtime effect today. Thorn does not enforce "
+            "per-host direct egress yet (Phase D open question R3); "
+            "container outbound is restricted only by "
+            "sandbox.egress_network membership and the attached OCI "
+            "network topology.",
             rendered,
         )
 
