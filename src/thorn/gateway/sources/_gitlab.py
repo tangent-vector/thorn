@@ -15,6 +15,13 @@ The source captures the TODO ``author`` (numeric ``id``, ``username``,
 and bot flag) into an :class:`~thorn.gateway._actor.ActorIdentity` so
 the gateway's peer registry can look up the actor without
 re-fetching the user from GitLab.
+
+GitLab TODO acknowledgement is handoff-based: after the gateway
+callback accepts a TODO event, this source marks that TODO done on
+GitLab even though the agent may still be handling the local inbox
+item.  If gateway handoff raises, the TODO is left pending for a
+later poll.  Project-event polling is read-only and does not mutate
+upstream project events.
 """
 
 from __future__ import annotations

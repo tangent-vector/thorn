@@ -4,12 +4,15 @@ Polls ``GET /notifications`` (the user-scoped Notifications API) to
 discover @-mentions, assignments, review requests, and other activity
 directed at the authenticated bot user.
 
-Read/unread state lives on GitHub.  After delivering a
+Read/unread state lives on GitHub.  This source uses handoff-based
+acknowledgement: after the gateway callback accepts a
 :class:`RawIncomingEvent` for a notification thread, the source
 ``PATCH``-es the thread to ``read`` so the next poll won't see it
-again.  At startup the source drains the existing unread set the
-same way so the agent isn't flooded with whatever accumulated while
-the gateway was down.  No client-side "seen" cache is maintained;
+again.  It does not wait for the agent to finish local inbox work.
+If gateway handoff raises, the thread is left unread for a later
+poll.  At startup the source drains the existing unread set the same
+way so the agent isn't flooded with whatever accumulated while the
+gateway was down.  No client-side "seen" cache is maintained;
 cross-poll deduplication of in-flight events is handled by the
 gateway's :class:`~thorn.runtime._in_flight_index.InFlightIndex`.
 
