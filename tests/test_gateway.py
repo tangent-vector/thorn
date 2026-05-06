@@ -2160,6 +2160,8 @@ class TestProjectCoordinator:
         tool_names = {getattr(t, "__name__", str(t)) for t in tools}
         assert "read_file" in tool_names
         assert "edit_file" in tool_names
+        assert "create_file" in tool_names
+        assert "write_file" not in tool_names
 
     def test_serialization_round_trip(self, tmp_path: Path, monkeypatch):
         from thorn.gateway._agents import ProjectCoordinator

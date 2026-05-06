@@ -121,7 +121,8 @@ Your responsibilities are ...
     ]
     tools = [
         read_file,
-        write_file,
+        create_file,
+        edit_file,
         list_directory,
         build_project,
         github_reading,

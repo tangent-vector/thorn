@@ -458,23 +458,6 @@ def _format_file_result(
 
 
 @tool(venue=ToolVenue.SANDBOX)
-async def write_file(path: str, content: str) -> str:
-    """Write content to a file, creating parent directories as needed.
-
-    .. deprecated::
-        Use ``edit_file`` for modifying existing files and
-        ``create_file`` for new files.  ``write_file`` remains
-        available for backward compatibility but is no longer
-        included in the default tool sets.
-    """
-    p = _resolve(path)
-    _enforce_access(str(p), "WRITE")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
-    return f"Wrote {len(content)} bytes to {path}"
-
-
-@tool(venue=ToolVenue.SANDBOX)
 async def delete_file(path: str) -> str:
     """Delete a file at the given path.
 

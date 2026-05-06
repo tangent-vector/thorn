@@ -168,6 +168,17 @@ class TestCatalogParity:
         expected_names = {fn.__name__ for fn in SANDBOXED_TOOLS}
         assert registered_names == expected_names
 
+    def test_write_file_is_not_registered_anywhere(self):
+        from thorn.core._func import _known_builtin_tools
+        from thorn.toolhost._server import build_default_registry
+
+        _registry, table = build_default_registry()
+        known_names = {fn.__name__ for fn in _known_builtin_tools()}
+
+        assert "write_file" not in known_names
+        assert "write_file" not in table
+        assert "write_file" not in {fn.__name__ for fn in SANDBOXED_TOOLS}
+
     def test_in_process_tools_absent_from_daemon_registry(self):
         # The daemon must not see in-process tools: those need brain
         # state it doesn't have, and registering them there would mask
