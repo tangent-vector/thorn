@@ -16,14 +16,18 @@ import asyncio
 import fnmatch as fnmatch_mod
 import re
 import shutil
+import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TextIO
 
 from pydantic import Field
 from pydantic.dataclasses import dataclass
 
 from thorn.core._executor import ToolVenue
 from thorn.core._func import tool
+from thorn.core._history import DirectoryListCallNode, FileReadCallNode
 
 
 def _resolve(path: str) -> Path:
@@ -211,6 +215,9 @@ async def read_file(
 EDIT_CONTEXT_LINES: int = 4
 """Lines of context shown around each edit region in ``edit_file`` results."""
 
+EditedLineRegion = tuple[int, int]
+"""Inclusive line range affected by an ``edit_file`` replacement."""
+
 
 @dataclass
 class FileEdit:
@@ -232,36 +239,58 @@ class FileEdit:
     )
 
 
-@tool(venue=ToolVenue.SANDBOX)
-async def edit_file(path: str, edits: list[FileEdit]) -> str:
-    """Apply one or more find-and-replace edits to an existing file.
+@contextmanager
+def _open_text_file_for_locked_update(path: Path) -> Generator[TextIO, None, None]:
+    """Open *path* for update and hold the writer lock until writes flush."""
+    with path.open("r+", encoding="utf-8") as file:
+        with _exclusive_file_lock(file):
+            try:
+                yield file
+            finally:
+                file.flush()
 
-    Each edit replaces exactly one occurrence of ``old_string`` with
-    ``new_string``.  Edits are applied sequentially; later edits match
-    against the content resulting from earlier ones.
 
-    Returns a contextual view of the file around each edited region so
-    the caller can verify the changes without a separate ``read_file``.
+@contextmanager
+def _exclusive_file_lock(file: TextIO) -> Generator[None, None, None]:
+    if sys.platform == "win32":
+        with _exclusive_win32_file_lock(file):
+            yield
+        return
 
-    Args:
-        path: Filesystem path to the file to edit.
-        edits: Edits to apply in order.  Each edit's ``old_string``
-            must match exactly once in the file at the time it is
-            applied.
-    """
-    p = _resolve(path)
-    _enforce_access(str(p), "WRITE")
-    if not p.is_file():
-        raise FileNotFoundError(f"File not found: {path}")
+    import fcntl
 
-    if not edits:
-        content = p.read_text(encoding="utf-8")
-        total = len(content.splitlines())
-        return f"No edits to apply. {path} is unchanged ({total} lines)."
+    fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(file.fileno(), fcntl.LOCK_UN)
 
-    content = p.read_text(encoding="utf-8")
 
-    edit_regions: list[tuple[int, int]] = []
+@contextmanager
+def _exclusive_win32_file_lock(file: TextIO) -> Generator[None, None, None]:
+    import msvcrt
+
+    original_position = file.tell()
+    file.seek(0)
+    msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1)
+    file.seek(original_position)
+    try:
+        yield
+    finally:
+        unlock_position = file.tell()
+        file.seek(0)
+        try:
+            msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            file.seek(unlock_position)
+
+
+def _apply_file_edits(
+    content: str,
+    edits: list[FileEdit],
+    path: str,
+) -> tuple[str, list[EditedLineRegion]]:
+    edit_regions: list[EditedLineRegion] = []
 
     for i, edit in enumerate(edits):
         label = f"Edit {i + 1}/{len(edits)}"
@@ -306,21 +335,58 @@ async def edit_file(path: str, edits: list[FileEdit]) -> str:
         if line_delta != 0:
             edit_end_in_old = start_line + old_newlines
             for j in range(len(edit_regions)):
-                r_start, r_end = edit_regions[j]
-                if r_start > edit_end_in_old:
+                region_start, region_end = edit_regions[j]
+                if region_start > edit_end_in_old:
                     edit_regions[j] = (
-                        r_start + line_delta,
-                        r_end + line_delta,
+                        region_start + line_delta,
+                        region_end + line_delta,
                     )
 
         edit_regions.append((start_line, end_line))
 
-    p.write_text(content, encoding="utf-8")
+    return content, edit_regions
 
-    all_lines = content.splitlines()
-    header = f"Applied {len(edits)} edit(s) to {path}."
-    body = _format_file_result(all_lines, edit_regions)
-    return f"{header}\n{body}"
+
+@tool(venue=ToolVenue.SANDBOX)
+async def edit_file(path: str, edits: list[FileEdit]) -> str:
+    """Apply one or more find-and-replace edits to an existing file.
+
+    Each edit replaces exactly one occurrence of ``old_string`` with
+    ``new_string``.  Edits are applied sequentially; later edits match
+    against the content resulting from earlier ones.  The file is held
+    open for update with an exclusive advisory lock while Thorn reads,
+    applies, and writes the edit transaction.
+
+    Returns a contextual view of the file around each edited region so
+    the caller can verify the changes without a separate ``read_file``.
+
+    Args:
+        path: Filesystem path to the file to edit.
+        edits: Edits to apply in order.  Each edit's ``old_string``
+            must match exactly once in the file at the time it is
+            applied.
+    """
+    p = _resolve(path)
+    _enforce_access(str(p), "WRITE")
+    if not p.is_file():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    with _open_text_file_for_locked_update(p) as file:
+        content = file.read()
+
+        if not edits:
+            total = len(content.splitlines())
+            return f"No edits to apply. {path} is unchanged ({total} lines)."
+
+        content, edit_regions = _apply_file_edits(content, edits, path)
+        file.seek(0)
+        file.write(content)
+        file.truncate()
+
+        all_lines = content.splitlines()
+        header = f"Applied {len(edits)} edit(s) to {path}."
+        body = _format_file_result(all_lines, edit_regions)
+        return f"{header}\n{body}"
 
 
 @tool(venue=ToolVenue.SANDBOX)
@@ -371,7 +437,7 @@ async def create_file(path: str, content: str) -> str:
 
 def _format_file_result(
     lines: list[str],
-    regions: list[tuple[int, int]],
+    regions: list[EditedLineRegion],
 ) -> str:
     """Format a view of file content highlighting specific regions.
 
@@ -895,11 +961,8 @@ async def run_shell(
     return output
 
 
-# Register ToolCallNode subclasses on built-in tools so that
-# HistoryTree records typed nodes, enabling isinstance-based
-# identification (e.g. in context injection).
-from thorn.core._history import DirectoryListCallNode, FileReadCallNode
-
+# Register ToolCallNode subclasses on built-in tools so that HistoryTree records
+# typed nodes, enabling isinstance-based identification (e.g. in context injection).
 read_file._thorn_call_node_class = FileReadCallNode  # type: ignore[attr-defined]
 list_directory._thorn_call_node_class = DirectoryListCallNode  # type: ignore[attr-defined]
 
