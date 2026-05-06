@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import queue
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
-from thorn.core._history import DirectoryListCallNode, FileReadCallNode
 from thorn.core._context import (
     ExecutionContext,
     reset_context,
     set_context,
 )
+from thorn.core._history import DirectoryListCallNode, FileReadCallNode
 from thorn.core._provider import MockProvider
 from thorn.core._tools import (
     EDIT_CONTEXT_LINES,
@@ -21,7 +24,6 @@ from thorn.core._tools import (
     MAX_LIST_ENTRIES,
     MAX_READ_CHARS,
     MAX_READ_LINES,
-    MAX_SEARCH_CHARS,
     MAX_SEARCH_MATCHES,
     OUTLINE_THRESHOLD,
     FileEdit,
@@ -38,7 +40,6 @@ from thorn.core._tools import (
     search_files,
     write_file,
 )
-
 
 # ---------------------------------------------------------------------------
 # call_node_class registration on built-in tools
@@ -158,7 +159,9 @@ class TestReadFile:
         n = MAX_READ_LINES + 200
         p = _make_file(tmp_path, "big.txt", n)
         result = await read_file(str(p), offset=1, limit=MAX_READ_LINES)
-        numbered_lines = [l for l in result.split("\n") if "| line " in l]
+        numbered_lines = [
+            line for line in result.split("\n") if "| line " in line
+        ]
         assert len(numbered_lines) == MAX_READ_LINES
         assert "[Truncated:" in result
 
@@ -167,7 +170,9 @@ class TestReadFile:
         n = MAX_READ_LINES + 200
         p = _make_file(tmp_path, "big.txt", n)
         result = await read_file(str(p), limit=n)
-        numbered_lines = [l for l in result.split("\n") if "| line " in l]
+        numbered_lines = [
+            line for line in result.split("\n") if "| line " in line
+        ]
         assert len(numbered_lines) == MAX_READ_LINES
         assert "[Truncated:" in result
         assert f"of {n} total" in result
@@ -176,7 +181,9 @@ class TestReadFile:
         n = MAX_READ_LINES + 200
         p = _make_file(tmp_path, "overcap.txt", n)
         result = await read_file(str(p), limit=n)
-        numbered_lines = [l for l in result.split("\n") if "| line " in l]
+        numbered_lines = [
+            line for line in result.split("\n") if "| line " in line
+        ]
         assert len(numbered_lines) == MAX_READ_LINES
         assert "[Truncated:" in result
 
@@ -204,7 +211,7 @@ class TestReadFile:
         p = _make_file(tmp_path, "exact.txt", OUTLINE_THRESHOLD)
         result = await read_file(str(p))
         assert "[Outline:" not in result
-        assert f"1| line 1" in result
+        assert "1| line 1" in result
 
     async def test_file_just_above_threshold_outlined(self, tmp_path):
         n = OUTLINE_THRESHOLD + 1
@@ -378,6 +385,60 @@ class TestEditFile:
         assert "EDIT_B_1" in content
         assert "Applied 2 edit(s)" in result
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
+    def test_waits_for_existing_writer_before_reading(self, tmp_path):
+        import fcntl
+
+        path = tmp_path / "f.txt"
+        path.write_text("before\n", encoding="utf-8")
+        worker_started = threading.Event()
+        edit_results: queue.Queue[BaseException | str] = queue.Queue()
+
+        def run_edit_file() -> None:
+            worker_started.set()
+            try:
+                result = asyncio.run(edit_file(str(path), [
+                    FileEdit(old_string="before", new_string="after"),
+                ]))
+            except BaseException as exc:
+                edit_results.put(exc)
+                return
+
+            edit_results.put(result)
+
+        no_early_result = object()
+        early_result: object = no_early_result
+        worker = threading.Thread(target=run_edit_file, daemon=True)
+
+        with path.open("r+", encoding="utf-8") as locked_file:
+            fcntl.flock(locked_file.fileno(), fcntl.LOCK_EX)
+            try:
+                worker.start()
+                assert worker_started.wait(timeout=1)
+
+                try:
+                    early_result = edit_results.get(timeout=0.2)
+                except queue.Empty:
+                    pass
+
+                locked_file.seek(0)
+                locked_file.truncate()
+                locked_file.write("before\nparent\n")
+                locked_file.flush()
+            finally:
+                fcntl.flock(locked_file.fileno(), fcntl.LOCK_UN)
+
+        worker.join(timeout=2)
+        assert early_result is no_early_result
+        assert not worker.is_alive()
+
+        result = edit_results.get_nowait()
+        if isinstance(result, BaseException):
+            raise result
+
+        assert "Applied 1 edit(s)" in result
+        assert path.read_text(encoding="utf-8") == "after\nparent\n"
+
 
 # ---------------------------------------------------------------------------
 # create_file
@@ -476,7 +537,9 @@ class TestListDirectory:
         assert "b/" in result
         # depth 3 and beyond should be excluded
         lines = result.split("\n")
-        deep_entries = [l for l in lines if "d/" in l or "d/file.txt" in l]
+        deep_entries = [
+            line for line in lines if "d/" in line or "d/file.txt" in line
+        ]
         assert not deep_entries
 
     async def test_recursive_truncation(self, tmp_path):
@@ -569,7 +632,7 @@ class TestSearchFiles:
         assert "price is $100" in result
         # "$100" as regex would match "100" at end of line — verify it doesn't.
         lines = result.strip().split("\n")
-        match_lines = [l for l in lines if "| " in l]
+        match_lines = [line for line in lines if "| " in line]
         assert len(match_lines) == 1
 
     async def test_recursive_directory_search(self, tmp_path):
