@@ -14,14 +14,19 @@ from thorn.core._messages import (
 )
 from thorn.core._provider import (
     FinishChunk,
+    LLMConfig,
+    LLMModelConfig,
+    LLMProviderType,
     MockProvider,
     OpenAIProvider,
     OpenAIProviderConfig,
+    OpenAIProviderSettings,
     TextChunk,
     ToolCallChunk,
     _iter_sse_chunks,
     _message_to_openai,
     _parse_retry_after,
+    load_provider_from_config,
     load_provider_from_env,
 )
 from thorn.core.errors import (
@@ -222,7 +227,7 @@ class TestLoadProviderFromEnv:
         monkeypatch.setenv("OPENAI_MAX_TOKENS", "8192")
         provider = load_provider_from_env()
         assert isinstance(provider, OpenAIProvider)
-        assert provider.config.max_tokens == 8192
+        assert provider.config.model_options == {"max_tokens": 8192}
 
     def test_max_tokens_absent_from_env(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_URL", "http://localhost")
@@ -231,7 +236,7 @@ class TestLoadProviderFromEnv:
         monkeypatch.delenv("OPENAI_MAX_TOKENS", raising=False)
         provider = load_provider_from_env()
         assert isinstance(provider, OpenAIProvider)
-        assert provider.config.max_tokens is None
+        assert provider.config.model_options == {}
 
     def test_max_tokens_non_integer_raises(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_URL", "http://localhost")
@@ -242,22 +247,94 @@ class TestLoadProviderFromEnv:
             load_provider_from_env()
 
 
+class TestLoadProviderFromConfig:
+    def test_config_supplies_non_secret_provider_and_model_settings(
+        self, monkeypatch,
+    ):
+        monkeypatch.delenv("OPENAI_API_URL", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_MODEL_NAME", raising=False)
+        monkeypatch.setenv("THORN_LLM_KEY", "secret-value")
+
+        provider = load_provider_from_config(LLMConfig(
+            provider=OpenAIProviderSettings(
+                type=LLMProviderType.OPENAI,
+                api_url="https://llm.example/v1",
+                api_key_env_var="THORN_LLM_KEY",
+            ),
+            model=LLMModelConfig(
+                name="agent-model",
+                options={"max_tokens": 2048, "reasoning_effort": "medium"},
+            ),
+        ))
+
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.config.api_url == "https://llm.example/v1"
+        assert provider.config.api_key == "secret-value"
+        assert provider.config.model_name == "agent-model"
+        assert provider.config.model_options == {
+            "max_tokens": 2048,
+            "reasoning_effort": "medium",
+        }
+
+    def test_config_path_ignores_legacy_non_secret_env(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_URL", "https://llm.example/v1")
+        monkeypatch.setenv("OPENAI_API_KEY", "key")
+        monkeypatch.setenv("OPENAI_API_MODEL_NAME", "env-model")
+        monkeypatch.setenv("OPENAI_MAX_TOKENS", "8192")
+        monkeypatch.setenv("THORN_LLM_KEY", "configured-key")
+
+        provider = load_provider_from_config(LLMConfig(
+            provider=OpenAIProviderSettings(
+                type=LLMProviderType.OPENAI,
+                api_url="https://configured.example/v1",
+                api_key_env_var="THORN_LLM_KEY",
+            ),
+            model=LLMModelConfig(
+                name="configured-model",
+            ),
+        ))
+
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.config.api_url == "https://configured.example/v1"
+        assert provider.config.api_key == "configured-key"
+        assert provider.config.model_name == "configured-model"
+        assert provider.config.model_options == {}
+
+    def test_missing_configured_api_key_env_var_is_reported(self, monkeypatch):
+        monkeypatch.delenv("MISSING_LLM_KEY", raising=False)
+
+        with pytest.raises(ProviderError, match="MISSING_LLM_KEY"):
+            load_provider_from_config(LLMConfig(
+                provider=OpenAIProviderSettings(
+                    type=LLMProviderType.OPENAI,
+                    api_url="https://llm.example/v1",
+                    api_key_env_var="MISSING_LLM_KEY",
+                ),
+                model=LLMModelConfig(name="model"),
+            ))
+
+    def test_missing_configured_provider_and_model_are_reported(self):
+        with pytest.raises(ProviderError, match="llm.provider") as exc_info:
+            load_provider_from_config(LLMConfig(), environ={})
+        assert "llm.model" in str(exc_info.value)
+
+
 # ---------------------------------------------------------------------------
-# OpenAIProvider max_tokens in request body
+# OpenAIProvider model options in request body
 # ---------------------------------------------------------------------------
 
-class TestOpenAIProviderMaxTokens:
-    """Verify that max_tokens is conditionally included in the HTTP body."""
+class TestOpenAIProviderModelOptions:
+    """Verify provider/model-specific options are added to the HTTP body."""
 
     async def test_max_tokens_included_when_set(self):
-        """When max_tokens is configured, the request body includes it."""
         captured_bodies: list[dict] = []
 
         config = OpenAIProviderConfig(
             api_url="http://localhost:1234",
             api_key="test",
             model_name="test-model",
-            max_tokens=4096,
+            model_options={"max_tokens": 4096},
         )
         provider = OpenAIProvider(config)
 
@@ -283,7 +360,6 @@ class TestOpenAIProviderMaxTokens:
         assert captured_bodies[0]["max_tokens"] == 4096
 
     async def test_max_tokens_omitted_when_none(self):
-        """When max_tokens is None, the request body does not contain the key."""
         captured_bodies: list[dict] = []
 
         config = OpenAIProviderConfig(
@@ -312,6 +388,46 @@ class TestOpenAIProviderMaxTokens:
 
         assert len(captured_bodies) == 1
         assert "max_tokens" not in captured_bodies[0]
+
+    async def test_reasoning_effort_included_when_set(self):
+        captured_bodies: list[dict] = []
+
+        config = OpenAIProviderConfig(
+            api_url="http://localhost:1234",
+            api_key="test",
+            model_name="test-model",
+            model_options={"reasoning_effort": "high", "temperature": 0.2},
+        )
+        provider = OpenAIProvider(config)
+
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def capturing_stream(method, url, *, json=None, **kwargs):
+            captured_bodies.append(json)
+            fake = _FakeHttpResponse(200, [
+                'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}',
+                "data: [DONE]",
+            ])
+            yield fake
+
+        provider._client.stream = capturing_stream  # type: ignore[assignment]
+
+        async for _ in provider.complete(["sys"], [], [UserMessage(content="hi")]):
+            pass
+
+        assert len(captured_bodies) == 1
+        assert captured_bodies[0]["reasoning_effort"] == "high"
+        assert captured_bodies[0]["temperature"] == 0.2
+
+    def test_model_options_cannot_replace_thorn_managed_fields(self):
+        with pytest.raises(ProviderError, match="messages"):
+            OpenAIProviderConfig(
+                api_url="http://localhost:1234",
+                api_key="test",
+                model_name="test-model",
+                model_options={"messages": []},
+            )
 
 
 class _FakeHttpResponse:

@@ -288,7 +288,7 @@ class Agent:
         policy (write within workspace, ``.thorn/`` read-only) is
         returned.
         """
-        from thorn.core._file_access import FileAccessLevel, FileAccessRule as _FAR  # noqa: F811
+        from thorn.core._file_access import FileAccessRule as _FAR
 
         collected: list[_FAR] = []
         found_any = False
@@ -458,6 +458,9 @@ async def _run_session_prompt(
         file_access_policy=policy,
         session_key=str(session.key) if session.key is not None else None,
     )
+
+    if ctx.runtime is not None:
+        child.provider = ctx.runtime.provider_for_session(session)
 
     if ctx.runtime is not None and child.sandbox_executor is None:
         runtime_executor = ctx.runtime.get_or_create_sandbox_executor(agent)

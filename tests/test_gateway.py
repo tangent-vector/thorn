@@ -2512,6 +2512,46 @@ class TestGatewayConfigLoading:
         assert config.forges == []
         assert config.projects == []
 
+    def test_load_llm_config(self, tmp_path: Path):
+        import json
+
+        from thorn.gateway._config import load_gateway_config
+
+        thorn_dir = tmp_path / ".thorn"
+        thorn_dir.mkdir()
+        (thorn_dir / "gateway.json").write_text(
+            json.dumps({
+                "llm": {
+                    "provider": {
+                        "type": "openai",
+                        "api_url": "https://llm.example/v1",
+                        "api_key_env_var": "THORN_LLM_KEY",
+                    },
+                    "model": {
+                        "name": "agency-model",
+                        "options": {
+                            "max_tokens": 4096,
+                            "reasoning_effort": "medium",
+                        },
+                    },
+                },
+                "forges": [],
+                "projects": [],
+            }),
+            encoding="utf-8",
+        )
+
+        config = load_gateway_config(thorn_dir)
+        assert config.llm.provider is not None
+        assert config.llm.provider.api_url == "https://llm.example/v1"
+        assert config.llm.provider.api_key_env_var == "THORN_LLM_KEY"
+        assert config.llm.model is not None
+        assert config.llm.model.name == "agency-model"
+        assert config.llm.model.options == {
+            "max_tokens": 4096,
+            "reasoning_effort": "medium",
+        }
+
     def test_load_defaults_to_empty_arrays(self, tmp_path: Path):
         import json
 
@@ -3725,10 +3765,8 @@ class TestBootstrapCoordinator:
         :func:`load_gateway_config` and picks up the auto-filled
         secure defaults (container sandbox + bundled broker).
 
-        This is the load-bearing assertion for the "just run thorn
-        serve" promise: bootstrap writes only the project / workspace
-        entries, and the new GatewayConfig defaults fill in the
-        sandbox + broker shapes that ``thorn serve`` needs.
+        Bootstrap can omit explicit sandbox/broker blocks; the schema
+        validators fill in those runtime defaults.
         """
         from thorn.gateway._bootstrap import bootstrap_coordinator
         from thorn.gateway._config import load_gateway_config
@@ -3749,6 +3787,39 @@ class TestBootstrapCoordinator:
         assert loaded.broker is not None
         assert loaded.broker.mode == "bundled"
         assert loaded.broker.enabled is True
+
+    def test_bootstrap_can_write_llm_config(self, tmp_path: Path):
+        from thorn.core._provider import (
+            LLMConfig,
+            LLMModelConfig,
+            LLMProviderType,
+            OpenAIProviderSettings,
+        )
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+        from thorn.gateway._config import load_gateway_config
+
+        bootstrap_coordinator(
+            agency_home=tmp_path / ".thorn",
+            agency_workspace=tmp_path,
+            agent_id="test-coord",
+            project_name="my-project",
+            project_url="https://github.com/owner/my-project",
+            llm_config=LLMConfig(
+                provider=OpenAIProviderSettings(
+                    type=LLMProviderType.OPENAI,
+                    api_url="https://llm.example/v1",
+                    api_key_env_var="THORN_LLM_KEY",
+                ),
+                model=LLMModelConfig(name="agency-model"),
+            ),
+        )
+
+        loaded = load_gateway_config(tmp_path / ".thorn")
+        assert loaded.llm.provider is not None
+        assert loaded.llm.provider.api_url == "https://llm.example/v1"
+        assert loaded.llm.provider.api_key_env_var == "THORN_LLM_KEY"
+        assert loaded.llm.model is not None
+        assert loaded.llm.model.name == "agency-model"
 
     def test_bootstrap_appends_to_existing_gateway_config(self, tmp_path: Path):
         import json

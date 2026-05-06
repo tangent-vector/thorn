@@ -48,7 +48,6 @@ from thorn.core._messages import (
 from thorn.core._session import Session
 from thorn.runtime._session import AgentID, SessionKey
 
-
 _SESSION_FILE = "session.json"
 _HISTORY_FILE = "history.json"
 
@@ -414,6 +413,14 @@ class JsonSessionSerializer:
             )
             if sandbox_dict:
                 agent_data["sandbox"] = sandbox_dict
+        llm_config = getattr(agent, "llm_config", None)
+        if llm_config is not None:
+            from thorn.core._provider import LLMConfig
+            if not isinstance(llm_config, LLMConfig):
+                llm_config = LLMConfig.model_validate(llm_config)
+            llm_dict = llm_config.model_dump(mode="json", exclude_none=True)
+            if llm_dict:
+                agent_data["llm"] = llm_dict
         _atomic_write_text(
             path,
             json.dumps(agent_data, indent=2, ensure_ascii=False) + "\n",
@@ -449,6 +456,11 @@ class JsonSessionSerializer:
             kwargs["sandbox_override"] = AgentSandboxOverride.model_validate(
                 raw_sandbox,
             )
+
+        raw_llm = agent_data.get("llm")
+        if raw_llm is not None:
+            from thorn.core._provider import LLMConfig
+            kwargs["llm_config"] = LLMConfig.model_validate(raw_llm)
 
         return agent_cls(
             id=path_id,
@@ -487,6 +499,14 @@ class JsonSessionSerializer:
             session_data["logical_agent_workspace_path"] = str(
                 session.logical_agent_workspace_path,
             )
+        llm_config = getattr(session, "llm_config", None)
+        if llm_config is not None:
+            from thorn.core._provider import LLMConfig
+            if not isinstance(llm_config, LLMConfig):
+                llm_config = LLMConfig.model_validate(llm_config)
+            llm_dict = llm_config.model_dump(mode="json", exclude_none=True)
+            if llm_dict:
+                session_data["llm"] = llm_dict
         _atomic_write_text(
             directory / _SESSION_FILE,
             json.dumps(session_data, indent=2, ensure_ascii=False) + "\n",
@@ -519,6 +539,12 @@ class JsonSessionSerializer:
             Path(logical_ws_raw) if logical_ws_raw is not None else None
         )
 
+        raw_llm = session_data.get("llm")
+        llm_config = None
+        if raw_llm is not None:
+            from thorn.core._provider import LLMConfig
+            llm_config = LLMConfig.model_validate(raw_llm)
+
         session = Session(
             agent=agent,
             key=key,
@@ -527,6 +553,7 @@ class JsonSessionSerializer:
             metadata=session_data.get("metadata", {}),
             workspace_root=workspace_root,
             logical_agent_workspace_path=logical_agent_workspace_path,
+            llm_config=llm_config,
         )
 
         history_path = directory / _HISTORY_FILE
