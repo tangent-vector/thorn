@@ -828,13 +828,15 @@ class Gateway:
 
         1. If the event carries an explicit ``agent_id``, use that.
         2. Look for a pre-configured coordinator agent in the runtime
-           store.  For the single-coordinator vertical slice, the
-           first (and only) persisted agent is used.
+           store.  This remains a single-coordinator fallback for
+           events from sources that are not tied to an agent account.
         3. Fall back to a bare ``Agent`` with the default ID.
 
-        Future multi-project support would match event metadata (e.g.
-        ``project_id``) to the appropriate project-scoped
-        coordinator.
+        Agent-owned account sources should stamp ``agent_id`` before
+        handing events to the gateway.  Project, repository, issue,
+        and change-request identity belongs in the session key within
+        that owning agent rather than in a cross-agent coordinator
+        lookup.
         """
         if event.agent_id is not None:
             return self._get_or_load_validated_agent(event.agent_id)
