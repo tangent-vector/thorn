@@ -108,7 +108,7 @@ async def test_unique_names_pass_through_unprefixed():
     result = await discover_mcp_tools(
         sandbox_executor=executor,
         mcp_configs=[cfg],
-        builtin_tool_names={"read_file", "write_file"},
+        builtin_tool_names={"read_file", "create_file"},
     )
 
     assert sorted(_name(w) for w in result) == ["issue_list", "pr_create"]

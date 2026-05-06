@@ -38,7 +38,6 @@ from thorn.core._tools import (
     read_file,
     run_shell,
     search_files,
-    write_file,
 )
 
 # ---------------------------------------------------------------------------
@@ -57,6 +56,19 @@ class TestBuiltinToolCallNodeClass:
             assert not hasattr(fn, "_thorn_call_node_class"), (
                 f"{fn.__name__} should not have _thorn_call_node_class"
             )
+
+
+class TestRemovedWriteFileTool:
+    def test_write_file_is_not_exported(self):
+        import thorn
+        import thorn.core as thorn_core
+        import thorn.core._tools as core_tools
+        import thorn.tools as thorn_tools
+
+        assert not hasattr(core_tools, "write_file")
+        assert not hasattr(thorn_core, "write_file")
+        assert not hasattr(thorn_tools, "write_file")
+        assert not hasattr(thorn, "write_file")
 
 
 # ---------------------------------------------------------------------------
@@ -228,23 +240,6 @@ class TestReadFile:
         assert "50| line 50" in result
         assert "59| line 59" in result
         assert "[Outline:" not in result
-
-
-# ---------------------------------------------------------------------------
-# write_file
-# ---------------------------------------------------------------------------
-
-class TestWriteFile:
-    async def test_writes_content(self, tmp_path):
-        p = tmp_path / "out.txt"
-        result = await write_file(str(p), "data")
-        assert p.read_text(encoding="utf-8") == "data"
-        assert "4" in result  # mentions byte count
-
-    async def test_creates_parent_directories(self, tmp_path):
-        p = tmp_path / "a" / "b" / "c.txt"
-        await write_file(str(p), "nested")
-        assert p.read_text(encoding="utf-8") == "nested"
 
 
 # ---------------------------------------------------------------------------

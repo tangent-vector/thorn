@@ -283,7 +283,6 @@ class ConsoleEventSink(EventSink):
         "create_file": ["path"],
         "delete_file": ["path"],
         "move_file": ["source", "destination"],
-        "write_file": ["path"],
         "find_files": ["pattern", "path"],
         "search_files": ["pattern", "path"],
         "list_directory": ["path"],

@@ -27,7 +27,7 @@ from __future__ import annotations
 from typing import Any
 
 from thorn.core._journal import JOURNAL_TOOLS
-from thorn.core._tools import ALL_BUILTIN_TOOLS, run_shell, write_file
+from thorn.core._tools import ALL_BUILTIN_TOOLS, run_shell
 from thorn.runtime._inbox_tools import INBOX_TOOLS
 from thorn.tools.forge import FORGE_TOOLS
 from thorn.tools.peers import PEER_TOOLS
@@ -71,7 +71,6 @@ SANDBOXED_TOOLS: list[Any] = _dedup(
     [
         *ALL_BUILTIN_TOOLS,
         run_shell,
-        write_file,
         *JOURNAL_TOOLS,
     ]
 )

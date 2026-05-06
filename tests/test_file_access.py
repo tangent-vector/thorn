@@ -544,45 +544,6 @@ class TestToolEnforcement:
         finally:
             reset_context(token)
 
-    async def test_write_file_denied(self, tmp_path):
-        from thorn.core._tools import write_file
-
-        policy = FileAccessPolicy(
-            [FileAccessRule("**", FileAccessLevel.READ)],
-            roots=_workspace_roots(tmp_path),
-        )
-        ctx = ExecutionContext(
-            provider=MockProvider(),
-            workspace_root=tmp_path,
-            file_access_policy=policy,
-        )
-        token = set_context(ctx)
-        try:
-            with pytest.raises(PermissionError, match="WRITE"):
-                await write_file(str(tmp_path / "file.txt"), "data")
-        finally:
-            reset_context(token)
-
-    async def test_write_file_allowed(self, tmp_path):
-        from thorn.core._tools import write_file
-
-        policy = FileAccessPolicy(
-            [FileAccessRule("**", FileAccessLevel.WRITE)],
-            roots=_workspace_roots(tmp_path),
-        )
-        ctx = ExecutionContext(
-            provider=MockProvider(),
-            workspace_root=tmp_path,
-            file_access_policy=policy,
-        )
-        token = set_context(ctx)
-        try:
-            result = await write_file(str(tmp_path / "file.txt"), "data")
-            assert "4" in result
-            assert (tmp_path / "file.txt").read_text(encoding="utf-8") == "data"
-        finally:
-            reset_context(token)
-
     async def test_edit_file_denied(self, tmp_path):
         from thorn.core._tools import FileEdit, edit_file
 

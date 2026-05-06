@@ -138,8 +138,8 @@ def _flatten_tools(items: Iterable[Any]) -> Iterable[Any]:
     ``FILE_READING = [read_file, list_directory, search_files]`` to be
     nested inside another tool list::
 
-        tools = [FILE_READING, write_file]
-        # flattens to [read_file, list_directory, search_files, write_file]
+        tools = [FILE_READING, create_file]
+        # flattens to [read_file, list_directory, search_files, create_file]
     """
     for item in items:
         if isinstance(item, _WrappedTool) or callable(item):

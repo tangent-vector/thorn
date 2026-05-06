@@ -32,8 +32,6 @@ Import it explicitly from ``thorn.core._tools`` if you need it::
 
     from thorn.core._tools import run_shell
 
-``write_file`` is deprecated in favour of ``edit_file`` + ``create_file``
-but remains importable from ``thorn.core._tools`` for backward compatibility.
 """
 
 from thorn.core._tools import (
@@ -49,7 +47,6 @@ from thorn.core._tools import (
     move_file,
     read_file,
     search_files,
-    write_file,
 )
 
 __all__ = [
@@ -58,7 +55,6 @@ __all__ = [
     "create_file",
     "delete_file",
     "move_file",
-    "write_file",
     "FileEdit",
     "list_directory",
     "find_files",
