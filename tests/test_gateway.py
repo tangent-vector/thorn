@@ -3257,6 +3257,7 @@ class TestInferEventSources:
                 forges=[ForgeSpec(name="gl", type="gitlab", url="https://gl.example.com")],
             )
             agent = Agent(
+                id=AgentID("bot"),
                 name="bot",
                 accounts=AgentAccountsConfig(accounts=[
                     GitLabAccountConfig(
@@ -3296,6 +3297,7 @@ class TestInferEventSources:
             )],
         )
         agent = Agent(
+            id=AgentID("bot"),
             name="bot",
             accounts=AgentAccountsConfig(accounts=[
                 GitHubAccountConfig(
@@ -3311,6 +3313,236 @@ class TestInferEventSources:
         assert len(sources) == 1
         assert isinstance(sources[0], GitHubNotificationsSource)
         assert sources[0]._config.native_id_to_project_name == {"owner/repo": "repo"}
+
+    def test_inferred_github_source_stamps_owner_agent_id(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from thorn.core._account import AgentAccountsConfig
+        from thorn.core._agent import Agent
+        from thorn.core._credentials import Credential
+        from thorn.gateway._config import (
+            ForgeSpec,
+            GatewayConfig,
+            ProjectSpec,
+            infer_event_sources,
+        )
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            _LatestCommentInfo,
+        )
+        from thorn.tools.forge import GitHubAccountConfig
+
+        monkeypatch.setenv("THORN_TEST_GH_TOK_A", "ghp-a")
+        monkeypatch.setenv("THORN_TEST_GH_TOK_B", "ghp-b")
+        config = GatewayConfig(
+            forges=[ForgeSpec(name="gh", type="github", url="https://github.com")],
+            projects=[ProjectSpec(
+                name="repo", url="https://github.com/owner/repo",
+            )],
+        )
+        agent_a = Agent(
+            id=AgentID("agent-a"),
+            name="agent-a",
+            accounts=AgentAccountsConfig(accounts=[
+                GitHubAccountConfig(
+                    service="gh",
+                    credentials=[Credential(
+                        kind="pat",
+                        env_var_name="THORN_TEST_GH_TOK_A",
+                    )],
+                ),
+            ]),
+        )
+        agent_b = Agent(
+            id=AgentID("agent-b"),
+            name="agent-b",
+            accounts=AgentAccountsConfig(accounts=[
+                GitHubAccountConfig(
+                    service="gh",
+                    credentials=[Credential(
+                        kind="pat",
+                        env_var_name="THORN_TEST_GH_TOK_B",
+                    )],
+                ),
+            ]),
+        )
+
+        sources = infer_event_sources(config, [agent_a, agent_b])
+        source = next(
+            source for source in sources if source.name == "agent-b-gh-events"
+        )
+        assert isinstance(source, GitHubNotificationsSource)
+
+        with (
+            patch.object(
+                source,
+                "_fetch_unread_thread_list",
+                return_value=[_make_notification_thread()],
+            ),
+            patch.object(
+                source,
+                "_fetch_latest_comment_payload",
+                return_value=_LatestCommentInfo(body="Hello"),
+            ),
+        ):
+            events = source._fetch_new_notifications()
+
+        assert len(events) == 1
+        assert events[0].agent_id == AgentID("agent-b")
+        assert events[0].session_key == SessionKey("repo/issue/7")
+
+    @pytest.mark.asyncio
+    async def test_inferred_gitlab_source_stamps_owner_agent_id(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        with (
+            patch("thorn.gateway.sources._gitlab._HAS_GITLAB", True),
+            patch("thorn.gateway.sources._gitlab._gitlab_lib") as mock_gl_mod,
+        ):
+            mock_gl_instance = MagicMock()
+            mock_gl_mod.Gitlab.return_value = mock_gl_instance
+
+            from thorn.core._account import AgentAccountsConfig
+            from thorn.core._agent import Agent
+            from thorn.core._credentials import Credential
+            from thorn.gateway._config import (
+                ForgeSpec,
+                ForkSpec,
+                GatewayConfig,
+                ProjectSpec,
+                infer_event_sources,
+            )
+            from thorn.gateway.sources._gitlab import GitLabTODOsSource
+            from thorn.tools.forge import GitLabAccountConfig
+
+            monkeypatch.setenv("THORN_TEST_GL_TOK_A", "gl-a")
+            monkeypatch.setenv("THORN_TEST_GL_TOK_B", "gl-b")
+            config = GatewayConfig(
+                forges=[
+                    ForgeSpec(
+                        name="gl",
+                        type="gitlab",
+                        url="https://gitlab.example.com",
+                    ),
+                ],
+                projects=[
+                    ProjectSpec(
+                        name="repo",
+                        forks=[
+                            ForkSpec(
+                                forge="gl",
+                                url="https://gitlab.example.com/org/repo",
+                            ),
+                        ],
+                    ),
+                ],
+            )
+            agent_a = Agent(
+                id=AgentID("agent-a"),
+                name="agent-a",
+                accounts=AgentAccountsConfig(accounts=[
+                    GitLabAccountConfig(
+                        service="gl",
+                        credentials=[Credential(
+                            kind="gitlab-pat",
+                            env_var_name="THORN_TEST_GL_TOK_A",
+                        )],
+                    ),
+                ]),
+            )
+            agent_b = Agent(
+                id=AgentID("agent-b"),
+                name="agent-b",
+                accounts=AgentAccountsConfig(accounts=[
+                    GitLabAccountConfig(
+                        service="gl",
+                        credentials=[Credential(
+                            kind="gitlab-pat",
+                            env_var_name="THORN_TEST_GL_TOK_B",
+                        )],
+                    ),
+                ]),
+            )
+            sources = infer_event_sources(config, [agent_a, agent_b])
+            source = next(
+                source for source in sources if source.name == "agent-b-gl-events"
+            )
+            assert isinstance(source, GitLabTODOsSource)
+
+            todo = _make_mock_todo()
+            mock_gl_instance.todos.list.side_effect = [[todo], []]
+
+            existing_project_events = [
+                _make_mock_gitlab_project_event(event_id=201),
+            ]
+
+            def list_project_events(**kwargs: Any) -> list[MagicMock]:
+                if kwargs["target_type"] == "issue":
+                    return list(existing_project_events)
+                if kwargs["target_type"] == "merge_request":
+                    return []
+                raise AssertionError(f"unexpected event query: {kwargs!r}")
+
+            project = MagicMock()
+            project.events.list.side_effect = list_project_events
+            mock_gl_instance.projects.get.return_value = project
+
+            events: list[RawIncomingEvent] = []
+
+            async def on_event(event: RawIncomingEvent) -> None:
+                events.append(event)
+
+            await source._poll_once(on_event)
+            existing_project_events[:] = [
+                _make_mock_gitlab_project_event(
+                    event_id=202,
+                    target_iid=43,
+                ),
+            ]
+            await source._poll_once(on_event)
+
+            assert [event.agent_id for event in events] == [
+                AgentID("agent-b"),
+                AgentID("agent-b"),
+            ]
+            assert [event.session_key for event in events] == [
+                SessionKey("repo/issue/42"),
+                SessionKey("repo/issue/43"),
+            ]
+
+    def test_skips_account_source_when_agent_has_no_persistent_id(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from thorn.core._account import AgentAccountsConfig
+        from thorn.core._agent import Agent
+        from thorn.core._credentials import Credential
+        from thorn.gateway._config import (
+            ForgeSpec,
+            GatewayConfig,
+            infer_event_sources,
+        )
+        from thorn.tools.forge import GitLabAccountConfig
+
+        monkeypatch.setenv("THORN_TEST_GL_TOK", "tok")
+        config = GatewayConfig(
+            forges=[ForgeSpec(name="gl", type="gitlab", url="https://gl.example.com")],
+        )
+        agent = Agent(
+            name="bot",
+            accounts=AgentAccountsConfig(accounts=[
+                GitLabAccountConfig(
+                    service="gl",
+                    credentials=[Credential(
+                        kind="gitlab-pat",
+                        env_var_name="THORN_TEST_GL_TOK",
+                    )],
+                ),
+            ]),
+        )
+
+        sources = infer_event_sources(config, [agent])
+
+        assert sources == []
 
     def test_no_sources_when_agent_has_no_accounts(self):
         from thorn.core._agent import Agent
@@ -3374,6 +3606,7 @@ class TestInferEventSources:
             forges=[ForgeSpec(name="gh", type="github", url="https://github.com")],
         )
         agent = Agent(
+            id=AgentID("bot"),
             name="bot",
             accounts=AgentAccountsConfig(accounts=[
                 GitHubAccountConfig(
@@ -3828,6 +4061,7 @@ class TestBootstrapCoordinator:
             os.environ["THORN_TEST_INFERRED_TOK"] = "tok"
             try:
                 agent = Agent(
+                    id=AgentID("bot"),
                     name="bot",
                     accounts=AgentAccountsConfig(accounts=[
                         GitLabAccountConfig(

@@ -57,6 +57,7 @@ from thorn.gateway._event import (
     event_source_status_timestamp,
 )
 from thorn.gateway._routing import Noteable, NoteableKind, route_github_event
+from thorn.runtime._session import AgentID
 
 log = logging.getLogger(__name__)
 
@@ -322,6 +323,7 @@ def _make_raw_event(
     native_id_to_project_name: dict[str, str],
     base_url: str = "",
     forge_name: str = "github",
+    owner_agent_id: AgentID | None = None,
 ) -> RawIncomingEvent:
     """Convert a GitHub notification thread + comment payload into a :class:`RawIncomingEvent`.
 
@@ -399,6 +401,7 @@ def _make_raw_event(
         primary_actor=actor,
         summary=summary,
         items=items,
+        agent_id=owner_agent_id,
         metadata={
             "notification_id": thread_id,
             "reason": reason,
@@ -435,9 +438,11 @@ class GitHubNotificationsSource(EventSource):
         config: GitHubNotificationsSourceConfig,
         *,
         service_name: str = "",
+        owner_agent_id: AgentID | None = None,
     ) -> None:
         self._config = config
         self._service_name = service_name
+        self._owner_agent_id = owner_agent_id
         self._http = httpx.Client(
             base_url=config.base_url.rstrip("/"),
             headers={
@@ -667,6 +672,7 @@ class GitHubNotificationsSource(EventSource):
                     native_id_to_project_name=self._config.native_id_to_project_name,
                     base_url=self._config.base_url,
                     forge_name=self._config.forge_name,
+                    owner_agent_id=self._owner_agent_id,
                 ),
             )
 

@@ -77,6 +77,7 @@ from pydantic_core import CoreSchema, core_schema
 from thorn.core._service import Service
 from thorn.gateway._event import EventSource
 from thorn.gateway._peer import PeerSpec
+from thorn.runtime._session import AgentID
 
 log = logging.getLogger(__name__)
 
@@ -1893,21 +1894,35 @@ def infer_event_sources(
         if accounts is None:
             continue
 
-        for acct in accounts.accounts:
-            forge_spec = forge_specs_by_name.get(acct.service)
-            if forge_spec is None:
-                # Account references a service that is not a configured
-                # forge -- could be a non-forge service we're not
-                # responsible for here, or a typo.  Either way, the
-                # event-source inference path only handles forge
-                # accounts; skip silently.
-                continue
+        forge_accounts = [
+            acct
+            for acct in accounts.accounts
+            if getattr(acct, "service", None) in forge_specs_by_name
+        ]
+        if not forge_accounts:
+            continue
 
+        owner_agent_id = _event_source_owner_agent_id(agent)
+        if owner_agent_id is None:
+            agent_name = (
+                getattr(agent, "name", None)
+                or getattr(agent, "id", "unknown")
+            )
+            log.warning(
+                "Skipping inferred event sources for agent %r: agent "
+                "has no persistent id.",
+                agent_name,
+            )
+            continue
+
+        for acct in forge_accounts:
+            forge_spec = forge_specs_by_name[acct.service]
             info = forge_project_info.get(forge_spec.name, _ForgeProjectInfo())
             source = _create_event_source_for_account(
                 forge_spec=forge_spec,
                 account=acct,
                 agent=agent,
+                owner_agent_id=owner_agent_id,
                 native_id_to_project_name=info.native_id_to_project_name,
             )
             if source is not None:
@@ -1916,11 +1931,25 @@ def infer_event_sources(
     return sources
 
 
+def _event_source_owner_agent_id(agent: Any) -> AgentID | None:
+    """Return the persistent agent ID that owns inferred account sources."""
+    agent_id = getattr(agent, "id", None)
+    if isinstance(agent_id, AgentID):
+        return agent_id
+    if agent_id is None:
+        return None
+    agent_id_text = str(agent_id).strip()
+    if not agent_id_text:
+        return None
+    return AgentID(agent_id_text)
+
+
 def _create_event_source_for_account(
     *,
     forge_spec: ForgeSpec,
     account: Any,
     agent: Any,
+    owner_agent_id: AgentID,
     native_id_to_project_name: dict[str, str],
 ) -> EventSource | None:
     """Create a single event source for an agent's account on a forge."""
@@ -1931,6 +1960,7 @@ def _create_event_source_for_account(
             forge_spec=forge_spec,
             account=account,
             agent_name=str(agent_name),
+            owner_agent_id=owner_agent_id,
             native_id_to_project_name=native_id_to_project_name,
         )
 
@@ -1939,6 +1969,7 @@ def _create_event_source_for_account(
             forge_spec=forge_spec,
             account=account,
             agent_name=str(agent_name),
+            owner_agent_id=owner_agent_id,
             native_id_to_project_name=native_id_to_project_name,
         )
 
@@ -1990,6 +2021,7 @@ def _create_github_source(
     forge_spec: ForgeSpec,
     account: Any,
     agent_name: str,
+    owner_agent_id: AgentID,
     native_id_to_project_name: dict[str, str],
 ) -> EventSource | None:
     """Create a GitHub notifications source for one (agent, forge) pair.
@@ -2019,7 +2051,11 @@ def _create_github_source(
         native_id_to_project_name=native_id_to_project_name,
         forge_name=forge_spec.name,
     )
-    source = GitHubNotificationsSource(cfg, service_name=source_name)
+    source = GitHubNotificationsSource(
+        cfg,
+        service_name=source_name,
+        owner_agent_id=owner_agent_id,
+    )
     log.info(
         "Inferred GitHub notifications source %r (agent=%s)",
         source_name, agent_name,
@@ -2032,6 +2068,7 @@ def _create_gitlab_source(
     forge_spec: ForgeSpec,
     account: Any,
     agent_name: str,
+    owner_agent_id: AgentID,
     native_id_to_project_name: dict[str, str],
 ) -> EventSource | None:
     """Create a GitLab TODOs source for one (agent, forge) pair.
@@ -2058,7 +2095,11 @@ def _create_gitlab_source(
         project_id_to_name=native_id_to_project_name,
         forge_name=forge_spec.name,
     )
-    source = GitLabTODOsSource(cfg, service_name=source_name)
+    source = GitLabTODOsSource(
+        cfg,
+        service_name=source_name,
+        owner_agent_id=owner_agent_id,
+    )
     log.info(
         "Inferred GitLab event source %r (agent=%s)",
         source_name, agent_name,

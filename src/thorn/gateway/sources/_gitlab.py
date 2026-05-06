@@ -46,7 +46,7 @@ from thorn.gateway._event import (
     event_source_status_timestamp,
 )
 from thorn.gateway._routing import Noteable, NoteableKind, route_gitlab_todo
-from thorn.runtime._session import SessionKey
+from thorn.runtime._session import AgentID, SessionKey
 from thorn.tools.gitlab import GitLabProjectResolver
 
 log = logging.getLogger(__name__)
@@ -349,6 +349,7 @@ def _make_raw_event(
     *,
     gitlab_url: str = "",
     forge_name: str = "gitlab",
+    owner_agent_id: AgentID | None = None,
 ) -> RawIncomingEvent:
     """Convert a GitLab TODO into a :class:`RawIncomingEvent`.
 
@@ -389,6 +390,7 @@ def _make_raw_event(
         primary_actor=actor,
         summary=_make_summary(todo),
         items=items,
+        agent_id=owner_agent_id,
         metadata={
             "todo_id": todo.id,
             "project_id": pid,
@@ -422,6 +424,7 @@ def _make_project_event_raw_event(
     project_name: str = "",
     gitlab_url: str = "",
     forge_name: str = "gitlab",
+    owner_agent_id: AgentID | None = None,
 ) -> RawIncomingEvent:
     """Convert a GitLab project event into a structural gateway event."""
     target_type = str(_field_value(project_event, "target_type", ""))
@@ -464,6 +467,7 @@ def _make_project_event_raw_event(
         kind=EventKind.STRUCTURAL,
         primary_actor=actor,
         summary=summary,
+        agent_id=owner_agent_id,
         metadata={
             "project_event_id": event_id,
             "project_id": project_id,
@@ -488,10 +492,17 @@ class GitLabTODOsSource(EventSource):
 
     Config = GitLabSourceConfig
 
-    def __init__(self, config: GitLabSourceConfig, *, service_name: str = "") -> None:
+    def __init__(
+        self,
+        config: GitLabSourceConfig,
+        *,
+        service_name: str = "",
+        owner_agent_id: AgentID | None = None,
+    ) -> None:
         _require_gitlab()
         self._config = config
         self._service_name = service_name
+        self._owner_agent_id = owner_agent_id
         self._gl = _gitlab_lib.Gitlab(  # type: ignore[union-attr]
             url=config.url,
             private_token=config.token,
@@ -594,6 +605,7 @@ class GitLabTODOsSource(EventSource):
                     project_id_to_name=id_to_name,
                     gitlab_url=self._config.url,
                     forge_name=self._config.forge_name,
+                    owner_agent_id=self._owner_agent_id,
                 )
                 try:
                     await on_event(event)
@@ -683,6 +695,7 @@ class GitLabTODOsSource(EventSource):
                     project_name=record.project_name,
                     gitlab_url=self._config.url,
                     forge_name=self._config.forge_name,
+                    owner_agent_id=self._owner_agent_id,
                 )
                 await on_event(raw_event)
             except Exception:
