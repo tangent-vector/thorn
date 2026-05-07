@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from thorn.core._agent import Agent
     from thorn.core._context_injection import SeedContent
     from thorn.core._file_access import FileAccessRule
+    from thorn.core._provider import LLMConfig
     from thorn.runtime._session import SessionKey
 
 
@@ -52,6 +53,11 @@ class Session:
             (the missing ``agency -> agent -> ??? -> session`` rung
             from the design plan, which is *deferred* — we just
             smuggle the value through the Session for now).
+        llm_config: Optional session-level LLM configuration layered
+            over the owning agent and agency defaults.  The gateway does
+            not create session overrides yet, but the field is persisted
+            so that future session-key policies have a natural place to
+            land.
     """
 
     def __init__(
@@ -64,6 +70,7 @@ class Session:
         metadata: dict[str, Any] | None = None,
         workspace_root: Path | None = None,
         logical_agent_workspace_path: Path | None = None,
+        llm_config: LLMConfig | None = None,
     ) -> None:
         from thorn.core._history import HistoryTree
 
@@ -77,6 +84,7 @@ class Session:
         self.logical_agent_workspace_path: Path | None = (
             logical_agent_workspace_path
         )
+        self.llm_config: LLMConfig | None = llm_config
 
     def touch(self) -> None:
         """Update ``last_active`` to the current UTC time."""

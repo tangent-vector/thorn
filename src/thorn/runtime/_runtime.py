@@ -37,7 +37,7 @@ from thorn.core._context import (
     reset_context,
     set_context,
 )
-from thorn.core._provider import LLMProvider
+from thorn.core._provider import LLMConfig, LLMProvider, load_provider_from_config
 from thorn.core._service import Service
 from thorn.core._session import Session
 from thorn.runtime._address import AddressBook
@@ -179,8 +179,11 @@ class Runtime:
         sandbox_broker_binding_lookup: (
             SandboxBrokerBindingLookup | None
         ) = None,
+        provider_config: LLMConfig | None = None,
     ) -> None:
         self.provider = provider
+        self.provider_config = provider_config
+        self._configured_provider_cache: dict[str, LLMProvider] = {}
         self.event_sink: EventSink = event_sink or NullEventSink()
         self.workspace_root = workspace_root
         self.global_ignores = global_ignores
@@ -315,6 +318,65 @@ class Runtime:
             agency_root_directory=self.workspace_root,
             runtime=self,
         )
+
+    def provider_for_agent(self, agent: Agent) -> LLMProvider:
+        """Return the effective provider for *agent*.
+
+        Most agents use the runtime-wide provider.  Agents loaded from
+        ``agent.json`` may carry an ``llm_config`` override; in that case
+        the override is merged with the agency default and cached by its
+        non-secret configuration key.
+        """
+        return self._provider_for_llm_overrides(getattr(agent, "llm_config", None))
+
+    def provider_for_session(self, session: Session) -> LLMProvider:
+        """Return the effective provider for *session*.
+
+        The layering model is agency config, then agent config, then
+        session config.  Thorn does not create session-specific LLM config
+        yet, but keeping this as the prompt-time entry point makes that
+        future extension local to session construction and persistence.
+        """
+        return self._provider_for_llm_overrides(
+            getattr(session.agent, "llm_config", None),
+            getattr(session, "llm_config", None),
+        )
+
+    def _provider_for_llm_overrides(self, *raw_configs: Any) -> LLMProvider:
+        effective_config = self.provider_config
+        has_override = False
+
+        for raw_config in raw_configs:
+            override = self._coerce_llm_config(raw_config)
+            if override is None or not override.has_operator_config():
+                continue
+
+            has_override = True
+            if effective_config is None:
+                effective_config = LLMConfig()
+            effective_config = effective_config.merged_with(override)
+
+        if not has_override:
+            return self.provider
+        if effective_config is None or not effective_config.has_operator_config():
+            return self.provider
+
+        cache_key = effective_config.cache_key()
+        cached = self._configured_provider_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        provider = load_provider_from_config(effective_config)
+        self._configured_provider_cache[cache_key] = provider
+        return provider
+
+    @staticmethod
+    def _coerce_llm_config(raw_config: Any) -> LLMConfig | None:
+        if raw_config is None:
+            return None
+        if isinstance(raw_config, LLMConfig):
+            return raw_config
+        return LLMConfig.model_validate(raw_config)
 
     @property
     def context(self) -> ExecutionContext:

@@ -1419,9 +1419,7 @@ class TestServePreflightCommand:
     def test_preflight_reports_missing_source_token_before_live_polling(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setenv("OPENAI_API_URL", "https://llm.example/v1")
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-        monkeypatch.setenv("OPENAI_API_MODEL_NAME", "test-model")
         monkeypatch.delenv("THORN_TEST_MISSING_GL_TOKEN", raising=False)
 
         agency_home = tmp_path / "agency"
@@ -1436,6 +1434,9 @@ class TestServePreflightCommand:
                 "--project-name", "thorn",
                 "--project-url", "https://gitlab.com/group/project",
                 "--token-env", "THORN_TEST_MISSING_GL_TOKEN",
+                "--llm-api-url", "https://llm.example/v1",
+                "--llm-model", "test-model",
+                "--llm-api-key-env", "OPENAI_API_KEY",
                 "--agency-home", str(agency_home),
                 "--agency-workspace", str(workspace),
             ],

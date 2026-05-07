@@ -23,7 +23,14 @@ from thorn.core._context import (
 )
 from thorn.core._event_bus import EventBus, in_session
 from thorn.core._func import _prepare_tools
-from thorn.core._provider import load_provider_from_env
+from thorn.core._provider import (
+    LLMConfig,
+    LLMModelConfig,
+    LLMProviderType,
+    OpenAIProviderSettings,
+    load_provider_from_config,
+    load_provider_from_env,
+)
 from thorn.core._session import Session
 from thorn.core._tools import ALL_BUILTIN_TOOLS
 from thorn.core.errors import SkillError, ThornError
@@ -166,6 +173,7 @@ def _build_runtime(
     paths: "AgencyPaths | None" = None,
     sandbox_executor_enabled: bool = False,
     sandbox_config: "SandboxConfig | None" = None,
+    llm_config: LLMConfig | None = None,
 ) -> Runtime:
     """Create a ``Runtime`` whose event sink is an :class:`EventBus`.
 
@@ -197,7 +205,11 @@ def _build_runtime(
     from thorn.core._file_access import load_global_ignores
     from thorn.runtime._paths import AgencyPaths
 
-    provider = load_provider_from_env()
+    provider = (
+        load_provider_from_config(llm_config)
+        if llm_config is not None
+        else load_provider_from_env()
+    )
 
     bus = EventBus()
     if trace_file is not None:
@@ -217,6 +229,7 @@ def _build_runtime(
         paths=paths,
         sandbox_executor_enabled=sandbox_executor_enabled,
         sandbox_config=sandbox_config,
+        provider_config=llm_config,
     )
 
 
@@ -1416,6 +1429,7 @@ def _serve_gateway(
             paths=paths,
             sandbox_executor_enabled=True,
             sandbox_config=gateway_config.sandbox,
+            llm_config=gateway_config.llm,
         )
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -1627,6 +1641,7 @@ def _serve_preflight(
             paths=paths,
             sandbox_executor_enabled=True,
             sandbox_config=gateway_config.sandbox,
+            llm_config=gateway_config.llm,
         )
     except ThornError as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -1904,6 +1919,21 @@ async def _preflight_agent_git_targets(
 @click.option("--git-user-name", default=None, help="Git author/committer name for this agent (default: agent-id).")
 @click.option("--git-user-email", default=None, help="Git author/committer email for this agent (default: <agent-id>@thorn).")
 @click.option(
+    "--llm-api-url",
+    default=None,
+    help="Base URL for the OpenAI-compatible LLM provider API.",
+)
+@click.option(
+    "--llm-model",
+    default=None,
+    help="Default LLM model name for the agency.",
+)
+@click.option(
+    "--llm-api-key-env",
+    default=None,
+    help="Env var holding the LLM provider API key.",
+)
+@click.option(
     "--agency-home",
     "agency_home_path",
     type=click.Path(file_okay=False),
@@ -1933,6 +1963,9 @@ def serve_bootstrap(
     token_env: str | None,
     git_user_name: str | None,
     git_user_email: str | None,
+    llm_api_url: str | None,
+    llm_model: str | None,
+    llm_api_key_env: str | None,
     agency_home_path: str,
     agency_workspace_path: str,
 ) -> None:
@@ -1943,6 +1976,26 @@ def serve_bootstrap(
 
     agency_home = Path(agency_home_path).expanduser().resolve()
     agency_workspace = Path(agency_workspace_path).expanduser().resolve()
+    llm_args = [llm_api_url, llm_model, llm_api_key_env]
+    if any(value is not None for value in llm_args) and not all(llm_args):
+        console.print(
+            "[red]Error:[/red] --llm-api-url, --llm-model, and "
+            "--llm-api-key-env must be provided together."
+        )
+        sys.exit(1)
+    llm_config = None
+    if all(llm_args):
+        assert llm_api_url is not None
+        assert llm_model is not None
+        assert llm_api_key_env is not None
+        llm_config = LLMConfig(
+            provider=OpenAIProviderSettings(
+                type=LLMProviderType.OPENAI,
+                api_url=llm_api_url,
+                api_key_env_var=llm_api_key_env,
+            ),
+            model=LLMModelConfig(name=llm_model),
+        )
     try:
         aid = bootstrap_coordinator(
             agency_home=agency_home,
@@ -1953,6 +2006,7 @@ def serve_bootstrap(
             access_token_env=token_env,
             git_user_name=git_user_name or "",
             git_user_email=git_user_email or "",
+            llm_config=llm_config,
         )
     except ValueError as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -1971,6 +2025,8 @@ def serve_bootstrap(
     console.print(
         f"\nSet ${token_env} before running 'thorn serve'."
     )
+    if llm_api_key_env is not None:
+        console.print(f"Set ${llm_api_key_env} before running 'thorn serve'.")
 
 
 @serve.command("mcp")

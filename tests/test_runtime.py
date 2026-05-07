@@ -12,13 +12,11 @@ import pytest
 
 from thorn.core._agent import Agent
 from thorn.core._context import ExecutionContext, get_context
-from thorn.core._service import Service
 from thorn.core._history import (
     ArchiveMarkerNode,
     CollapseState,
     HistoryTree,
     HousekeepingNode,
-    ToolCallNode,
     TurnNode,
     UserPromptNode,
 )
@@ -28,7 +26,16 @@ from thorn.core._messages import (
     ToolResultMessage,
     UserMessage,
 )
-from thorn.core._provider import MockProvider
+from thorn.core._provider import (
+    LLMConfig,
+    LLMModelConfig,
+    LLMProviderType,
+    MockProvider,
+    OpenAIProvider,
+    OpenAIProviderSettings,
+    load_provider_from_config,
+)
+from thorn.core._service import Service
 from thorn.core._session import Session
 from thorn.runtime import (
     AgentID,
@@ -40,7 +47,6 @@ from thorn.runtime import (
     serialize_history,
 )
 from thorn.runtime._paths import AgencyPaths
-
 
 # ---------------------------------------------------------------------------
 # Agent identity fields (id, workspace, name, metadata)
@@ -850,6 +856,39 @@ class TestJsonSessionSerializerAgent:
         assert restored_override.container_ready_timeout_s == 60.0
         assert restored_override.backend is None
 
+    def test_llm_config_roundtrips(self, tmp_path: Path):
+        llm_config = LLMConfig(
+            provider=OpenAIProviderSettings(
+                type=LLMProviderType.OPENAI,
+                api_url="https://llm.example/v1",
+                api_key_env_var="THORN_LLM_KEY",
+            ),
+            model=LLMModelConfig(
+                name="agent-model",
+                options={"reasoning_effort": "high"},
+            ),
+        )
+        agent = Agent(
+            id=AgentID("model-agent"),
+            name="model-agent",
+            llm_config=llm_config,
+        )
+        serializer = JsonSessionSerializer()
+        agent_dir = tmp_path / "model-agent"
+        agent_dir.mkdir()
+        agent_path = agent_dir / "agent.json"
+        serializer.save_agent(agent, agent_path)
+
+        on_disk = json.loads(agent_path.read_text(encoding="utf-8"))
+        assert on_disk["llm"]["provider"]["api_url"] == "https://llm.example/v1"
+        assert on_disk["llm"]["provider"]["api_key_env_var"] == "THORN_LLM_KEY"
+        assert on_disk["llm"]["model"]["name"] == "agent-model"
+        assert on_disk["llm"]["model"]["options"]["reasoning_effort"] == "high"
+
+        restored = serializer.load_agent(agent_path)
+        restored_llm_config = getattr(restored, "llm_config", None)
+        assert restored_llm_config == llm_config
+
     def test_no_sandbox_override_omits_block(self, tmp_path: Path):
         agent = Agent(id=AgentID("plain"), name="plain")
         serializer = JsonSessionSerializer()
@@ -1177,6 +1216,33 @@ class TestJsonSessionSerializerSession:
 
         assert restored.created_at == ts
         assert restored.last_active == ts
+
+    def test_llm_config_roundtrips(self, tmp_path: Path):
+        agent = self._make_agent()
+        llm_config = LLMConfig(
+            model=LLMModelConfig(
+                name="session-model",
+                options={"temperature": 0.4},
+            ),
+        )
+        session = Session(
+            agent=agent,
+            key=SessionKey("session-model"),
+            llm_config=llm_config,
+        )
+
+        serializer = JsonSessionSerializer()
+        session_dir = tmp_path / "session_dir"
+        serializer.save_session(session, session_dir)
+
+        on_disk = json.loads(
+            (session_dir / "session.json").read_text(encoding="utf-8")
+        )
+        assert on_disk["llm"]["model"]["name"] == "session-model"
+        assert on_disk["llm"]["model"]["options"] == {"temperature": 0.4}
+
+        restored = serializer.load_session(session_dir, agent)
+        assert restored.llm_config == llm_config
 
     def test_session_json_is_human_readable(self, tmp_path: Path):
         agent = self._make_agent()
@@ -1796,6 +1862,144 @@ class TestRuntime:
         assert ctx.workspace_root == tmp_path
         assert "Extra prompt." in ctx.system_prompts
 
+    def test_provider_for_agent_uses_agent_llm_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("AGENCY_LLM_KEY", "agency-secret")
+        monkeypatch.setenv("AGENT_LLM_KEY", "agent-secret")
+
+        agency_llm_config = LLMConfig(
+            provider=OpenAIProviderSettings(
+                type=LLMProviderType.OPENAI,
+                api_url="https://agency.example/v1",
+                api_key_env_var="AGENCY_LLM_KEY",
+            ),
+            model=LLMModelConfig(
+                name="agency-model",
+                options={"max_tokens": 4096},
+            ),
+        )
+        runtime = Runtime(
+            provider=load_provider_from_config(agency_llm_config),
+            provider_config=agency_llm_config,
+            workspace_root=tmp_path,
+        )
+        agent = Agent(
+            id=AgentID("agent"),
+            llm_config=LLMConfig(
+                provider=OpenAIProviderSettings(
+                    type=LLMProviderType.OPENAI,
+                    api_url="https://agent.example/v1",
+                    api_key_env_var="AGENT_LLM_KEY",
+                ),
+                model=LLMModelConfig(
+                    name="agent-model",
+                    options={"reasoning_effort": "medium"},
+                ),
+            ),
+        )
+
+        provider = runtime.provider_for_agent(agent)
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.config.api_url == "https://agent.example/v1"
+        assert provider.config.api_key == "agent-secret"
+        assert provider.config.model_name == "agent-model"
+        assert provider.config.model_options == {
+            "max_tokens": 4096,
+            "reasoning_effort": "medium",
+        }
+        assert runtime.provider_for_agent(agent) is provider
+
+    def test_provider_for_agent_without_override_uses_runtime_provider(
+        self, tmp_path: Path,
+    ):
+        runtime = self._make_runtime(tmp_path)
+        agent = Agent(id=AgentID("plain"))
+
+        assert runtime.provider_for_agent(agent) is runtime.provider
+
+    def test_provider_for_agent_model_override_inherits_gateway_provider(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("AGENCY_LLM_KEY", "agency-secret")
+        agency_llm_config = LLMConfig(
+            provider=OpenAIProviderSettings(
+                type=LLMProviderType.OPENAI,
+                api_url="https://agency.example/v1",
+                api_key_env_var="AGENCY_LLM_KEY",
+            ),
+            model=LLMModelConfig(name="agency-model"),
+        )
+        runtime = Runtime(
+            provider=load_provider_from_config(agency_llm_config),
+            provider_config=agency_llm_config,
+            workspace_root=tmp_path,
+        )
+        agent = Agent(
+            id=AgentID("agent"),
+            llm_config=LLMConfig(
+                model=LLMModelConfig(name="agent-model"),
+            ),
+        )
+
+        provider = runtime.provider_for_agent(agent)
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.config.api_url == "https://agency.example/v1"
+        assert provider.config.api_key == "agency-secret"
+        assert provider.config.model_name == "agent-model"
+
+    def test_provider_for_session_applies_session_override_last(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("AGENCY_LLM_KEY", "agency-secret")
+        agency_llm_config = LLMConfig(
+            provider=OpenAIProviderSettings(
+                type=LLMProviderType.OPENAI,
+                api_url="https://agency.example/v1",
+                api_key_env_var="AGENCY_LLM_KEY",
+            ),
+            model=LLMModelConfig(
+                name="agency-model",
+                options={"temperature": 0.1, "max_tokens": 4096},
+            ),
+        )
+        runtime = Runtime(
+            provider=load_provider_from_config(agency_llm_config),
+            provider_config=agency_llm_config,
+            workspace_root=tmp_path,
+        )
+        agent = Agent(
+            id=AgentID("agent"),
+            llm_config=LLMConfig(
+                model=LLMModelConfig(
+                    name="agent-model",
+                    options={"reasoning_effort": "medium"},
+                ),
+            ),
+        )
+        session = Session(
+            agent=agent,
+            key=SessionKey("session-model"),
+            llm_config=LLMConfig(
+                model=LLMModelConfig(
+                    name="session-model",
+                    options={"temperature": 0.4},
+                ),
+            ),
+        )
+
+        provider = runtime.provider_for_session(session)
+
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.config.api_url == "https://agency.example/v1"
+        assert provider.config.api_key == "agency-secret"
+        assert provider.config.model_name == "session-model"
+        assert provider.config.model_options == {
+            "max_tokens": 4096,
+            "reasoning_effort": "medium",
+            "temperature": 0.4,
+        }
+
     def test_create_agent_with_auto_id(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
         agent = rt.create_agent()
@@ -2083,11 +2287,11 @@ class TestReExports:
     def test_runtime_importable_from_thorn_runtime(self):
         from thorn.runtime import (
             AgentID,
+            JsonSessionSerializer,
             Runtime,
             SessionKey,
-            SessionStore,
             SessionSerializer,
-            JsonSessionSerializer,
+            SessionStore,
         )
         assert all(cls is not None for cls in [
             AgentID, Runtime, SessionKey, SessionStore,

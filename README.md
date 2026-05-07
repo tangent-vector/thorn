@@ -33,17 +33,15 @@ $ uv sync --all-extras
 ### 2. Create a `.env` file
 
 The gateway only reads **secrets** from environment variables; all
-other configuration (forge base URL, project metadata, polling cadence,
-etc.) lives in `gateway.json` and the per-agent identity JSON files
-that `thorn serve bootstrap` writes for you. The CLI loads a `.env`
-file from the working tree, so create one at the repository root with
-just the secrets:
+other configuration (LLM provider URL, model name, forge base URL,
+project metadata, polling cadence, etc.) lives in `gateway.json` and
+the per-agent identity JSON files that `thorn serve bootstrap` writes
+for you. The CLI loads a `.env` file from the working tree, so create
+one at the repository root with just the secrets:
 
 ```dotenv
 # LLM provider (any OpenAI-compatible API)
-OPENAI_API_URL=https://api.openai.com/v1
 OPENAI_API_KEY=sk-...
-OPENAI_API_MODEL_NAME=gpt-4o
 
 # GitHub (PAT auth) -- the only required forge secret for GitHub.
 GITHUB_TOKEN=ghp_...
@@ -69,6 +67,9 @@ $ uv run thorn serve bootstrap \
     --agent-id my-coordinator \
     --project-name my-repo \
     --project-url https://github.com/owner/repo \
+    --llm-api-url https://api.openai.com/v1 \
+    --llm-model gpt-4o \
+    --llm-api-key-env OPENAI_API_KEY \
     --agency-home ~/.thorn \
     --agency-workspace ~/thorn-workspace
 ```
@@ -80,6 +81,9 @@ $ uv run thorn serve bootstrap \
     --agent-id my-coordinator \
     --project-name my-repo \
     --project-url https://gitlab.com/group/my-repo \
+    --llm-api-url https://api.openai.com/v1 \
+    --llm-model gpt-4o \
+    --llm-api-key-env OPENAI_API_KEY \
     --agency-home ~/.thorn \
     --agency-workspace ~/thorn-workspace
 ```
@@ -94,7 +98,7 @@ This writes these files and directories:
 |------|---------|
 | `~/.thorn/agents/my-coordinator/agent.json` | Agent identity, including the forge account and a `credentials[*].env_var_name` reference naming the env var that holds the literal token. |
 | `~/.thorn/agents/my-coordinator/home/MEMORY.md` | Persistent memory mounted into the agent sandbox. |
-| `~/.thorn/gateway.json` | Workspace path and project metadata. No secrets live here. |
+| `~/.thorn/gateway.json` | Workspace path, LLM provider/model settings, and project metadata. No secrets live here. |
 | `~/thorn-workspace/my-coordinator/` | Agent workspace prefix where sessions clone repositories and make changes. |
 
 ### 4. Run the first-readiness preflight
@@ -242,14 +246,46 @@ from all other configuration (held in JSON on disk).  The on-disk
 files live under the agency home you pass with `--agency-home`
 (`~/.thorn` in the quick start):
 
-- `gateway.json` -- workspace path, optional forge entries (`name`,
-  `type`, `url`, optional `api_url`), and project metadata. Contains
-  *no* secrets.
+- `gateway.json` -- workspace path, optional LLM provider/model
+  defaults, optional forge entries (`name`, `type`, `url`, optional
+  `api_url`), and project metadata. Contains *no* secrets.
 - `agents/<agent-id>/agent.json` -- the agent identity, including an
   `accounts` list whose `credentials[*].env_var_name` field names the
   env var the operator put the literal secret into (e.g.
   `"GITHUB_TOKEN"`). The literal value lives only in the environment;
-  the agent state never carries it.
+  the agent state never carries it. Agents may also carry an `llm`
+  block that overrides the gateway's LLM defaults for that agent.
+
+For example, a gateway can make provider/model selection explicit while
+still keeping the API key in an environment variable:
+
+```json
+{
+  "workspace": "/home/me/thorn-workspace",
+  "llm": {
+    "provider": {
+      "type": "openai",
+      "api_url": "https://api.openai.com/v1",
+      "api_key_env_var": "OPENAI_API_KEY"
+    },
+    "model": {
+      "name": "gpt-4o",
+      "options": {
+        "temperature": 0.2,
+        "reasoning_effort": "medium",
+        "max_tokens": 8192
+      }
+    }
+  },
+  "projects": []
+}
+```
+
+An agent-level `agent.json` can specify just the model fields that
+differ from the gateway default, such as
+`{"llm": {"model": {"name": "gpt-4o-mini"}}}`.
+The `options` object is provider/model-specific JSON; Thorn preserves
+it in config and lets the selected provider interpret the keys.
 
 To change a forge URL, edit `gateway.json` (no env-var indirection
 needed).  To rotate a secret, change the env var the agent identity
@@ -257,13 +293,12 @@ points to and restart the gateway.
 
 ### Environment variables
 
-Only secrets are read from the environment:
+Secrets are read from the environment. Non-secret LLM provider and model
+settings live in `gateway.json`.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENAI_API_URL` | Yes | Base URL of an OpenAI-compatible LLM API |
-| `OPENAI_API_KEY` | Yes | API key for the LLM provider |
-| `OPENAI_API_MODEL_NAME` | Yes | Model name (e.g. `gpt-4o`, `claude-sonnet-4-20250514`) |
+| Env var named by `llm.provider.api_key_env_var` | For LLM provider | API key for the LLM provider |
 | `GITHUB_TOKEN` | For GitHub | Personal access token with `repo`, `notifications`, and (if needed) `read:org` scopes.  Default name written by `bootstrap`; any name may be used by editing the agent identity JSON. |
 | `GITLAB_TOKEN` | For GitLab | Personal access token with API scope.  Default name written by `bootstrap`; any name may be used by editing the agent identity JSON. |
 

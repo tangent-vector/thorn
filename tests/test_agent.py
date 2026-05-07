@@ -8,26 +8,26 @@ from typing import Any
 
 import pytest
 
-from thorn.core._agent import Agent, _SafeDict, _derive_stable_agent_id
+from thorn.core._agent import Agent, _derive_stable_agent_id, _SafeDict
 from thorn.core._context import (
     ExecutionContext,
     get_context,
     reset_context,
     set_context,
 )
+from thorn.core._executor import ToolVenue
 from thorn.core._func import skill
 from thorn.core._journal import JOURNAL_TOOLS
+from thorn.core._messages import AssistantMessage
+from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
+from thorn.core._session import Session
+from thorn.runtime import Runtime
 from thorn.runtime._inbox_tools import INBOX_TOOLS
+from thorn.runtime._session import AgentID
 
 # Framework-default tools appended to every agent, in the order
 # ``Agent._collect_tools`` adds them.
 _DEFAULT_TOOLS = list(JOURNAL_TOOLS) + list(INBOX_TOOLS)
-from thorn.core._messages import AssistantMessage
-from thorn.core._provider import FinishChunk, MockProvider, TextChunk, ToolCallChunk
-from thorn.core._session import Session
-from thorn.runtime._session import AgentID
-from thorn.core._executor import ToolVenue
-
 
 # ---------------------------------------------------------------------------
 # _SafeDict
@@ -353,6 +353,29 @@ class TestAgentPromptTextMode:
         agent = SimpleAgent()
         result = await agent.prompt("do it", system="Extra instruction.")
         assert isinstance(result, str)
+
+    async def test_prompt_uses_runtime_session_provider(self, tmp_path: Path):
+        default_provider = MockProvider(canned_responses=[[
+            TextChunk(text="default"),
+            FinishChunk(reason="stop"),
+        ]])
+        selected_provider = MockProvider(canned_responses=[[
+            TextChunk(text="selected"),
+            FinishChunk(reason="stop"),
+        ]])
+        runtime = Runtime(provider=default_provider, workspace_root=tmp_path)
+        agent = Agent(id=AgentID("configured"))
+
+        def provider_for_session(selected_session: Session):
+            assert selected_session.agent is agent
+            return selected_provider
+
+        runtime.provider_for_session = provider_for_session  # type: ignore[method-assign]
+
+        async with runtime:
+            result = await agent.prompt("hello")
+
+        assert result == "selected"
 
 
 # ---------------------------------------------------------------------------

@@ -74,6 +74,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field, GetCoreSchemaHandler, model_validator
 from pydantic_core import CoreSchema, core_schema
 
+from thorn.core._provider import LLMConfig
 from thorn.core._service import Service
 from thorn.gateway._event import EventSource
 from thorn.gateway._peer import PeerSpec
@@ -1246,6 +1247,14 @@ class GatewayConfig(BaseModel):
     )
     forges: list[ForgeSpec] = Field(default_factory=list)
     projects: list[ProjectSpec] = Field(default_factory=list)
+    llm: LLMConfig = Field(
+        default_factory=LLMConfig,
+        description=(
+            "Agency-wide default LLM provider and model settings.  "
+            "Agent agent.json files may override this with their own "
+            "`llm` block; secrets remain environment-variable references."
+        ),
+    )
     peers: list[PeerSpec] = Field(
         default_factory=list,
         description=(

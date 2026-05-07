@@ -2,8 +2,9 @@
 
 Creates the agent identity file (``<agent-id>.json``), the agent's
 home directory, a ``MEMORY.md`` containing project-specific knowledge,
-and a ``gateway.json`` service configuration (workspace + project
-definition; forges are inferred from the project URL).
+and a ``gateway.json`` service configuration (workspace, optional LLM
+provider/model defaults, and project definition; forges are inferred
+from the project URL).
 
 The bootstrap takes two filesystem roots, matching the
 home-vs-workspace split that ``AgencyPaths`` already exposes for the
@@ -52,6 +53,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from thorn.core._provider import LLMConfig
 from thorn.gateway._config import (
     GATEWAY_CONFIG_FILENAME,
     derive_forge_type_from_url,
@@ -80,6 +82,7 @@ def _ensure_gateway_config(
     *,
     workspace_path: str,
     project_entry: dict[str, Any],
+    llm_config: LLMConfig | None = None,
 ) -> None:
     """Create or update ``gateway.json`` with workspace and project entry.
 
@@ -93,6 +96,9 @@ def _ensure_gateway_config(
     the matching forge entry from the project URL at load time;
     operators only need to write an explicit ``forges:`` array when
     targeting a self-hosted forge whose type cannot be inferred.
+    When ``llm_config`` is supplied, it replaces the gateway-level
+    ``llm`` block; rerunning bootstrap without it preserves any existing
+    LLM config.
     """
     config_path = agency_home / GATEWAY_CONFIG_FILENAME
 
@@ -102,6 +108,8 @@ def _ensure_gateway_config(
         data = {}
 
     data["workspace"] = workspace_path
+    if llm_config is not None:
+        data["llm"] = llm_config.model_dump(mode="json", exclude_none=True)
 
     projects: list[dict[str, Any]] = data.setdefault("projects", [])
     _upsert_by_name(projects, project_entry)
@@ -129,6 +137,7 @@ def bootstrap_coordinator(
     access_token_env: str | None = None,
     git_user_name: str = "",
     git_user_email: str = "",
+    llm_config: LLMConfig | None = None,
 ) -> AgentID:
     """Create a ProjectCoordinator agent in the given agency.
 
@@ -159,6 +168,11 @@ def bootstrap_coordinator(
     accounts always use PAT authentication (default
     ``$GITHUB_TOKEN``) -- the inferred Notifications event source
     requires user-scoped credentials.
+
+    *llm_config* records gateway-level LLM provider/model defaults.
+    The config stores only non-secret values and an environment-variable
+    name for the provider key; the literal key stays in the process
+    environment.
 
     Returns the ``AgentID`` of the created agent.
     """
@@ -287,6 +301,7 @@ def bootstrap_coordinator(
         agency_home,
         workspace_path=str(agency_workspace),
         project_entry=project_entry,
+        llm_config=llm_config,
     )
 
     return aid
