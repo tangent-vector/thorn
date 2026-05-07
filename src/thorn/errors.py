@@ -7,6 +7,7 @@ now live in ``thorn.core.errors``.
 from thorn.core.errors import (
     AgentFailureError,
     LoopLimitError,
+    LoopRepetitionError,
     ProviderError,
     ProviderUnavailableError,
     RateLimitError,
@@ -18,6 +19,7 @@ from thorn.core.errors import (
 __all__ = [
     "AgentFailureError",
     "LoopLimitError",
+    "LoopRepetitionError",
     "ProviderError",
     "ProviderUnavailableError",
     "RateLimitError",

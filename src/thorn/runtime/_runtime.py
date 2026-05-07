@@ -413,10 +413,30 @@ class Runtime:
                 # process start will recreate its socket.
                 pass
 
+        await self._close_providers()
+
         if self._context_token is not None:
             reset_context(self._context_token)
             self._context_token = None
         self._context = None
+
+    async def _close_providers(self) -> None:
+        providers = [
+            self.provider,
+            *self._configured_provider_cache.values(),
+        ]
+        self._configured_provider_cache.clear()
+
+        closed_provider_ids: set[int] = set()
+        for provider in providers:
+            provider_id = id(provider)
+            if provider_id in closed_provider_ids:
+                continue
+            closed_provider_ids.add(provider_id)
+            try:
+                await provider.aclose()
+            except Exception:
+                pass
 
     # -- Sandbox executor pool ---------------------------------------------
 

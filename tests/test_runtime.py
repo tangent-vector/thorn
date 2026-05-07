@@ -2000,6 +2000,42 @@ class TestRuntime:
             "temperature": 0.4,
         }
 
+    @pytest.mark.asyncio
+    async def test_context_exit_closes_runtime_and_cached_providers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("AGENCY_LLM_KEY", "agency-secret")
+        agency_llm_config = LLMConfig(
+            provider=OpenAIProviderSettings(
+                type=LLMProviderType.OPENAI,
+                api_url="https://agency.example/v1",
+                api_key_env_var="AGENCY_LLM_KEY",
+            ),
+            model=LLMModelConfig(name="agency-model"),
+        )
+        runtime = Runtime(
+            provider=load_provider_from_config(agency_llm_config),
+            provider_config=agency_llm_config,
+            workspace_root=tmp_path,
+        )
+        agent = Agent(
+            id=AgentID("agent"),
+            llm_config=LLMConfig(model=LLMModelConfig(name="agent-model")),
+        )
+        runtime.provider_for_agent(agent)
+
+        closed_model_names: list[str] = []
+
+        async def record_close(provider: OpenAIProvider) -> None:
+            closed_model_names.append(provider.config.model_name)
+
+        monkeypatch.setattr(OpenAIProvider, "aclose", record_close)
+
+        async with runtime:
+            pass
+
+        assert sorted(closed_model_names) == ["agency-model", "agent-model"]
+
     def test_create_agent_with_auto_id(self, tmp_path: Path):
         rt = self._make_runtime(tmp_path)
         agent = rt.create_agent()

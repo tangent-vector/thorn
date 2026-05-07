@@ -15,6 +15,8 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +53,7 @@ from thorn.core._schema import (
 from thorn.core.errors import (
     AgentFailureError,
     LoopLimitError,
+    LoopRepetitionError,
     ProviderError,
     ProviderUnavailableError,
     RateLimitError,
@@ -71,6 +74,51 @@ _DEFAULT_RETRY_POLICY = RetryPolicy.from_env()
 # Sentinel returned by _execute_tool_calls when the structured-mode
 # ``return_result`` tool is invoked.
 _RESULT_SENTINEL = object()
+
+
+class _AssistantRoundKind(StrEnum):
+    TEXT = "text"
+    TOOL_CALLS = "tool_calls"
+
+
+@dataclass(frozen=True)
+class _ToolCallFingerprint:
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True)
+class _ToolResultFingerprint:
+    content: str
+    is_error: bool
+
+
+@dataclass(frozen=True)
+class _AssistantRoundFingerprint:
+    kind: _AssistantRoundKind
+    text: str
+    tool_calls: tuple[_ToolCallFingerprint, ...] = ()
+    tool_results: tuple[_ToolResultFingerprint, ...] = ()
+
+
+@dataclass
+class _ConsecutiveRepetitionTracker:
+    limit: int
+    previous: _AssistantRoundFingerprint | None = None
+    count: int = 0
+
+    def observe(self, fingerprint: _AssistantRoundFingerprint) -> int:
+        if self.previous == fingerprint:
+            self.count += 1
+            return self.count
+
+        self.previous = fingerprint
+        self.count = 1
+        return self.count
+
+    def reset(self) -> None:
+        self.previous = None
+        self.count = 0
 
 
 class _WrappedTool:
@@ -132,6 +180,7 @@ async def run_agent_loop(
     system_prompts: list[str] | None = None,
     result_type: type | None = None,
     max_tool_rounds: int = 50,
+    max_repeated_rounds: int = 3,
     max_failures: int = 5,
     history: HistoryTree | None = None,
     session: Any = None,
@@ -154,10 +203,17 @@ async def run_agent_loop(
     When *session* is provided, it is passed to status providers so
     they can tailor advisory content to the active session/agent.
 
+    ``max_repeated_rounds`` aborts a stuck loop before
+    ``max_tool_rounds`` when identical text-only structured responses
+    or identical tool-error rounds repeat consecutively.
+
     The *_housekeeping* flag is set by the housekeeping subsystem to
     prevent recursive housekeeping triggers within a sub-loop.
     External callers should not set this.
     """
+    if max_repeated_rounds < 2:
+        raise ValueError("max_repeated_rounds must be at least 2")
+
     structured = result_type is not None and result_type is not str
 
     # -- build schemas and registry ----------------------------------------
@@ -206,6 +262,9 @@ async def run_agent_loop(
     overhead_tokens = _estimate_overhead(prompts, all_schemas) if context_window else 0
 
     consecutive_failures = 0
+    repetition_tracker = _ConsecutiveRepetitionTracker(
+        limit=max_repeated_rounds,
+    )
 
     for round_num in range(max_tool_rounds):
         rendered = history.render()
@@ -235,6 +294,11 @@ async def run_agent_loop(
                 "You must call the `return_result` tool with your "
                 "answer, or `raise_error` if you cannot proceed.  "
                 "Do not reply with plain text."
+            )
+            await _raise_if_repeated(
+                tracker=repetition_tracker,
+                fingerprint=_fingerprint_text_round(text),
+                context=context,
             )
             continue
 
@@ -294,8 +358,92 @@ async def run_agent_loop(
         if captured is not _RESULT_SENTINEL:
             return captured
 
+        tool_round_fingerprint = _fingerprint_repeated_tool_error_round(
+            text=text,
+            tool_calls=tool_calls,
+            result_messages=result_msgs,
+        )
+        if tool_round_fingerprint is None:
+            repetition_tracker.reset()
+        else:
+            await _raise_if_repeated(
+                tracker=repetition_tracker,
+                fingerprint=tool_round_fingerprint,
+                context=context,
+            )
+
     raise LoopLimitError(
         f"agent loop exceeded {max_tool_rounds} rounds", max_tool_rounds,
+    )
+
+
+def _fingerprint_text_round(text: str) -> _AssistantRoundFingerprint:
+    return _AssistantRoundFingerprint(
+        kind=_AssistantRoundKind.TEXT,
+        text=text,
+    )
+
+
+def _fingerprint_repeated_tool_error_round(
+    *,
+    text: str,
+    tool_calls: list[ToolCall],
+    result_messages: list[ToolResultMessage],
+) -> _AssistantRoundFingerprint | None:
+    if any(not result.is_error for result in result_messages):
+        return None
+
+    return _AssistantRoundFingerprint(
+        kind=_AssistantRoundKind.TOOL_CALLS,
+        text=text,
+        tool_calls=tuple(
+            _ToolCallFingerprint(
+                name=tool_call.name,
+                arguments=_canonicalize_tool_arguments(tool_call.arguments),
+            )
+            for tool_call in tool_calls
+        ),
+        tool_results=tuple(
+            _ToolResultFingerprint(
+                content=result.content,
+                is_error=result.is_error,
+            )
+            for result in result_messages
+        ),
+    )
+
+
+def _canonicalize_tool_arguments(arguments: str) -> str:
+    if not arguments:
+        return ""
+
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return arguments
+
+    return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+
+
+async def _raise_if_repeated(
+    *,
+    tracker: _ConsecutiveRepetitionTracker,
+    fingerprint: _AssistantRoundFingerprint,
+    context: ExecutionContext,
+) -> None:
+    repetitions = tracker.observe(fingerprint)
+    if repetitions < tracker.limit:
+        return
+
+    await context.event_sink.on_status(
+        f"loop repetition: repeated {fingerprint.kind.value} round "
+        f"{repetitions} times",
+        scope=context.scope,
+    )
+    raise LoopRepetitionError(
+        f"agent loop repeated the same {fingerprint.kind.value} round "
+        f"{repetitions} times",
+        repetitions,
     )
 
 
