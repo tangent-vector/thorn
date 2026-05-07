@@ -7,7 +7,10 @@ import json
 import sys
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -45,6 +48,7 @@ from thorn.runtime import (
     SessionKey,
     make_cli_prompt_dispatcher,
 )
+from thorn.runtime._lock import SessionLockError, session_lock
 from thorn.runtime._project_detection import (
     pick_logical_agent_workspace_path_for_cli_session,
 )
@@ -67,13 +71,220 @@ CLI_AGENT_ID = AgentID("local")
 """Well-known agent ID for the CLI local coding agent."""
 
 
+class _WorkspaceState(StrEnum):
+    PRESENT = "present"
+    MISSING = "missing"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class _CLISessionRecord:
+    agent_id: AgentID
+    session_key: SessionKey
+    created_at: datetime | None
+    last_active: datetime | None
+    workspace_root: Path | None
+    workspace_state: _WorkspaceState
+
+    def to_json(self) -> dict[str, str | None]:
+        return {
+            "agent_id": str(self.agent_id),
+            "key": str(self.session_key),
+            "created_at": (
+                self.created_at.isoformat()
+                if self.created_at is not None
+                else None
+            ),
+            "last_active": (
+                self.last_active.isoformat()
+                if self.last_active is not None
+                else None
+            ),
+            "workspace_root": (
+                str(self.workspace_root)
+                if self.workspace_root is not None
+                else None
+            ),
+            "workspace_state": self.workspace_state.value,
+        }
+
+
+@dataclass(frozen=True)
+class _CLICommandStartup:
+    agency_home: Path
+    workspace_root: Path
+    resume_session_key: SessionKey | None
+
+
+def _workspace_state_for(workspace_root: Path | None) -> _WorkspaceState:
+    if workspace_root is None:
+        return _WorkspaceState.UNKNOWN
+    if workspace_root.is_dir():
+        return _WorkspaceState.PRESENT
+    return _WorkspaceState.MISSING
+
+
+def _session_sort_key(record: _CLISessionRecord) -> datetime:
+    return (
+        record.last_active
+        or record.created_at
+        or datetime.min.replace(tzinfo=timezone.utc)
+    )
+
+
+def _parse_resume_session_key(raw: str | None) -> SessionKey | None:
+    if raw is None:
+        return None
+    try:
+        return SessionKey(raw)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _resolve_cli_sessions_agency_home(agency_path: str | None) -> Path:
+    if agency_path is not None:
+        agency_home = Path(agency_path).expanduser().resolve()
+        if not agency_home.is_dir():
+            raise click.ClickException(
+                f"Agency home directory does not exist: {agency_home}"
+            )
+        return agency_home
+    return (Path.home() / ".thorn").resolve()
+
+
+def _load_cli_session_records(
+    *,
+    agency_home: Path,
+    workspace_root: Path,
+) -> list[_CLISessionRecord]:
+    from thorn.runtime._paths import AgencyPaths
+    from thorn.runtime._store import SessionStore
+
+    if not agency_home.is_dir():
+        return []
+
+    paths = AgencyPaths(home_root=agency_home, workspace_root=workspace_root)
+    store = SessionStore(paths)
+    if not store.agent_exists(CLI_AGENT_ID):
+        return []
+
+    agent = store.load_agent(CLI_AGENT_ID)
+    records: list[_CLISessionRecord] = []
+    for session_key in store.list_session_keys(CLI_AGENT_ID):
+        if session_key.components[0] != "cli":
+            continue
+        session = store.load_session(agent, session_key)
+        records.append(
+            _CLISessionRecord(
+                agent_id=CLI_AGENT_ID,
+                session_key=session_key,
+                created_at=session.created_at,
+                last_active=session.last_active,
+                workspace_root=session.workspace_root,
+                workspace_state=_workspace_state_for(session.workspace_root),
+            )
+        )
+    records.sort(key=_session_sort_key, reverse=True)
+    return records
+
+
+def _load_cli_session_for_resume(
+    *,
+    agency_home: Path,
+    workspace_root: Path,
+    session_key: SessionKey,
+) -> Session:
+    from thorn.runtime._paths import AgencyPaths
+    from thorn.runtime._store import SessionStore
+
+    paths = AgencyPaths(home_root=agency_home, workspace_root=workspace_root)
+    store = SessionStore(paths)
+    if not store.agent_exists(CLI_AGENT_ID):
+        raise click.ClickException(
+            f"No local CLI agent is persisted under {agency_home}."
+        )
+    if not store.session_exists(CLI_AGENT_ID, session_key):
+        raise click.ClickException(
+            f"No persisted CLI session {session_key!s} found under "
+            f"{agency_home}."
+        )
+    agent = store.load_agent(CLI_AGENT_ID)
+    return store.load_session(agent, session_key)
+
+
+def _resolve_cli_command_startup(
+    *,
+    agency_path: str | None,
+    workspace_path: str | None,
+    resume_session_key_raw: str | None,
+) -> _CLICommandStartup:
+    resume_session_key = _parse_resume_session_key(resume_session_key_raw)
+    agency_home = (
+        _resolve_cli_agency_home(agency_path)
+        if resume_session_key is None
+        else _resolve_cli_sessions_agency_home(agency_path)
+    )
+    requested_workspace = (
+        Path(workspace_path).resolve()
+        if workspace_path is not None
+        else None
+    )
+    if resume_session_key is None:
+        return _CLICommandStartup(
+            agency_home=agency_home,
+            workspace_root=requested_workspace or Path.cwd().resolve(),
+            resume_session_key=None,
+        )
+
+    provisional_workspace = requested_workspace or Path.cwd().resolve()
+    session = _load_cli_session_for_resume(
+        agency_home=agency_home,
+        workspace_root=provisional_workspace,
+        session_key=resume_session_key,
+    )
+    stored_workspace = (
+        session.workspace_root.resolve()
+        if session.workspace_root is not None
+        else None
+    )
+    if stored_workspace is not None and requested_workspace is not None:
+        if stored_workspace != requested_workspace:
+            raise click.ClickException(
+                f"CLI session {resume_session_key!s} was created for "
+                f"workspace {stored_workspace}, but --workspace resolved "
+                f"to {requested_workspace}."
+            )
+
+    workspace_root = stored_workspace or requested_workspace or Path.cwd().resolve()
+    if not workspace_root.is_dir():
+        raise click.ClickException(
+            f"Workspace for CLI session {resume_session_key!s} does not "
+            f"exist: {workspace_root}"
+        )
+    return _CLICommandStartup(
+        agency_home=agency_home,
+        workspace_root=workspace_root,
+        resume_session_key=resume_session_key,
+    )
+
+
+def _raise_locked_session(
+    *,
+    session_key: SessionKey,
+    error: SessionLockError,
+) -> None:
+    raise click.ClickException(
+        f"CLI session {session_key!s} is already active in another "
+        f"Thorn process: {error}"
+    ) from error
+
+
 def _generate_cli_session_key(workspace_root: Path) -> SessionKey:
     """Generate a fresh session key for a single CLI invocation.
 
-    Phase 5 of the CLI/gateway unification: every ``thorn run`` and
-    every ``thorn chat`` invocation gets a brand-new ephemeral session
-    rather than resuming a stable per-workspace one.  The aspirational
-    architecture doc says:
+    Every ``thorn run`` and ``thorn chat`` invocation gets a brand-new
+    session by default rather than resuming a stable per-workspace one.
+    The aspirational architecture doc says:
 
         Each invocation of ``thorn chat`` or ``thorn run`` creates a
         fresh session by default, with a key that depends on the
@@ -92,8 +303,8 @@ def _generate_cli_session_key(workspace_root: Path) -> SessionKey:
       keeps each individual session unique so collisions are
       harmless;
     - the 8-hex-char uuid suffix guarantees uniqueness across
-      invocations and is short enough to type or paste in a future
-      ``/resume <key>`` slash command.
+      invocations and is short enough to copy into ``thorn run
+      --resume`` or ``thorn chat --resume``.
 
     Characters in the basename that aren't safe as a single directory
     component are percent-encoded via :func:`safe_dirname`; the rest
@@ -263,6 +474,65 @@ def main() -> None:
         load_dotenv(find_dotenv(usecwd=True))
     except ImportError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# thorn sessions
+# ---------------------------------------------------------------------------
+
+@main.group()
+def sessions() -> None:
+    """Inspect persisted local CLI sessions."""
+
+
+@sessions.command("list")
+@click.option(
+    "--agency",
+    "agency_path",
+    type=click.Path(file_okay=False),
+    default=None,
+    help=(
+        "Agency home directory containing the local CLI agent. "
+        "Defaults to ~/.thorn."
+    ),
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    default=False,
+    help="Print machine-readable JSON.",
+)
+def sessions_list(agency_path: str | None, json_output: bool) -> None:
+    """List persisted ``thorn run`` and ``thorn chat`` sessions."""
+    agency_home = _resolve_cli_sessions_agency_home(agency_path)
+    records = _load_cli_session_records(
+        agency_home=agency_home,
+        workspace_root=Path.cwd().resolve(),
+    )
+    if json_output:
+        _emit_json([record.to_json() for record in records])
+        return
+    if not records:
+        console.print("[dim]No CLI sessions found.[/dim]")
+        return
+
+    console.print(f"[bold]CLI sessions ({len(records)}):[/bold]")
+    for record in records:
+        last_active = (
+            record.last_active.isoformat()
+            if record.last_active is not None
+            else "unknown"
+        )
+        workspace = (
+            str(record.workspace_root)
+            if record.workspace_root is not None
+            else "unknown"
+        )
+        console.print(
+            f"  {record.session_key}  last_active={last_active}  "
+            f"workspace={workspace} ({record.workspace_state.value})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -792,6 +1062,7 @@ def _write_result_file(
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
 @click.option("--workspace", "workspace_path", type=click.Path(exists=True, file_okay=False), default=None, help="Override workspace root directory.")
+@click.option("--resume", "resume_session_key_raw", default=None, help="Resume an existing CLI session key.")
 @click.option(
     "--agency",
     "agency_path",
@@ -803,22 +1074,34 @@ def _write_result_file(
     ),
 )
 @click.option("--result-file", "result_file_path", type=click.Path(), default=None, help="Write a JSON result summary (outcome, duration, token usage).")
-def run(prompt_text: str, verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, result_file_path: str | None) -> None:
+def run(
+    prompt_text: str,
+    verbose: int,
+    quiet: bool,
+    trace_path: str | None,
+    workspace_path: str | None,
+    resume_session_key_raw: str | None,
+    agency_path: str | None,
+    result_file_path: str | None,
+) -> None:
     """Execute a single prompt and print the result."""
     from thorn.runtime._paths import AgencyPaths
 
     verbosity = _resolve_verbosity(verbose, quiet)
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        agency_home = _resolve_cli_agency_home(agency_path)
-        ws_root = (
-            Path(workspace_path).resolve() if workspace_path
-            else Path.cwd().resolve()
+        startup = _resolve_cli_command_startup(
+            agency_path=agency_path,
+            workspace_path=workspace_path,
+            resume_session_key_raw=resume_session_key_raw,
         )
-        paths = AgencyPaths(home_root=agency_home, workspace_root=ws_root)
+        paths = AgencyPaths(
+            home_root=startup.agency_home,
+            workspace_root=startup.workspace_root,
+        )
         runtime = _build_runtime(
             trace_file=trace_file,
-            workspace=str(ws_root),
+            workspace=str(startup.workspace_root),
             paths=paths,
             sandbox_executor_enabled=True,
         )
@@ -831,6 +1114,19 @@ def run(prompt_text: str, verbose: int, quiet: bool, trace_path: str | None, wor
                 Path(result_file_path), "agent_error", 0.0, None, str(exc), trace_path,
             )
         sys.exit(1)
+    except click.ClickException as exc:
+        if trace_file:
+            trace_file.close()
+        if result_file_path:
+            _write_result_file(
+                Path(result_file_path),
+                "agent_error",
+                0.0,
+                None,
+                exc.message,
+                trace_path,
+            )
+        raise
 
     ctx_holder: list[ExecutionContext] = []
 
@@ -850,19 +1146,18 @@ def run(prompt_text: str, verbose: int, quiet: bool, trace_path: str | None, wor
             ctx_holder.append(runtime.context)
             agent = _ensure_cli_agent(runtime)
 
-            # Phase 5: every CLI invocation gets a fresh session
-            # under a unique key (``cli/<workspace-basename>/<uuid>``).
-            # The in-memory session is never persisted
-            # (``save_session=None`` below) so the only on-disk
-            # artefacts are the session's inbox directory (empty
-            # after the dispatcher deletes the one notification it
-            # processes) and, in future, shutdown-housekeeping
-            # journal entries that the agent may choose to write.
+            # By default every CLI invocation gets a fresh session
+            # under a unique key (``cli/<workspace-basename>/<uuid>``);
+            # ``--resume`` opts into loading one of those persisted
+            # sessions and appending another one-shot prompt.
             if agent.id is None:
                 raise RuntimeError(
                     "CLI agent has no id; cannot build a session inbox"
                 )
-            session_key = _generate_cli_session_key(runtime.workspace_root)
+            session_key = (
+                startup.resume_session_key
+                or _generate_cli_session_key(runtime.workspace_root)
+            )
             # Pick the logical agent-workspace upper bound for this
             # CLI session by scanning ancestors of the session
             # workspace for a project-root marker.  Persisted on
@@ -894,9 +1189,9 @@ def run(prompt_text: str, verbose: int, quiet: bool, trace_path: str | None, wor
                 console_listener,
                 scope_filter=in_session(session_key),
             ):
-                session = Session(
-                    agent=agent,
-                    key=session_key,
+                session = runtime.get_or_create_session(
+                    agent,
+                    session_key,
                     workspace_root=runtime.workspace_root,
                     logical_agent_workspace_path=(
                         logical_agent_workspace_path
@@ -924,22 +1219,39 @@ def run(prompt_text: str, verbose: int, quiet: bool, trace_path: str | None, wor
                         "ask questions."
                     ),
                 )
-                # ``save_session=None``: ``thorn run`` is ephemeral.
-                # Phase 5 will revisit when the local-agency defaults
-                # land and persistence semantics get redesigned.
+
+                async def _save_session_async(sess: Session) -> None:
+                    runtime.save_session(sess)
+
                 scheduler = AgentScheduler(
                     agent=agent,
                     prompt_dispatcher=dispatcher,
-                    save_session=None,
+                    save_session=_save_session_async,
                 )
                 try:
-                    inbox.post(NotificationSpec(
-                        source="user",
-                        content=prompt_text,
-                        target=session_address,
-                    ))
-                    await scheduler.submit(session, inbox)
-                    return await result_future
+                    lock_context = (
+                        session_lock(
+                            runtime.paths.session_metadata_dir(
+                                agent.id, session_key,
+                            )
+                        )
+                        if startup.resume_session_key is not None
+                        else nullcontext()
+                    )
+                    try:
+                        with lock_context:
+                            inbox.post(NotificationSpec(
+                                source="user",
+                                content=prompt_text,
+                                target=session_address,
+                            ))
+                            await scheduler.submit(session, inbox)
+                            return await result_future
+                    except SessionLockError as exc:
+                        _raise_locked_session(
+                            session_key=session_key,
+                            error=exc,
+                        )
                 finally:
                     # Bounded grace period so a misbehaving
                     # dispatcher cannot wedge process exit
@@ -966,6 +1278,9 @@ def run(prompt_text: str, verbose: int, quiet: bool, trace_path: str | None, wor
     except ThornError as exc:
         outcome, error_msg, exit_code = "agent_error", str(exc), 1
         console.print(f"\n[red]Error:[/red] {exc}")
+    except click.ClickException as exc:
+        outcome, error_msg, exit_code = "agent_error", exc.message, 1
+        raise
     except KeyboardInterrupt:
         outcome, error_msg, exit_code = "agent_error", "interrupted", 130
         console.print("\n[dim]Interrupted.[/dim]")
@@ -1040,6 +1355,7 @@ async def _chat_loop(
 @click.option("-q", "--quiet", is_flag=True, default=False, help="Suppress all output except the final answer.")
 @click.option("--trace", "trace_path", type=click.Path(), default=None, help="Write execution trace to a JSONL file.")
 @click.option("--workspace", "workspace_path", type=click.Path(exists=True, file_okay=False), default=None, help="Override workspace root directory.")
+@click.option("--resume", "resume_session_key_raw", default=None, help="Resume an existing CLI session key.")
 @click.option(
     "--agency",
     "agency_path",
@@ -1060,22 +1376,33 @@ async def _chat_loop(
         "remembering from this session)."
     ),
 )
-def chat(verbose: int, quiet: bool, trace_path: str | None, workspace_path: str | None, agency_path: str | None, no_housekeeping: bool) -> None:
+def chat(
+    verbose: int,
+    quiet: bool,
+    trace_path: str | None,
+    workspace_path: str | None,
+    resume_session_key_raw: str | None,
+    agency_path: str | None,
+    no_housekeeping: bool,
+) -> None:
     """Start an interactive chat session."""
     from thorn.runtime._paths import AgencyPaths
 
     verbosity = _resolve_verbosity(verbose, quiet)
     trace_file = open(trace_path, "w", encoding="utf-8") if trace_path else None
     try:
-        agency_home = _resolve_cli_agency_home(agency_path)
-        ws_root = (
-            Path(workspace_path).resolve() if workspace_path
-            else Path.cwd().resolve()
+        startup = _resolve_cli_command_startup(
+            agency_path=agency_path,
+            workspace_path=workspace_path,
+            resume_session_key_raw=resume_session_key_raw,
         )
-        paths = AgencyPaths(home_root=agency_home, workspace_root=ws_root)
+        paths = AgencyPaths(
+            home_root=startup.agency_home,
+            workspace_root=startup.workspace_root,
+        )
         runtime = _build_runtime(
             trace_file=trace_file,
-            workspace=str(ws_root),
+            workspace=str(startup.workspace_root),
             paths=paths,
             sandbox_executor_enabled=True,
         )
@@ -1084,6 +1411,10 @@ def chat(verbose: int, quiet: bool, trace_path: str | None, workspace_path: str 
         if trace_file:
             trace_file.close()
         sys.exit(1)
+    except click.ClickException:
+        if trace_file:
+            trace_file.close()
+        raise
 
     console.print("[bold]thorn[/bold] interactive chat  (Ctrl+C to exit)\n")
 
@@ -1095,12 +1426,8 @@ def chat(verbose: int, quiet: bool, trace_path: str | None, workspace_path: str 
         # ``ChatPromptRouter.dispatcher`` which calls ``session.prompt``
         # and resolves a per-turn future the REPL awaits.
         #
-        # Phase 5: each invocation gets a fresh session key, so the
-        # implicit per-workspace resume (and the PID-suffixed
-        # collision-fallback hack) are gone.  The session lock is no
-        # longer useful either -- the uuid-suffixed key cannot collide
-        # across processes -- so it's dropped.  An explicit
-        # ``--resume <key>`` flow is a Phase 5 follow-up.
+        # Each invocation gets a fresh session key unless the caller
+        # explicitly asks to resume a persisted local CLI session.
         async with runtime:
             agent = _ensure_cli_agent(runtime)
             if agent.id is None:
@@ -1108,7 +1435,10 @@ def chat(verbose: int, quiet: bool, trace_path: str | None, workspace_path: str 
                     "CLI agent has no id; cannot build a session inbox"
                 )
 
-            session_key = _generate_cli_session_key(runtime.workspace_root)
+            session_key = (
+                startup.resume_session_key
+                or _generate_cli_session_key(runtime.workspace_root)
+            )
             # Pick the logical agent-workspace upper bound for this
             # CLI session.  See the matching comment on the ``thorn
             # run`` path for the rationale.
@@ -1185,44 +1515,60 @@ def chat(verbose: int, quiet: bool, trace_path: str | None, workspace_path: str 
                 )
 
                 try:
-                    await _chat_loop(
-                        router=router,
-                        scheduler=scheduler,
-                        session=session,
-                        inbox=inbox,
-                    )
-                    # Shutdown housekeeping (Phase 5): gives the
-                    # agent one last turn to journal anything
-                    # worth remembering before the session is
-                    # discarded.  Bypasses the scheduler/router
-                    # -- this is a framework-driven action, not a
-                    # user turn, and the scheduler's drain task
-                    # is about to be torn down.  ``--no-
-                    # housekeeping`` skips the turn entirely for
-                    # scripted / test use.  We run housekeeping
-                    # *only after a clean REPL exit*; if
-                    # ``_chat_loop`` raised (``KeyboardInterrupt``,
-                    # unexpected error) we skip, because the
-                    # agent is unlikely to produce a useful final
-                    # turn mid-panic and the user wants their
-                    # shell prompt back.
-                    if not no_housekeeping:
-                        from thorn.core._housekeeping import (
-                            perform_shutdown_housekeeping,
-                        )
-                        try:
-                            await perform_shutdown_housekeeping(session)
-                            runtime.save_session(session)
-                        except ThornError as exc:
-                            # Shutdown housekeeping swallows
-                            # Thorn-level errors internally, but
-                            # save_session could still raise
-                            # (disk full, etc.); log and move on
-                            # rather than block exit.
-                            console.print(
-                                f"[yellow]Shutdown housekeeping "
-                                f"failed to save:[/yellow] {exc}"
+                    lock_context = (
+                        session_lock(
+                            runtime.paths.session_metadata_dir(
+                                agent.id, session_key,
                             )
+                        )
+                        if startup.resume_session_key is not None
+                        else nullcontext()
+                    )
+                    try:
+                        with lock_context:
+                            await _chat_loop(
+                                router=router,
+                                scheduler=scheduler,
+                                session=session,
+                                inbox=inbox,
+                            )
+                            # Shutdown housekeeping (Phase 5): gives the
+                            # agent one last turn to journal anything
+                            # worth remembering before the session is
+                            # discarded.  Bypasses the scheduler/router
+                            # -- this is a framework-driven action, not a
+                            # user turn, and the scheduler's drain task
+                            # is about to be torn down.  ``--no-
+                            # housekeeping`` skips the turn entirely for
+                            # scripted / test use.  We run housekeeping
+                            # *only after a clean REPL exit*; if
+                            # ``_chat_loop`` raised (``KeyboardInterrupt``,
+                            # unexpected error) we skip, because the
+                            # agent is unlikely to produce a useful final
+                            # turn mid-panic and the user wants their
+                            # shell prompt back.
+                            if not no_housekeeping:
+                                from thorn.core._housekeeping import (
+                                    perform_shutdown_housekeeping,
+                                )
+                                try:
+                                    await perform_shutdown_housekeeping(session)
+                                    runtime.save_session(session)
+                                except ThornError as exc:
+                                    # Shutdown housekeeping swallows
+                                    # Thorn-level errors internally, but
+                                    # save_session could still raise
+                                    # (disk full, etc.); log and move on
+                                    # rather than block exit.
+                                    console.print(
+                                        f"[yellow]Shutdown housekeeping "
+                                        f"failed to save:[/yellow] {exc}"
+                                    )
+                    except SessionLockError as exc:
+                        _raise_locked_session(
+                            session_key=session_key,
+                            error=exc,
+                        )
                 finally:
                     # Bounded grace period mirrors ``thorn
                     # run``: in the success case the driver is

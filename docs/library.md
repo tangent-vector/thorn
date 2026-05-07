@@ -177,7 +177,18 @@ The CLI
 
 ### Basic Usage
 
-Use `thorn run "..."` to execute a single prompt, or `thorn chat` to start an interactive CLI chat session.
+Use `thorn run "..."` to execute a single prompt, or `thorn chat` to
+start an interactive CLI chat session. Both commands create a fresh
+local CLI session by default and persist it under the local agency
+(`~/.thorn`, or the directory passed with `--agency`).
+
+Use `thorn sessions list` to inspect persisted local CLI sessions.
+Use `thorn chat --resume <session-key>` to re-enter one interactively,
+or `thorn run --resume <session-key> "..."` to append a non-interactive
+follow-up turn. A resumed session keeps the workspace path stored in
+the session metadata; an explicit `--workspace` must match that stored
+path, and resume fails if the stored workspace no longer exists or the
+session is already locked by another Thorn process.
 
 ### Providing Tools and Skills
 
