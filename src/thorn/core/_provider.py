@@ -228,6 +228,9 @@ class LLMProvider(ABC):
         """Submit a chat-completion request and stream the response."""
         ...  # pragma: no cover
 
+    async def aclose(self) -> None:
+        """Release provider resources held across completion calls."""
+
 
 # ---------------------------------------------------------------------------
 # Mock provider (testing)
@@ -352,6 +355,10 @@ class OpenAIProvider(LLMProvider):
             },
             timeout=httpx.Timeout(120.0, connect=30.0),
         )
+
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.aclose()
 
     async def complete(
         self,

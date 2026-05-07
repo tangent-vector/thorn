@@ -557,6 +557,19 @@ def _mock_streaming_provider(
 
 
 class TestOpenAIProviderErrorMapping:
+    async def test_aclose_closes_http_client(self):
+        provider = OpenAIProvider(
+            OpenAIProviderConfig(
+                api_url="http://localhost:1234",
+                api_key="test",
+                model_name="test-model",
+            )
+        )
+
+        await provider.aclose()
+
+        assert provider._client.is_closed
+
     async def test_remote_protocol_error_mid_stream_becomes_transient(self):
         """A ``RemoteProtocolError`` raised while reading the SSE stream
         must surface as :class:`TransientProviderError` so the agent-loop

@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from thorn.core._context import ExecutionContext, StatusProvider, scoped_status_provider, set_context
+from thorn.core._context import (
+    ExecutionContext,
+    scoped_status_provider,
+    set_context,
+)
+from thorn.core._executor import ToolVenue
 from thorn.core._func import wrap_function
 from thorn.core._history import AdvisoryNode, CollapseState, HistoryTree, TurnNode
-from thorn.core._loop import _WrappedTool, _normalize_tool_name, run_agent_loop
+from thorn.core._loop import _normalize_tool_name, run_agent_loop
 from thorn.core._provider import (
     FinishChunk,
     LLMProvider,
@@ -19,17 +24,16 @@ from thorn.core._provider import (
 )
 from thorn.core._retry import RetryPolicy
 from thorn.core._validation_tracker import ValidationTracker
-from thorn.core._executor import ToolVenue
 from thorn.core.errors import (
     AgentFailureError,
     LoopLimitError,
+    LoopRepetitionError,
     ProviderError,
     ProviderUnavailableError,
     RateLimitError,
     SkillError,
     TransientProviderError,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -221,6 +225,85 @@ class TestLoopLimit:
             await run_agent_loop(
                 context=ctx, user_prompt="x", tools=[],
                 result_type=bool, max_tool_rounds=5,
+            )
+
+
+class TestLoopRepetition:
+    async def test_repeated_structured_text_raises_repetition_error(self):
+        provider = MockProvider(canned_responses=[
+            _text_response("I think true"),
+            _text_response("I think true"),
+            _text_response("I think true"),
+        ])
+        ctx = ExecutionContext(provider=provider)
+
+        with pytest.raises(LoopRepetitionError) as exc_info:
+            await run_agent_loop(
+                context=ctx,
+                user_prompt="is it?",
+                tools=[],
+                result_type=bool,
+                max_tool_rounds=10,
+            )
+
+        assert exc_info.value.repetitions == 3
+        assert exc_info.value.rounds == 3
+
+    async def test_repeated_tool_error_round_raises_repetition_error(self):
+        provider = MockProvider(canned_responses=[
+            _tool_call_response("c1", "missing_tool", '{"value": 1}'),
+            _tool_call_response("c2", "missing_tool", '{"value": 1}'),
+            _tool_call_response("c3", "missing_tool", '{"value": 1}'),
+        ])
+        ctx = ExecutionContext(provider=provider)
+
+        with pytest.raises(LoopRepetitionError) as exc_info:
+            await run_agent_loop(
+                context=ctx,
+                user_prompt="observe repeatedly",
+                tools=[],
+                max_tool_rounds=10,
+            )
+
+        assert exc_info.value.repetitions == 3
+
+    async def test_repeated_successful_tool_round_uses_round_limit(self):
+        async def observe(value: int) -> str:
+            """Observe a value."""
+            return f"value={value}"
+
+        tool = wrap_function(observe, venue=ToolVenue.SANDBOX)
+        provider = MockProvider(canned_responses=[
+            _tool_call_response("c1", "observe", '{"value": 1}'),
+            _tool_call_response("c2", "observe", '{"value": 1}'),
+            _tool_call_response("c3", "observe", '{"value": 1}'),
+            _text_response("done"),
+        ])
+        ctx = ExecutionContext(provider=provider)
+
+        result = await run_agent_loop(
+            context=ctx,
+            user_prompt="observe repeatedly",
+            tools=[tool],
+            max_tool_rounds=10,
+        )
+
+        assert result == "done"
+
+    async def test_tool_argument_json_is_canonicalized_for_repetition(self):
+        provider = MockProvider(canned_responses=[
+            _tool_call_response("c1", "combine", '{"a": 1, "b": 2}'),
+            _tool_call_response("c2", "combine", '{"b":2,"a":1}'),
+            _tool_call_response("c3", "combine", '{\n  "a": 1,\n  "b": 2\n}'),
+        ])
+        ctx = ExecutionContext(provider=provider)
+
+        with pytest.raises(LoopRepetitionError):
+            await run_agent_loop(
+                context=ctx,
+                user_prompt="combine repeatedly",
+                tools=[],
+                max_tool_rounds=10,
             )
 
 
@@ -524,7 +607,6 @@ class TestTurnNodeAdvisory:
     """Tests for TurnNode with advisory nodes."""
 
     def test_render_appends_advisory_to_last_tool_result(self):
-        from thorn.core._messages import AssistantMessage, ToolCall, ToolResultMessage
 
         tcn = _make_tool_call_node("c1", "greet", "ok")
         adv = AdvisoryNode(source="validation", content="[build: stale]")
@@ -599,9 +681,6 @@ class TestAdvisoryCompaction:
         history = HistoryTree()
         history.append_user_prompt("do something")
 
-        from thorn.core._messages import AssistantMessage, ToolCall, ToolResultMessage
-        tc = ToolCall(call_id="c1", name="greet", arguments='{"x":"y"}')
-        result = ToolResultMessage(call_id="c1", content="x" * 500)
         adv = AdvisoryNode(source="test", content="x" * 500)
 
         turn = TurnNode(
@@ -627,12 +706,11 @@ class TestAdvisoryCompaction:
 
 class TestAdvisorySerialization:
     def test_round_trip(self):
-        from thorn.runtime._serializer import serialize_history, deserialize_history
+        from thorn.runtime._serializer import deserialize_history, serialize_history
 
         history = HistoryTree()
         history.append_user_prompt("test")
 
-        from thorn.core._messages import AssistantMessage, ToolCall, ToolResultMessage
         adv = AdvisoryNode(source="validation", content="[build: stale]")
         turn = TurnNode(
             assistant_content="ok",

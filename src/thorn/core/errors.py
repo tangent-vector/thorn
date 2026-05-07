@@ -82,6 +82,20 @@ class LoopLimitError(ThornError):
         self.rounds = rounds
 
 
+class LoopRepetitionError(LoopLimitError):
+    """The agent loop repeated the same response pattern without progress.
+
+    Raised before the ordinary maximum-round limit when consecutive
+    provider turns produce the same text or the same failing tool-call
+    round.  This is a loop-control failure rather than a provider
+    transport failure.
+    """
+
+    def __init__(self, message: str, repetitions: int) -> None:
+        super().__init__(message, repetitions)
+        self.repetitions = repetitions
+
+
 class SkillError(ThornError):
     """A prompt-based skill signalled failure via the ``raise_error`` tool.
 
