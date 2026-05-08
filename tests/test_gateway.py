@@ -857,6 +857,174 @@ class TestGatewayInboxIntegration:
         )
 
     @pytest.mark.asyncio
+    async def test_startup_activation_uses_validated_agent_for_forge_tools(
+        self, tmp_path: Path,
+    ):
+        """A resumed session must use the scheduler's typed agent instance.
+
+        ``SessionStore.load_agent`` restores account entries as
+        ``UntypedAccountConfig``.  Gateway startup validates the
+        persisted agent before creating the scheduler, but the startup
+        activation path also reloads sessions from disk.  This test
+        covers the requeue/restart path where a pending inbox item is
+        resumed without a fresh incoming event: forge tools should see
+        the scheduler-owned validated agent, not a freshly deserialized
+        untyped one.
+        """
+        from thorn.core._account import (
+            AgentAccountsConfig,
+            UntypedAccountConfig,
+        )
+        from thorn.core._context import reset_context, set_context
+        from thorn.runtime._address import SessionAddress
+        from thorn.runtime._dispatch import apply_handling_transition
+        from thorn.runtime._inbox import SessionInbox
+        from thorn.runtime._notification import (
+            NotificationSpec,
+            NotificationStatus,
+        )
+        from thorn.tools.forge import (
+            ForkConfig,
+            GitLabAccountConfig,
+            GitLabForgeService,
+            GitLabForgeServiceConfig,
+            ProjectService,
+            ProjectServiceConfig,
+            forge_create_change_request,
+            forge_get_change_request,
+            forge_post_comment,
+            forge_read_issue,
+        )
+
+        agent_id = AgentID("resume-forge-agent")
+        key = SessionKey("github/42/issue/7")
+
+        runtime_seed = self._make_runtime(tmp_path)
+        async with runtime_seed:
+            agent = Agent(
+                id=agent_id,
+                name="resume-forge-agent",
+                accounts=AgentAccountsConfig.model_construct(accounts=[
+                    UntypedAccountConfig(service="gl"),
+                ]),
+            )
+            runtime_seed.save_agent(agent)
+            ws = runtime_seed.paths.session_workspace(agent_id, key)
+            ws.mkdir(parents=True, exist_ok=True)
+            session = runtime_seed.get_or_create_session(
+                agent, key, workspace_root=ws,
+            )
+            runtime_seed.save_session(session)
+            inbox_dir = runtime_seed.paths.session_inbox_dir(agent_id, key)
+            SessionInbox(
+                inbox_dir, SessionAddress(agent_id, key),
+            ).post(NotificationSpec(
+                source="test",
+                content="resume forge work",
+                target=SessionAddress(agent_id, key),
+            ))
+
+        runtime = self._make_runtime(tmp_path)
+        mock_client = MagicMock()
+        mock_client.get_issue.return_value = {
+            "id": 7,
+            "title": "Bug",
+            "state": "open",
+            "url": "https://gl.example.com/issues/7",
+            "description": "broken",
+            "labels": ["bug"],
+            "assignees": ["alice"],
+        }
+        mock_client.create_change_request.return_value = {
+            "id": 1,
+            "title": "Fix bug",
+            "state": "open",
+            "url": "https://gl.example.com/mr/1",
+            "source_branch": "fix",
+            "target_branch": "main",
+        }
+        mock_client.get_change_request.return_value = {
+            "id": 1,
+            "title": "Fix bug",
+            "state": "open",
+            "url": "https://gl.example.com/mr/1",
+            "source_branch": "fix",
+            "target_branch": "main",
+            "description": "fixes bug",
+        }
+
+        forge_service = GitLabForgeService(
+            GitLabForgeServiceConfig(url="https://gl.example.com"),
+            service_name="gl",
+        )
+        forge_service.authenticated_client = MagicMock(  # type: ignore[method-assign]
+            return_value=mock_client,
+        )
+        runtime.register_service(forge_service)
+        runtime.register_service(ProjectService(
+            ProjectServiceConfig(forks=[
+                ForkConfig(forge="gl", native_id="group/proj"),
+            ]),
+            service_name="test-proj",
+        ))
+
+        handled_ids: list[str] = []
+
+        async def dispatcher(session_obj, inbox_obj):
+            account = session_obj.agent.accounts.accounts[0]
+            assert isinstance(account, GitLabAccountConfig)
+
+            child = runtime.context.push_scope(
+                "test-forge-tools",
+                agent=session_obj.agent,
+            )
+            token = set_context(child)
+            try:
+                assert "Bug" in await forge_read_issue("test-proj", 7)
+                assert "Created change request" in (
+                    await forge_create_change_request(
+                        "test-proj", "fix", "Fix bug", "fixes bug", "main",
+                    )
+                )
+                assert "Change request #1" in (
+                    await forge_get_change_request("test-proj", 1)
+                )
+                assert "Posted comment" in (
+                    await forge_post_comment(
+                        "test-proj", "ChangeRequest", 1, "looks good",
+                    )
+                )
+            finally:
+                reset_context(token)
+
+            for item in list(inbox_obj.prompt_pending()):
+                handled_ids.append(item.id)
+                apply_handling_transition(
+                    inbox_obj,
+                    item.id,
+                    NotificationStatus.HANDLED,
+                    address_book=runtime.address_book,
+                )
+
+        gateway = self._make_gateway(
+            runtime, [StubSource([])], prompt_dispatcher=dispatcher,
+        )
+        await gateway.run()
+
+        assert handled_ids
+        assert mock_client.get_issue.call_args_list == [call("group/proj", 7)]
+        assert mock_client.create_change_request.call_count == 1
+        assert mock_client.get_change_request.call_args_list == [
+            call("group/proj", 1),
+        ]
+        assert mock_client.post_comment.call_args_list == [
+            call("group/proj", "ChangeRequest", 1, "looks good"),
+        ]
+        assert forge_service.authenticated_client.call_count == 4
+        for auth_call in forge_service.authenticated_client.call_args_list:
+            assert isinstance(auth_call.args[0], GitLabAccountConfig)
+
+    @pytest.mark.asyncio
     async def test_startup_sweep_dispatches_stuck_handled(
         self, tmp_path: Path,
     ):
