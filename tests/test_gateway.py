@@ -173,6 +173,35 @@ class TestGateway:
             workspace_root=tmp_path,
         )
 
+    async def _prompt_oldest_item_and_mark_handled(
+        self,
+        runtime: Runtime,
+        session_obj: Session,
+        inbox_obj: Any,
+    ) -> None:
+        """Run one prompt round for the oldest item, then close it out.
+
+        The default inbox dispatcher may batch multiple pending items
+        into one prompt.  These history tests want to observe two
+        distinct prompt rounds in a single session, so the test
+        dispatcher handles exactly one item per scheduler iteration.
+        """
+        from thorn.runtime._dispatch import apply_handling_transition
+        from thorn.runtime._notification import NotificationStatus
+        from thorn.runtime._prompt_format import build_inbox_prompt
+
+        pending = inbox_obj.prompt_pending()
+        if not pending:
+            return
+        item = pending[0]
+        await session_obj.prompt(build_inbox_prompt([item]))
+        apply_handling_transition(
+            inbox_obj,
+            item.id,
+            NotificationStatus.HANDLED,
+            address_book=runtime.address_book,
+        )
+
     @pytest.mark.asyncio
     async def test_handles_events(self, tmp_path: Path):
         event = IncomingEvent(
@@ -374,7 +403,17 @@ class TestGateway:
         )
         source = StubSource([event1, event2])
         runtime = self._make_runtime(tmp_path)
-        gateway = Gateway(runtime=runtime, sources=[source])
+
+        async def dispatcher(session_obj: Session, inbox_obj: Any) -> None:
+            await self._prompt_oldest_item_and_mark_handled(
+                runtime, session_obj, inbox_obj,
+            )
+
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[source],
+            prompt_dispatcher=dispatcher,
+        )
 
         await gateway.run()
 
@@ -427,7 +466,17 @@ class TestGateway:
                 yield chunk
 
         provider.complete = tracking_complete  # type: ignore[assignment]
-        gateway = Gateway(runtime=runtime, sources=[source])
+
+        async def dispatcher(session_obj: Session, inbox_obj: Any) -> None:
+            await self._prompt_oldest_item_and_mark_handled(
+                runtime, session_obj, inbox_obj,
+            )
+
+        gateway = Gateway(
+            runtime=runtime,
+            sources=[source],
+            prompt_dispatcher=dispatcher,
+        )
         await gateway.run()
 
         assert len(calls_messages) == 2
