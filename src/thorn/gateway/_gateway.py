@@ -675,6 +675,10 @@ class Gateway:
 
             agent = self._runtime.get_or_create_agent(agent_id)
             scheduler = self._ensure_scheduler_for_agent(agent)
+            # If startup already created the scheduler, its agent is
+            # the validated in-memory instance.  Keep resumed sessions
+            # attached to that object rather than a fresh store load.
+            agent = scheduler.agent
 
             ws = self._runtime.paths.session_workspace(agent_id, session_key)
             ws.mkdir(parents=True, exist_ok=True)
@@ -961,6 +965,10 @@ class Gateway:
             self._runtime.save_agent(agent)
 
         scheduler = self._ensure_scheduler_for_agent(agent)
+        # Keep session construction aligned with the scheduler-owned
+        # agent instance.  This is a no-op for fresh schedulers, but
+        # preserves typed accounts when a scheduler already exists.
+        agent = scheduler.agent
 
         ws = self._runtime.paths.session_workspace(
             agent.id, event.session_key,
