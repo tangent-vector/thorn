@@ -18,7 +18,6 @@ import pytest
 from thorn.tools._github_connection import GitHubConnectionConfig, GitHubPatAuth
 from thorn.tools.github import GitHubClient
 
-
 # ---------------------------------------------------------------------------
 # Mock object factories
 # ---------------------------------------------------------------------------
@@ -108,6 +107,30 @@ def _make_mock_content_file(**overrides: Any) -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
+class _FakeGHAuth:
+    """Small stand-in for the PyGithub ``Auth`` module used by tests."""
+
+    class Token:
+        def __init__(self, token: str) -> None:
+            self.token = str(token)
+
+    class AppInstallationAuth:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+    class AppAuth:
+        def __init__(self, app_id: int, private_key: str) -> None:
+            self.app_id = app_id
+            self.private_key = private_key
+
+        def get_installation_auth(
+            self, installation_id: int,
+        ) -> "_FakeGHAuth.AppInstallationAuth":
+            return _FakeGHAuth.AppInstallationAuth(
+                f"installation-token-{installation_id}",
+            )
+
+
 @pytest.fixture()
 def mock_client() -> GitHubClient:
     """Build a GitHubClient with a mocked PyGithub backend.
@@ -117,6 +140,7 @@ def mock_client() -> GitHubClient:
     """
     with (
         patch("thorn.tools.github._Github") as mock_gh_cls,
+        patch("thorn.tools.github._GHAuth", _FakeGHAuth),
         patch("thorn.tools.github._HAS_GITHUB", True),
     ):
         mock_gh_instance = MagicMock()
