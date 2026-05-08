@@ -236,6 +236,48 @@ cause of an errored item, use `thorn inbox requeue`; requeueing moves
 the local `inbox/errored/` file back to pending work and does not
 recreate an upstream TODO or GitHub notification.
 
+Local CLI sessions
+------------------
+
+`thorn run` and `thorn chat` use the local CLI agent in `~/.thorn` by
+default, or the agency directory passed with `--agency`. Each
+invocation creates a fresh `cli/<workspace-name>/<uuid8>` session key
+unless you explicitly resume an existing session.
+
+List persisted local CLI sessions:
+
+```console
+$ uv run thorn sessions list --agency ~/.thorn
+```
+
+Add `--json` for scripts. The listing includes each session key, its
+last activity time, the workspace recorded when the session was
+created, and whether that workspace still exists.
+
+Resume a session in interactive chat:
+
+```console
+$ uv run thorn chat --resume cli/my-repo/1a2b3c4d --agency ~/.thorn
+```
+
+Or append a non-interactive follow-up turn:
+
+```console
+$ uv run thorn run --resume cli/my-repo/1a2b3c4d \
+    --agency ~/.thorn \
+    "continue from the previous result"
+```
+
+A resumed session uses the workspace path stored in its session
+metadata. If you also pass `--workspace`, that path must match the
+stored workspace; Thorn fails rather than silently moving the
+conversation to a different project. If the stored workspace is
+missing, restore it or start a fresh session. If another Thorn
+process is already using the session, resume fails with a lock error.
+On POSIX hosts the advisory lock is released when the owning process
+exits even if the `.lock` file remains; on Windows, confirm no Thorn
+process is active before removing a stale `.lock` file manually.
+
 Configuration
 -------------
 

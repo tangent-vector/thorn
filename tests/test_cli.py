@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from thorn._cli import main as cli_main
+from thorn.core._messages import AssistantMessage, UserMessage
 from thorn.core._provider import (
     FinishChunk,
     MockProvider,
@@ -60,6 +63,38 @@ def _mock_provider_factory(provider: MockProvider):
     def factory() -> MockProvider:
         return provider
     return factory
+
+
+class _RecordingProvider(MockProvider):
+    """Mock provider variant that records user/assistant text history."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.message_text_batches: list[list[str]] = []
+
+    async def complete(self, system_prompts, tools, messages):
+        texts: list[str] = []
+        for message in messages:
+            if isinstance(message, UserMessage | AssistantMessage):
+                texts.append(message.content)
+        self.message_text_batches.append(texts)
+        async for chunk in super().complete(system_prompts, tools, messages):
+            yield chunk
+
+
+def _list_cli_session_payloads(
+    *,
+    agency_home: Path,
+) -> list[dict[str, object]]:
+    result = CliRunner().invoke(
+        cli_main,
+        ["sessions", "list", "--agency", str(agency_home), "--json"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert isinstance(payload, list)
+    return payload
 
 
 def _find_session_state_dirs(
@@ -633,6 +668,292 @@ class TestRunResultFile:
         )
         assert result.exit_code == 0
         assert not (tmp_path / "result.json").exists()
+
+
+class TestCLISessionListingAndResume:
+    """Local CLI sessions can be inspected and explicitly resumed."""
+
+    def test_run_persists_session_that_can_be_listed(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "make a note",
+                "--workspace", str(workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = _list_cli_session_payloads(agency_home=agency_home)
+        assert len(payload) == 1
+        session = payload[0]
+        assert isinstance(session["key"], str)
+        assert session["key"].startswith(f"cli/{workspace.name}/")
+        assert session["agent_id"] == "local"
+        assert session["workspace_root"] == str(workspace)
+        assert session["workspace_state"] == "present"
+        assert session["last_active"] is not None
+
+    def test_run_resume_reuses_existing_history(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = _RecordingProvider(canned_responses=[
+            [TextChunk(text="first answer"), FinishChunk(reason="stop")],
+            [TextChunk(text="second answer"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+        runner = CliRunner()
+
+        first = runner.invoke(
+            cli_main,
+            [
+                "run", "first prompt",
+                "--workspace", str(workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0
+        [session] = _list_cli_session_payloads(agency_home=agency_home)
+
+        second = runner.invoke(
+            cli_main,
+            [
+                "run", "second prompt",
+                "--resume", str(session["key"]),
+                "--workspace", str(workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert second.exit_code == 0
+        assert provider.message_text_batches[1] == [
+            "first prompt",
+            "first answer",
+            "second prompt",
+        ]
+        assert len(_list_cli_session_payloads(agency_home=agency_home)) == 1
+
+    def test_chat_resume_uses_stored_workspace_when_invoked_elsewhere(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = _RecordingProvider(canned_responses=[
+            [TextChunk(text="first answer"), FinishChunk(reason="stop")],
+            [TextChunk(text="second answer"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        original_workspace = tmp_path / "original"
+        other_workspace = tmp_path / "other"
+        original_workspace.mkdir()
+        other_workspace.mkdir()
+        monkeypatch.chdir(original_workspace)
+        runner = CliRunner()
+
+        first = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--workspace", str(original_workspace),
+                "--agency", str(agency_home),
+                "--no-housekeeping",
+                "--quiet",
+            ],
+            input="first prompt\n",
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0
+        [session] = _list_cli_session_payloads(agency_home=agency_home)
+
+        monkeypatch.chdir(other_workspace)
+        second = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--resume", str(session["key"]),
+                "--agency", str(agency_home),
+                "--no-housekeeping",
+                "--quiet",
+            ],
+            input="second prompt\n",
+            catch_exceptions=False,
+        )
+
+        assert second.exit_code == 0
+        assert provider.message_text_batches[1] == [
+            "first prompt",
+            "first answer",
+            "second prompt",
+        ]
+        assert len(_list_cli_session_payloads(agency_home=agency_home)) == 1
+
+    def test_resume_rejects_explicit_workspace_mismatch(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        original_workspace = tmp_path / "original"
+        other_workspace = tmp_path / "other"
+        original_workspace.mkdir()
+        other_workspace.mkdir()
+        monkeypatch.chdir(original_workspace)
+
+        first = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "first prompt",
+                "--workspace", str(original_workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0
+        [session] = _list_cli_session_payloads(agency_home=agency_home)
+
+        resumed = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "second prompt",
+                "--resume", str(session["key"]),
+                "--workspace", str(other_workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+        )
+
+        assert resumed.exit_code != 0
+        assert str(original_workspace) in resumed.output
+        assert str(other_workspace) in resumed.output
+
+    def test_resume_reports_missing_workspace(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+
+        first = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "first prompt",
+                "--workspace", str(workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0
+        [session] = _list_cli_session_payloads(agency_home=agency_home)
+        monkeypatch.chdir(tmp_path)
+        shutil.rmtree(workspace)
+
+        resumed = CliRunner().invoke(
+            cli_main,
+            [
+                "chat",
+                "--resume", str(session["key"]),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            input="second prompt\n",
+        )
+
+        assert resumed.exit_code != 0
+        assert str(workspace) in resumed.output
+
+    def test_resume_reports_active_session_lock(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from thorn.runtime._lock import SessionLockError
+
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+
+        first = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "first prompt",
+                "--workspace", str(workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0
+        [session] = _list_cli_session_payloads(agency_home=agency_home)
+
+        @contextmanager
+        def _locked_session(_session_dir):
+            raise SessionLockError("locked for test")
+            yield
+
+        monkeypatch.setattr("thorn._cli.session_lock", _locked_session)
+        resumed = CliRunner().invoke(
+            cli_main,
+            [
+                "chat",
+                "--resume", str(session["key"]),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            input="second prompt\n",
+        )
+
+        assert resumed.exit_code != 0
+        assert str(session["key"]) in resumed.output
 
 
 class TestAgencyHomeResolution:
