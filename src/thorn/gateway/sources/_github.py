@@ -211,14 +211,126 @@ class _LatestCommentInfo:
 
     GitHub's ``latest_comment_url`` points at one of three kinds of
     resource depending on the thread state: a per-comment endpoint, an
-    issue endpoint (when the trigger was the issue body), or a PR
-    endpoint.  All three share the relevant fields (``body``,
-    ``user``, ``created_at``), so a single shape covers the cases.
+    issue endpoint (when the trigger was the issue body), a PR
+    endpoint, or sometimes a pull-request review endpoint.  The first
+    three share the relevant fields (``body``, ``user``,
+    ``created_at``).  Reviews use ``submitted_at`` and carry a
+    ``state`` such as ``CHANGES_REQUESTED``; this shape normalizes
+    those differences for downstream event construction.
     """
 
     body: str = ""
     user: dict[str, Any] | None = None
     created_at: str = ""
+    kind: ContextItemKind | None = None
+    review_state: str = ""
+    html_url: str = ""
+
+
+def _looks_like_pull_request_review(data: dict[str, Any]) -> bool:
+    """Return ``True`` when *data* has GitHub pull-request review shape."""
+    return bool(data.get("submitted_at") and data.get("state"))
+
+
+def _format_pull_request_review_body(*, state: str, body: str) -> str:
+    """Render review state plus body as one external review item."""
+    state_label = state or "UNKNOWN"
+    body = body.strip()
+    if body:
+        return f"GitHub pull request review state: {state_label}\n\n{body}"
+    return f"GitHub pull request review state: {state_label}"
+
+
+def _latest_comment_info_from_payload(data: dict[str, Any]) -> _LatestCommentInfo:
+    """Normalize a GitHub comment / issue / PR / review payload."""
+    body = data.get("body") or ""
+    created_at = data.get("created_at") or ""
+    kind: ContextItemKind | None = None
+    review_state = ""
+
+    if _looks_like_pull_request_review(data):
+        kind = ContextItemKind.REVIEW
+        review_state = str(data.get("state") or "").strip()
+        created_at = data.get("submitted_at") or created_at
+        body = _format_pull_request_review_body(
+            state=review_state,
+            body=body,
+        )
+
+    return _LatestCommentInfo(
+        body=body,
+        user=data.get("user"),
+        created_at=created_at,
+        kind=kind,
+        review_state=review_state,
+        html_url=data.get("html_url") or "",
+    )
+
+
+def _pull_request_reviews_url(thread: dict[str, Any]) -> str:
+    """Return the reviews-list URL for a PR notification thread, if any."""
+    subject = thread.get("subject") or {}
+    if subject.get("type") != "PullRequest":
+        return ""
+    subject_url = (subject.get("url") or "").rstrip("/")
+    if not subject_url:
+        return ""
+    return f"{subject_url}/reviews"
+
+
+def _url_matches_subject(thread: dict[str, Any], url: str) -> bool:
+    """Return whether *url* is the notification subject URL itself."""
+    subject_url = ((thread.get("subject") or {}).get("url") or "").rstrip("/")
+    return bool(subject_url and subject_url == url.rstrip("/"))
+
+
+def _should_try_pull_request_review_fallback(
+    thread: dict[str, Any],
+    latest_comment_url: str,
+    info: _LatestCommentInfo,
+) -> bool:
+    """Return whether PR-review lookup may be more precise than *info*."""
+    if not _pull_request_reviews_url(thread):
+        return False
+    if info.kind is ContextItemKind.REVIEW:
+        return False
+    if info.user is None or not info.body:
+        return True
+    return _url_matches_subject(thread, latest_comment_url)
+
+
+def _review_timestamp(review: dict[str, Any]) -> str:
+    """Return the best sortable timestamp for a GitHub PR review payload."""
+    return (
+        review.get("submitted_at")
+        or review.get("created_at")
+        or review.get("updated_at")
+        or ""
+    )
+
+
+def _select_pull_request_review(
+    reviews: list[Any],
+    *,
+    thread_updated_at: str,
+) -> dict[str, Any] | None:
+    """Pick the review most likely responsible for a notification thread."""
+    review_payloads = [
+        review for review in reviews
+        if isinstance(review, dict) and _looks_like_pull_request_review(review)
+    ]
+    if not review_payloads:
+        return None
+
+    if thread_updated_at:
+        eligible = [
+            review for review in review_payloads
+            if _review_timestamp(review) <= thread_updated_at
+        ]
+        if eligible:
+            return max(eligible, key=_review_timestamp)
+
+    return max(review_payloads, key=_review_timestamp)
 
 
 # ---------------------------------------------------------------------------
@@ -388,11 +500,31 @@ def _make_raw_event(
         items = (
             ContextItem(
                 body=comment_info.body,
-                kind=_kind_for_subject(subject_type, reason),
+                kind=comment_info.kind or _kind_for_subject(subject_type, reason),
                 actor=actor,
                 timestamp=comment_info.created_at,
             ),
         )
+
+    metadata: dict[str, Any] = {
+        "notification_id": thread_id,
+        "reason": reason,
+        "subject_type": subject_type,
+        "subject_title": subject_title,
+        "repo_full_name": repo_full_name,
+        "repo_id": repo_id,
+        "clone_url": clone_url,
+        "default_branch": default_branch,
+        "html_url": html_url,
+        "project_name": project_name,
+        "updated_at": updated_at,
+    }
+    if comment_info.kind is not None:
+        metadata["activity_kind"] = comment_info.kind.value
+    if comment_info.review_state:
+        metadata["review_state"] = comment_info.review_state
+    if comment_info.html_url:
+        metadata["activity_url"] = comment_info.html_url
 
     return RawIncomingEvent(
         source="github",
@@ -402,19 +534,7 @@ def _make_raw_event(
         summary=summary,
         items=items,
         agent_id=owner_agent_id,
-        metadata={
-            "notification_id": thread_id,
-            "reason": reason,
-            "subject_type": subject_type,
-            "subject_title": subject_title,
-            "repo_full_name": repo_full_name,
-            "repo_id": repo_id,
-            "clone_url": clone_url,
-            "default_branch": default_branch,
-            "html_url": html_url,
-            "project_name": project_name,
-            "updated_at": updated_at,
-        },
+        metadata=metadata,
         external_key=_make_external_key(base_url, thread_id, updated_at),
     )
 
@@ -718,24 +838,74 @@ class GitHubNotificationsSource(EventSource):
         :class:`ActorIdentity`.
         """
         url = (thread.get("subject") or {}).get("latest_comment_url") or ""
+        if url:
+            try:
+                resp = self._http.get(url)
+                resp.raise_for_status()
+                data = resp.json() or {}
+                if isinstance(data, dict):
+                    info = _latest_comment_info_from_payload(data)
+                    if info.body or info.user is not None:
+                        if _should_try_pull_request_review_fallback(
+                            thread,
+                            url,
+                            info,
+                        ):
+                            review_info = (
+                                self._fetch_latest_pull_request_review_payload(thread)
+                            )
+                            if review_info is not None:
+                                return review_info
+                        return info
+            except Exception:
+                log.debug(
+                    "Failed to fetch latest comment for thread %s",
+                    thread.get("id", "?"),
+                    exc_info=True,
+                )
+
+        review_info = self._fetch_latest_pull_request_review_payload(thread)
+        if review_info is not None:
+            return review_info
+        return _LatestCommentInfo()
+
+    def _fetch_latest_pull_request_review_payload(
+        self,
+        thread: dict[str, Any],
+    ) -> _LatestCommentInfo | None:
+        """Fetch the review that likely triggered a PR notification.
+
+        GitHub's Notifications API does not always give
+        ``latest_comment_url`` for pull-request review submissions.
+        Request-changes reviews are conversational feedback, so when
+        the thread subject is a PR and the normal latest-comment path
+        yields no actor/body, fall back to the PR reviews list and
+        pick the latest submitted review at or before the thread's
+        ``updated_at`` snapshot.
+        """
+        url = _pull_request_reviews_url(thread)
         if not url:
-            return _LatestCommentInfo()
+            return None
         try:
             resp = self._http.get(url)
             resp.raise_for_status()
-            data = resp.json() or {}
-            return _LatestCommentInfo(
-                body=data.get("body") or "",
-                user=data.get("user"),
-                created_at=data.get("created_at") or "",
+            data = resp.json() or []
+            if not isinstance(data, list):
+                return None
+            review = _select_pull_request_review(
+                data,
+                thread_updated_at=thread.get("updated_at") or "",
             )
+            if review is None:
+                return None
+            return _latest_comment_info_from_payload(review)
         except Exception:
             log.debug(
-                "Failed to fetch latest comment for thread %s",
+                "Failed to fetch pull request reviews for thread %s",
                 thread.get("id", "?"),
                 exc_info=True,
             )
-            return _LatestCommentInfo()
+            return None
 
 
 __all__ = [

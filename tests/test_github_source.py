@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from thorn.gateway._event import (
+    ContextItemKind,
     EventKind,
     EventSourceStatusState,
     RawIncomingEvent,
@@ -70,6 +71,38 @@ def _comment_payload(
 ) -> dict[str, Any]:
     """Build a minimal GitHub comment / issue payload for tests."""
     payload: dict[str, Any] = {"body": body, "created_at": created_at}
+    if user_id is not None or user_login or user_type is not None:
+        user: dict[str, Any] = {}
+        if user_id is not None:
+            user["id"] = user_id
+        if user_login:
+            user["login"] = user_login
+        if user_type is not None:
+            user["type"] = user_type
+        payload["user"] = user
+    return payload
+
+
+def _review_payload(
+    *,
+    body: str = "@thorn-agent please fix the formatting failure",
+    state: str = "CHANGES_REQUESTED",
+    user_id: int | None = 10618364,
+    user_login: str = "tangent-vector",
+    user_type: str | None = "User",
+    submitted_at: str = "2026-05-08T21:44:49Z",
+    html_url: str = (
+        "https://github.com/octocat/hello-world/pull/27"
+        "#pullrequestreview-123"
+    ),
+) -> dict[str, Any]:
+    """Build a minimal GitHub pull-request review payload for tests."""
+    payload: dict[str, Any] = {
+        "body": body,
+        "state": state,
+        "submitted_at": submitted_at,
+        "html_url": html_url,
+    }
     if user_id is not None or user_login or user_type is not None:
         user: dict[str, Any] = {}
         if user_id is not None:
@@ -404,6 +437,77 @@ class TestGitHubNotificationsSourceFetchNewNotifications:
 
         assert [ev.metadata["notification_id"] for ev in result] == ["111", "222"]
         assert all(ev.source == "github" for ev in result)
+
+    def test_fetch_pr_review_notification_captures_reviewer_actor(self) -> None:
+        from thorn.gateway.sources._github import (
+            GitHubNotificationsSource,
+            GitHubNotificationsSourceConfig,
+        )
+
+        config = GitHubNotificationsSourceConfig(token="ghp_test")
+        source = GitHubNotificationsSource(config)
+
+        pr_subject_url = (
+            "https://api.github.com/repos/octocat/hello-world/pulls/27"
+        )
+        thread = _make_notification_thread(
+            thread_id="333",
+            subject_type="PullRequest",
+            subject_title="Implement lexer module",
+            subject_url=pr_subject_url,
+            latest_comment_url=pr_subject_url,
+            reason="mention",
+            updated_at="2026-05-08T21:44:49Z",
+        )
+        request_changes = _review_payload(
+            state="CHANGES_REQUESTED",
+            body="@thorn-agent please fix the formatting failure",
+            submitted_at="2026-05-08T21:44:49Z",
+        )
+        later_approval = _review_payload(
+            state="APPROVED",
+            body="looks good now",
+            submitted_at="2026-05-08T21:49:31Z",
+        )
+
+        def mock_get(url: str, **kwargs: Any) -> MagicMock:
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock()
+            resp.headers = {}
+            if url == "/notifications":
+                resp.json.return_value = [thread]
+            elif url == pr_subject_url:
+                resp.json.return_value = _comment_payload(
+                    body="stale PR body",
+                    user_id=999,
+                    user_login="thorn-agent",
+                    user_type="Bot",
+                )
+            elif str(url).endswith("/pulls/27/reviews"):
+                resp.json.return_value = [request_changes, later_approval]
+            else:
+                raise AssertionError(f"unexpected GET {url!r}")
+            return resp
+
+        with patch.object(source._http, "get", side_effect=mock_get):
+            result = source._fetch_new_notifications()
+
+        assert len(result) == 1
+        event = result[0]
+        assert event.session_key == SessionKey("github/456/change-request/27")
+        assert event.primary_actor is not None
+        assert event.primary_actor.service == "github"
+        assert event.primary_actor.account_id == "10618364"
+        assert "tangent-vector" in event.primary_actor.secondary_account_ids
+        assert event.items[0].kind is ContextItemKind.REVIEW
+        assert event.items[0].actor == event.primary_actor
+        assert event.items[0].timestamp == "2026-05-08T21:44:49Z"
+        assert "CHANGES_REQUESTED" in event.items[0].body
+        assert "@thorn-agent please fix" in event.items[0].body
+        assert "looks good now" not in event.items[0].body
+        assert event.metadata["activity_kind"] == "review"
+        assert event.metadata["review_state"] == "CHANGES_REQUESTED"
 
     def test_fetch_returns_empty_on_304(self) -> None:
         from thorn.gateway.sources._github import (
