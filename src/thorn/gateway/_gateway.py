@@ -57,7 +57,7 @@ import signal
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from thorn.core._agent import Agent
 from thorn.core._session import Session
@@ -166,8 +166,9 @@ class BundledBrokerSupervisorFactory(Protocol):
         self,
         *,
         images: BundledBrokerImageConfig,
+        oci_runtime: Literal["podman", "docker"] | None,
     ) -> BundledBrokerSupervisor:
-        """Return a supervisor configured for the given image overrides."""
+        """Return a supervisor for the image and sandbox-runtime config."""
         ...
 
 
@@ -1340,7 +1341,13 @@ class Gateway:
         images = config.broker.bundled_images
         if not isinstance(images, BundledBrokerImageConfig):
             images = BundledBrokerImageConfig.model_validate(images)
-        supervisor = self._bundled_broker_supervisor_factory(images=images)
+        oci_runtime = (
+            sandbox_config.oci_runtime if sandbox_config is not None else None
+        )
+        supervisor = self._bundled_broker_supervisor_factory(
+            images=images,
+            oci_runtime=oci_runtime,
+        )
         self._bundled_broker_supervisor = supervisor
         synthesized = await supervisor.start()
 

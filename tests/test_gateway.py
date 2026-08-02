@@ -10,7 +10,7 @@ import os
 import subprocess
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -6340,14 +6340,21 @@ class TestGatewayBundledBrokerWiring:
     """
 
     def _make_runtime_with_sandbox(
-        self, tmp_path: Path, *, backend: str = "container",
+        self,
+        tmp_path: Path,
+        *,
+        backend: Literal["subprocess", "container"] = "container",
+        oci_runtime: Literal["podman", "docker"] | None = None,
     ) -> Runtime:
         from thorn.gateway._config import SandboxConfig
 
         return Runtime(
             provider=MockProvider(),
             workspace_root=tmp_path,
-            sandbox_config=SandboxConfig(backend=backend),
+            sandbox_config=SandboxConfig(
+                backend=backend,
+                oci_runtime=oci_runtime,
+            ),
         )
 
     def _make_gateway_config(
@@ -6411,7 +6418,7 @@ class TestGatewayBundledBrokerWiring:
         )
 
     @pytest.mark.asyncio
-    async def test_start_passes_bundled_image_config_to_supervisor(
+    async def test_start_passes_images_and_sandbox_runtime_to_supervisor(
         self, tmp_path: Path,
     ) -> None:
         from thorn.gateway._config import (
@@ -6419,7 +6426,10 @@ class TestGatewayBundledBrokerWiring:
             BundledBrokerImageConfig,
         )
 
-        runtime = self._make_runtime_with_sandbox(tmp_path)
+        runtime = self._make_runtime_with_sandbox(
+            tmp_path,
+            oci_runtime="docker",
+        )
         config = self._make_gateway_config()
         config.broker = BrokerConfig.model_validate({
             "mode": "bundled",
@@ -6430,9 +6440,17 @@ class TestGatewayBundledBrokerWiring:
         })
         supervisor = _FakeBundledSupervisor()
         captured_images: list[BundledBrokerImageConfig] = []
+        captured_oci_runtimes: list[
+            Literal["podman", "docker"] | None
+        ] = []
 
-        def _factory(*, images: BundledBrokerImageConfig):
+        def _factory(
+            *,
+            images: BundledBrokerImageConfig,
+            oci_runtime: Literal["podman", "docker"] | None,
+        ):
             captured_images.append(images)
+            captured_oci_runtimes.append(oci_runtime)
             return supervisor
 
         gateway = Gateway(
@@ -6451,6 +6469,7 @@ class TestGatewayBundledBrokerWiring:
         assert captured_images[0].postgres == (
             "registry.example.com/mirror/postgres:18-alpine"
         )
+        assert captured_oci_runtimes == ["docker"]
 
     @pytest.mark.asyncio
     async def test_start_no_op_when_subprocess_sandbox_leaves_broker_unset(

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from typing import Literal
 
 import httpx
 import pytest
@@ -41,29 +42,9 @@ from thorn.gateway._bundled_broker import (
 _PODMAN_AVAILABLE = shutil.which("podman") is not None
 _DOCKER_AVAILABLE = shutil.which("docker") is not None
 
-
-def _force_runtime_factory(binary: str):
-    """Build a ``compose_runtime_factory`` that forces a specific runtime.
-
-    The supervisor's default factory prefers podman over docker; the
-    smoke test wants to exercise *exactly* the runtime that the
-    pytest marker selected, so each test pins the runtime explicitly
-    rather than relying on the auto-detection order.
-    """
-
-    path = shutil.which(binary)
-    if path is None:
-        raise RuntimeError(f"{binary} not on PATH")
-
-    def _factory() -> tuple[str, tuple[str, ...]]:
-        return binary, (path, "compose")
-
-    return _factory
-
-
-async def _exercise(binary: str) -> None:
+async def _exercise(binary: Literal["podman", "docker"]) -> None:
     supervisor = BundledBrokerSupervisor(
-        compose_runtime_factory=_force_runtime_factory(binary),
+        oci_runtime=binary,
         # Real OneCLI + Postgres bring-up can take a while on cold
         # cache; the supervisor's default 60s health budget is
         # already generous, but we extend a touch here to absorb
@@ -122,7 +103,7 @@ def test_orphan_cleanup_helpers_round_trip() -> None:
 
     async def _run() -> None:
         supervisor = BundledBrokerSupervisor(
-            compose_runtime_factory=_force_runtime_factory("docker"),
+            oci_runtime="docker",
             health_timeout_s=180.0,
         )
         await supervisor.start()

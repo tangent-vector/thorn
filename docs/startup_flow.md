@@ -57,8 +57,9 @@ calls `start()` on it.  The supervisor:
   on the same host don't collide.
 * Materialises the bundled `broker.compose.yml` (shipped inside the
   installed wheel) to a real on-disk path.
-* Detects the OCI runtime (prefers podman, falls back to docker;
-  fails loudly when neither is on PATH).
+* Uses the runtime selected by `sandbox.oci_runtime`. When that field is null,
+  it prefers podman and falls back to docker. An explicit selection fails
+  loudly when its executable is not on PATH.
 * Runs `<oci> compose -p <project> -f <yaml> up -d --wait` with
   `ONECLI_ADMIN_PORT=0` / `ONECLI_PROXY_PORT=0` so docker picks free
   host ports, and with a random per-stack `ONECLI_POSTGRES_PASSWORD`.
@@ -149,7 +150,8 @@ gateway process.
 ### 6. Sandbox containers
 
 When the gateway later spawns a per-agent sandbox container, it
-joins the supervisor's per-project Docker network
+uses the same OCI runtime as the bundled-broker supervisor and joins the
+supervisor's per-project Compose network
 (`<project>_thorn-broker`, an `internal: true` bridge with no NAT
 to the host network).  Sandboxes therefore reach only the narrow
 sandbox-facing proxy service by service DNS (`onecli-proxy:10255`) and
@@ -277,6 +279,13 @@ Common failure modes and where to look:
   containerised sandboxing (and therefore without the broker), set
   `"sandbox": { "backend": "subprocess" }` in `gateway.json` to opt
   out of both.
+
+* **The selected runtime has no working Compose provider**: set
+  `sandbox.oci_runtime` to a runtime whose container and Compose commands both
+  work, then rebuild the sandbox image with the matching
+  `thorn sandbox build --runtime <name>` option. Thorn passes an explicit
+  runtime selection to both the sandbox and bundled broker; it does not mix a
+  Docker network with Podman containers or vice versa.
 
 * **"OneCLI /api/health did not return 200 within 60s"**: the
   OneCLI image is taking unusually long to boot.  Startup failures

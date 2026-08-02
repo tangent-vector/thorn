@@ -469,6 +469,61 @@ class TestSupervisorStart:
         assert env["ONECLI_NEXTAUTH_SECRET"] == ""
 
     @pytest.mark.asyncio
+    async def test_explicit_runtime_uses_its_compose_binary(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        recorder = _ComposeRecorder()
+        recorder.script("up")
+        recorder.script("port", stdout="127.0.0.1:34567\n")
+        recorder.script("port", stdout="127.0.0.1:34568\n")
+        handler = _ok_health_handler(
+            [(200, {"apiKey": "oc_existing"})],
+        )
+
+        def _which(binary_name: str) -> str | None:
+            if binary_name == "docker":
+                return "/configured/bin/docker"
+            return "/unexpected/bin/podman"
+
+        monkeypatch.setattr(
+            "thorn.gateway._bundled_broker.shutil.which",
+            _which,
+        )
+        supervisor = BundledBrokerSupervisor(
+            oci_runtime="docker",
+            bind_host="127.0.0.1",
+            health_timeout_s=2.0,
+            health_poll_interval_s=0.01,
+            http_client_factory=_http_factory(handler),
+            subprocess_runner=recorder,
+        )
+
+        await supervisor.start()
+
+        assert recorder.calls[0][0][:2] == (
+            "/configured/bin/docker",
+            "compose",
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_runtime_missing_from_path_is_actionable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "thorn.gateway._bundled_broker.shutil.which",
+            lambda _binary_name: None,
+        )
+        supervisor = BundledBrokerSupervisor(oci_runtime="docker")
+
+        with pytest.raises(
+            BundledBrokerError,
+            match="sandbox.oci_runtime.*docker.*not on PATH",
+        ):
+            await supervisor.start()
+
+    @pytest.mark.asyncio
     async def test_configured_images_override_compose_env(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

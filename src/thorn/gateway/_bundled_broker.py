@@ -199,6 +199,26 @@ def _detect_compose_runtime() -> tuple[str, tuple[str, ...]]:
     )
 
 
+def _compose_runtime_for_name(
+    runtime_name: Literal["podman", "docker"],
+) -> tuple[str, tuple[str, ...]]:
+    """Resolve the compose command for an operator-selected OCI runtime.
+
+    The sandbox and bundled broker must use the same runtime because the
+    sandbox joins a compose-created internal network.  An explicit
+    ``sandbox.oci_runtime`` therefore takes precedence over the supervisor's
+    normal podman-first auto-detection.
+    """
+    binary_path = shutil.which(runtime_name)
+    if binary_path is not None:
+        return runtime_name, (binary_path, "compose")
+    raise BundledBrokerError(
+        f"sandbox.oci_runtime selects {runtime_name!r}, but that executable "
+        "is not on PATH. Install the selected runtime or update "
+        "sandbox.oci_runtime before starting the bundled broker.",
+    )
+
+
 class BundledBrokerSupervisor:
     """Lifecycle owner for a per-process bundled OneCLI broker stack.
 
@@ -216,6 +236,7 @@ class BundledBrokerSupervisor:
         self,
         *,
         images: BundledBrokerImageConfig | None = None,
+        oci_runtime: Literal["podman", "docker"] | None = None,
         bind_host: str = "127.0.0.1",
         health_timeout_s: float = _DEFAULT_HEALTH_TIMEOUT_S,
         health_poll_interval_s: float = _DEFAULT_HEALTH_POLL_INTERVAL_S,
@@ -245,10 +266,16 @@ class BundledBrokerSupervisor:
         is absent, the supervisor leaves the matching compose env var
         to the host environment / compose default path.
 
+        *oci_runtime* is the agency's explicit ``sandbox.oci_runtime``
+        selection. The bundled broker must use the same runtime as its
+        sandbox containers so they share the same runtime-local network.
+        When omitted, the existing podman-first auto-detection remains in
+        effect.
+
         *compose_runtime_factory* is a test seam: production callers
-        leave it ``None`` and the supervisor auto-detects podman /
-        docker.  Tests inject a fake that returns a record-and-replay
-        argv prefix.
+        leave it ``None``. Tests inject a fake that returns a
+        record-and-replay argv prefix; an injected factory takes precedence
+        over *oci_runtime*.
 
         *http_client_factory* is a test seam for the OneCLI admin-key
         acquisition step: production leaves it ``None`` and the
@@ -259,9 +286,14 @@ class BundledBrokerSupervisor:
         self._bind_host = bind_host
         self._health_timeout_s = health_timeout_s
         self._health_poll_interval_s = health_poll_interval_s
-        self._compose_runtime_factory = (
-            compose_runtime_factory or _detect_compose_runtime
-        )
+        if compose_runtime_factory is not None:
+            self._compose_runtime_factory = compose_runtime_factory
+        elif oci_runtime is not None:
+            self._compose_runtime_factory = (
+                lambda: _compose_runtime_for_name(oci_runtime)
+            )
+        else:
+            self._compose_runtime_factory = _detect_compose_runtime
         self._http_client_factory = http_client_factory
         # Default to spawning a real subprocess; tests inject a fake
         # that records argv/env and returns scripted (rc, stdout, stderr).

@@ -62,6 +62,26 @@ The command selects Podman when available, otherwise Docker, and tags the
 image for the installed Thorn version. Thorn deliberately does not build this
 image implicitly when the gateway starts.
 
+If both runtimes are installed, or Podman's Compose provider is not configured,
+select one runtime explicitly in the agency's sandbox configuration and use
+the same choice for the image build:
+
+```json
+{
+  "sandbox": {
+    "backend": "container",
+    "oci_runtime": "docker"
+  }
+}
+```
+
+```console
+$ uv run thorn sandbox build --runtime docker
+```
+
+The bundled broker honors `sandbox.oci_runtime` so its Compose network and the
+agent sandboxes are always created by the same OCI runtime.
+
 ### 3. Provide secrets through the process environment
 
 The gateway only reads **secrets** from environment variables; all
