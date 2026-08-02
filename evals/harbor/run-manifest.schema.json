@@ -1,0 +1,681 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/tangent-vector/thorn/main/evals/harbor/run-manifest.schema.json",
+  "title": "Thorn Harbor Run Manifest",
+  "description": "Versioned non-secret configuration and result metadata for one Thorn attempt under Harbor.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_state",
+    "identity",
+    "revisions",
+    "task",
+    "agent",
+    "model",
+    "execution",
+    "comparison",
+    "artifacts",
+    "outcome",
+    "metrics"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.7.0"
+    },
+    "record_state": {
+      "enum": ["planned", "completed"]
+    },
+    "identity": {
+      "$ref": "#/$defs/identity"
+    },
+    "revisions": {
+      "$ref": "#/$defs/revisions"
+    },
+    "task": {
+      "$ref": "#/$defs/task"
+    },
+    "agent": {
+      "$ref": "#/$defs/agent"
+    },
+    "model": {
+      "$ref": "#/$defs/model"
+    },
+    "execution": {
+      "$ref": "#/$defs/execution"
+    },
+    "comparison": {
+      "$ref": "#/$defs/comparison"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/artifacts"
+    },
+    "outcome": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/infrastructureFailure"},
+        {"$ref": "#/$defs/agentBehaviorFailure"},
+        {"$ref": "#/$defs/completedOutcome"}
+      ]
+    },
+    "metrics": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/metrics"}
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"record_state": {"const": "planned"}},
+        "required": ["record_state"]
+      },
+      "then": {
+        "properties": {
+          "outcome": {"type": "null"},
+          "metrics": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"record_state": {"const": "completed"}},
+        "required": ["record_state"]
+      },
+      "then": {
+        "properties": {
+          "outcome": {
+            "oneOf": [
+              {"$ref": "#/$defs/infrastructureFailure"},
+              {"$ref": "#/$defs/agentBehaviorFailure"},
+              {"$ref": "#/$defs/completedOutcome"}
+            ]
+          },
+          "metrics": {"$ref": "#/$defs/metrics"}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitRevision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "nullableNonNegativeInteger": {
+      "oneOf": [
+        {"type": "integer", "minimum": 0},
+        {"type": "null"}
+      ]
+    },
+    "nullableNonNegativeNumber": {
+      "oneOf": [
+        {"type": "number", "minimum": 0},
+        {"type": "null"}
+      ]
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "experiment_id",
+        "logical_run_id",
+        "attempt_id",
+        "attempt_number",
+        "repetition_index",
+        "scheduled_order_index",
+        "configuration_sha256",
+        "planned_at",
+        "started_at",
+        "completed_at",
+        "retry_of_attempt_id",
+        "supersedes_attempt_id"
+      ],
+      "properties": {
+        "experiment_id": {"type": "string", "minLength": 1},
+        "logical_run_id": {"type": "string", "minLength": 1},
+        "attempt_id": {"type": "string", "minLength": 1},
+        "attempt_number": {"type": "integer", "minimum": 1},
+        "repetition_index": {"type": "integer", "minimum": 1},
+        "scheduled_order_index": {"type": "integer", "minimum": 1},
+        "configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "planned_at": {"type": "string", "format": "date-time"},
+        "started_at": {
+          "oneOf": [
+            {"type": "string", "format": "date-time"},
+            {"type": "null"}
+          ]
+        },
+        "completed_at": {
+          "oneOf": [
+            {"type": "string", "format": "date-time"},
+            {"type": "null"}
+          ]
+        },
+        "retry_of_attempt_id": {
+          "oneOf": [
+            {"type": "string", "minLength": 1},
+            {"type": "null"}
+          ]
+        },
+        "supersedes_attempt_id": {
+          "oneOf": [
+            {"type": "string", "minLength": 1},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "sourceRevision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "revision"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "revision": {"$ref": "#/$defs/gitRevision"}
+      }
+    },
+    "revisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["thorn", "harbor", "adapter"],
+      "properties": {
+        "thorn": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository",
+            "revision",
+            "working_tree_state",
+            "dirty_diff_sha256"
+          ],
+          "properties": {
+            "repository": {"type": "string", "minLength": 1},
+            "revision": {"$ref": "#/$defs/gitRevision"},
+            "working_tree_state": {"enum": ["clean", "dirty"]},
+            "dirty_diff_sha256": {
+              "oneOf": [
+                {"$ref": "#/$defs/sha256"},
+                {"type": "null"}
+              ]
+            }
+          }
+        },
+        "harbor": {"$ref": "#/$defs/sourceRevision"},
+        "adapter": {"$ref": "#/$defs/sourceRevision"}
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dataset",
+        "dataset_revision",
+        "task_id",
+        "split",
+        "purpose",
+        "selection_file",
+        "selection_file_sha256",
+        "instruction_sha256",
+        "image",
+        "image_validation",
+        "oracle_validation",
+        "verifier"
+      ],
+      "properties": {
+        "dataset": {
+          "enum": ["custom_canary", "swe_gym_lite", "swe_bench_verified"]
+        },
+        "dataset_revision": {"type": "string", "minLength": 1},
+        "task_id": {"type": "string", "minLength": 1},
+        "split": {
+          "enum": ["development", "validation", "holdout", "external_gate"]
+        },
+        "purpose": {
+          "enum": [
+            "integration_canary",
+            "catastrophic_failure",
+            "baseline_calibration",
+            "intervention_development",
+            "promotion_validation",
+            "held_out_evaluation"
+          ]
+        },
+        "selection_file": {"type": "string", "minLength": 1},
+        "selection_file_sha256": {"$ref": "#/$defs/sha256"},
+        "instruction_sha256": {"$ref": "#/$defs/sha256"},
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference", "digest"],
+          "properties": {
+            "reference": {"type": "string", "minLength": 1},
+            "digest": {
+              "oneOf": [
+                {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                {"type": "null"}
+              ]
+            }
+          }
+        },
+        "image_validation": {
+          "enum": ["pending", "passed", "failed"]
+        },
+        "oracle_validation": {
+          "enum": ["pending", "passed", "failed"]
+        },
+        "verifier": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "revision", "timeout_seconds"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "revision": {"type": "string", "minLength": 1},
+            "timeout_seconds": {"type": "integer", "minimum": 1}
+          }
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "implementation",
+        "profile",
+        "prompt_delivery",
+        "action_policy",
+        "history_policy",
+        "validation_convergence_policy",
+        "read_reuse_policy",
+        "read_reuse_telemetry_schema_version",
+        "task_shell_environment"
+      ],
+      "properties": {
+        "implementation": {"const": "thorn"},
+        "profile": {
+          "enum": ["local", "lean-coordinator", "project-coordinator"]
+        },
+        "prompt_delivery": {"enum": ["direct", "inbox"]},
+        "action_policy": {
+          "enum": ["baseline", "bounded-action-v1", "semantic-work-v2"]
+        },
+        "history_policy": {
+          "enum": ["baseline", "bounded-history-v1", "bounded-history-v2"]
+        },
+        "validation_convergence_policy": {
+          "enum": [
+            "baseline",
+            "action-epoch-v1",
+            "workspace-content-observe-v2",
+            "workspace-content-v2"
+          ]
+        },
+        "read_reuse_policy": {"enum": ["baseline", "session-ledger-v1"]},
+        "read_reuse_telemetry_schema_version": {"const": 2},
+        "task_shell_environment": {"enum": ["inherit", "conda-testbed"]}
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "endpoint_label", "model_name", "options"],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "endpoint_label": {"type": "string", "minLength": 1},
+        "model_name": {"type": "string", "minLength": 1},
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reasoning_effort",
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "seed"
+          ],
+          "properties": {
+            "reasoning_effort": {
+              "oneOf": [
+                {"enum": ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]},
+                {"type": "null"}
+              ]
+            },
+            "max_output_tokens": {
+              "oneOf": [
+                {"type": "integer", "minimum": 1},
+                {"type": "null"}
+              ]
+            },
+            "temperature": {
+              "oneOf": [
+                {"type": "number", "minimum": 0, "maximum": 2},
+                {"type": "null"}
+              ]
+            },
+            "top_p": {
+              "oneOf": [
+                {"type": "number", "minimum": 0, "maximum": 1},
+                {"type": "null"}
+              ]
+            },
+            "seed": {
+              "oneOf": [
+                {"type": "integer"},
+                {"type": "null"}
+              ]
+            }
+          }
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_request_timeout_seconds",
+        "model_context_window_tokens",
+        "max_tool_rounds",
+        "no_progress_warning_rounds",
+        "no_progress_hard_stop_rounds",
+        "run_timeout_seconds",
+        "default_tool_timeout_seconds",
+        "workspace_path",
+        "isolation",
+        "tool_execution",
+        "resources"
+      ],
+      "properties": {
+        "provider_request_timeout_seconds": {"type": "integer", "minimum": 1},
+        "model_context_window_tokens": {"type": "integer", "minimum": 1},
+        "max_tool_rounds": {"type": "integer", "minimum": 1},
+        "no_progress_warning_rounds": {"type": "integer", "minimum": 1},
+        "no_progress_hard_stop_rounds": {"type": "integer", "minimum": 1},
+        "run_timeout_seconds": {"type": "integer", "minimum": 1},
+        "default_tool_timeout_seconds": {"type": "integer", "minimum": 1},
+        "workspace_path": {"type": "string", "minLength": 1},
+        "isolation": {"const": "harbor_task_container"},
+        "tool_execution": {"const": "subprocess"},
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu_cores", "memory_mb", "disk_mb", "network_access"],
+          "properties": {
+            "cpu_cores": {"type": "number", "exclusiveMinimum": 0},
+            "memory_mb": {"type": "integer", "minimum": 1},
+            "disk_mb": {"type": "integer", "minimum": 1},
+            "network_access": {
+              "enum": ["none", "public", "private_allowlist"]
+            }
+          }
+        }
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "group_id", "configuration_label"],
+      "properties": {
+        "mode": {
+          "enum": ["standalone", "same_model_scaffold", "best_supported_product"]
+        },
+        "group_id": {
+          "oneOf": [
+            {"type": "string", "minLength": 1},
+            {"type": "null"}
+          ]
+        },
+        "configuration_label": {"type": "string", "minLength": 1}
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_log_directory",
+        "manifest_path",
+        "thorn_result_path",
+        "thorn_trace_path",
+        "atif_trajectory_path",
+        "verifier_output_path",
+        "raw_prompt_capture"
+      ],
+      "properties": {
+        "agent_log_directory": {"type": "string", "minLength": 1},
+        "manifest_path": {"type": "string", "minLength": 1},
+        "thorn_result_path": {"type": "string", "minLength": 1},
+        "thorn_trace_path": {"type": "string", "minLength": 1},
+        "atif_trajectory_path": {
+          "oneOf": [
+            {"type": "string", "minLength": 1},
+            {"type": "null"}
+          ]
+        },
+        "verifier_output_path": {"type": "string", "minLength": 1},
+        "raw_prompt_capture": {"enum": ["disabled", "redacted", "raw_secured"]}
+      }
+    },
+    "infrastructureFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["category", "code", "verifier_status", "patch_status", "material_action_status"],
+      "properties": {
+        "category": {"const": "infrastructure_failure"},
+        "code": {
+          "enum": [
+            "installation_failure",
+            "startup_failure",
+            "provider_authentication_failure",
+            "provider_transport_failure",
+            "run_timeout",
+            "missing_artifact",
+            "verifier_execution_failure"
+          ]
+        },
+        "verifier_status": {"enum": ["not_run", "error"]},
+        "patch_status": {"enum": ["none", "valid", "invalid", "unknown"]},
+        "material_action_status": {"enum": ["observed", "not_observed", "unknown"]}
+      }
+    },
+    "agentBehaviorFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["category", "code", "verifier_status", "patch_status", "material_action_status"],
+      "properties": {
+        "category": {"const": "agent_behavior_failure"},
+        "code": {
+          "enum": [
+            "no_material_action",
+            "no_progress_eviction",
+            "tool_round_limit",
+            "invalid_patch",
+            "agent_error"
+          ]
+        },
+        "verifier_status": {"enum": ["not_run", "passed", "failed", "error"]},
+        "patch_status": {"enum": ["none", "valid", "invalid", "unknown"]},
+        "material_action_status": {"enum": ["observed", "not_observed", "unknown"]}
+      }
+    },
+    "completedOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["category", "code", "verifier_status", "patch_status", "material_action_status"],
+      "properties": {
+        "category": {"const": "completed"},
+        "code": {"enum": ["resolved", "unresolved"]},
+        "verifier_status": {"enum": ["passed", "failed"]},
+        "patch_status": {"enum": ["none", "valid"]},
+        "material_action_status": {"enum": ["observed", "not_observed"]}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"code": {"const": "resolved"}},
+            "required": ["code"]
+          },
+          "then": {
+            "properties": {"verifier_status": {"const": "passed"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"code": {"const": "unresolved"}},
+            "required": ["code"]
+          },
+          "then": {
+            "properties": {"verifier_status": {"const": "failed"}}
+          }
+        }
+      ]
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wall_clock_seconds",
+        "verifier_reward",
+        "cost",
+        "provider",
+        "tokens",
+        "milestones",
+        "tools",
+        "inspection",
+        "workflow"
+      ],
+      "properties": {
+        "wall_clock_seconds": {"$ref": "#/$defs/nullableNonNegativeNumber"},
+        "verifier_reward": {"$ref": "#/$defs/nullableNonNegativeNumber"},
+        "cost": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["currency", "amount"],
+          "properties": {
+            "currency": {
+              "oneOf": [
+                {"type": "string", "minLength": 3, "maxLength": 3},
+                {"type": "null"}
+              ]
+            },
+            "amount": {"$ref": "#/$defs/nullableNonNegativeNumber"}
+          }
+        },
+        "provider": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "attempts",
+            "successes",
+            "failures",
+            "retries",
+            "duration_seconds_p50",
+            "duration_seconds_p90",
+            "duration_seconds_p95",
+            "duration_seconds_maximum"
+          ],
+          "properties": {
+            "attempts": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "successes": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "failures": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "retries": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "duration_seconds_p50": {"$ref": "#/$defs/nullableNonNegativeNumber"},
+            "duration_seconds_p90": {"$ref": "#/$defs/nullableNonNegativeNumber"},
+            "duration_seconds_p95": {"$ref": "#/$defs/nullableNonNegativeNumber"},
+            "duration_seconds_maximum": {"$ref": "#/$defs/nullableNonNegativeNumber"}
+          }
+        },
+        "tokens": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "prompt",
+            "completion",
+            "cache_read",
+            "cache_write",
+            "total",
+            "first_prompt",
+            "final_prompt",
+            "maximum_prompt"
+          ],
+          "properties": {
+            "prompt": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "completion": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "cache_read": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "cache_write": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "total": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "first_prompt": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "final_prompt": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "maximum_prompt": {"$ref": "#/$defs/nullableNonNegativeInteger"}
+          }
+        },
+        "milestones": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "first_material_action_round",
+            "first_material_action_seconds",
+            "first_validation_round",
+            "first_validation_seconds"
+          ],
+          "properties": {
+            "first_material_action_round": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "first_material_action_seconds": {"$ref": "#/$defs/nullableNonNegativeNumber"},
+            "first_validation_round": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "first_validation_seconds": {"$ref": "#/$defs/nullableNonNegativeNumber"}
+          }
+        },
+        "tools": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["total_calls", "by_name"],
+          "properties": {
+            "total_calls": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "by_name": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "count"],
+                "properties": {
+                  "name": {"type": "string", "minLength": 1},
+                  "count": {"type": "integer", "minimum": 0}
+                }
+              }
+            }
+          }
+        },
+        "inspection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "structured_read_calls",
+            "structured_search_calls",
+            "classified_shell_inspection_calls",
+            "overlap_observations",
+            "prior_context_hints"
+          ],
+          "properties": {
+            "structured_read_calls": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "structured_search_calls": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "classified_shell_inspection_calls": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "overlap_observations": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "prior_context_hints": {"$ref": "#/$defs/nullableNonNegativeInteger"}
+          }
+        },
+        "workflow": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["working_set_transitions", "no_progress_warnings", "no_progress_evictions"],
+          "properties": {
+            "working_set_transitions": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "no_progress_warnings": {"$ref": "#/$defs/nullableNonNegativeInteger"},
+            "no_progress_evictions": {"$ref": "#/$defs/nullableNonNegativeInteger"}
+          }
+        }
+      }
+    }
+  }
+}

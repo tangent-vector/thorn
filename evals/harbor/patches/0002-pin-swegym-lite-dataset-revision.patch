@@ -1,0 +1,35 @@
+diff --git a/adapters/swegym/adapter.py b/adapters/swegym/adapter.py
+index df22702..e88310b 100644
+--- a/adapters/swegym/adapter.py
++++ b/adapters/swegym/adapter.py
+@@ -54 +54 @@ class SWEGymLoader:
+-    def __init__(self, dataset: str = "lite") -> None:
++    def __init__(self, dataset_revision: str, dataset: str = "lite") -> None:
+@@ -57 +57 @@ class SWEGymLoader:
+-            ds = load_dataset(hf_name)["train"]
++            ds = load_dataset(hf_name, revision=dataset_revision)["train"]
+@@ -60 +60,2 @@ class SWEGymLoader:
+-                f"Failed to load HuggingFace dataset '{hf_name}'. "
++                f"Failed to load HuggingFace dataset '{hf_name}' "
++                f"at revision '{dataset_revision}'. "
+@@ -122,0 +124 @@ class SWEGymToHarbor:
++        dataset_revision: str,
+@@ -140 +142,4 @@ class SWEGymToHarbor:
+-        self.loader = SWEGymLoader(dataset=dataset)
++        self.loader = SWEGymLoader(
++            dataset=dataset,
++            dataset_revision=dataset_revision,
++        )
+diff --git a/adapters/swegym/run_adapter.py b/adapters/swegym/run_adapter.py
+index 2887293..4a6aa9f 100644
+--- a/adapters/swegym/run_adapter.py
++++ b/adapters/swegym/run_adapter.py
+@@ -20,0 +21,6 @@ def main() -> None:
++    ap.add_argument(
++        "--dataset-revision",
++        required=True,
++        help="Exact Hugging Face dataset revision to load",
++    )
++
+@@ -83,0 +90 @@ def main() -> None:
++        dataset_revision=args.dataset_revision,

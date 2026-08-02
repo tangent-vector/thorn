@@ -1,0 +1,20 @@
+{
+  "name": "thorn-agent",
+  "agent_class": "ProjectCoordinator",
+  "metadata": {
+    "project": "thorn"
+  },
+  "accounts": [
+    {
+      "service": "gitlab-primary",
+      "credentials": [
+        {
+          "kind": "gitlab-pat",
+          "env_var_name": "GITLAB_MASTER_TOKEN"
+        }
+      ],
+      "git_user_name": "thorn-agent",
+      "git_user_email": "thorn-agent@example.com"
+    }
+  ]
+}

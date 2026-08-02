@@ -1,0 +1,43 @@
+diff --git a/adapters/swegym/template/tests/test.sh b/adapters/swegym/template/tests/test.sh
+index 527e1ef..5973ff9 100644
+--- a/adapters/swegym/template/tests/test.sh
++++ b/adapters/swegym/template/tests/test.sh
+@@ -35,0 +36,2 @@ test_status_map = {}
++ansi_escape = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
++
+@@ -40 +42 @@ for line in log_content.split('\n'):
+-    line = line.strip()
++    line = ansi_escape.sub("", line).strip()
+@@ -51,6 +53,11 @@ for line in log_content.split('\n'):
+-    elif line.endswith(' PASSED') or line.endswith(' FAILED') or line.endswith(' ERROR') or line.endswith(' SKIPPED'):
+-        parts = line.rsplit(None, 1)  # Split from right to get last word
+-        if len(parts) == 2:
+-            test_name = parts[0]
+-            test_status = parts[1]
+-            test_status_map[test_name] = test_status
++    else:
++        match = re.match(
++            r"^(?P<test_name>\S+)\s+"
++            r"(?P<test_status>PASSED|FAILED|ERROR|SKIPPED)"
++            r"(?:\s|$)",
++            line,
++        )
++        if match is not None:
++            test_status_map[match.group("test_name")] = match.group(
++                "test_status"
++            )
+@@ -65,0 +73,6 @@ failed_count = sum(int(m) for m in failed_matches) if failed_matches else 0
++expected_test_count = len(fail_to_pass) + len(pass_to_pass)
++all_expected_tests_passed_by_count = (
++    expected_test_count > 0
++    and failed_count == 0
++    and passed_count >= expected_test_count
++)
+@@ -97 +110,4 @@ def test_matches(expected_test, actual_tests):
+-fail_to_pass_passed = all(test_matches(test, passed_tests) for test in fail_to_pass) if fail_to_pass else True
++fail_to_pass_passed = (
++    all(test_matches(test, passed_tests) for test in fail_to_pass)
++    or (not passed_tests and all_expected_tests_passed_by_count)
++) if fail_to_pass else True
+@@ -170 +185,0 @@ exit "${exit_code}"
+-

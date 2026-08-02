@@ -1,0 +1,17 @@
+{
+  "workspace": "/var/lib/thorn/workspaces/bundled-broker-mirrors",
+  "broker": {
+    "mode": "bundled",
+    "bundled_images": {
+      "onecli": "registry.example.com/team/mirror/onecli:2026-05-01",
+      "postgres": "registry.example.com/team/mirror/postgres:18-alpine",
+      "proxy": "registry.example.com/team/mirror/haproxy:3.2-alpine"
+    }
+  },
+  "projects": [
+    {
+      "name": "my-repo",
+      "url": "https://github.com/owner/my-repo"
+    }
+  ]
+}

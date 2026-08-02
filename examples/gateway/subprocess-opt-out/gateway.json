@@ -1,0 +1,12 @@
+{
+  "workspace": "/var/lib/thorn/workspaces/subprocess-opt-out",
+  "sandbox": {
+    "backend": "subprocess"
+  },
+  "projects": [
+    {
+      "name": "my-repo",
+      "url": "https://github.com/owner/my-repo"
+    }
+  ]
+}

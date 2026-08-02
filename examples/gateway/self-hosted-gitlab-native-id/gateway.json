@@ -1,0 +1,29 @@
+{
+  "workspace": "/var/lib/thorn/workspaces/self-hosted-gitlab-native-id",
+  "forges": [
+    {
+      "name": "gitlab-primary",
+      "type": "gitlab",
+      "url": "https://gitlab-primary.example.com"
+    }
+  ],
+  "projects": [
+    {
+      "name": "thorn",
+      "url": "https://gitlab-primary.example.com/team/thorn",
+      "native_id": "264873"
+    }
+  ],
+  "peers": [
+    {
+      "id": "operator",
+      "name": "Example Operator",
+      "accounts": [
+        {
+          "service": "gitlab-primary",
+          "account_id": "2136"
+        }
+      ]
+    }
+  ]
+}

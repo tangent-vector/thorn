@@ -1,0 +1,233 @@
+# OneCLI credential broker stack -- bundled with `thorn serve`.
+#
+# This file is the canonical compose definition for the OneCLI broker
+# stack.  Two consumers:
+#
+# 1. ``thorn serve`` (the dominant case): the gateway brings the stack
+#    up automatically via ``BundledBrokerSupervisor`` on startup and
+#    tears it down on shutdown.  The supervisor runs ``docker compose
+#    up -d --wait`` against this file with a per-process compose
+#    project name, anonymous Docker volumes, and ephemeral host ports;
+#    nothing here needs to be edited for that path.
+#
+# 2. Advanced operators running their own external broker.  Extract
+#    this file via ``python -c "from importlib.resources import files;
+#    print(files('thorn.gateway._resources').joinpath(
+#    'broker.compose.yml').read_text())"`` and run ``docker compose -f
+#    broker.compose.yml up -d`` against it; the gateway then talks to
+#    it through ``broker.admin_url`` / ``broker.proxy_url`` /
+#    ``broker.admin_api_key`` in ``gateway.json`` (see ``broker.mode:
+#    "external"``).
+#
+# Network names are *not* pinned with ``name:`` so each compose project
+# gets its own scoped networks (``<project>_thorn-broker``,
+# ``<project>_thorn-onecli-proxy``, ``<project>_thorn-broker-db``,
+# ``<project>_thorn-default``) -- this is what makes per-process
+# bundled bring-up safe to run alongside other agencies on the same
+# host.  Sandbox containers launched by the gateway join only the
+# broker's sandbox-facing project-scoped network via the supervisor's
+# discovered network name.
+#
+# Host port bindings use ``${ONECLI_ADMIN_PORT:-10254}`` and
+# ``${ONECLI_PROXY_PORT:-10255}`` so the bundled supervisor can
+# request ephemeral ports (port 0 -> docker picks).  Operators
+# running this themselves get the historical pinned ports as the
+# default.
+#
+# The ``thorn-broker`` network is created with ``internal: true`` and
+# contains only sandbox containers plus a narrow TCP proxy service that
+# forwards OneCLI's substitution proxy port.  OneCLI itself does not
+# join that sandbox-facing network, so untrusted tool execution cannot
+# reach OneCLI's admin API port.  The separate ``thorn-broker-db``
+# network is private to OneCLI and Postgres.  OneCLI also joins the
+# outbound ``thorn-default`` network so its substitution proxy can
+# forward requests to upstream APIs after credential injection.
+#
+# The CA cert acquisition is handled entirely by the Thorn gateway
+# at startup via ``GET /api/gateway/ca``.  No Docker volume needs to
+# be shared between OneCLI and the gateway for this; OneCLI's
+# generated CA stays in its own ``/app/data`` and the gateway writes
+# its local copy under ``<agency_home>/onecli-ca.pem`` (or wherever
+# ``broker.ca_certificate_path`` in ``gateway.json`` says).
+#
+# Environment variables (all optional with sensible defaults):
+#   ONECLI_BIND_HOST          IP to bind the published ports to
+#                             (default 127.0.0.1).  Set to 0.0.0.0
+#                             only on hosts behind separate auth.
+#   THORN_BUNDLED_BROKER_ONECLI_IMAGE
+#                             OneCLI image reference used by the bundled
+#                             stack (default ghcr.io/onecli/onecli:latest).
+#   THORN_BUNDLED_BROKER_POSTGRES_IMAGE
+#                             Postgres image reference used by the bundled
+#                             stack (default postgres:18-alpine).
+#   THORN_BUNDLED_BROKER_PROXY_IMAGE
+#                             HAProxy image reference used for the sandbox-
+#                             facing TCP proxy sidecar (default
+#                             haproxy:3.2-alpine).
+#   ONECLI_ADMIN_PORT         Host port for the admin API (default
+#                             10254; bundled supervisor uses 0 to
+#                             let docker pick a free port).
+#   ONECLI_PROXY_PORT         Host port for the substitution proxy
+#                             (default 10255; bundled supervisor
+#                             uses 0).
+#   ONECLI_POSTGRES_USER      default 'onecli'
+#   ONECLI_POSTGRES_PASSWORD  REQUIRED when running this compose file
+#                             directly; generate one with
+#                             ``openssl rand -hex 32``. The bundled
+#                             supervisor injects a random per-stack value.
+#   ONECLI_POSTGRES_DB        default 'onecli'
+#   ONECLI_NEXTAUTH_SECRET    NextAuth session-signing secret.
+#                             Leave UNSET to keep OneCLI in its
+#                             single-user "local" mode (the bundled
+#                             supervisor relies on this).  Set with
+#                             ``openssl rand -hex 32`` only when
+#                             standing up a multi-user broker.
+#   ONECLI_HOST_CA_BUNDLE     Host CA bundle to mount into the OneCLI
+#                             container for outbound TLS (default
+#                             /etc/ssl/certs/ca-certificates.crt).
+#                             Useful on hosts whose egress policy is
+#                             enforced by a local TLS proxy trusted by
+#                             the host but not by the OneCLI image.
+#   ONECLI_HOST_GATEWAY_HOST  Optional hostname to resolve to Docker's
+#                             host gateway inside the OneCLI container
+#                             (default host.docker.internal).  Use this
+#                             when the host resolver maps an upstream
+#                             service name to a host-local egress proxy.
+#   ONECLI_SKIP_VERIFY_HOSTS  Optional comma-separated host patterns passed
+#                             to OneCLI's GATEWAY_SKIP_VERIFY_HOSTS. Use only
+#                             for operator-trusted hosts whose outbound TLS is
+#                             terminated by a local egress proxy not trusted by
+#                             OneCLI's Rust TLS client. Patterns may be exact
+#                             hosts or wildcard subdomains.
+
+services:
+  postgres:
+    image: ${THORN_BUNDLED_BROKER_POSTGRES_IMAGE:-postgres:18-alpine}
+    environment:
+      POSTGRES_USER: ${ONECLI_POSTGRES_USER:-onecli}
+      POSTGRES_PASSWORD: ${ONECLI_POSTGRES_PASSWORD:?Set ONECLI_POSTGRES_PASSWORD to a generated hex secret before running this compose stack}
+      POSTGRES_DB: ${ONECLI_POSTGRES_DB:-onecli}
+    volumes:
+      - onecli-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ONECLI_POSTGRES_USER:-onecli}"]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 10
+    networks:
+      - thorn-broker-db
+    restart: unless-stopped
+
+  onecli:
+    image: ${THORN_BUNDLED_BROKER_ONECLI_IMAGE:-ghcr.io/onecli/onecli:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Admin API.  Bundled supervisor sets ONECLI_ADMIN_PORT=0 so
+      # docker picks a free port; supervisor reads the actual bound
+      # port back via ``docker compose port``.
+      - "${ONECLI_BIND_HOST:-127.0.0.1}:${ONECLI_ADMIN_PORT:-10254}:10254"
+      # Substitution proxy.  Same parameterization as the admin API.
+      - "${ONECLI_BIND_HOST:-127.0.0.1}:${ONECLI_PROXY_PORT:-10255}:10255"
+    environment:
+      DATABASE_URL: postgresql://${ONECLI_POSTGRES_USER:-onecli}:${ONECLI_POSTGRES_PASSWORD:?Set ONECLI_POSTGRES_PASSWORD to a generated hex secret before running this compose stack}@postgres:5432/${ONECLI_POSTGRES_DB:-onecli}
+      NEXTAUTH_SECRET: ${ONECLI_NEXTAUTH_SECRET:-}
+      NEXT_PUBLIC_APP_URL: http://${ONECLI_BIND_HOST:-127.0.0.1}:${ONECLI_ADMIN_PORT:-10254}
+      APP_URL: http://${ONECLI_BIND_HOST:-127.0.0.1}:${ONECLI_ADMIN_PORT:-10254}
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+      GATEWAY_SKIP_VERIFY_HOSTS: ${ONECLI_SKIP_VERIFY_HOSTS:-}
+    extra_hosts:
+      - "${ONECLI_HOST_GATEWAY_HOST:-host.docker.internal}:host-gateway"
+    volumes:
+      - onecli-app-data:/app/data
+      - ${ONECLI_HOST_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
+    networks:
+      # OneCLI must reach Postgres over the private DB network, serve
+      # its substitution proxy to the narrow sidecar over an internal
+      # proxy-only network, AND have outbound to ``thorn-default`` so
+      # the substitution proxy can forward requests to upstream APIs
+      # after credential injection.  It deliberately does NOT join
+      # ``thorn-broker``; sandboxes on that network can reach only
+      # ``onecli-proxy:10255``, not OneCLI's admin API on 10254.
+      - thorn-default
+      - thorn-onecli-proxy
+      - thorn-broker-db
+    restart: unless-stopped
+
+  onecli-proxy:
+    image: ${THORN_BUNDLED_BROKER_PROXY_IMAGE:-haproxy:3.2-alpine}
+    depends_on:
+      - onecli
+    command:
+      - sh
+      - -ec
+      - |
+        cat >/usr/local/etc/haproxy/haproxy.cfg <<'EOF'
+        global
+            log stdout format raw local0
+
+        defaults
+            mode tcp
+            timeout connect 5s
+            timeout client 1m
+            timeout server 1m
+
+        frontend thorn_sandbox_proxy
+            bind *:10255
+            default_backend onecli_substitution_backend
+
+        backend onecli_substitution_backend
+            server onecli onecli:10255
+        EOF
+        exec haproxy -f /usr/local/etc/haproxy/haproxy.cfg
+    networks:
+      - thorn-broker
+      - thorn-onecli-proxy
+    restart: unless-stopped
+
+volumes:
+  # Anonymous in the bundled case: ``compose down --volumes`` on
+  # gateway shutdown blows them away.  Operators running this stack
+  # themselves can override with named volumes via a compose override
+  # file if they want broker state to survive ``compose down``.
+  onecli-pgdata:
+  onecli-app-data:
+
+networks:
+  # Outbound bridge: OneCLI uses this to reach upstream APIs.  Has
+  # NAT to the host (the Docker default).  Sandbox containers do
+  # NOT join this network.
+  #
+  # No ``name:`` pinning: each compose project gets a scoped network
+  # (``<project>_thorn-default``).  The bundled supervisor uses a
+  # per-process compose project name so concurrent ``thorn serve``
+  # runs on the same host don't collide.
+  thorn-default:
+    driver: bridge
+
+  # Sandbox-facing internal network: no NAT to the host network,
+  # so anything attached to it can reach the narrow OneCLI proxy
+  # sidecar and nothing else.  Sandboxes spawned by the Thorn gateway
+  # join this network via ``--network <project>_thorn-broker`` (the
+  # supervisor passes this as ``sandbox.egress_network`` at runtime).
+  thorn-broker:
+    driver: bridge
+    internal: true
+
+  # Proxy-only internal network: connects the narrow sandbox-facing
+  # sidecar to OneCLI's substitution proxy port without placing
+  # OneCLI itself on the sandbox-facing network.
+  thorn-onecli-proxy:
+    driver: bridge
+    internal: true
+
+  # DB-only internal network: sandboxes never join this network, so
+  # compromised sandbox code cannot bypass OneCLI and connect to the
+  # broker database directly.
+  thorn-broker-db:
+    driver: bridge
+    internal: true

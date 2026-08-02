@@ -1,0 +1,423 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thorn.invalid/evals/harbor/validation-gate.schema.json",
+  "title": "Thorn paired validation-gate state documents",
+  "oneOf": [
+    {"$ref": "#/$defs/gateDefinition"},
+    {"$ref": "#/$defs/authorizationReceipt"},
+    {"$ref": "#/$defs/slotReceipt"},
+    {"$ref": "#/$defs/terminalObservation"},
+    {"$ref": "#/$defs/terminalAudit"}
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitRevision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "fileIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "slotDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "order",
+        "block_order",
+        "slot_id",
+        "task_id",
+        "arm_id",
+        "selection_sha256",
+        "task_checksum",
+        "source_image_digest",
+        "configuration",
+        "required_artifact_ids"
+      ],
+      "properties": {
+        "order": {"type": "integer", "minimum": 1, "maximum": 4},
+        "block_order": {"type": "integer", "minimum": 1, "maximum": 2},
+        "slot_id": {"$ref": "#/$defs/identifier"},
+        "task_id": {"$ref": "#/$defs/identifier"},
+        "arm_id": {"enum": ["codex-v3", "thorn-candidate"]},
+        "selection_sha256": {"$ref": "#/$defs/sha256"},
+        "task_checksum": {"$ref": "#/$defs/sha256"},
+        "source_image_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "configuration": {"$ref": "#/$defs/fileIdentity"},
+        "required_artifact_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/identifier"}
+        }
+      }
+    },
+    "gateDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_type",
+        "schema_version",
+        "gate_id",
+        "repository_revision",
+        "declaration",
+        "task_manifest",
+        "between_block_submitted_token_limit",
+        "schedule"
+      ],
+      "properties": {
+        "document_type": {"const": "validation-gate-definition"},
+        "schema_version": {"const": 1},
+        "gate_id": {"$ref": "#/$defs/identifier"},
+        "repository_revision": {"$ref": "#/$defs/gitRevision"},
+        "declaration": {"$ref": "#/$defs/fileIdentity"},
+        "task_manifest": {"$ref": "#/$defs/fileIdentity"},
+        "between_block_submitted_token_limit": {"const": 1200000},
+        "schedule": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {"$ref": "#/$defs/slotDefinition"}
+        }
+      }
+    },
+    "authorizationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_type",
+        "schema_version",
+        "gate_id",
+        "gate_definition_sha256",
+        "repository_revision",
+        "authorization_scope",
+        "attempt_policy",
+        "authorized_slot_ids"
+      ],
+      "properties": {
+        "document_type": {"const": "validation-gate-authorization"},
+        "schema_version": {"const": 1},
+        "gate_id": {"$ref": "#/$defs/identifier"},
+        "gate_definition_sha256": {"$ref": "#/$defs/sha256"},
+        "repository_revision": {"$ref": "#/$defs/gitRevision"},
+        "authorization_scope": {"const": "provider-backed-validation-v2"},
+        "attempt_policy": {"const": "single-no-retry"},
+        "authorized_slot_ids": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/identifier"}
+        }
+      }
+    },
+    "slotReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_type",
+        "schema_version",
+        "status",
+        "gate_id",
+        "gate_definition_sha256",
+        "authorization_receipt_sha256",
+        "repository_revision",
+        "declaration_sha256",
+        "task_manifest_sha256",
+        "slot_id",
+        "order",
+        "block_order",
+        "task_id",
+        "arm_id",
+        "selection_sha256",
+        "configuration_sha256",
+        "task_checksum",
+        "source_image_digest"
+      ],
+      "properties": {
+        "document_type": {"const": "validation-gate-slot-receipt"},
+        "schema_version": {"const": 1},
+        "status": {"const": "consumed"},
+        "gate_id": {"$ref": "#/$defs/identifier"},
+        "gate_definition_sha256": {"$ref": "#/$defs/sha256"},
+        "authorization_receipt_sha256": {"$ref": "#/$defs/sha256"},
+        "repository_revision": {"$ref": "#/$defs/gitRevision"},
+        "declaration_sha256": {"$ref": "#/$defs/sha256"},
+        "task_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "slot_id": {"$ref": "#/$defs/identifier"},
+        "order": {"type": "integer", "minimum": 1, "maximum": 4},
+        "block_order": {"type": "integer", "minimum": 1, "maximum": 2},
+        "task_id": {"$ref": "#/$defs/identifier"},
+        "arm_id": {"enum": ["codex-v3", "thorn-candidate"]},
+        "selection_sha256": {"$ref": "#/$defs/sha256"},
+        "configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "task_checksum": {"$ref": "#/$defs/sha256"},
+        "source_image_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "artifactInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "path"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/identifier"},
+        "path": {"type": "string", "minLength": 1}
+      }
+    },
+    "terminalObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_type",
+        "schema_version",
+        "slot_id",
+        "terminal_outcome",
+        "reward",
+        "usability",
+        "reported_integrity",
+        "submitted_tokens",
+        "provider_success_count",
+        "harbor_retry_count",
+        "harness_retry_count",
+        "artifacts"
+      ],
+      "properties": {
+        "document_type": {"const": "validation-gate-terminal-observation"},
+        "schema_version": {"const": 1},
+        "slot_id": {"$ref": "#/$defs/identifier"},
+        "terminal_outcome": {
+          "enum": [
+            "completed",
+            "agent-exception",
+            "loop-limit",
+            "timeout",
+            "infrastructure-failure"
+          ]
+        },
+        "reward": {
+          "oneOf": [
+            {"type": "number", "minimum": 0, "maximum": 1},
+            {"type": "null"}
+          ]
+        },
+        "usability": {"enum": ["usable", "unusable", "not-assessed"]},
+        "reported_integrity": {"enum": ["passed", "failed"]},
+        "submitted_tokens": {
+          "oneOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "null"}
+          ]
+        },
+        "provider_success_count": {
+          "oneOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "null"}
+          ]
+        },
+        "harbor_retry_count": {"type": "integer", "minimum": 0},
+        "harness_retry_count": {"type": "integer", "minimum": 0},
+        "artifacts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/artifactInput"}
+        }
+      }
+    },
+    "terminalAudit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_type",
+        "schema_version",
+        "gate_id",
+        "gate_definition_sha256",
+        "receipt_sha256",
+        "authorization_receipt_sha256",
+        "slot_id",
+        "order",
+        "block_order",
+        "task_id",
+        "arm_id",
+        "selection_sha256",
+        "terminal_outcome",
+        "reward",
+        "usability",
+        "reported_integrity",
+        "integrity_status",
+        "integrity_failures",
+        "submitted_tokens",
+        "provider_success_count",
+        "harbor_retry_count",
+        "harness_retry_count",
+        "expected_identity",
+        "observed_identity",
+        "artifact_sha256",
+        "artifact_status",
+        "unexpected_artifact_count"
+      ],
+      "properties": {
+        "document_type": {"const": "validation-gate-terminal-audit"},
+        "schema_version": {"const": 1},
+        "gate_id": {"$ref": "#/$defs/identifier"},
+        "gate_definition_sha256": {"$ref": "#/$defs/sha256"},
+        "receipt_sha256": {"$ref": "#/$defs/sha256"},
+        "authorization_receipt_sha256": {"$ref": "#/$defs/sha256"},
+        "slot_id": {"$ref": "#/$defs/identifier"},
+        "order": {"type": "integer", "minimum": 1, "maximum": 4},
+        "block_order": {"type": "integer", "minimum": 1, "maximum": 2},
+        "task_id": {"$ref": "#/$defs/identifier"},
+        "arm_id": {"enum": ["codex-v3", "thorn-candidate"]},
+        "selection_sha256": {"$ref": "#/$defs/sha256"},
+        "terminal_outcome": {
+          "enum": [
+            "completed",
+            "agent-exception",
+            "loop-limit",
+            "timeout",
+            "infrastructure-failure"
+          ]
+        },
+        "reward": {
+          "oneOf": [
+            {"type": "number", "minimum": 0, "maximum": 1},
+            {"type": "null"}
+          ]
+        },
+        "usability": {"enum": ["usable", "unusable", "not-assessed"]},
+        "reported_integrity": {"enum": ["passed", "failed"]},
+        "integrity_status": {"enum": ["passed", "failed"]},
+        "integrity_failures": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "reported-integrity-failed",
+              "repository-observation-unavailable",
+              "repository-revision-mismatch",
+              "repository-worktree-dirty",
+              "declaration-mismatch",
+              "task-manifest-mismatch",
+              "task-manifest-contract-mismatch",
+              "task-package-mismatch",
+              "configuration-mismatch",
+              "retry-count-nonzero",
+              "required-artifact-missing",
+              "artifact-unreadable",
+              "unexpected-artifact"
+            ]
+          }
+        },
+        "submitted_tokens": {
+          "oneOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "null"}
+          ]
+        },
+        "provider_success_count": {
+          "oneOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "null"}
+          ]
+        },
+        "harbor_retry_count": {"type": "integer", "minimum": 0},
+        "harness_retry_count": {"type": "integer", "minimum": 0},
+        "expected_identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository_revision",
+            "declaration_sha256",
+            "task_manifest_sha256",
+            "configuration_sha256",
+            "task_checksum",
+            "source_image_digest"
+          ],
+          "properties": {
+            "repository_revision": {"$ref": "#/$defs/gitRevision"},
+            "declaration_sha256": {"$ref": "#/$defs/sha256"},
+            "task_manifest_sha256": {"$ref": "#/$defs/sha256"},
+            "configuration_sha256": {"$ref": "#/$defs/sha256"},
+            "task_checksum": {"$ref": "#/$defs/sha256"},
+            "source_image_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          }
+        },
+        "observed_identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository_revision",
+            "repository_state",
+            "declaration_sha256",
+            "task_manifest_sha256",
+            "configuration_sha256",
+            "task_package_status"
+          ],
+          "properties": {
+            "repository_revision": {
+              "oneOf": [
+                {"$ref": "#/$defs/gitRevision"},
+                {"type": "null"}
+              ]
+            },
+            "repository_state": {"enum": ["clean", "dirty", "unavailable"]},
+            "declaration_sha256": {
+              "oneOf": [
+                {"$ref": "#/$defs/sha256"},
+                {"type": "null"}
+              ]
+            },
+            "task_manifest_sha256": {
+              "oneOf": [
+                {"$ref": "#/$defs/sha256"},
+                {"type": "null"}
+              ]
+            },
+            "configuration_sha256": {
+              "oneOf": [
+                {"$ref": "#/$defs/sha256"},
+                {"type": "null"}
+              ]
+            },
+            "task_package_status": {"enum": ["passed", "failed", "unavailable"]}
+          }
+        },
+        "artifact_sha256": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              {"$ref": "#/$defs/sha256"},
+              {"type": "null"}
+            ]
+          }
+        },
+        "artifact_status": {
+          "type": "object",
+          "additionalProperties": {
+            "enum": ["hashed", "missing", "unreadable"]
+          }
+        },
+        "unexpected_artifact_count": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

@@ -1,0 +1,179 @@
+"""Session inbox: the DurableQueue that drives a session's prompt loop.
+
+A :class:`SessionInbox` is a thin specialization of
+:class:`~thorn.runtime._queue.DurableQueue` attached to a specific
+:class:`~thorn.runtime._address.SessionAddress`.  Its additional role
+over the base queue is categorizing its contents by where the
+notification is in the two-step handling lifecycle:
+
+- **Prompt-ready** (``pending`` or ``in_progress``): items the agent
+  should see on its next prompt.
+- **Awaiting dispatch** (``handled`` or ``errored``): items the agent
+  has already closed out but whose step-2 move/delete hasn't yet
+  run -- typically only observed during the startup recovery sweep.
+- **Awaiting cleanup** (``confirmed``): items that finished their
+  RSVP round-trip but whose delete didn't land.  Session inboxes
+  should never produce these directly, but the primitive makes them
+  representable so tests and sweeps can exercise the full lifecycle
+  uniformly.
+
+Scheduling, prompt construction, and the actual mechanics of
+transitioning items through their lifecycle all live at higher
+layers.  :class:`SessionInbox` owns only the "which notifications
+belong in which slice of the lifecycle" question.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from thorn.runtime._address import SessionAddress
+from thorn.runtime._notification import Notification, NotificationStatus
+from thorn.runtime._queue import DurableQueue
+
+if TYPE_CHECKING:
+    from thorn.runtime._in_flight_index import InFlightIndex
+
+
+class SessionInbox(DurableQueue):
+    """A session's durable inbox.
+
+    Attached to a :class:`SessionAddress` so the rest of the runtime
+    can identify which session a given queue belongs to without
+    round-tripping through the address book.
+
+    An optional :class:`~thorn.runtime.InFlightIndex` is forwarded to
+    the base :class:`DurableQueue`; see its docstring for the
+    semantics and crash-ordering guarantees.
+    """
+
+    def __init__(
+        self,
+        root_dir: Path,
+        address: SessionAddress,
+        *,
+        in_flight_index: "InFlightIndex | None" = None,
+    ) -> None:
+        super().__init__(root_dir, in_flight_index=in_flight_index)
+        self._address = address
+
+    @property
+    def address(self) -> SessionAddress:
+        """The session address this inbox belongs to."""
+        return self._address
+
+    # ------------------------------------------------------------------
+    # Lifecycle-aware views
+
+    def prompt_pending(self) -> list[Notification]:
+        """Return items the scheduler should present to the agent.
+
+        Includes everything in ``pending`` or ``in_progress`` status,
+        in post order.  Items in ``handled``, ``errored``, or
+        ``confirmed`` status are deliberately excluded -- they have
+        already been closed out by the agent and are awaiting
+        downstream dispatch / cleanup.
+        """
+        return self.list(status=(
+            NotificationStatus.PENDING,
+            NotificationStatus.IN_PROGRESS,
+        ))
+
+    def awaiting_dispatch(self) -> list[Notification]:
+        """Return items the agent has closed out but not yet dispatched.
+
+        These are items with ``status`` ``handled`` or ``errored``
+        still physically present in the inbox directory -- step 1 of
+        the two-step handling flow ran, but step 2 (move to RSVP
+        target / delete / move to errored) did not.  The startup
+        sweep uses this to recover from a crash between the two
+        steps.
+        """
+        return self.list(status=(
+            NotificationStatus.HANDLED,
+            NotificationStatus.ERRORED,
+        ))
+
+    def awaiting_cleanup(self) -> list[Notification]:
+        """Return ``confirmed``-status items.
+
+        A session inbox should never contain these under normal
+        operation, because confirmed only happens on the RSVP
+        recipient's side.  The method exists so the startup sweep
+        can enumerate every pathological state uniformly.
+        """
+        return self.list(status=NotificationStatus.CONFIRMED)
+
+    # ------------------------------------------------------------------
+    # Operator recovery
+
+    def errored_items(self) -> list[Notification]:
+        """Return items parked in this inbox's ``errored/`` directory.
+
+        These items reached ``errored`` without an RSVP target and are
+        no longer visible to the session prompt loop.  Operators use
+        this view for recovery tooling that needs to inspect or requeue
+        failed work without waiting for a new upstream event.
+        """
+        return self._errored_queue().list()
+
+    def requeue_errored(self, notification_id: str) -> Notification:
+        """Move a parked errored item back to this inbox as ``pending``.
+
+        The notification keeps its original content, metadata, target,
+        RSVP, external key, and timestamp.  The previous terminal
+        status and failure annotations are cleared so the scheduler
+        treats the item exactly like prompt-ready work on the next
+        gateway run.
+
+        Raises ``KeyError`` if *notification_id* is not parked in the
+        ``errored/`` directory.
+        """
+        errored_queue = self._errored_queue()
+        errored_queue.update_status(
+            notification_id,
+            NotificationStatus.PENDING,
+            notes=None,
+            completion_rationale=None,
+            error_reason=None,
+        )
+        return errored_queue.move_to(notification_id, self)
+
+    def park_live(
+        self,
+        notification_id: str,
+        *,
+        error_reason: str,
+    ) -> Notification:
+        """Move a live pending/in-progress item to ``errored/``.
+
+        This is an operator recovery primitive for interrupted or
+        runaway gateway sessions.  It deliberately does not dispatch
+        RSVP notifications; it only removes local prompt-ready work
+        from the scheduler path while preserving the item for later
+        inspection or requeue.
+        """
+        notification = self.get(notification_id)
+        if notification.status not in (
+            NotificationStatus.PENDING,
+            NotificationStatus.IN_PROGRESS,
+        ):
+            raise ValueError(
+                "Only live pending or in_progress inbox items can be parked."
+            )
+        self.update_status(
+            notification_id,
+            NotificationStatus.ERRORED,
+            error_reason=error_reason,
+        )
+        return self.move_to(notification_id, self._errored_queue())
+
+    def _errored_queue(self) -> DurableQueue:
+        """Queue wrapper for the ``errored/`` sibling directory."""
+        return DurableQueue(self.root_dir / "errored")
+
+
+__all__ = [
+    "SessionInbox",
+]

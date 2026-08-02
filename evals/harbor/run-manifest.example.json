@@ -1,0 +1,112 @@
+{
+  "schema_version": "1.7.0",
+  "record_state": "planned",
+  "identity": {
+    "experiment_id": "thorn-swegym-catastrophic-v1",
+    "logical_run_id": "dask__dask-8820-local-direct-r1",
+    "attempt_id": "dask__dask-8820-local-direct-r1-a1",
+    "attempt_number": 1,
+    "repetition_index": 1,
+    "scheduled_order_index": 1,
+    "configuration_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "planned_at": "2026-07-19T23:00:00Z",
+    "started_at": null,
+    "completed_at": null,
+    "retry_of_attempt_id": null,
+    "supersedes_attempt_id": null
+  },
+  "revisions": {
+    "thorn": {
+      "repository": "https://github.com/tangent-vector/thorn.git",
+      "revision": "0000000000000000000000000000000000000000",
+      "working_tree_state": "clean",
+      "dirty_diff_sha256": null
+    },
+    "harbor": {
+      "repository": "https://github.com/laude-institute/harbor.git",
+      "revision": "071281b3d931aafd6a5375fa7d5933e23054d784"
+    },
+    "adapter": {
+      "repository": "https://github.com/tangent-vector/thorn.git",
+      "revision": "0000000000000000000000000000000000000000"
+    }
+  },
+  "task": {
+    "dataset": "swe_gym_lite",
+    "dataset_revision": "harbor-071281b3d931aafd6a5375fa7d5933e23054d784",
+    "task_id": "dask__dask-8820",
+    "split": "development",
+    "purpose": "catastrophic_failure",
+    "selection_file": "evals/harbor/task-selection.md",
+    "selection_file_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "instruction_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "image": {
+      "reference": "pending-swe-gym-image-for-dask__dask-8820",
+      "digest": null
+    },
+    "image_validation": "pending",
+    "oracle_validation": "pending",
+    "verifier": {
+      "name": "swe-gym",
+      "revision": "harbor-071281b3d931aafd6a5375fa7d5933e23054d784",
+      "timeout_seconds": 3000
+    }
+  },
+  "agent": {
+    "implementation": "thorn",
+    "profile": "local",
+    "prompt_delivery": "direct",
+    "action_policy": "baseline",
+    "history_policy": "baseline",
+    "validation_convergence_policy": "baseline",
+    "read_reuse_policy": "baseline",
+    "read_reuse_telemetry_schema_version": 2,
+    "task_shell_environment": "conda-testbed"
+  },
+  "model": {
+    "provider": "openai_compatible",
+    "endpoint_label": "evaluation-provider",
+    "model_name": "evaluation-model",
+    "options": {
+      "reasoning_effort": "high",
+      "max_output_tokens": null,
+      "temperature": null,
+      "top_p": null,
+      "seed": null
+    }
+  },
+  "execution": {
+    "provider_request_timeout_seconds": 180,
+    "model_context_window_tokens": 128000,
+    "max_tool_rounds": 50,
+    "no_progress_warning_rounds": 24,
+    "no_progress_hard_stop_rounds": 48,
+    "run_timeout_seconds": 3000,
+    "default_tool_timeout_seconds": 120,
+    "workspace_path": "/testbed",
+    "isolation": "harbor_task_container",
+    "tool_execution": "subprocess",
+    "resources": {
+      "cpu_cores": 1,
+      "memory_mb": 4096,
+      "disk_mb": 10240,
+      "network_access": "public"
+    }
+  },
+  "comparison": {
+    "mode": "standalone",
+    "group_id": null,
+    "configuration_label": "thorn-local-direct-baseline"
+  },
+  "artifacts": {
+    "agent_log_directory": "/logs/agent",
+    "manifest_path": "/logs/agent/thorn-run-manifest.json",
+    "thorn_result_path": "/logs/agent/thorn-result.json",
+    "thorn_trace_path": "/logs/agent/thorn-trace.jsonl",
+    "atif_trajectory_path": null,
+    "verifier_output_path": "/logs/verifier/verifier-output.json",
+    "raw_prompt_capture": "redacted"
+  },
+  "outcome": null,
+  "metrics": null
+}

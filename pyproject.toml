@@ -1,0 +1,86 @@
+[project]
+name = "thorn-agent"
+version = "0.2.0"
+description = "Persistent agent harness and GitHub/GitLab gateway"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Theresa Foley" }]
+keywords = ["agents", "llm", "github", "gitlab", "automation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.0",
+    "click>=8.0",
+    "rich>=13.0",
+    "python-dotenv>=1.0",
+    "docstring-parser>=0.16",
+    "pathspec>=0.12",
+    "psutil>=5.9",
+    "mistletoe>=1.4",
+    "PyYAML>=6.0",
+    "google-re2>=1.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/tangent-vector/thorn"
+Repository = "https://github.com/tangent-vector/thorn.git"
+Issues = "https://github.com/tangent-vector/thorn/issues"
+
+[project.scripts]
+thorn = "thorn._cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+mcp = ["mcp>=1.0,<2"]
+gitlab = ["python-gitlab>=5.0"]
+github = ["PyGithub>=2.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/thorn"]
+# Force-include the non-Python resource files (broker compose YAML
+# and sandbox Dockerfile) so they ride along in the wheel.  Hatch
+# would normally drop these because its default `include` patterns
+# only catch Python sources.  Without this rule, BundledBrokerSupervisor
+# can't find broker.compose.yml at runtime in wheel-based installs.
+[tool.hatch.build.targets.wheel.force-include]
+"src/thorn/sandbox/_resources/Dockerfile.sandbox" = "thorn/sandbox/_resources/Dockerfile.sandbox"
+"src/thorn/sandbox/_resources/thorn-sandbox-entrypoint" = "thorn/sandbox/_resources/thorn-sandbox-entrypoint"
+"src/thorn/gateway/_resources/broker.compose.yml" = "thorn/gateway/_resources/broker.compose.yml"
+"src/thorn/gateway/_resources/default_operator_AGENTS.md" = "thorn/gateway/_resources/default_operator_AGENTS.md"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "requires_podman: smoke test that talks to a real podman; opt-in only",
+    "requires_docker: smoke test that talks to a real docker; opt-in only",
+]
+# Smoke tests against real OCI runtimes are opt-in: developers should not
+# pay 20s of container churn on every ``uv run pytest``.  Run them
+# explicitly via ``pytest -m requires_podman`` (or ``-m requires_docker``,
+# or ``-m 'requires_podman or requires_docker'``).
+addopts = "-m 'not requires_podman and not requires_docker'"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.12",
+]

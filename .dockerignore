@@ -1,0 +1,35 @@
+# Secrets — never send to the build context
+.env
+*.env
+
+# Runtime state
+.thorn/
+gateway-trial/
+
+# Version control
+.git/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Development / editor
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.cursor/
+*.swp
+*.swo
+
+# Deployment scripts (not needed inside the image, except the entrypoint)
+deploy/
+!deploy/docker/entrypoint.sh
+
+# Misc
+uv.lock
+tools/
+tests/

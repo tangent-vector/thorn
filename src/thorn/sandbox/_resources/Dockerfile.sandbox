@@ -1,0 +1,106 @@
+# ---------------------------------------------------------------------------
+# Thorn sandbox image (Phase B)
+#
+# Minimal, single-purpose image whose only job is to host a per-agent
+# `thorn-toolhost` daemon for sandboxed tool execution.  Intentionally small
+# so the 90% case is "an agent uses this directly"; the 10% that need extra
+# toolchains (Rust, Node, etc.) compose this in (`FROM thorn-sandbox:<ver>`)
+# and add what they need.  This Dockerfile is *not* a substitute for the
+# heavier gateway image (`Dockerfile`); the two address separate concerns
+# and ship/version independently.
+#
+# Build:   thorn sandbox build              (recommended; tags thorn-sandbox:<thorn-version>)
+#   or:    docker|podman build -f Dockerfile.sandbox -t thorn-sandbox:<tag> .
+#
+# Run:     never directly; the gateway provisions one per agent via
+#          ContainerDaemonHost.  The container is launched detached, with
+#          host bind-mounts at /agent/{home,workspace,control}, and runs
+#          as the host UID/GID by default so bind-mount writes land with
+#          operator ownership.
+# ---------------------------------------------------------------------------
+
+# ---- uv binary (fast Python package installer) ----------------------------
+FROM ghcr.io/astral-sh/uv:0.7 AS uv
+
+# ---- builder: install thorn into a portable venv --------------------------
+FROM python:3.12-slim AS builder
+
+COPY --from=uv /uv /usr/local/bin/uv
+
+WORKDIR /build
+COPY pyproject.toml ./
+COPY README.md LICENSE ./
+COPY src/ src/
+
+# Sandbox image is intentionally minimal -- no [github,gitlab] extras here.
+# `[mcp]` is bundled because Phase C.1 hosts MCP servers inside this
+# container as subprocesses of the toolhost daemon; the `mcp` Python
+# package is the daemon's MCP client and is a baseline requirement of
+# the sandbox image rather than an agent-specific toolchain.
+# Agent-specific toolchains and SDKs belong in derived images that
+# compose `FROM thorn-sandbox:<version>` and add what they need.
+RUN uv venv /opt/thorn-venv \
+ && VIRTUAL_ENV=/opt/thorn-venv uv pip install ".[mcp]"
+
+# ---- runtime: small image hosting a single per-agent toolhost daemon -----
+FROM python:3.12-slim
+
+# Baseline tools every agent is expected to use:
+#
+# * `git` is the spine of the journal/workspace tools and is small
+#   enough that bundling it here saves every derived image from
+#   re-installing it.
+# * `ca-certificates` ships the system trust bundle *and* the
+#   ``update-ca-certificates`` helper that the sandbox entrypoint
+#   uses to install the broker MITM CA into
+#   ``/etc/ssl/certs/ca-certificates.crt`` at container start.  That
+#   canonical bundle is what Go's ``crypto/x509`` reads on Debian, so
+#   installing through it is what makes Go-based CLIs (``gh``,
+#   ``glab``, etc.) trust the broker without per-tool env wiring.
+# * `util-linux` supplies ``setpriv``, which the entrypoint uses to
+#   drop to the operator's uid/gid and clear the capability bounding
+#   set after the one-shot CA install completes.
+#
+# Anything heavier (build toolchains, language runtimes) belongs to
+# the operator's derived image.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        git ca-certificates util-linux \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/thorn-venv /opt/thorn-venv
+
+# `uv` is bundled in the runtime stage so command-style MCP server
+# entries can use `uvx <pkg>` (the dominant invocation pattern in
+# the MCP ecosystem) without each agent re-installing uv.  The
+# binary is a single static blob; cost is negligible.
+COPY --from=uv /uv /usr/local/bin/uv
+
+# One-shot entrypoint trampoline.  The container boots as uid 0 long
+# enough for this script to install the broker MITM CA into the
+# system trust store and then ``setpriv`` down to the operator's
+# uid/gid (injected via ``THORN_SANDBOX_UID``/``THORN_SANDBOX_GID``)
+# before execing the toolhost daemon.  See the script's own header
+# for the full rationale.
+COPY src/thorn/sandbox/_resources/thorn-sandbox-entrypoint \
+     /usr/local/bin/thorn-sandbox-entrypoint
+RUN chmod 0755 /usr/local/bin/thorn-sandbox-entrypoint
+
+ENV PATH="/opt/thorn-venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Rendezvous directory; the gateway bind-mounts `<host control dir>` over
+# this so the in-container daemon can bind its socket here and the brain
+# can read it from the host side.
+WORKDIR /agent
+RUN mkdir -p /agent/home /agent/workspace /agent/control
+
+# The entrypoint is a thin root-then-drop trampoline; the image
+# command is still the daemon invocation that the gateway overrides
+# at ``run`` time with per-agent argv (see
+# :class:`thorn.sandbox.ContainerDaemonHost`).  A derived image that
+# keeps the default command unchanged therefore still gets a
+# working daemon when launched without the gateway.
+ENTRYPOINT ["/usr/local/bin/thorn-sandbox-entrypoint"]
+CMD ["python", "-m", "thorn.toolhost"]

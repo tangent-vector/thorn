@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "declaration": "../../task-selection-validation-v2.md",
+  "harbor_revision": "071281b3d931aafd6a5375fa7d5933e23054d784",
+  "harbor_patches": [
+    {
+      "path": "../../patches/0001-swegym-pytest-output-parsing.patch",
+      "sha256": "7afa6d4790bd8fdf0154974346403f3632593049631556c4795e78a59b5493a4"
+    },
+    {
+      "path": "../../patches/0002-pin-swegym-lite-dataset-revision.patch",
+      "sha256": "06e54a343cf8929c12dba7bd550315fb63c503f1e7d62baa2dbce9cb1fbf18e3"
+    }
+  ],
+  "dataset_revision": "f70b1a29ab120eb0a0ee7a1deb029825e735b2b0",
+  "verifier_script_sha256": "28ee869bc50392efc20d16705e5dd382ffd5bb6a376849d527bc8d9bbad78665",
+  "task_checksum_algorithm": "harbor-task-dirhash-sha256-name-data",
+  "sanitizer": {
+    "policy": "fresh-repository-v1",
+    "implementation_version": 2,
+    "implementation_sha256": "49fb8771e32cba650c1a26915462335648d7b04fb79bcbf3893e0fa98b236a31",
+    "workspace_metrics_collector_sha256": "7f97a0400f8705a2a80060cc520a85aaab3b0df527829432c9c819261a63719f"
+  },
+  "provider_inert_canary": {
+    "job_name": "thorn-heldout-provider-inert-digest-admission-20260720",
+    "source_sha256": "13ad79589828f8e4383f9b4b55e6adf8ea2fb4f926111203ce3373159b8becb3",
+    "config_sha256": "73d0289bcb8420db9a2c41f23a0155e3e15ac83c0a35a653290d6671aa67a1d5",
+    "aggregate_result_sha256": "26d3778a910e2e9c95cf59ba1c146a8077b9ab54e585705fdeca89e3c5100083",
+    "completed_trial_count": 2,
+    "errored_trial_count": 0,
+    "retry_count": 0,
+    "input_tokens": null,
+    "cache_tokens": null,
+    "output_tokens": null,
+    "cost_usd": null
+  },
+  "schedule": {
+    "seed": "thorn-issue-146-heldout-paired-gate-v1",
+    "seed_sha256": "fbc08a41d890c77835001ce07f3dd25fdca15cafc28b7b1d4f15093d990127ac",
+    "entries": [
+      {
+        "order": 1,
+        "task_id": "bokeh__bokeh-13289",
+        "arm": "codex-v3",
+        "selection_sha256": "82a0b5e456c89563582346e8fd9e0a1e0beda4d8d6925eceab10e0a9c18c12e9"
+      },
+      {
+        "order": 2,
+        "task_id": "bokeh__bokeh-13289",
+        "arm": "thorn-candidate",
+        "selection_sha256": "df4e96fffd8d99ccea89edd0ee34d040f932b7b255bb76f52a541e626e5d73cb"
+      },
+      {
+        "order": 3,
+        "task_id": "conan-io__conan-11560",
+        "arm": "codex-v3",
+        "selection_sha256": "bb38b74d25729020c12d983e86c61715fe9f636ae357a1bd5334463d44f1b5d7"
+      },
+      {
+        "order": 4,
+        "task_id": "conan-io__conan-11560",
+        "arm": "thorn-candidate",
+        "selection_sha256": "c4abb0dfae205ea4c3e816da24881e6ce625423eebdf4d4ecdccbd2c449a391b"
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "task_id": "bokeh__bokeh-13289",
+      "package_directory": "bokeh__bokeh-13289",
+      "validation_v1_task_checksum": "3a1f854154a29bec803954d72c8308d8d03135bf6067da3dafc0778dd98898a0",
+      "task_checksum": "eec893cc542db1f29c2e399afedebb7baf41999eabbc310700b3ff637ec475a5",
+      "canary_lock_task_digest": "sha256:c9b3eb84696ed9752e3f942c391ee85706891749f033f1995ccb19e9194d8cc4",
+      "source_image": "xingyaoww/sweb.eval.x86_64.bokeh_s_bokeh-13289@sha256:ef51e22313c72834be97f6beaa3f822accb037cdf29832a8ab0fae1e89b0f504",
+      "source_image_digest": "sha256:ef51e22313c72834be97f6beaa3f822accb037cdf29832a8ab0fae1e89b0f504",
+      "canary": {
+        "trial_name": "bokeh__bokeh-13289__2HHx5PN",
+        "reward": 0.0,
+        "exception": null,
+        "source_head": "d5ce3ec088f06bfaeac1e553bb42b4b88c069f58",
+        "source_tree": "8eb01513aa8dd7bc9ee4a65f8bafd81687e8b590",
+        "synthetic_head": "cff438c2c4ea968f38db2e510f573378164f65cd",
+        "result_tree": "8eb01513aa8dd7bc9ee4a65f8bafd81687e8b590",
+        "tracked_path_count": 5173,
+        "overlay_changed_path_count": 0,
+        "workspace_identity_sha256": "79bee09fe5870ef769df7c492700a613e9aee7f6b7cb31117b1f6c898ec13128"
+      },
+      "files": {
+        "environment/Dockerfile": {"mode": "0644", "sha256": "61c98d8b504965b8e8782b9cb4b9236c9de93d82499278351dd23cda5a402903"},
+        "instruction.md": {"mode": "0644", "sha256": "5bb71c93d832ae95b67f898ed71d40082ef037844c3f4928473c484307bf9a85"},
+        "solution/solution.diff": {"mode": "0644", "sha256": "ccc477f31575c5dc106824ac299f9001b7abe65b130233e037f1e7e2c9b3020b"},
+        "solution/solve.sh": {"mode": "0755", "sha256": "dd9251705ec27ac1fb0a080541176725718cd4a8960a7cd0962747a8b9b5ee31"},
+        "task.toml": {"mode": "0644", "sha256": "d84ab85b5c4051092ad2b07ab2d677e7b6eff42a87122b220d9b919128b54fdb"},
+        "tests/config.json": {"mode": "0644", "sha256": "5b6234f503d1f3485c92daa278535323906ab9bcabcd7c18e9d9953244545d72"},
+        "tests/test.sh": {"mode": "0755", "sha256": "7b486fe328d1e65c4048eee1d5c9b160561b535908cc01b60d2bba452b6cd180"}
+      }
+    },
+    {
+      "task_id": "conan-io__conan-11560",
+      "package_directory": "conan-io__conan-11560",
+      "validation_v1_task_checksum": "041d542cd4a5bab906f8a6e44f8819d146ac691992f33855fa890f9f81b3bad7",
+      "task_checksum": "23b3afbcee2d69bd33736a7b3fccee90685f3aa70a64633e73512ac0b1636fa3",
+      "canary_lock_task_digest": "sha256:e7fbd72d14f23bd58ab7d76df13f1fe94faed73e86989d04692d97de6239982f",
+      "source_image": "xingyaoww/sweb.eval.x86_64.conan-io_s_conan-11560@sha256:2ab97e51d7c77d280b6e818043472af58b388043171bfb6a725deda81583b44e",
+      "source_image_digest": "sha256:2ab97e51d7c77d280b6e818043472af58b388043171bfb6a725deda81583b44e",
+      "canary": {
+        "trial_name": "conan-io__conan-11560__Av62PMX",
+        "reward": 0.0,
+        "exception": null,
+        "source_head": "345be91a038e1bda707e07a19889953412d358dc",
+        "source_tree": "e34214d86fd1cd12e56ad04b71583a9d2c0ed6a2",
+        "synthetic_head": "ad1534d71768148f646b3953e8fcd46c9a3f2373",
+        "result_tree": "e34214d86fd1cd12e56ad04b71583a9d2c0ed6a2",
+        "tracked_path_count": 1243,
+        "overlay_changed_path_count": 0,
+        "workspace_identity_sha256": "9fab69e054aee244c9365846b2fe1873de528a4f7b142219014901071328a2e8"
+      },
+      "files": {
+        "environment/Dockerfile": {"mode": "0644", "sha256": "5f4541b4e7cec87a5ed9f25d57126422cea7317efc205308951c42187e64e8af"},
+        "instruction.md": {"mode": "0644", "sha256": "b2b46b20d5392f6c621c83145d39c942fcbafdf83672903eb14ad77e853a27e6"},
+        "solution/solution.diff": {"mode": "0644", "sha256": "0c0a96da87e7f6b88ce14b06d27237cbae8f4b2534e1bbe27f4fc078ad1d7897"},
+        "solution/solve.sh": {"mode": "0755", "sha256": "dd9251705ec27ac1fb0a080541176725718cd4a8960a7cd0962747a8b9b5ee31"},
+        "task.toml": {"mode": "0644", "sha256": "d84ab85b5c4051092ad2b07ab2d677e7b6eff42a87122b220d9b919128b54fdb"},
+        "tests/config.json": {"mode": "0644", "sha256": "ac61b24d1353f07240b3849509e6f445a59ab7e38f8b7a4cd277698c3390d8d4"},
+        "tests/test.sh": {"mode": "0755", "sha256": "84f716ebf787a349cc4e2d2855acb8615d7f152c2323f2f98d143523c16b3379"}
+      }
+    }
+  ]
+}

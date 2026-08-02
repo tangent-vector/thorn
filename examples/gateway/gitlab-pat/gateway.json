@@ -1,0 +1,31 @@
+{
+  "workspace": "/var/lib/thorn/workspaces/gitlab-pat",
+  "llm": {
+    "provider": {
+      "type": "openai",
+      "api_url": "https://api.openai.com/v1",
+      "api_key_env_var": "OPENAI_API_KEY"
+    },
+    "model": {
+      "name": "gpt-4o"
+    }
+  },
+  "projects": [
+    {
+      "name": "my-repo",
+      "url": "https://gitlab.com/group/my-repo"
+    }
+  ],
+  "peers": [
+    {
+      "id": "operator",
+      "name": "Example Operator",
+      "accounts": [
+        {
+          "service": "gitlab",
+          "account_id": "7654321"
+        }
+      ]
+    }
+  ]
+}

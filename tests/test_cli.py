@@ -1,0 +1,3502 @@
+"""Tests for the thorn CLI — specifically ``thorn run --result-file``."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import shutil
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+from thorn._cli import main as cli_main
+from thorn.agents._action_policy import (
+    RUN_ACTION_POLICY_DEFINITIONS,
+    RunActionPolicy,
+)
+from thorn.agents._history_policy import RunHistoryPolicy
+from thorn.agents._read_reuse_policy import (
+    RUN_READ_REUSE_POLICY_DEFINITIONS,
+    RunReadReusePolicy,
+)
+from thorn.agents._validation_convergence_policy import (
+    RUN_VALIDATION_CONVERGENCE_POLICY_DEFINITIONS,
+    RunValidationConvergencePolicy,
+)
+from thorn.core._agent import Agent
+from thorn.core._messages import AssistantMessage, ToolResultMessage, UserMessage
+from thorn.core._provider import (
+    FinishChunk,
+    LLMProvider,
+    MockProvider,
+    ResponseChunk,
+    TextChunk,
+    ToolCallChunk,
+    UsageChunk,
+)
+from thorn.core.errors import ProviderError
+from thorn.gateway._bundled_broker import BundledBrokerStackInfo
+from thorn.gateway._heartbeat import write_gateway_heartbeat
+from thorn.runtime import (
+    AddressBook,
+    AgencyPaths,
+    AgentID,
+    NotificationID,
+    NotificationSpec,
+    NotificationStatus,
+    SessionAddress,
+    SessionInbox,
+    SessionKey,
+    apply_handling_transition,
+)
+from thorn.runtime._provider_state import PROVIDER_UNAVAILABLE_METADATA_KEY
+from thorn.runtime._todo import SessionTodoList
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cli_agency_home(monkeypatch, tmp_path):
+    """Redirect the CLI's default ``~/.thorn`` agency home into ``tmp_path``.
+
+    Phase 5 of the CLI/gateway unification switched the CLI's default
+    agency home to ``~/.thorn``.  Without this fixture every test that
+    invokes ``thorn run`` or ``thorn chat`` without an explicit
+    ``--agency`` would create agent directories under the developer's
+    real home directory, polluting it and breaking test isolation.
+
+    We patch :func:`pathlib.Path.home` to point at ``tmp_path``; the
+    CLI's agency-home resolver calls ``Path.home() / '.thorn'``, so
+    the effective default agency becomes ``tmp_path/.thorn`` for the
+    lifetime of each test.  Tests that want to inspect the resulting
+    agency tree continue to assert on ``tmp_path / '.thorn' / ...``
+    just like they did under the pre-Phase-5 ``for_cli`` layout.
+
+    Autouse so new tests added here inherit the isolation by default;
+    a test that explicitly wants the real home dir can override the
+    fixture in its own scope.
+    """
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+
+
+def _mock_provider_factory(provider: MockProvider):
+    """Return a callable that ignores arguments and returns *provider*."""
+    def factory() -> MockProvider:
+        return provider
+    return factory
+
+
+class _RecordingProvider(MockProvider):
+    """Mock provider variant that records user/assistant text history."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.message_text_batches: list[list[str]] = []
+        self.system_prompt_batches: list[list[str]] = []
+        self.tool_results_by_call_id: dict[str, ToolResultMessage] = {}
+
+    async def complete(self, system_prompts, tools, messages):
+        self.system_prompt_batches.append(list(system_prompts))
+        texts: list[str] = []
+        for message in messages:
+            if isinstance(message, UserMessage | AssistantMessage):
+                texts.append(message.content)
+            elif isinstance(message, ToolResultMessage):
+                self.tool_results_by_call_id[message.call_id] = message
+        self.message_text_batches.append(texts)
+        async for chunk in super().complete(system_prompts, tools, messages):
+            yield chunk
+
+
+class _FailingProvider(LLMProvider):
+    async def complete(self, system_prompts, tools, messages):
+        raise ProviderError("provider returned HTTP 401: key_model_access_denied")
+        yield TextChunk(text="unreachable")
+
+
+def _list_cli_session_payloads(
+    *,
+    agency_home: Path,
+) -> list[dict[str, object]]:
+    result = CliRunner().invoke(
+        cli_main,
+        ["sessions", "list", "--agency", str(agency_home), "--json"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert isinstance(payload, list)
+    return payload
+
+
+def _find_session_state_dirs(
+    sessions_root: Path,
+    *,
+    key_prefix: str | None = None,
+) -> list[Path]:
+    """Return every session ``_state`` directory under *sessions_root*.
+
+    Hierarchical session keys produce nested directories under
+    ``sessions/`` (e.g. ``cli/<workspace-basename>/<8 hex>``), with
+    each session's framework files living one level deeper, in a
+    ``_state`` sentinel subdirectory (see
+    ``AgencyPaths.session_metadata_dir``).  This helper walks that
+    layout, optionally filtering by the leading components of the
+    decoded session key (e.g. ``key_prefix='cli'``).
+    """
+    from thorn.runtime._paths import (
+        SESSION_STATE_DIR,
+        session_key_from_path,
+    )
+    if not sessions_root.is_dir():
+        return []
+    matches: list[Path] = []
+    for state_dir in sessions_root.rglob(SESSION_STATE_DIR):
+        if not state_dir.is_dir() or state_dir.name != SESSION_STATE_DIR:
+            continue
+        rel = state_dir.parent.relative_to(sessions_root)
+        if not rel.parts or SESSION_STATE_DIR in rel.parts:
+            continue
+        if key_prefix is not None:
+            key = session_key_from_path(rel)
+            head = key.components[: len(key_prefix.split("/"))]
+            if "/".join(head) != key_prefix:
+                continue
+        matches.append(state_dir)
+    return matches
+
+
+def _park_errored_inbox_item(
+    *,
+    agency_home: Path,
+    workspace_root: Path,
+    agent_id: AgentID,
+    session_key: SessionKey,
+) -> tuple[SessionInbox, str]:
+    paths = AgencyPaths(home_root=agency_home, workspace_root=workspace_root)
+    address = SessionAddress(agent_id, session_key)
+    inbox = SessionInbox(paths.session_inbox_dir(agent_id, session_key), address)
+    posted = inbox.post(
+        NotificationSpec(
+            source="test",
+            content="please retry this notification",
+            target=address,
+            metadata={"todo_id": 123},
+            external_key="gitlab:https://gitlab.example.com:todo:123",
+        )
+    )
+    apply_handling_transition(
+        inbox,
+        posted.id,
+        NotificationStatus.ERRORED,
+        address_book=AddressBook(),
+        error_reason="provider key was invalid",
+    )
+    return inbox, posted.id
+
+
+def _post_pending_inbox_item(
+    *,
+    agency_home: Path,
+    workspace_root: Path,
+    agent_id: AgentID,
+    session_key: SessionKey,
+) -> tuple[SessionInbox, str]:
+    paths = AgencyPaths(home_root=agency_home, workspace_root=workspace_root)
+    address = SessionAddress(agent_id, session_key)
+    inbox = SessionInbox(paths.session_inbox_dir(agent_id, session_key), address)
+    posted = inbox.post(
+        NotificationSpec(
+            source="test",
+            content="please handle this notification",
+            target=address,
+            metadata={"todo_id": 456},
+            external_key="github:https://github.example.com:thread:456",
+        )
+    )
+    return inbox, posted.id
+
+
+class TestCliEnvFileLoading:
+    def test_cwd_dotenv_is_not_loaded_implicitly(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("THORN_MALICIOUS_SECRET", raising=False)
+        (tmp_path / ".env").write_text(
+            "THORN_MALICIOUS_SECRET=from-cwd\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["sessions", "list", "--json"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert os.environ.get("THORN_MALICIOUS_SECRET") is None
+
+    def test_explicit_env_file_loads(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("THORN_TRUSTED_SECRET", raising=False)
+        env_file = tmp_path / "trusted.env"
+        env_file.write_text(
+            "THORN_TRUSTED_SECRET=from-explicit-file\n",
+            encoding="utf-8",
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["--env-file", str(env_file), "sessions", "list", "--json"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert os.environ["THORN_TRUSTED_SECRET"] == "from-explicit-file"
+
+    def test_thorn_env_file_loads(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("THORN_ENV_VAR_SECRET", raising=False)
+        env_file = tmp_path / "trusted-from-env.env"
+        env_file.write_text(
+            "THORN_ENV_VAR_SECRET=from-env-var\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("THORN_ENV_FILE", str(env_file))
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["sessions", "list", "--json"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert os.environ["THORN_ENV_VAR_SECRET"] == "from-env-var"
+
+
+class TestInboxRequeueCommand:
+    def test_requeues_errored_item(self, tmp_path: Path, monkeypatch) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        agent_id = AgentID("coordinator")
+        session_key = SessionKey("projects/thorn/issues/5")
+        workspace_root.mkdir()
+        inbox, item_id = _park_errored_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=agent_id,
+            session_key=session_key,
+        )
+        monkeypatch.chdir(workspace_root)
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "requeue", item_id,
+                "--agency", str(agency_home),
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert item_id in result.output
+        assert "coordinator" in result.output
+        assert "projects/thorn/issues/5" in result.output
+        assert inbox.errored_items() == []
+        requeued = inbox.get(item_id)
+        assert requeued.status is NotificationStatus.PENDING
+        assert requeued.error_reason is None
+        assert (
+            requeued.external_key
+            == "gitlab:https://gitlab.example.com:todo:123"
+        )
+
+    def test_reports_missing_item_without_error_reason(
+        self, tmp_path: Path
+    ) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        _park_errored_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "requeue", "missing-item",
+                "--agency", str(agency_home),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "missing-item" in result.output
+        assert "provider key was invalid" not in result.output
+
+
+class TestInboxParkCommand:
+    def test_parks_live_item(self, tmp_path: Path, monkeypatch) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        agent_id = AgentID("coordinator")
+        session_key = SessionKey("projects/thorn/issues/5")
+        inbox, item_id = _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=agent_id,
+            session_key=session_key,
+        )
+        inbox.update_status(item_id, NotificationStatus.IN_PROGRESS)
+        monkeypatch.chdir(workspace_root)
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "park", item_id,
+                "--reason", "operator stopped runaway session",
+                "--agency", str(agency_home),
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert item_id in result.output
+        assert inbox.prompt_pending() == []
+        parked = inbox.errored_items()
+        assert [item.id for item in parked] == [item_id]
+        assert parked[0].status is NotificationStatus.ERRORED
+        assert parked[0].error_reason == "operator stopped runaway session"
+
+    def test_reports_missing_live_item(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "park", "missing-item",
+                "--reason", "operator cleanup",
+                "--agency", str(agency_home),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "missing-item" in result.output
+
+
+class TestInboxInspectionCommands:
+    def test_list_shows_live_and_parked_items(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+        _park_errored_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+        monkeypatch.chdir(workspace_root)
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["inbox", "list", "--agency", str(agency_home)],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "pending" in result.output
+        assert "parked_errored" in result.output
+        assert "projects/thorn/issues/5" in result.output
+
+    def test_list_truncates_linked_todo_titles(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        agent_id = AgentID("coordinator")
+        session_key = SessionKey("projects/thorn/issues/5")
+        _inbox, item_id = _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=agent_id,
+            session_key=session_key,
+        )
+        paths = AgencyPaths(home_root=agency_home, workspace_root=workspace_root)
+        long_title = "x" * 200
+        SessionTodoList(paths.session_todo_file(agent_id, session_key)).create(
+            title=long_title,
+            linked_inbox_item_id=NotificationID(item_id),
+        )
+        monkeypatch.chdir(workspace_root)
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["inbox", "list", "--agency", str(agency_home)],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "TODOs: 1 open" in result.output
+        assert "..." in result.output
+        assert long_title not in result.output
+
+    def test_show_parked_item_prints_requeue_hint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        _inbox, item_id = _park_errored_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+        monkeypatch.chdir(workspace_root)
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "show", item_id,
+                "--agency", str(agency_home),
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "provider key was invalid" in result.output
+        assert "thorn inbox requeue" in result.output
+        assert item_id in result.output
+
+    def test_list_json_is_machine_readable(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        _inbox, item_id = _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "list",
+                "--agency", str(agency_home),
+                "--json",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload[0]["id"] == item_id
+        assert payload[0]["status"] == "pending"
+
+    def test_list_filters_by_agent_session_and_status(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        included_agent_id = AgentID("coordinator")
+        included_session_key = SessionKey("projects/thorn/issues/5")
+        _inbox, included_item_id = _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=included_agent_id,
+            session_key=included_session_key,
+        )
+        _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("other-agent"),
+            session_key=SessionKey("projects/other/issues/9"),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "list",
+                "--agency", str(agency_home),
+                "--agent", str(included_agent_id),
+                "--session", str(included_session_key),
+                "--status", "pending",
+                "--json",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert [item["id"] for item in payload] == [included_item_id]
+
+    def test_show_json_includes_content(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        _inbox, item_id = _post_pending_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "inbox", "show", item_id,
+                "--agency", str(agency_home),
+                "--json",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["id"] == item_id
+        assert payload["content"] == "please handle this notification"
+
+    def test_status_json_counts_parked_errors(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        _park_errored_inbox_item(
+            agency_home=agency_home,
+            workspace_root=workspace_root,
+            agent_id=AgentID("coordinator"),
+            session_key=SessionKey("projects/thorn/issues/5"),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["status", "--agency", str(agency_home), "--json"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["inbox_counts"]["parked_errored"] == 1
+        assert payload["heartbeat"]["liveness"] == "unknown"
+
+    def test_status_json_reports_stale_heartbeat(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / ".thorn"
+        agency_home.mkdir()
+        write_gateway_heartbeat(
+            agency_home / "gateway-status.json",
+            {
+                "status": "running",
+                "updated_at": "2020-01-01T00:00:00+00:00",
+                "heartbeat_interval_s": 1,
+            },
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["status", "--agency", str(agency_home), "--json"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["heartbeat"]["liveness"] == "stale"
+
+    def test_status_reports_provider_waits(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / ".thorn"
+        workspace_root = tmp_path / "workspace"
+        paths = AgencyPaths.for_gateway(
+            agency_dir=agency_home,
+            workspace_dir=workspace_root,
+        )
+        agent_id = AgentID("coordinator")
+        session_key = SessionKey("projects/thorn/issues/7")
+        metadata_dir = paths.session_metadata_dir(agent_id, session_key)
+        metadata_dir.mkdir(parents=True)
+        (metadata_dir / "session.json").write_text(
+            json.dumps({
+                "key": str(session_key),
+                "created_at": None,
+                "last_active": None,
+                "metadata": {
+                    PROVIDER_UNAVAILABLE_METADATA_KEY: {
+                        "state": "waiting_on_provider",
+                        "attempts": 4,
+                        "reason": "read timeout",
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        runner = CliRunner()
+        json_result = runner.invoke(
+            cli_main,
+            ["status", "--agency", str(agency_home), "--json"],
+            catch_exceptions=False,
+        )
+        text_result = runner.invoke(
+            cli_main,
+            ["status", "--agency", str(agency_home)],
+            catch_exceptions=False,
+        )
+
+        assert json_result.exit_code == 0
+        payload = json.loads(json_result.output)
+        waits = payload["provider_unavailable_sessions"]
+        assert waits[0]["agent_id"] == "coordinator"
+        assert waits[0]["session_key"] == "projects/thorn/issues/7"
+        assert waits[0]["metadata"]["attempts"] == 4
+        assert text_result.exit_code == 0
+        assert "Provider waits" in text_result.output
+        assert "coordinator/projects/thorn/issues/7" in text_result.output
+        assert "attempts=4" in text_result.output
+
+
+class TestBrokerLogsCommand:
+    def test_prints_redacted_logs_for_single_stack(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        stack = BundledBrokerStackInfo(
+            project_name="thorn-broker-test",
+            runtime_name="podman",
+            status="running(2)",
+        )
+
+        async def _list_stacks() -> list[BundledBrokerStackInfo]:
+            return [stack]
+
+        async def _collect_logs(
+            selected_stack: BundledBrokerStackInfo,
+            *,
+            tail: int,
+        ) -> str:
+            assert selected_stack == stack
+            assert tail == 7
+            return "Recent bundled-broker logs (redacted, tail 7):\nclean"
+
+        monkeypatch.setattr(
+            "thorn.gateway._bundled_broker.list_bundled_broker_stacks",
+            _list_stacks,
+        )
+        monkeypatch.setattr(
+            "thorn.gateway._bundled_broker.collect_bundled_broker_stack_logs",
+            _collect_logs,
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            ["broker", "logs", "--tail", "7"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "thorn-broker-test" in result.output
+        assert "clean" in result.output
+
+    def test_requires_project_when_multiple_stacks(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def _list_stacks() -> list[BundledBrokerStackInfo]:
+            return [
+                BundledBrokerStackInfo(
+                    project_name="thorn-broker-a",
+                    runtime_name="podman",
+                    status="running(2)",
+                ),
+                BundledBrokerStackInfo(
+                    project_name="thorn-broker-b",
+                    runtime_name="docker",
+                    status="running(2)",
+                ),
+            ]
+
+        monkeypatch.setattr(
+            "thorn.gateway._bundled_broker.list_bundled_broker_stacks",
+            _list_stacks,
+        )
+
+        result = CliRunner().invoke(cli_main, ["broker", "logs"])
+
+        assert result.exit_code != 0
+        assert "Multiple bundled-broker stacks" in result.output
+        assert "thorn-broker-a" in result.output
+        assert "thorn-broker-b" in result.output
+
+
+class TestRunResultFile:
+    """``thorn run --result-file`` writes structured JSON."""
+
+    def test_success_writes_result(self, tmp_path: Path, monkeypatch):
+        provider = MockProvider(canned_responses=[
+            [
+                TextChunk(text="done"),
+                UsageChunk(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+                FinishChunk(reason="stop"),
+            ],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result_file = tmp_path / "result.json"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "say hello",
+                "--workspace", str(tmp_path),
+                "--result-file", str(result_file),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+        assert data["outcome"] == "success"
+        assert data["error"] is None
+        assert data["duration_s"] >= 0
+        assert data["token_usage"]["prompt_tokens"] == 10
+        assert data["token_usage"]["completion_tokens"] == 5
+        assert data["token_usage"]["total_tokens"] == 15
+        assert data["agent_profile"] == "local"
+        assert data["prompt_delivery"] == "direct"
+        assert data["action_policy"] == "baseline"
+        assert data["history_policy"] == "bounded-history-v2"
+        assert data["read_reuse_policy"] == "baseline"
+        assert data["validation_convergence_policy"] == "baseline"
+        assert data["read_reuse_telemetry_schema_version"] == 2
+        assert data["agent_id"] == "local"
+        assert data["agent_class"] == "LocalCodingAgent"
+        assert "read_file" in data["tool_inventory"]
+        assert "run_shell" in data["tool_inventory"]
+
+    def test_agent_error_writes_result(self, tmp_path: Path, monkeypatch):
+        provider = MockProvider(canned_responses=[
+            [
+                ToolCallChunk(
+                    call_id="c1",
+                    name="raise_error",
+                    arguments='{"message": "something went wrong"}',
+                ),
+                FinishChunk(reason="tool_calls"),
+            ],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result_file = tmp_path / "result.json"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "do something",
+                "--workspace", str(tmp_path),
+                "--result-file", str(result_file),
+                "--quiet",
+            ],
+        )
+        assert result.exit_code == 1
+
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+        assert data["outcome"] == "agent_error"
+        assert "something went wrong" in data["error"]
+        assert data["duration_s"] >= 0
+
+    def test_trace_file_recorded_in_result(self, tmp_path: Path, monkeypatch):
+        provider = MockProvider(canned_responses=[
+            [
+                TextChunk(text="ok"),
+                UsageChunk(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                FinishChunk(reason="stop"),
+            ],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result_file = tmp_path / "result.json"
+        trace_file = tmp_path / "trace.jsonl"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--workspace", str(tmp_path),
+                "--result-file", str(result_file),
+                "--trace", str(trace_file),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+        assert data["trace_file"] == "trace.jsonl"
+        assert trace_file.exists()
+        # The trace listener is a subscriber on the runtime's
+        # EventBus; if the bus is wired up correctly, the agent
+        # round's events should have reached it.  This guards against
+        # a regression where ``_build_runtime`` builds a bus with no
+        # subscriptions or where the bus drops events silently.
+        trace_lines = [
+            ln for ln in trace_file.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        assert trace_lines, (
+            "expected the trace listener subscribed on the EventBus to "
+            "receive at least one event during the agent round"
+        )
+        events = [json.loads(ln)["event"] for ln in trace_lines]
+        # The agent loop always pushes a scope and emits text chunks,
+        # so the trace must contain at least these.  Asserting a
+        # superset of expected events keeps the test robust to
+        # additions of new event types.
+        assert "scope_enter" in events
+        assert "scope_exit" in events
+        assert "prompt_trace" in events
+        run_metadata = next(
+            json.loads(line)
+            for line in trace_lines
+            if json.loads(line)["event"] == "run_metadata"
+        )
+        assert run_metadata["agent_profile"] == "local"
+        assert run_metadata["prompt_delivery"] == "direct"
+        assert run_metadata["action_policy"] == "baseline"
+        assert run_metadata["history_policy"] == "bounded-history-v2"
+        assert run_metadata["read_reuse_policy"] == "baseline"
+        assert run_metadata["validation_convergence_policy"] == "baseline"
+        assert run_metadata["read_reuse_telemetry_schema_version"] == 2
+        assert run_metadata["agent_id"] == "local"
+        assert run_metadata["agent_class"] == "LocalCodingAgent"
+        assert "run_shell" in run_metadata["tool_inventory"]
+        prompt_trace_records = [
+            json.loads(ln) for ln in trace_lines
+            if json.loads(ln)["event"] == "prompt_trace"
+        ]
+        assert len(prompt_trace_records) == 1
+        sidecar_path = Path(prompt_trace_records[0]["artifact_path"])
+        assert sidecar_path.exists()
+        assert sidecar_path.parent == Path(f"{trace_file}.prompts")
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        assert sidecar["capture_mode"] == "redacted"
+        assert sidecar["context"]["history_ledger"]["resolved_budget"] == {
+            "history_tokens": 12_000,
+            "source": "fixed_default",
+            "hard_prompt_tokens": None,
+        }
+
+    @pytest.mark.parametrize(
+        (
+            "agent_profile",
+            "expected_agent_id",
+            "expected_agent_class",
+            "required_tool",
+            "excluded_tool",
+        ),
+        [
+            (
+                "local",
+                "local",
+                "LocalCodingAgent",
+                "read_file",
+                "forge_read_issue",
+            ),
+            (
+                "lean-coordinator",
+                "cli-lean-coordinator",
+                "LeanProjectCoordinator",
+                "forge_read_issue",
+                "peer_by_account",
+            ),
+            (
+                "project-coordinator",
+                "cli-project-coordinator",
+                "ProjectCoordinator",
+                "peer_by_account",
+                None,
+            ),
+        ],
+    )
+    def test_agent_profile_selects_persisted_role_and_reports_inventory(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        agent_profile: str,
+        expected_agent_id: str,
+        expected_agent_class: str,
+        required_tool: str,
+        excluded_tool: str | None,
+    ):
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="ok"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        agency_home = tmp_path / "agency"
+        result_file = tmp_path / "result.json"
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "hello",
+                "--workspace",
+                str(tmp_path),
+                "--agency",
+                str(agency_home),
+                "--agent-profile",
+                agent_profile,
+                "--result-file",
+                str(result_file),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        result_data = json.loads(result_file.read_text(encoding="utf-8"))
+        assert result_data["agent_profile"] == agent_profile
+        assert result_data["prompt_delivery"] == "direct"
+        assert result_data["agent_id"] == expected_agent_id
+        assert result_data["agent_class"] == expected_agent_class
+        tool_inventory = result_data["tool_inventory"]
+        assert len(tool_inventory) == len(set(tool_inventory))
+        assert required_tool in tool_inventory
+        if excluded_tool is not None:
+            assert excluded_tool not in tool_inventory
+
+        agent_file = (
+            agency_home / "agents" / expected_agent_id / "agent.json"
+        )
+        persisted_agent = json.loads(agent_file.read_text(encoding="utf-8"))
+        assert persisted_agent["agent_class"] == expected_agent_class
+
+    def test_trace_raw_prompts_requires_trace(self, tmp_path: Path, monkeypatch):
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="hi"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--workspace", str(tmp_path),
+                "--trace-raw-prompts",
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 1
+        assert "--trace-raw-prompts requires --trace" in result.output
+
+    def test_no_result_file_when_not_requested(self, tmp_path: Path, monkeypatch):
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="hi"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert not (tmp_path / "result.json").exists()
+
+
+class TestRunActionPolicy:
+    """``thorn run`` action policy is an explicit evaluation axis."""
+
+    def test_bounded_action_v1_prompt_has_frozen_byte_identity(self) -> None:
+        treatment_prompt = RUN_ACTION_POLICY_DEFINITIONS[
+            RunActionPolicy.BOUNDED_ACTION_V1
+        ].system_prompt
+        assert treatment_prompt is not None
+
+        prompt_bytes = treatment_prompt.encode("utf-8")
+        assert len(prompt_bytes) == 1_279
+        assert hashlib.sha256(prompt_bytes).hexdigest() == (
+            "b15dd9014797e2b8a35f95dc94eb458a7c80e89f04f259b25f0822d940e18bd6"
+        )
+
+    def test_baseline_does_not_add_treatment_prompt(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        provider = _RecordingProvider(
+            canned_responses=[
+                [TextChunk(text="done"), FinishChunk(reason="stop")],
+            ]
+        )
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "make a small change",
+                "--workspace",
+                str(tmp_path),
+                "--action-policy",
+                "baseline",
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert len(provider.system_prompt_batches) == 1
+        rendered_system_prompt = "\n\n".join(
+            provider.system_prompt_batches[0]
+        )
+        treatment_prompts = [
+            definition.system_prompt
+            for policy, definition in RUN_ACTION_POLICY_DEFINITIONS.items()
+            if policy is not RunActionPolicy.BASELINE
+        ]
+        assert all(prompt is not None for prompt in treatment_prompts)
+        assert all(
+            prompt not in rendered_system_prompt
+            for prompt in treatment_prompts
+            if prompt is not None
+        )
+
+    @pytest.mark.parametrize(
+        "action_policy",
+        [
+            RunActionPolicy.BOUNDED_ACTION_V1,
+            RunActionPolicy.SEMANTIC_WORK_V2,
+        ],
+    )
+    def test_treatment_reaches_every_provider_request_and_artifact(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        action_policy: RunActionPolicy,
+    ) -> None:
+        provider = _RecordingProvider(
+            canned_responses=[
+                [
+                    ToolCallChunk(
+                        call_id="act",
+                        name="update_focus",
+                        arguments=json.dumps({"phase": "act"}),
+                    ),
+                    FinishChunk(reason="tool_calls"),
+                ],
+                [TextChunk(text="done"), FinishChunk(reason="stop")],
+            ]
+        )
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        result_file = tmp_path / "result.json"
+        trace_file = tmp_path / "trace.jsonl"
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "make a small change",
+                "--workspace",
+                str(tmp_path),
+                "--action-policy",
+                action_policy.value,
+                "--result-file",
+                str(result_file),
+                "--trace",
+                str(trace_file),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        treatment_prompt = RUN_ACTION_POLICY_DEFINITIONS[action_policy].system_prompt
+        assert treatment_prompt is not None
+        assert result.exit_code == 0
+        assert len(provider.system_prompt_batches) == 2
+        assert all(
+            treatment_prompt in "\n\n".join(batch)
+            for batch in provider.system_prompt_batches
+        )
+        result_data = json.loads(result_file.read_text(encoding="utf-8"))
+        assert result_data["action_policy"] == action_policy.value
+        run_metadata = next(
+            json.loads(line)
+            for line in trace_file.read_text(encoding="utf-8").splitlines()
+            if json.loads(line)["event"] == "run_metadata"
+        )
+        assert run_metadata["action_policy"] == action_policy.value
+
+    def test_unknown_policy_is_rejected_before_execution(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "make a small change",
+                "--workspace",
+                str(tmp_path),
+                "--action-policy",
+                "untracked-experiment",
+            ],
+        )
+
+        assert result.exit_code == 2
+        assert "Invalid value for '--action-policy'" in result.output
+
+
+class TestRunHistoryPolicy:
+    """``thorn run`` history policy is an explicit evaluation axis."""
+
+    def test_default_bounded_policy_reaches_provider_trace_and_artifacts(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        result_file = tmp_path / "result.json"
+        trace_file = tmp_path / "trace.jsonl"
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "make a small change",
+                "--workspace",
+                str(tmp_path),
+                "--result-file",
+                str(result_file),
+                "--trace",
+                str(trace_file),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        result_data = json.loads(result_file.read_text(encoding="utf-8"))
+        assert result_data["history_policy"] == "bounded-history-v2"
+        trace_records = [
+            json.loads(line)
+            for line in trace_file.read_text(encoding="utf-8").splitlines()
+        ]
+        run_metadata = next(
+            record for record in trace_records
+            if record["event"] == "run_metadata"
+        )
+        assert run_metadata["history_policy"] == "bounded-history-v2"
+        prompt_trace_record = next(
+            record for record in trace_records
+            if record["event"] == "prompt_trace"
+        )
+        sidecar = json.loads(
+            Path(prompt_trace_record["artifact_path"]).read_text(encoding="utf-8")
+        )
+        ledger = sidecar["context"]["history_ledger"]
+        assert ledger["resolved_budget"]["source"] == "fixed_default"
+        assert ledger["resolved_budget"]["history_tokens"] == 12_000
+        assert ledger["policy"]["search_replacement_policy"] == (
+            "complete-current-read"
+        )
+
+    def test_explicit_v1_preserves_frozen_projection_policy(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        trace_file = tmp_path / "trace.jsonl"
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "make a small change",
+                "--workspace",
+                str(tmp_path),
+                "--history-policy",
+                RunHistoryPolicy.BOUNDED_HISTORY_V1.value,
+                "--trace",
+                str(trace_file),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        prompt_trace_record = next(
+            json.loads(line)
+            for line in trace_file.read_text(encoding="utf-8").splitlines()
+            if json.loads(line)["event"] == "prompt_trace"
+        )
+        sidecar = json.loads(
+            Path(prompt_trace_record["artifact_path"]).read_text(encoding="utf-8")
+        )
+        assert sidecar["context"]["history_ledger"]["policy"][
+            "search_replacement_policy"
+        ] == "exact-duplicate-only"
+
+    def test_explicit_baseline_preserves_legacy_provider_history(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        result_file = tmp_path / "result.json"
+        trace_file = tmp_path / "trace.jsonl"
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "make a small change",
+                "--workspace",
+                str(tmp_path),
+                "--history-policy",
+                RunHistoryPolicy.BASELINE.value,
+                "--result-file",
+                str(result_file),
+                "--trace",
+                str(trace_file),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert json.loads(result_file.read_text())["history_policy"] == "baseline"
+        prompt_trace_record = next(
+            record
+            for record in (
+                json.loads(line)
+                for line in trace_file.read_text(encoding="utf-8").splitlines()
+            )
+            if record["event"] == "prompt_trace"
+        )
+        sidecar = json.loads(
+            Path(prompt_trace_record["artifact_path"]).read_text(encoding="utf-8")
+        )
+        assert "history_ledger" not in sidecar["context"]
+
+    def test_unknown_policy_is_rejected_before_execution(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "make a small change",
+                "--workspace",
+                str(tmp_path),
+                "--history-policy",
+                "untracked-experiment",
+            ],
+        )
+
+        assert result.exit_code == 2
+        assert "Invalid value for '--history-policy'" in result.output
+
+
+class TestRunReadReusePolicy:
+    """``thorn run`` always observes reads but only R1 advises the model."""
+
+    def test_arms_share_frozen_observation_policy(self) -> None:
+        baseline = RUN_READ_REUSE_POLICY_DEFINITIONS[
+            RunReadReusePolicy.BASELINE
+        ]
+        treatment = RUN_READ_REUSE_POLICY_DEFINITIONS[
+            RunReadReusePolicy.SESSION_LEDGER_V1
+        ]
+
+        assert baseline.read_file_observation_policy is (
+            treatment.read_file_observation_policy
+        )
+        assert baseline.read_file_advisory_policy is None
+        assert treatment.read_file_advisory_policy is (
+            treatment.read_file_observation_policy
+        )
+
+    def test_treatment_reaches_runtime_and_artifacts(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        result_file = tmp_path / "result.json"
+        trace_file = tmp_path / "trace.jsonl"
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "make a small change",
+                "--workspace",
+                str(tmp_path),
+                "--read-reuse-policy",
+                RunReadReusePolicy.SESSION_LEDGER_V1.value,
+                "--result-file",
+                str(result_file),
+                "--trace",
+                str(trace_file),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        definition = RUN_READ_REUSE_POLICY_DEFINITIONS[
+            RunReadReusePolicy.SESSION_LEDGER_V1
+        ]
+        assert definition.read_file_advisory_policy is not None
+        result_data = json.loads(result_file.read_text(encoding="utf-8"))
+        assert result_data["read_reuse_policy"] == "session-ledger-v1"
+        assert result_data["read_reuse_telemetry_schema_version"] == 2
+        run_metadata = next(
+            json.loads(line)
+            for line in trace_file.read_text(encoding="utf-8").splitlines()
+            if json.loads(line)["event"] == "run_metadata"
+        )
+        assert run_metadata["read_reuse_policy"] == "session-ledger-v1"
+        assert run_metadata["read_reuse_telemetry_schema_version"] == 2
+
+    def test_unknown_policy_is_rejected_before_execution(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "make a small change",
+                "--workspace",
+                str(tmp_path),
+                "--read-reuse-policy",
+                "untracked-experiment",
+            ],
+        )
+
+        assert result.exit_code == 2
+        assert "Invalid value for '--read-reuse-policy'" in result.output
+
+
+class TestRunValidationConvergencePolicy:
+    """``thorn run`` validation convergence is an explicit opt-in axis."""
+
+    @pytest.mark.parametrize(
+        "selected_policy",
+        [
+            RunValidationConvergencePolicy.ACTION_EPOCH_V1,
+            RunValidationConvergencePolicy.WORKSPACE_CONTENT_OBSERVE_V2,
+            RunValidationConvergencePolicy.WORKSPACE_CONTENT_V2,
+        ],
+    )
+    def test_treatment_reaches_runtime_and_artifacts(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        selected_policy: RunValidationConvergencePolicy,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        result_file = tmp_path / "result.json"
+        trace_file = tmp_path / "trace.jsonl"
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "make a small change",
+                "--workspace",
+                str(tmp_path),
+                "--validation-convergence-policy",
+                selected_policy.value,
+                "--result-file",
+                str(result_file),
+                "--trace",
+                str(trace_file),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        definition = RUN_VALIDATION_CONVERGENCE_POLICY_DEFINITIONS[
+            selected_policy
+        ]
+        assert definition.validation_convergence_policy.value == selected_policy.value
+        result_data = json.loads(result_file.read_text(encoding="utf-8"))
+        assert result_data["validation_convergence_policy"] == selected_policy.value
+        run_metadata = next(
+            json.loads(line)
+            for line in trace_file.read_text(encoding="utf-8").splitlines()
+            if json.loads(line)["event"] == "run_metadata"
+        )
+        assert run_metadata["validation_convergence_policy"] == selected_policy.value
+
+    def test_unknown_policy_is_rejected_before_execution(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "make a small change",
+                "--workspace",
+                str(tmp_path),
+                "--validation-convergence-policy",
+                "untracked-experiment",
+            ],
+        )
+
+        assert result.exit_code == 2
+        assert (
+            "Invalid value for '--validation-convergence-policy'"
+            in result.output
+        )
+
+
+class TestCLISubprocessSandboxWarning:
+    """``thorn run`` / ``thorn chat`` surface host-subprocess shell risk."""
+
+    def test_run_warns_that_shell_tools_use_host_subprocess(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="ok"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        normalized_output = " ".join(result.output.split())
+        assert "Security warning" in normalized_output
+        assert "run_shell" in normalized_output
+        assert "host subprocess" in normalized_output
+        assert "hosted or shared deployments" in normalized_output
+
+    def test_chat_warns_before_repl_starts(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "chat",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            input="",
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        normalized_output = " ".join(result.output.split())
+        assert "Security warning" in normalized_output
+        assert "run_shell" in normalized_output
+        assert "for thorn run/chat" in normalized_output
+
+
+class TestCLISubprocessDefaultToolPaths:
+    """Pathless file tools operate on the workspace shown to the agent."""
+
+    def test_pathless_file_tools_use_selected_workspace(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        marker = workspace / "default_path_marker.py"
+        marker.write_text("default-path-marker\n", encoding="utf-8")
+        provider = _RecordingProvider(canned_responses=[
+            [
+                ToolCallChunk(
+                    call_id="list-default",
+                    name="list_directory",
+                    arguments="{}",
+                ),
+                FinishChunk(reason="tool_calls"),
+            ],
+            [
+                ToolCallChunk(
+                    call_id="find-default",
+                    name="find_files",
+                    arguments='{"pattern": "*.py"}',
+                ),
+                FinishChunk(reason="tool_calls"),
+            ],
+            [
+                ToolCallChunk(
+                    call_id="search-default",
+                    name="search_files",
+                    arguments='{"pattern": "default-path-marker"}',
+                ),
+                FinishChunk(reason="tool_calls"),
+            ],
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run",
+                "inspect the workspace",
+                "--workspace",
+                str(workspace),
+                "--agency",
+                str(tmp_path / "agency"),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        expected_content = {
+            "list-default": marker.name,
+            "find-default": marker.name,
+            "search-default": "default-path-marker",
+        }
+        assert provider.tool_results_by_call_id.keys() >= expected_content.keys()
+        for call_id, expected in expected_content.items():
+            tool_result = provider.tool_results_by_call_id[call_id]
+            assert tool_result.is_error is False
+            assert expected in tool_result.content
+
+
+class TestCLISessionListingAndResume:
+    """Local CLI sessions can be inspected and explicitly resumed."""
+
+    def test_run_persists_session_that_can_be_listed(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "make a note",
+                "--workspace", str(workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        payload = _list_cli_session_payloads(agency_home=agency_home)
+        assert len(payload) == 1
+        session = payload[0]
+        assert isinstance(session["key"], str)
+        assert session["key"].startswith(f"cli/{workspace.name}/")
+        assert session["agent_id"] == "local"
+        assert session["workspace_root"] == str(workspace)
+        assert session["workspace_state"] == "present"
+        assert session["last_active"] is not None
+
+    def test_run_resume_reuses_existing_history(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = _RecordingProvider(canned_responses=[
+            [TextChunk(text="first answer"), FinishChunk(reason="stop")],
+            [TextChunk(text="second answer"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+        runner = CliRunner()
+
+        first = runner.invoke(
+            cli_main,
+            [
+                "run", "first prompt",
+                "--workspace", str(workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0
+        [session] = _list_cli_session_payloads(agency_home=agency_home)
+
+        second = runner.invoke(
+            cli_main,
+            [
+                "run", "second prompt",
+                "--resume", str(session["key"]),
+                "--workspace", str(workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert second.exit_code == 0
+        assert provider.message_text_batches[1] == [
+            "first prompt",
+            "first answer",
+            "second prompt",
+        ]
+        resumed_system = "\n".join(provider.system_prompt_batches[1])
+        assert "Phase: intake" in resumed_system
+        assert "Focused inbox item: none" in resumed_system
+        assert len(_list_cli_session_payloads(agency_home=agency_home)) == 1
+
+    def test_run_resume_uses_selected_profile_identity(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from thorn.runtime._paths import session_key_from_path
+
+        provider = _RecordingProvider(canned_responses=[
+            [TextChunk(text="first answer"), FinishChunk(reason="stop")],
+            [TextChunk(text="second answer"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+        runner = CliRunner()
+
+        first = runner.invoke(
+            cli_main,
+            [
+                "run",
+                "first prompt",
+                "--agent-profile",
+                "lean-coordinator",
+                "--workspace",
+                str(workspace),
+                "--agency",
+                str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0
+
+        sessions_root = (
+            agency_home
+            / "agents"
+            / "cli-lean-coordinator"
+            / "sessions"
+        )
+        [session_state_dir] = _find_session_state_dirs(
+            sessions_root,
+            key_prefix="cli",
+        )
+        session_key = session_key_from_path(
+            session_state_dir.parent.relative_to(sessions_root),
+        )
+
+        second = runner.invoke(
+            cli_main,
+            [
+                "run",
+                "second prompt",
+                "--agent-profile",
+                "lean-coordinator",
+                "--resume",
+                str(session_key),
+                "--workspace",
+                str(workspace),
+                "--agency",
+                str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert second.exit_code == 0
+        assert provider.message_text_batches[1] == [
+            "first prompt",
+            "first answer",
+            "second prompt",
+        ]
+
+    def test_chat_resume_uses_stored_workspace_when_invoked_elsewhere(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = _RecordingProvider(canned_responses=[
+            [TextChunk(text="first answer"), FinishChunk(reason="stop")],
+            [TextChunk(text="second answer"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        original_workspace = tmp_path / "original"
+        other_workspace = tmp_path / "other"
+        original_workspace.mkdir()
+        other_workspace.mkdir()
+        monkeypatch.chdir(original_workspace)
+        runner = CliRunner()
+
+        first = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--workspace", str(original_workspace),
+                "--agency", str(agency_home),
+                "--no-housekeeping",
+                "--quiet",
+            ],
+            input="first prompt\n",
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0
+        [session] = _list_cli_session_payloads(agency_home=agency_home)
+
+        monkeypatch.chdir(other_workspace)
+        second = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--resume", str(session["key"]),
+                "--agency", str(agency_home),
+                "--no-housekeeping",
+                "--quiet",
+            ],
+            input="second prompt\n",
+            catch_exceptions=False,
+        )
+
+        assert second.exit_code == 0
+        assert provider.message_text_batches[1] == [
+            "first prompt",
+            "first answer",
+            "second prompt",
+        ]
+        assert len(_list_cli_session_payloads(agency_home=agency_home)) == 1
+
+    def test_resume_rejects_explicit_workspace_mismatch(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        original_workspace = tmp_path / "original"
+        other_workspace = tmp_path / "other"
+        original_workspace.mkdir()
+        other_workspace.mkdir()
+        monkeypatch.chdir(original_workspace)
+
+        first = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "first prompt",
+                "--workspace", str(original_workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0
+        [session] = _list_cli_session_payloads(agency_home=agency_home)
+
+        resumed = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "second prompt",
+                "--resume", str(session["key"]),
+                "--workspace", str(other_workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+        )
+
+        assert resumed.exit_code != 0
+        assert str(original_workspace) in resumed.output
+        assert str(other_workspace) in resumed.output
+
+    def test_resume_reports_missing_workspace(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+
+        first = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "first prompt",
+                "--workspace", str(workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0
+        [session] = _list_cli_session_payloads(agency_home=agency_home)
+        monkeypatch.chdir(tmp_path)
+        shutil.rmtree(workspace)
+
+        resumed = CliRunner().invoke(
+            cli_main,
+            [
+                "chat",
+                "--resume", str(session["key"]),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            input="second prompt\n",
+        )
+
+        assert resumed.exit_code != 0
+        assert str(workspace) in resumed.output
+
+    def test_resume_reports_active_session_lock(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from thorn.runtime._lock import SessionLockError
+
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="done"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+
+        first = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "first prompt",
+                "--workspace", str(workspace),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert first.exit_code == 0
+        [session] = _list_cli_session_payloads(agency_home=agency_home)
+
+        @contextmanager
+        def _locked_session(_session_dir):
+            raise SessionLockError("locked for test")
+            yield
+
+        monkeypatch.setattr("thorn._cli.session_lock", _locked_session)
+        resumed = CliRunner().invoke(
+            cli_main,
+            [
+                "chat",
+                "--resume", str(session["key"]),
+                "--agency", str(agency_home),
+                "--quiet",
+            ],
+            input="second prompt\n",
+        )
+
+        assert resumed.exit_code != 0
+        assert str(session["key"]) in resumed.output
+
+
+class TestAgencyHomeResolution:
+    """``thorn run`` / ``thorn chat`` honour ``--agency`` and the ``~/.thorn`` default.
+
+    Phase 5 of the CLI/gateway unification switched the CLI's default
+    agency home from ``{ws}/.thorn/`` (old ``for_cli`` nested layout)
+    to ``~/.thorn/`` (local-agency convention).  These tests lock
+    down both paths: an explicit ``--agency`` override wins over the
+    default, and the default actually lands at ``Path.home() /
+    '.thorn'`` (which the autouse fixture redirects to ``tmp_path``
+    so we are really asserting "the resolver consulted
+    ``Path.home()``").
+    """
+
+    def test_explicit_agency_override_beats_default(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """``--agency`` routes agent state to a caller-chosen directory."""
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="ok"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        agency_dir = tmp_path / "custom-agency"
+        workspace_dir = tmp_path / "elsewhere"
+        workspace_dir.mkdir()
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--workspace", str(workspace_dir),
+                "--agency", str(agency_dir),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+        # The agency home should hold the agent tree; the workspace
+        # must stay untouched (no stray .thorn/ inside it).
+        sessions_root = agency_dir / "agents" / "local" / "sessions"
+        assert sessions_root.is_dir(), (
+            "explicit --agency directory should hold the agent/session tree"
+        )
+        cli_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
+        assert len(cli_dirs) == 1, (
+            "one ephemeral cli/... session dir should live under --agency"
+        )
+        assert not (workspace_dir / ".thorn").exists(), (
+            "Phase 5 decouples workspace from agency home; the "
+            "workspace must not sprout a nested .thorn/ when --agency "
+            "is set explicitly"
+        )
+
+    def test_default_agency_is_home_dot_thorn(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """With no ``--agency``, state lands under ``Path.home() / '.thorn'``.
+
+        The autouse ``_isolate_cli_agency_home`` fixture redirects
+        ``Path.home()`` to ``tmp_path``, so the effective default is
+        ``tmp_path/.thorn``.  Asserting on that directory exercises
+        the full resolution path (resolver consulted ``Path.home()``,
+        appended ``.thorn``, and the runtime used the result).
+        """
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="ok"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        workspace_dir = tmp_path / "some-workspace"
+        workspace_dir.mkdir()
+        monkeypatch.chdir(workspace_dir)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--workspace", str(workspace_dir),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+        default_home = tmp_path / ".thorn"
+        assert default_home.is_dir(), (
+            "the default agency home should be auto-created at "
+            "~/.thorn on first use"
+        )
+        sessions_root = default_home / "agents" / "local" / "sessions"
+        assert sessions_root.is_dir(), (
+            "agent/session tree should live under the default ~/.thorn"
+        )
+        cli_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
+        assert len(cli_dirs) == 1
+
+        # And we should *not* have written a nested .thorn inside the
+        # workspace -- the Phase 5 clean-break behavior.
+        assert not (workspace_dir / ".thorn").exists(), (
+            "Phase 5 clean break: the default CLI path no longer "
+            "drops .thorn/ inside the workspace root"
+        )
+
+
+class TestRunPipelineStructure:
+    """``thorn run`` should flow through the in-process scheduler+inbox.
+
+    Phase 2 of the CLI/gateway unification routes ``thorn run`` through
+    an :class:`AgentScheduler` driven by ``make_cli_prompt_dispatcher``,
+    posting the user's prompt as a notification on a per-invocation
+    session inbox.  These tests verify the structural side effects of
+    that pipeline (inbox directory created, then drained) rather than
+    just the user-facing result, so a future regression that bypasses
+    the scheduler -- e.g. by calling ``run_agent_loop`` directly again
+    -- would be caught.
+    """
+
+    def test_session_inbox_dir_created_and_drained(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="ok"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+        # Per-invocation CLI session keys are
+        # ``cli/<workspace-basename>/<8 hex chars>``; framework files
+        # land at ``<home>/agents/local/sessions/<key-as-path>/_state/``
+        # with ``inbox/`` next to ``session.json`` inside the
+        # ``_state/`` sentinel.
+        sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
+        assert sessions_root.is_dir(), (
+            "the runtime should have created an agent sessions root"
+        )
+        cli_state_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
+        assert len(cli_state_dirs) == 1, (
+            f"expected exactly one ephemeral cli/... session, "
+            f"found state dirs: {[str(d) for d in cli_state_dirs]}"
+        )
+        inbox_dir = cli_state_dirs[0] / "inbox"
+        assert inbox_dir.is_dir(), (
+            "the SessionInbox constructor should have mkdir'd the inbox dir"
+        )
+        # The dispatcher deletes the notification it processes, so no
+        # ``*.json`` notification files should remain at the inbox root.
+        leftover_notifications = [
+            p for p in inbox_dir.iterdir()
+            if p.is_file() and p.suffix == ".json"
+        ]
+        assert leftover_notifications == [], (
+            "the CLI dispatcher must remove the notification it "
+            "processed; otherwise the scheduler would loop on it"
+        )
+
+    def test_fresh_run_focuses_direct_request_before_first_provider_call(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = _RecordingProvider(canned_responses=[
+            [TextChunk(text="ok"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "repair the delayed wrapper",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert provider.message_text_batches[0] == [
+            "repair the delayed wrapper",
+        ]
+        rendered_system = "\n".join(provider.system_prompt_batches[0])
+        assert "[Current working set]" in rendered_system
+        assert "Phase: inspect" in rendered_system
+        focused_line = next(
+            line for line in rendered_system.splitlines()
+            if line.startswith("Focused inbox item: ")
+        )
+        assert focused_line != "Focused inbox item: none"
+        assert "Objective: repair the delayed wrapper" in rendered_system
+
+        sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
+        [state_dir] = _find_session_state_dirs(
+            sessions_root,
+            key_prefix="cli",
+        )
+        session_data = json.loads(
+            (state_dir / "session.json").read_text(encoding="utf-8"),
+        )
+        assert session_data["working_set"] == {"phase": "intake"}
+
+
+class TestFreshDirectCompletion:
+    """A successful one-shot closeout should not need a synthesis request."""
+
+    @staticmethod
+    def _successful_closeout_responses(
+        *,
+        completion_text: str = "Final report from the completion round.",
+    ) -> list[list[ResponseChunk]]:
+        completion = {
+            "completed_actions": ["Implemented the requested change."],
+            "request_coverage": ["Checked the requested behavior."],
+            "remaining_work": [],
+            "self_review": "Reviewed the final diff.",
+            "external_follow_up": [],
+        }
+        return [
+            [
+                ToolCallChunk(
+                    call_id="act",
+                    name="update_focus",
+                    arguments=json.dumps({"phase": "act"}),
+                ),
+                FinishChunk(reason="tool_calls"),
+            ],
+            [
+                ToolCallChunk(
+                    call_id="validate",
+                    name="update_focus",
+                    arguments=json.dumps({
+                        "phase": "validate",
+                        "action_summary": "Implemented the change.",
+                    }),
+                ),
+                FinishChunk(reason="tool_calls"),
+            ],
+            [
+                ToolCallChunk(
+                    call_id="closeout",
+                    name="update_focus",
+                    arguments=json.dumps({
+                        "phase": "closeout",
+                        "validation_outcome": "passed",
+                        "validation_summary": "Targeted checks passed.",
+                        "validation_command": "pytest targeted_test.py",
+                    }),
+                ),
+                FinishChunk(reason="tool_calls"),
+            ],
+            [
+                TextChunk(text=completion_text),
+                ToolCallChunk(
+                    call_id="complete",
+                    name="complete_focused_work",
+                    arguments=json.dumps({"completion": completion}),
+                ),
+                FinishChunk(reason="tool_calls"),
+            ],
+        ]
+
+    def test_successful_closeout_returns_same_round_text_once(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = _RecordingProvider(
+            canned_responses=self._successful_closeout_responses(),
+        )
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "make a small change",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert len(provider.system_prompt_batches) == 4
+        assert result.output.count(
+            "Final report from the completion round.",
+        ) == 1
+
+    def test_empty_completion_text_uses_structured_rationale(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        provider = _RecordingProvider(canned_responses=(
+            self._successful_closeout_responses(completion_text="")
+        ))
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "make a small change",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert len(provider.system_prompt_batches) == 4
+        assert "Completion rationale:" in result.output
+        assert "Implemented the requested change." in result.output
+
+    def test_failed_closeout_continues_to_next_provider_request(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        completion = {
+            "completed_actions": ["Claimed completion too early."],
+            "request_coverage": ["Did not pass the closeout gate."],
+            "remaining_work": [],
+            "self_review": "The runtime rejected the closeout.",
+            "external_follow_up": [],
+        }
+        provider = _RecordingProvider(canned_responses=[
+            [
+                ToolCallChunk(
+                    call_id="premature-complete",
+                    name="complete_focused_work",
+                    arguments=json.dumps({"completion": completion}),
+                ),
+                FinishChunk(reason="tool_calls"),
+            ],
+            [
+                TextChunk(text="Closeout failed and the loop continued."),
+                FinishChunk(reason="stop"),
+            ],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "make a small change",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert len(provider.system_prompt_batches) == 2
+        assert "Closeout failed and the loop continued." in result.output
+
+    def test_multi_tool_closeout_continues_to_next_provider_request(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        responses = self._successful_closeout_responses()
+        closeout_call = responses[2][0]
+        completion_call = responses[3][1]
+        provider = _RecordingProvider(canned_responses=[
+            responses[0],
+            responses[1],
+            [
+                closeout_call,
+                completion_call,
+                FinishChunk(reason="tool_calls"),
+            ],
+            [
+                TextChunk(text="Multi-tool closeout received synthesis."),
+                FinishChunk(reason="stop"),
+            ],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "run", "make a small change",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert len(provider.system_prompt_batches) == 4
+        assert "Multi-tool closeout received synthesis." in result.output
+
+
+class TestRunEventBusWiring:
+    """``thorn run`` should fan events through the runtime's :class:`EventBus`.
+
+    Phase 3 of the CLI/gateway unification moves the runtime from
+    "one runtime, one sink" to "one runtime, one bus, many filtered
+    listeners".  These tests verify the wiring: a listener subscribed
+    to the runtime's bus *before* the agent round runs receives the
+    expected events, and a listener whose filter excludes the run
+    session sees nothing.
+    """
+
+    def test_subscribed_listener_receives_session_events(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from thorn._cli import _build_runtime
+        from thorn.core._event_bus import EventBus
+
+        # Wrap _build_runtime so the test can capture the runtime that
+        # ``thorn run`` constructed and subscribe a listener to its
+        # bus before the agent round starts.  We can't subscribe
+        # after ``runner.invoke`` returns -- the runtime is torn
+        # down by then.  A pre-subscription via ``_build_runtime``
+        # patching is the lightest-touch hook.
+        captured_events: list[tuple[str, str | None]] = []
+
+        class _CapturingSink:
+            async def on_response_chunk(self, chunk, scope=None):
+                key = scope.metadata.get("session_key") if scope else None
+                # Walk outer chain too (chunks come from inner scopes).
+                cur = scope
+                while cur is not None and key is None:
+                    key = cur.metadata.get("session_key")
+                    cur = cur.outer
+                captured_events.append(("chunk", key))
+
+            async def on_status(self, message, scope=None):
+                key = None
+                cur = scope
+                while cur is not None and key is None:
+                    key = cur.metadata.get("session_key")
+                    cur = cur.outer
+                captured_events.append(("status", key))
+
+            async def on_scope_enter(self, scope):
+                key = None
+                cur = scope
+                while cur is not None and key is None:
+                    key = cur.metadata.get("session_key")
+                    cur = cur.outer
+                captured_events.append(("scope_enter", key))
+
+            async def on_scope_exit(self, scope, *, duration_s=None):
+                key = None
+                cur = scope
+                while cur is not None and key is None:
+                    key = cur.metadata.get("session_key")
+                    cur = cur.outer
+                captured_events.append(("scope_exit", key))
+
+            async def on_tool_start(self, name, arguments, *, scope=None): ...
+            async def on_tool_end(self, name, **kwargs): ...
+            async def on_completion_end(self, **kwargs): ...
+            async def on_advisory(self, source, content, *, scope=None): ...
+
+        original_build = _build_runtime
+
+        def _patched_build(*args, **kwargs):
+            rt = original_build(*args, **kwargs)
+            # Subscribe an *unfiltered* observer so we can inspect
+            # what session_key tag the events carry; the assertions
+            # below check that tag, not the filter behaviour (which
+            # has its own dedicated unit tests).
+            assert isinstance(rt.event_sink, EventBus), (
+                "Phase 3 requires the CLI runtime's event sink to be "
+                "an EventBus"
+            )
+            rt.event_sink.subscribe(_CapturingSink())
+            return rt
+
+        monkeypatch.setattr("thorn._cli._build_runtime", _patched_build)
+
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="ok"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+        # The agent round must have produced at least scope_enter and
+        # scope_exit events tagged with the ephemeral CLI session key.
+        scope_events = [
+            (ev, key) for ev, key in captured_events
+            if ev in {"scope_enter", "scope_exit"}
+        ]
+        assert scope_events, (
+            f"expected scope events on the bus subscriber; got "
+            f"{captured_events}"
+        )
+        # Every captured scope event should be tagged with a
+        # ``cli/...`` ephemeral key (Phase 5 naming convention).
+        for ev, key in scope_events:
+            assert key is not None and key.startswith("cli/"), (
+                f"event {ev!r} carried session_key={key!r}; expected "
+                f"a 'cli/...' tag"
+            )
+
+    def test_listener_filtered_to_other_session_sees_nothing(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from thorn._cli import _build_runtime
+        from thorn.core._event_bus import EventBus, in_session
+
+        captured: list[str] = []
+
+        class _SilentExceptStatus:
+            async def on_response_chunk(self, chunk, scope=None): ...
+            async def on_status(self, message, scope=None):
+                captured.append(message)
+            async def on_scope_enter(self, scope): ...
+            async def on_scope_exit(self, scope, *, duration_s=None): ...
+            async def on_tool_start(self, name, arguments, *, scope=None): ...
+            async def on_tool_end(self, name, **kwargs): ...
+            async def on_completion_end(self, **kwargs): ...
+            async def on_advisory(self, source, content, *, scope=None): ...
+
+        original_build = _build_runtime
+
+        def _patched_build(*args, **kwargs):
+            rt = original_build(*args, **kwargs)
+            assert isinstance(rt.event_sink, EventBus)
+            # Filter is for a session that will never exist in this
+            # invocation: the ``cli/...`` keys are random-hex-suffixed,
+            # "other-key" cannot collide.
+            rt.event_sink.subscribe(
+                _SilentExceptStatus(), scope_filter=in_session("other-key"),
+            )
+            return rt
+
+        monkeypatch.setattr("thorn._cli._build_runtime", _patched_build)
+
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="ok"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "run", "hello",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert captured == [], (
+            f"a listener filtered to a non-matching session must not "
+            f"receive any events; got {captured}"
+        )
+
+
+class TestChat:
+    """``thorn chat`` REPL drives turns through the in-process scheduler.
+
+    Phase 4 of the CLI/gateway unification routes each user input
+    through ``ChatPromptRouter`` + ``AgentScheduler`` (rather than
+    calling ``session.prompt`` directly).  These tests exercise the
+    REPL by feeding stdin via ``CliRunner``; because the mock provider
+    yields canned chunks synchronously and the REPL exits cleanly on
+    EOF, no real concurrency is in play, but the scheduler's drain
+    loop and per-turn save callback are exercised end-to-end.
+    """
+
+    def test_eof_exits_cleanly_with_no_input(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Closing stdin before typing anything must produce a clean exit."""
+        provider = MockProvider(canned_responses=[])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            input="",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+    def test_single_turn_runs_and_persists_history(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """One user line drives one ``session.prompt`` round and persists."""
+        provider = MockProvider(canned_responses=[
+            [
+                TextChunk(text="hello back"),
+                UsageChunk(
+                    prompt_tokens=3, completion_tokens=2, total_tokens=5,
+                ),
+                FinishChunk(reason="stop"),
+            ],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--workspace", str(tmp_path),
+            ],
+            input="hi there\n",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert "hello back" in result.output
+
+        # Phase 5: chat keys are ``cli/<basename>/<uuid8>``; look up
+        # whatever single session was created in this invocation.
+        sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
+        cli_state_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
+        assert len(cli_state_dirs) == 1, (
+            f"expected exactly one chat session, got "
+            f"{[str(d) for d in cli_state_dirs]}"
+        )
+        # History file contents are an implementation detail of the
+        # serializer; just confirm something was written into the
+        # session's framework dir.
+        assert any(cli_state_dirs[0].iterdir()), (
+            "session _state directory should not be empty after a turn"
+        )
+
+    def test_multiple_turns_share_session_history(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Two turns in one chat invocation should both reach the provider."""
+        provider = MockProvider(canned_responses=[
+            [
+                TextChunk(text="answer one"),
+                FinishChunk(reason="stop"),
+            ],
+            [
+                TextChunk(text="answer two"),
+                FinishChunk(reason="stop"),
+            ],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--workspace", str(tmp_path),
+            ],
+            input="first question\nsecond question\n",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert "answer one" in result.output
+        assert "answer two" in result.output
+        assert provider.canned_responses == [], (
+            "both canned responses should have been consumed"
+        )
+
+    def test_each_invocation_creates_fresh_session(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Two ``thorn chat`` invocations must land in two separate session dirs.
+
+        Phase 5 replaces the static ``default`` session key with a
+        per-invocation ``cli/<basename>/<uuid8>`` key.  Running chat
+        twice in the same workspace must therefore produce two
+        distinct on-disk session directories, neither of which shows
+        the "Resuming session" banner (there is nothing to resume --
+        the session is brand-new).  This test guards against a
+        regression in which the key-generation helper is bypassed and
+        a stable ``default`` key sneaks back in.
+        """
+        def _one_turn(text: str) -> str:
+            provider = MockProvider(canned_responses=[
+                [TextChunk(text=text), FinishChunk(reason="stop")],
+            ])
+            monkeypatch.setattr(
+                "thorn._cli.load_provider_from_env",
+                _mock_provider_factory(provider),
+            )
+            runner = CliRunner()
+            result = runner.invoke(
+                cli_main,
+                [
+                    "chat",
+                    "--workspace", str(tmp_path),
+                ],
+                input="hi\n",
+                catch_exceptions=False,
+            )
+            assert result.exit_code == 0
+            assert "Resuming session" not in result.output, (
+                "Phase 5 dropped implicit per-workspace resume; the "
+                "REPL must not claim to be resuming anything"
+            )
+            return result.output
+
+        monkeypatch.chdir(tmp_path)
+
+        _one_turn("answer alpha")
+        _one_turn("answer beta")
+
+        sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
+        cli_state_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
+        assert len(cli_state_dirs) == 2, (
+            f"expected two distinct ephemeral chat sessions on disk, "
+            f"got {[str(d) for d in cli_state_dirs]}"
+        )
+
+    def test_session_inbox_dir_created_and_drained(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Phase 4 wiring: chat posts to a session inbox the scheduler drains.
+
+        The notification per turn must be removed by the router before
+        ``router.turn`` returns, so after the REPL exits the inbox
+        directory exists (created by ``SessionInbox.__init__``) but
+        contains no leftover notification files.  Catches a regression
+        in which the chat REPL silently bypasses the scheduler/router
+        path and goes back to calling ``session.prompt`` directly.
+        """
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="answer"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            input="please answer\n",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+        # Phase 5: chat keys are ``cli/<basename>/<uuid8>``; find the
+        # one session created this invocation.
+        sessions_root = tmp_path / ".thorn" / "agents" / "local" / "sessions"
+        cli_state_dirs = _find_session_state_dirs(sessions_root, key_prefix="cli")
+        assert len(cli_state_dirs) == 1, (
+            f"expected exactly one chat session, got "
+            f"{[str(d) for d in cli_state_dirs]}"
+        )
+        inbox_dir = cli_state_dirs[0] / "inbox"
+        assert inbox_dir.is_dir(), (
+            "the SessionInbox constructor should have mkdir'd "
+            "the per-session inbox dir"
+        )
+        leftover_notifications = [
+            p for p in inbox_dir.iterdir()
+            if p.is_file() and p.suffix == ".json"
+        ]
+        assert leftover_notifications == [], (
+            "ChatPromptRouter must remove notifications after each "
+            "turn; otherwise the scheduler's progress guarantee "
+            "would eventually evict them"
+        )
+
+    def test_shutdown_housekeeping_runs_by_default(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Clean REPL exit triggers one more ``session.prompt`` for housekeeping.
+
+        The provider is pre-loaded with *two* canned responses but only
+        one user turn is typed.  With shutdown housekeeping enabled
+        (the default), the second canned response is consumed by the
+        framework-driven housekeeping turn that runs after ``_chat_loop``
+        returns.  Guarding on ``canned_responses == []`` therefore
+        proves the housekeeping code path actually reaches the
+        provider; counting any other way (history length, session
+        files) would be fooled by the no-op echo fallback.
+        """
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="answer"), FinishChunk(reason="stop")],
+            [TextChunk(text="noted"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            input="hi there\n",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert provider.canned_responses == [], (
+            "shutdown housekeeping should have consumed the second "
+            "canned response on clean REPL exit"
+        )
+
+    def test_no_housekeeping_flag_skips_shutdown_turn(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """``--no-housekeeping`` must suppress the extra shutdown prompt.
+
+        Complement to ``test_shutdown_housekeeping_runs_by_default``:
+        with the opt-out flag set, the second canned response is left
+        untouched, which is the only observable difference from the
+        default behaviour under the mock provider.  Tests that pass
+        the flag implicitly (e.g. to avoid provider-queue
+        bookkeeping) rely on this semantic.
+        """
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="answer"), FinishChunk(reason="stop")],
+            [TextChunk(text="should-not-be-used"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--workspace", str(tmp_path),
+                "--no-housekeeping",
+                "--quiet",
+            ],
+            input="hi there\n",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert len(provider.canned_responses) == 1, (
+            "with --no-housekeeping, the second canned response must "
+            "be left untouched -- there is no shutdown turn to "
+            "consume it"
+        )
+
+    def test_shutdown_housekeeping_skipped_on_no_input(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """EOF without a single turn must not provoke a housekeeping call.
+
+        Running housekeeping on a brand-new, never-prompted session
+        would be pure overhead (nothing in history to journal) and
+        would burn a provider round in the common case of typing
+        ``thorn chat`` and immediately realising you meant something
+        else.  Empty-history fast-exit path.
+        """
+        provider = MockProvider(canned_responses=[
+            [TextChunk(text="should-not-be-used"), FinishChunk(reason="stop")],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--workspace", str(tmp_path),
+                "--quiet",
+            ],
+            input="",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert len(provider.canned_responses) == 1, (
+            "no user turn was typed, so nothing should have gone to "
+            "the provider -- including the housekeeping prompt"
+        )
+
+    def test_skill_error_does_not_terminate_repl(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A failed first turn (raise_error) leaves the REPL alive for a second."""
+        provider = MockProvider(canned_responses=[
+            [
+                ToolCallChunk(
+                    call_id="c1",
+                    name="raise_error",
+                    arguments='{"message": "bad"}',
+                ),
+                FinishChunk(reason="tool_calls"),
+            ],
+            [
+                TextChunk(text="recovered"),
+                FinishChunk(reason="stop"),
+            ],
+        ])
+        monkeypatch.setattr(
+            "thorn._cli.load_provider_from_env",
+            _mock_provider_factory(provider),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "chat",
+                "--workspace", str(tmp_path),
+            ],
+            input="please fail\nplease succeed\n",
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert "Agent error" in result.output
+        assert "bad" in result.output
+        assert "recovered" in result.output
+
+
+class TestServePreflightCommand:
+    def test_agency_option_is_a_serve_group_option(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_serve_preflight(**kwargs: object) -> int:
+            captured.update(kwargs)
+            return 0
+
+        monkeypatch.setattr("thorn._cli._serve_preflight", fake_serve_preflight)
+
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "serve",
+                "--agency", str(agency_home),
+                "--workspace", str(workspace),
+                "preflight",
+                "--agent", "coord",
+                "--timeout", "7",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert captured["agency_path"] == str(agency_home)
+        assert captured["workspace_path"] == str(workspace)
+        assert captured["agent_id_raw"] == "coord"
+        assert captured["timeout_s"] == 7
+
+    def test_preflight_reports_missing_source_token_before_live_polling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        monkeypatch.delenv("THORN_TEST_MISSING_GL_TOKEN", raising=False)
+
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        runner = CliRunner()
+        bootstrap_result = runner.invoke(
+            cli_main,
+            [
+                "serve",
+                "bootstrap",
+                "--agent-id", "coord",
+                "--project-name", "thorn",
+                "--project-url", "https://gitlab.com/group/project",
+                "--token-env", "THORN_TEST_MISSING_GL_TOKEN",
+                "--llm-api-url", "https://llm.example/v1",
+                "--llm-model", "test-model",
+                "--llm-api-key-env", "OPENAI_API_KEY",
+                "--agency-home", str(agency_home),
+                "--agency-workspace", str(workspace),
+            ],
+            catch_exceptions=False,
+        )
+        assert bootstrap_result.exit_code == 0
+
+        result = runner.invoke(
+            cli_main,
+            [
+                "serve",
+                "--agency", str(agency_home),
+                "preflight",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 1
+        assert "event-source readiness" in result.output
+        assert "THORN_TEST_MISSING_GL_TOKEN" in result.output
+
+    def test_forge_api_preflight_checks_configured_project(
+        self,
+    ) -> None:
+        from thorn._cli import _preflight_forge_api_targets
+        from thorn.core._account import AccountConfig
+        from thorn.core._brokering import BrokerCredentialPlan
+        from thorn.gateway._preflight import ForgeAPIPreflightTarget
+        from thorn.runtime import AgentID
+        from thorn.tools._credential_scopes import CredentialScopeInspection
+        from thorn.tools.forge import ForgeHostService
+
+        checked_project_ids: list[str] = []
+
+        class FakeForgeClient:
+            def get_project_info(self, native_project_id: str) -> dict[str, str]:
+                checked_project_ids.append(native_project_id)
+                return {"name": "thorn"}
+
+            def inspect_credential_scopes(self) -> CredentialScopeInspection:
+                return CredentialScopeInspection()
+
+        class FakeForgeService(ForgeHostService):
+            @property
+            def name(self) -> str:
+                return "gitlab"
+
+            def authenticated_client(self, account: AccountConfig) -> FakeForgeClient:
+                return FakeForgeClient()
+
+            def git_https_password_for(self, account: AccountConfig) -> str:
+                return ""
+
+            def broker_credential_plans(
+                self,
+                account: AccountConfig,
+            ) -> list[BrokerCredentialPlan]:
+                return []
+
+            def clone_url_for(self, native_id: str) -> str:
+                return f"https://gitlab.example.com/{native_id}.git"
+
+        class FakeRuntime:
+            def get_service(self, service_name: str) -> FakeForgeService:
+                assert service_name == "gitlab"
+                return FakeForgeService()
+
+        target = ForgeAPIPreflightTarget(
+            agent_id=AgentID("coord"),
+            account=AccountConfig(service="gitlab"),
+            forge_name="gitlab",
+            project_name="thorn",
+            fork_name="origin",
+            native_project_id="group/thorn",
+        )
+
+        failures = _preflight_forge_api_targets(
+            runtime=FakeRuntime(),  # type: ignore[arg-type]
+            targets=[target],
+        )
+
+        assert failures == 0
+        assert checked_project_ids == ["group/thorn"]
+
+    def test_forge_api_preflight_prints_credential_scope_warnings(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from thorn._cli import _preflight_forge_api_targets
+        from thorn.core._account import AccountConfig
+        from thorn.core._brokering import BrokerCredentialPlan
+        from thorn.gateway._preflight import ForgeAPIPreflightTarget
+        from thorn.runtime import AgentID
+        from thorn.tools._credential_scopes import (
+            BroadCredentialScopeWarning,
+            CredentialScopeInspection,
+        )
+        from thorn.tools.forge import ForgeHostService
+
+        class FakeForgeClient:
+            def get_project_info(self, native_project_id: str) -> dict[str, str]:
+                return {"name": native_project_id}
+
+            def inspect_credential_scopes(self) -> CredentialScopeInspection:
+                return CredentialScopeInspection(warnings=(
+                    BroadCredentialScopeWarning(
+                        summary="token can administer unrelated resources",
+                        detail="Use a narrower token for unattended work.",
+                    ),
+                ))
+
+        class FakeForgeService(ForgeHostService):
+            @property
+            def name(self) -> str:
+                return "github"
+
+            def authenticated_client(self, account: AccountConfig) -> FakeForgeClient:
+                return FakeForgeClient()
+
+            def git_https_password_for(self, account: AccountConfig) -> str:
+                return ""
+
+            def broker_credential_plans(
+                self,
+                account: AccountConfig,
+            ) -> list[BrokerCredentialPlan]:
+                return []
+
+            def clone_url_for(self, native_id: str) -> str:
+                return f"https://github.example.com/{native_id}.git"
+
+        class FakeRuntime:
+            def get_service(self, service_name: str) -> FakeForgeService:
+                assert service_name == "github"
+                return FakeForgeService()
+
+        target = ForgeAPIPreflightTarget(
+            agent_id=AgentID("coord"),
+            account=AccountConfig(service="github"),
+            forge_name="github",
+            project_name="thorn",
+            fork_name="origin",
+            native_project_id="owner/thorn",
+        )
+
+        failures = _preflight_forge_api_targets(
+            runtime=FakeRuntime(),  # type: ignore[arg-type]
+            targets=[target],
+        )
+
+        output = capsys.readouterr().out
+        assert failures == 0
+        assert "Warning" in output
+        assert "token can administer unrelated resources" in output
+        assert "Use a narrower token" in output
+
+    def test_llm_preflight_deduplicates_shared_agent_provider(self) -> None:
+        from thorn._cli import _preflight_agent_llm_targets
+
+        provider = _RecordingProvider(canned_responses=[
+            [TextChunk(text="OK"), FinishChunk(reason="stop")],
+        ])
+
+        class FakeRuntime:
+            def provider_for_agent(self, agent: Agent) -> LLMProvider:
+                return provider
+
+        failures = asyncio.run(_preflight_agent_llm_targets(
+            agents=[
+                Agent(id=AgentID("coord")),
+                Agent(id=AgentID("reviewer")),
+            ],
+            runtime=FakeRuntime(),  # type: ignore[arg-type]
+            timeout_s=1,
+        ))
+
+        assert failures == 0
+        assert len(provider.message_text_batches) == 1
+        assert len(provider.message_text_batches[0]) == 1
+
+    def test_llm_preflight_counts_provider_failure(self) -> None:
+        from thorn._cli import _preflight_agent_llm_targets
+
+        class FakeRuntime:
+            def provider_for_agent(self, agent: Agent) -> LLMProvider:
+                return _FailingProvider()
+
+        failures = asyncio.run(_preflight_agent_llm_targets(
+            agents=[Agent(id=AgentID("coord"))],
+            runtime=FakeRuntime(),  # type: ignore[arg-type]
+            timeout_s=1,
+        ))
+
+        assert failures == 1
+
+
+class TestAgencyCommandGroup:
+    def test_init_creates_minimal_agency_config(
+        self, tmp_path: Path,
+    ) -> None:
+        import yaml
+
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "agency",
+                "init",
+                str(agency_home),
+                "--workspace", str(workspace),
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0, result.output
+        config_path = agency_home / "agency.yaml"
+        assert config_path.is_file()
+        assert (agency_home / "agents").is_dir()
+        assert workspace.is_dir()
+
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert payload == {"workspace": str(workspace.resolve())}
+
+    def test_init_requires_explicit_workspace(self, tmp_path: Path) -> None:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            ["agency", "init", str(tmp_path / "agency")],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 2
+        assert "Missing option '--workspace'" in result.output
+
+    def test_init_refuses_to_overwrite_existing_config(
+        self, tmp_path: Path,
+    ) -> None:
+        agency_home = tmp_path / "agency"
+        agency_home.mkdir()
+        config_path = agency_home / "agency.yaml"
+        config_path.write_text("workspace: existing\n", encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "agency",
+                "init",
+                str(agency_home),
+                "--workspace", str(tmp_path / "workspace"),
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 1
+        assert "agency.yaml" in result.output
+        assert config_path.read_text(encoding="utf-8") == "workspace: existing\n"
+
+    def test_check_accepts_valid_direct_edit(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        agency_home.mkdir()
+        workspace.mkdir()
+        (agency_home / "agency.yaml").write_text(
+            f"workspace: {workspace}\n"
+            "projects:\n"
+            "  - name: thorn\n"
+            "    url: https://github.com/tangent-vector/thorn\n",
+            encoding="utf-8",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            ["agency", "check", "--agency", str(agency_home)],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "OK" in result.output
+
+    def test_check_reports_invalid_direct_edit(self, tmp_path: Path) -> None:
+        agency_home = tmp_path / "agency"
+        agency_home.mkdir()
+        (agency_home / "agency.yaml").write_text(
+            "projects:\n"
+            "  - name: broken\n",
+            encoding="utf-8",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            ["agency", "check", "--agency", str(agency_home)],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 1
+        assert "Project 'broken' must specify" in result.output
+
+    def test_check_validates_persisted_agent_accounts(
+        self, tmp_path: Path,
+    ) -> None:
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        bootstrap_coordinator(
+            agency_home=agency_home,
+            agency_workspace=workspace,
+            agent_id="bot",
+            project_name="thorn",
+            project_url="https://github.com/tangent-vector/thorn",
+        )
+        identity_path = agency_home / "agents" / "bot" / "agent.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["accounts"][0]["service"] = "missing-forge"
+        identity_path.write_text(
+            json.dumps(identity, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            ["agency", "check", "--agency", str(agency_home)],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 1
+        assert "missing-forge" in result.output
+        assert "registered on the runtime" in result.output
+
+    def test_bootstrap_writes_operator_agents_md(self, tmp_path: Path) -> None:
+        from thorn.gateway._bootstrap import bootstrap_coordinator
+
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        bootstrap_coordinator(
+            agency_home=agency_home,
+            agency_workspace=workspace,
+            agent_id="bot",
+            project_name="thorn",
+            project_url="https://github.com/tangent-vector/thorn",
+        )
+
+        operator_agents_path = agency_home / "agents" / "bot" / "AGENTS.md"
+        operator_agents_text = operator_agents_path.read_text(encoding="utf-8")
+
+        assert operator_agents_path.is_file()
+        assert "# Operator Instructions for thorn Coordinator" in operator_agents_text
+        assert "`bot` gateway agent" in operator_agents_text
+        assert "<agency-home>/agents/bot/AGENTS.md" in operator_agents_text
+        assert "agent's writable `home/` content" in operator_agents_text
+
+    def test_show_json_reports_resolved_config_summary(
+        self, tmp_path: Path,
+    ) -> None:
+        agency_home = tmp_path / "agency"
+        workspace = tmp_path / "workspace"
+        agency_home.mkdir()
+        workspace.mkdir()
+        (agency_home / "agency.yaml").write_text(
+            f"workspace: {workspace}\n"
+            "projects:\n"
+            "  - name: thorn\n"
+            "    url: https://github.com/tangent-vector/thorn\n",
+            encoding="utf-8",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_main,
+            [
+                "agency",
+                "show",
+                "--agency", str(agency_home),
+                "--json",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["agency_home"] == str(agency_home.resolve())
+        assert payload["config_file"] == str((agency_home / "agency.yaml").resolve())
+        assert payload["workspace"] == str(workspace.resolve())
+        assert payload["projects"] == [
+            {
+                "name": "thorn",
+                "forks": [
+                    {
+                        "name": "origin",
+                        "forge": "github",
+                        "native_id": "tangent-vector/thorn",
+                        "clone_url": "https://github.com/tangent-vector/thorn.git",
+                    },
+                ],
+            },
+        ]
+        assert payload["services"] == [{"name": "github", "type": "github"}]
