@@ -1,18 +1,18 @@
-# Gateway Configuration Examples
+# Agency Configuration Examples for Gateway Operation
 
 These directories are complete agency-home skeletons for common
 `thorn serve` configurations. The files are plain JSON so they can be
 validated by tests and used as starting points without stripping comments.
 
 None of the examples contain literal secrets. Provider, forge, and broker
-credentials are represented only by environment-variable names; the gateway
-reads the literal values from the process environment at runtime.
+credentials are represented only by environment-variable names; the running
+agency reads the literal values from the gateway process environment.
 
 ## Public GitHub PAT
 
 `github-pat/` shows the smallest public GitHub shape:
 
-- `gateway.json` declares a workspace, an OpenAI-compatible provider, a
+- The compatibility-named `gateway.json` declares a workspace, an
   project URL, and a peer.
 - No `forges` block is needed because `github.com` is inferred.
 - No `sandbox` or `broker` block is needed because `thorn serve` defaults to

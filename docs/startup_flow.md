@@ -1,10 +1,10 @@
 # What `thorn serve` does on startup
 
-This document walks through the bring-up sequence of `thorn serve`
-in the default configuration (no `sandbox` block, no `broker` block
-in `gateway.json`).  The goal is to give operators a mental model of
-what they're seeing in the logs and where to look when something
-goes wrong.
+This document walks through the bring-up sequence when `thorn serve` runs an
+agency in gateway mode with the default configuration (no `sandbox` or
+`broker` block in the agency configuration file). The goal is to give
+operators a mental model of what they are seeing in the logs and where to look
+when something goes wrong.
 
 The corresponding code lives in
 `src/thorn/gateway/_gateway.py::Gateway._startup` and
@@ -12,7 +12,7 @@ The corresponding code lives in
 
 ## TL;DR
 
-1. Load and validate `gateway.json` (auto-fills container sandbox +
+1. Load and validate the agency configuration (auto-fills container sandbox +
    bundled broker defaults).
 2. Bring up a per-process OneCLI + Postgres compose stack (`<oci>
    compose up -d --wait`).
@@ -33,18 +33,21 @@ On graceful shutdown:
 
 ### 1. Load configuration
 
-`thorn serve` reads `gateway.json` from the agency home directory
-and validates it against `GatewayConfig`.  The schema applies two
-"absent block -> secure default" rules at this point:
+`thorn serve` reads exactly one supported agency configuration file from the
+agency home directory. `agency.yaml` is preferred; `agency.json`,
+`gateway.yaml`, and `gateway.json` are compatibility names. The implementation
+currently validates that file against the transitionally named `GatewayConfig`
+schema, which applies two "absent block -> secure default" rules:
 
 * No `sandbox` block -> `SandboxConfig(backend="container")` with
   Phase E hardening (caps drop, read-only rootfs, resource limits).
 * No `broker` block, when sandbox resolves to container ->
   `BrokerConfig(mode="bundled")`.
 
-These defaults apply only when `gateway.json` is the thing being
-loaded; `thorn run` and `thorn chat` (which never read
-`gateway.json`) fall back to subprocess sandboxing as before.
+These defaults apply only when an agency configuration file is loaded.
+`thorn run` and `thorn chat` currently construct their local agency
+configuration from CLI defaults and the environment instead, and use a
+subprocess toolhost.
 
 ### 2. Bring up the bundled broker stack
 
@@ -63,7 +66,7 @@ calls `start()` on it.  The supervisor:
 * Runs `<oci> compose -p <project> -f <yaml> up -d --wait` with
   `ONECLI_ADMIN_PORT=0` / `ONECLI_PROXY_PORT=0` so docker picks free
   host ports, and with a random per-stack `ONECLI_POSTGRES_PASSWORD`.
-  If `broker.bundled_images` is set in `gateway.json`, the supervisor
+  If `broker.bundled_images` is set in the agency configuration, the supervisor
   passes those OneCLI/Postgres image references into compose; otherwise
   the compose file honors
   `THORN_BUNDLED_BROKER_ONECLI_IMAGE` and
@@ -277,7 +280,7 @@ Common failure modes and where to look:
 * **"No OCI runtime with a 'compose' subcommand found on PATH"**:
   install podman or docker.  If you really do want to run without
   containerised sandboxing (and therefore without the broker), set
-  `"sandbox": { "backend": "subprocess" }` in `gateway.json` to opt
+  `"sandbox": { "backend": "subprocess" }` in the agency configuration to opt
   out of both.
 
 * **The selected runtime has no working Compose provider**: set
