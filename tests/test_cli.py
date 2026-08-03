@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 from contextlib import contextmanager
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,34 @@ def _mock_provider_factory(provider: MockProvider):
     def factory() -> MockProvider:
         return provider
     return factory
+
+
+def test_cli_reports_installed_distribution_version() -> None:
+    result = CliRunner().invoke(cli_main, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output == f"thorn, version {version('thorn-agent')}\n"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_help"),
+    [
+        (["--help"], "Operate persistent Thorn agencies"),
+        (["serve", "--help"], "Run an agency in gateway mode"),
+        (["sandbox", "--help"], "agent tool sandboxes"),
+        (["serve", "bootstrap", "--help"], "Create a project-oriented agent"),
+    ],
+)
+def test_cli_help_uses_current_agency_vocabulary(
+    arguments: list[str],
+    expected_help: str,
+) -> None:
+    result = CliRunner().invoke(cli_main, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert expected_help in result.output
+    assert "Phase-B" not in result.output
+    assert "Bootstrap a ProjectCoordinator" not in result.output
 
 
 class _RecordingProvider(MockProvider):

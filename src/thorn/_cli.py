@@ -699,6 +699,7 @@ def _load_explicit_env_file(env_file_path: Path | None) -> None:
 
 
 @click.group()
+@click.version_option(package_name="thorn-agent", prog_name="thorn")
 @click.option(
     "--env-file",
     "env_file_path",
@@ -711,7 +712,7 @@ def _load_explicit_env_file(env_file_path: Path | None) -> None:
     ),
 )
 def main(env_file_path: Path | None) -> None:
-    """Thorn — a lightweight agent harness."""
+    """Operate persistent Thorn agencies locally or as gateway services."""
     _load_explicit_env_file(env_file_path)
 
 
@@ -2471,7 +2472,7 @@ def serve(
     agency_path: str | None,
     workspace_path: str | None,
 ) -> None:
-    """Start the Thorn gateway daemon (or an MCP server via 'thorn serve mcp')."""
+    """Run an agency in gateway mode (or expose Thorn tools over MCP)."""
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     ctx.obj["quiet"] = quiet
@@ -3477,8 +3478,9 @@ async def _preflight_agent_git_targets(
     default="ProjectCoordinator",
     show_default=True,
     help=(
-        "Coordinator role to persist in agent.json. "
-        "Use LeanProjectCoordinator for reduced-surface calibration runs."
+        "Agent implementation to persist in agent.json. "
+        "LeanProjectCoordinator exposes fewer tools and a smaller "
+        "policy surface."
     ),
 )
 @click.option(
@@ -3502,8 +3504,9 @@ async def _preflight_agent_git_targets(
     type=click.Path(file_okay=False),
     required=True,
     help=(
-        "Agency home directory: holds gateway.json and the agents/ tree. "
-        "Created if missing.  No .thorn/ subdirectory is appended."
+        "Agency home directory: holds the agency configuration and "
+        "agents/ tree. Created if missing. No .thorn/ subdirectory is "
+        "appended."
     ),
 )
 @click.option(
@@ -3513,8 +3516,8 @@ async def _preflight_agent_git_targets(
     required=True,
     help=(
         "Agency workspace directory: where agent sessions do their work.  "
-        "Recorded as the 'workspace' field of gateway.json so 'thorn serve' "
-        "can locate it.  Created if missing."
+        "Recorded in the agency configuration so 'thorn serve' can locate it.  "
+        "Created if missing."
     ),
 )
 @click.pass_context
@@ -3533,10 +3536,15 @@ def serve_bootstrap(
     agency_home_path: str,
     agency_workspace_path: str,
 ) -> None:
-    """Bootstrap a ProjectCoordinator agent in an agency home directory."""
+    """Create a project-oriented agent in an agency home directory."""
     from pathlib import Path
 
     from thorn.gateway._bootstrap import bootstrap_coordinator
+    from thorn.gateway._config import (
+        GATEWAY_CONFIG_FILENAME,
+        load_gateway_config,
+    )
+    from thorn.runtime import AgencyPaths
 
     agency_home = Path(agency_home_path).expanduser().resolve()
     agency_workspace = Path(agency_workspace_path).expanduser().resolve()
@@ -3561,7 +3569,7 @@ def serve_bootstrap(
             model=LLMModelConfig(name=llm_model),
         )
     try:
-        aid = bootstrap_coordinator(
+        persisted_agent_id = bootstrap_coordinator(
             agency_home=agency_home,
             agency_workspace=agency_workspace,
             agent_id=agent_id,
@@ -3573,16 +3581,26 @@ def serve_bootstrap(
             llm_config=llm_config,
             agent_class=agent_class,
         )
+        agency_config = load_gateway_config(agency_home)
     except ValueError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
 
-    gateway_config_path = agency_home / "gateway.json"
-    console.print(f"[green]Bootstrapped coordinator:[/green] {aid}")
-    console.print(f"  Identity: {agency_home / 'agents' / f'{aid}.json'}")
-    console.print(f"  Agent home: {agency_home / 'agents' / str(aid)}")
-    console.print(f"  Gateway config: {gateway_config_path}")
-    console.print(f"  Agent workspace: {agency_workspace / str(aid)}")
+    paths = AgencyPaths.for_gateway(agency_home, agency_workspace)
+    agency_config_path = agency_home / GATEWAY_CONFIG_FILENAME
+    console.print(f"[green]Bootstrapped agent:[/green] {persisted_agent_id}")
+    console.print(f"  Identity: {paths.agent_identity_file(persisted_agent_id)}")
+    console.print(f"  Agent home: {paths.agent_home_mount(persisted_agent_id)}")
+    console.print(f"  Agency config: {agency_config_path}")
+    console.print(
+        f"  Agent workspace: {paths.agent_workspace_mount(persisted_agent_id)}"
+    )
+    if not agency_config.peers:
+        console.print(
+            "\n[yellow]No trusted peers configured.[/yellow] Gateway mode will "
+            "deny conversational forge instructions until you add a peer to "
+            f"{agency_config_path}."
+        )
     if token_env is None:
         token_env = (
             "GITHUB_TOKEN" if "github.com" in project_url else "GITLAB_TOKEN"
@@ -3645,7 +3663,7 @@ def serve_mcp(
 
 @main.group()
 def sandbox() -> None:
-    """Manage Phase-B sandbox container images and runtime status."""
+    """Build and inspect agent tool sandboxes."""
 
 
 @sandbox.command("build")
