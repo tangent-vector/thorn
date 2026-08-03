@@ -1,8 +1,8 @@
 # Thorn Roadmap
 
-Thorn is an experimental end-user application. The CLI and the long-lived
-gateway are the product surfaces; the Python library API is supporting
-infrastructure and is not yet a stable compatibility contract.
+Thorn is an experimental end-user application. The CLI and gateway operating
+modes of an agency are the product surfaces; the Python library API is
+supporting infrastructure and is not yet a stable compatibility contract.
 
 ## Implemented foundation
 

@@ -1,8 +1,8 @@
 # Thorn threat model
 
 This document describes the boundary between *what Thorn defends
-against* and *what it does not*, plus practical guidance for
-operating a Thorn gateway responsibly.
+against* and *what it does not*, plus practical guidance for running
+an agency in gateway mode responsibly.
 
 If you are wondering "is it safe for my Thorn agent to listen on a
 public GitHub issue tracker?", or "what stops a stranger from
@@ -36,7 +36,8 @@ The short version:
                       │ (peer registry, envelope wrapping,
                       │  bot-default-deny)
        ┌──────────────▼───────────────────────┐
-       │  Thorn gateway / agent reasoning     │
+       │  Running Thorn agency / reasoning    │
+       │  (gateway mode)                      │
        │  (LLM, prompts, journals, memory)    │
        └──────────────┬───────────────────────┘
                       │ tool-call sandbox + broker
@@ -70,9 +71,9 @@ for the detailed sandbox model.
 
 Trigger authorization decides whether an event from the outside world
 (a comment, an issue, a review) becomes an instruction that the agent
-takes seriously.  It is built around the **peer registry** in
-`gateway.json`: the operator declares an explicit list of accounts
-whose messages count as authoritative directions.
+takes seriously. It is built around the **peer registry** in the agency
+configuration: the operator declares an explicit list of accounts whose
+messages count as authoritative directions.
 
 Trigger authorization is **best-effort**.  It is not the security
 boundary -- the sandbox is -- but it is what keeps a public bot from
@@ -82,8 +83,8 @@ done"; the failure does not on its own escape the sandbox.
 
 ## How peers work
 
-A peer is a real person (or registered bot) that the operator
-declares in `gateway.json`:
+A peer is a real person (or registered bot) that the operator declares in the
+agency configuration:
 
 ```jsonc
 {
