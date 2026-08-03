@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - public-relaunch
   pull_request:
 
 permissions:
@@ -72,3 +71,61 @@ jobs:
 
       - name: Build distributions
         run: uv build
+
+  installation:
+    name: Installation smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.8"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Smoke-test the base wheel
+        env:
+          UV_TOOL_DIR: ${{ runner.temp }}/thorn-base-wheel-tools
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/thorn-base-wheel-bin
+        run: |
+          uv tool install dist/*.whl
+          scripts/ci/smoke-installed-cli.sh \
+            "$UV_TOOL_BIN_DIR/thorn" \
+            "$RUNNER_TEMP/thorn-base-wheel-smoke"
+
+      - name: Smoke-test the current VCS revision
+        env:
+          UV_TOOL_DIR: ${{ runner.temp }}/thorn-vcs-tools
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/thorn-vcs-bin
+          THORN_VCS_REPOSITORY: "${{ github.event.pull_request.head.repo.clone_url || github.event.repository.clone_url }}"
+          THORN_VCS_REVISION: "${{ github.event.pull_request.head.sha || github.sha }}"
+        run: |
+          uv tool install \
+            "git+${THORN_VCS_REPOSITORY}@${THORN_VCS_REVISION}"
+          scripts/ci/smoke-installed-cli.sh \
+            "$UV_TOOL_BIN_DIR/thorn" \
+            "$RUNNER_TEMP/thorn-vcs-smoke"
+
+      - name: Exercise the GitHub gateway extra
+        run: |
+          uv sync --locked --no-dev --extra github
+          uv run --locked --no-sync python -c \
+            'import github; import thorn.gateway.sources._github'
+          uv run --locked --no-sync thorn serve --help >/dev/null
+
+      - name: Exercise the GitLab gateway extra
+        run: |
+          uv sync --locked --no-dev --extra gitlab
+          uv run --locked --no-sync python -c \
+            'import gitlab; import thorn.gateway.sources._gitlab'
+          uv run --locked --no-sync thorn serve --help >/dev/null

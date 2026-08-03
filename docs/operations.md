@@ -80,13 +80,19 @@ in sandbox image can be built. You need:
 - a dedicated GitHub or GitLab identity and least-privilege token; and
 - an agency home separate from the workspace where agents perform work.
 
-Clone and install all integration extras:
+Clone the source and install the forge integration the agency needs. For a
+GitHub agency:
 
 ```console
 $ git clone https://github.com/tangent-vector/thorn.git
 $ cd thorn
-$ uv sync --all-extras --locked
+$ uv sync --locked --no-dev --extra github
 ```
+
+Use `--extra gitlab` instead for GitLab. Pass both extra flags only when one
+agency connects to both forge types. `uv sync --all-extras --locked` remains
+the contributor command for a development checkout; operators do not need the
+test suite and every connector to run one agency.
 
 Build the versioned sandbox image before starting the agency:
 

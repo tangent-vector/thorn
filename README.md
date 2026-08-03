@@ -65,9 +65,8 @@ lives under `~/.thorn`, while the current directory is the session workspace.
 Use `thorn chat` for an interactive session or `thorn sessions list` to find a
 session that can be resumed.
 
-The base installation currently provides the lightweight CLI surface. Running
-an agency as a gateway uses a source checkout with all integration extras
-installed.
+The base installation provides the lightweight CLI surface. Gateway operation
+uses a source checkout plus the explicit extra for each configured forge.
 
 ## Run an agency as a gateway
 
@@ -79,9 +78,12 @@ tools run in a separate OCI sandbox.
 ```console
 $ git clone https://github.com/tangent-vector/thorn.git
 $ cd thorn
-$ uv sync --all-extras --locked
+$ uv sync --locked --no-dev --extra github
 $ uv run thorn sandbox build
 ```
+
+Use `--extra gitlab` instead for a GitLab agency. Pass both `--extra github`
+and `--extra gitlab` only when one agency connects to both forge types.
 
 After configuring the agency and its credentials, check it before consuming
 live forge notifications:
