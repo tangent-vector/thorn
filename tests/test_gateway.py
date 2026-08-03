@@ -4947,22 +4947,71 @@ class TestBootstrapCoordinator:
 
         from thorn._cli import main as cli_main
 
+        agency_home = tmp_path / ".thorn"
+        agency_workspace = tmp_path / "workspace"
         runner = CliRunner()
         result = runner.invoke(cli_main, [
             "serve", "bootstrap",
             "--agent-id", "cli-test",
             "--project-name", "test-proj",
             "--project-url", "https://gitlab.com/group/test-proj",
-            "--agency-home", str(tmp_path / ".thorn"),
-            "--agency-workspace", str(tmp_path),
+            "--agency-home", str(agency_home),
+            "--agency-workspace", str(agency_workspace),
         ])
         assert result.exit_code == 0, result.output
-        assert "cli-test" in result.output
-        assert (
-            tmp_path / ".thorn" / "agents" / "cli-test" / "agent.json"
-        ).is_file()
-        assert (tmp_path / ".thorn" / "gateway.json").is_file()
-        assert "gateway.json" in result.output
+        identity_file = agency_home / "agents" / "cli-test" / "agent.json"
+        agent_home = agency_home / "agents" / "cli-test" / "home"
+        agency_config = agency_home / "gateway.json"
+        agent_workspace = (
+            agency_workspace / "agents" / "cli-test" / "workspace"
+        )
+        assert identity_file.is_file()
+        assert agent_home.is_dir()
+        assert agency_config.is_file()
+        assert agent_workspace.is_dir()
+        compact_output = "".join(result.output.split())
+        assert "Bootstrappedagent:cli-test" in compact_output
+        assert f"Identity:{identity_file}" in compact_output
+        assert f"Agenthome:{agent_home}" in compact_output
+        assert f"Agencyconfig:{agency_config}" in compact_output
+        assert f"Agentworkspace:{agent_workspace}" in compact_output
+        assert "Notrustedpeersconfigured" in compact_output
+        assert "denyconversationalforgeinstructions" in compact_output
+
+    def test_cli_bootstrap_omits_peer_warning_when_peer_exists(
+        self,
+        tmp_path: Path,
+    ):
+        from click.testing import CliRunner
+
+        from thorn._cli import main as cli_main
+
+        agency_home = tmp_path / ".thorn"
+        agency_home.mkdir()
+        (agency_home / "gateway.json").write_text(
+            json.dumps({
+                "peers": [{
+                    "id": "operator",
+                    "accounts": [{
+                        "service": "gitlab",
+                        "account_id": "1234",
+                    }],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        result = CliRunner().invoke(cli_main, [
+            "serve", "bootstrap",
+            "--agent-id", "peer-aware",
+            "--project-name", "test-proj",
+            "--project-url", "https://gitlab.com/group/test-proj",
+            "--agency-home", str(agency_home),
+            "--agency-workspace", str(tmp_path / "workspace"),
+        ])
+
+        assert result.exit_code == 0, result.output
+        assert "No trusted peers configured" not in result.output
 
     def test_cli_bootstrap_can_select_lean_coordinator(self, tmp_path: Path):
         from click.testing import CliRunner

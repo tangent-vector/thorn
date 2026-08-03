@@ -1,8 +1,9 @@
-"""Bootstrap an agency directory with a pre-configured ProjectCoordinator.
+"""Bootstrap an agency directory with a project-oriented agent.
 
-Creates the agent identity file (``<agent-id>.json``), the agent's
-home directory, a ``MEMORY.md`` containing project-specific knowledge,
-and a ``gateway.json`` service configuration (workspace, optional LLM
+Creates the agent identity file
+(``agents/<agent-id>/agent.json``), the agent-visible home directory,
+a ``MEMORY.md`` containing project-specific knowledge, and a
+``gateway.json`` agency configuration (workspace, optional LLM
 provider/model defaults, and project definition; forges are inferred
 from the project URL).
 
@@ -151,7 +152,7 @@ def bootstrap_coordinator(
     llm_config: LLMConfig | None = None,
     agent_class: CoordinatorAgentClassName = "ProjectCoordinator",
 ) -> AgentID:
-    """Create a ProjectCoordinator agent in the given agency.
+    """Create a project-oriented agent in the given agency.
 
     *agency_home* is used as the agency home directory directly (no
     ``.thorn/`` subdirectory is appended).  The following files and
@@ -164,10 +165,10 @@ def bootstrap_coordinator(
 
     *agency_workspace* is used as the agency's workspace root.  Its
     absolute path is written into ``gateway.json`` (top-level
-    ``"workspace"`` field), and the per-agent session-workspace
-    prefix ``<agency_workspace>/<agent_id>/`` is created eagerly so
-    that misconfigured/unwritable workspaces fail at bootstrap rather
-    than at first session.
+    ``"workspace"`` field), and the per-agent workspace mount
+    ``<agency_workspace>/agents/<agent_id>/workspace/`` and its sibling
+    control directory are created eagerly so that an unwritable workspace
+    fails at bootstrap rather than at first session.
 
     *project_url* is the human-facing URL of the project on its forge
     (e.g. ``"https://github.com/owner/repo"`` or
