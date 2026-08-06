@@ -181,6 +181,9 @@ $ uv run pytest
 $ uv run ruff check .
 ```
 
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing a change. Report
+potential vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+
 The CLI and gateway operating modes are the end-user surfaces. The Python
 library API is supporting infrastructure and is not a stable compatibility
 contract.
