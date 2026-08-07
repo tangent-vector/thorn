@@ -36,8 +36,7 @@ Notes:
 - Every operation requires the queue's root to be writable; the
   directory is created lazily on first ``post``.
 - ``_rename`` is a single method rather than an inline call so tests
-  can patch it to simulate a mid-operation crash.  The plan's Phase 1
-  contract requires that these seams exist for crash testing.
+  can patch it to simulate and verify recovery from a mid-operation crash.
 """
 
 from __future__ import annotations

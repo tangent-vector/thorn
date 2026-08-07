@@ -370,8 +370,8 @@ class Gateway:
                 # source-string per forge type, so the per-forge policy
                 # is best-effort when an operator has multiple GitHub
                 # entries.  The "right" granularity for that case is
-                # per-service-instance keying, which is on the deferred
-                # list and tracked in the plan doc.
+                # per-service-instance keying, which the current event
+                # source identity and configuration model do not represent.
                 source_policies[forge.type or forge.name] = SourceTriggerPolicy(
                     unknown_actor_policy=forge.unknown_actor_policy,
                 )
@@ -929,12 +929,11 @@ class Gateway:
         Dropped events are logged at INFO and discarded; delivered
         events are routed through :meth:`_dispatch_formatted`.
 
-        Drops are *terminal* (see the threat-model docs and the
-        plan's open question #8): the source's mark-read / mark-done
-        behaviour fires uniformly for delivered, deduped, and
-        dropped events alike, so a non-peer event the policy
-        rejects does not stay in the source's "pending" set forever
-        and there is no replay path that could later inject it.
+        Drops are *terminal*: the source's mark-read / mark-done behaviour
+        fires uniformly for delivered, deduped, and dropped events alike.
+        A non-peer event the policy rejects therefore does not stay in the
+        source's "pending" set forever, and there is no replay path that
+        could later inject it.
         """
         result = self._formatter.process(event)
         if isinstance(result, FormatterDrop):

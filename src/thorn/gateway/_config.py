@@ -640,23 +640,22 @@ class PlannedEgressAllowlistEntry(BaseModel):
 class SandboxConfig(BaseModel):
     """Agency-wide defaults for the per-agent sandbox container.
 
-    Phase B introduces sandboxing in two layers: an agency-wide
-    default (this model, attached to :class:`GatewayConfig`) and an
-    optional per-agent override (``sandbox`` block of ``agent.json``).
-    A field set on the agent wins; otherwise the agency default
-    applies; otherwise the framework default applies.
+    Sandboxing has two configuration layers: an agency-wide default (this
+    model, attached to :class:`GatewayConfig`) and an optional per-agent
+    override (the ``sandbox`` block of ``agent.json``). A field set on the
+    agent wins; otherwise the agency default applies.
 
     Fields are intentionally named after operator concepts rather
     than implementation details so that diagnosing why a container
     behaved a certain way amounts to reading this block.
 
-    The ``backend`` knob exists so the existing Phase-A subprocess
-    behavior can be preserved by setting ``backend: "subprocess"``;
-    Phase B's default is ``"container"`` for any agency whose
-    operator opts in by writing this block.  When the block is
-    omitted entirely from ``gateway.json``, the runtime keeps the
-    Phase-A subprocess default so existing agencies see no behavior
-    change until they opt in.
+    The model defaults to the container backend. :class:`GatewayConfig`
+    materializes this model even when a parsed agency configuration omits its
+    ``sandbox`` block, making container execution the gateway's secure default.
+    Operators can explicitly select ``backend: "subprocess"``. Local CLI and
+    direct :class:`~thorn.runtime.Runtime` construction pass no agency-wide
+    sandbox model and use the subprocess fallback in
+    :mod:`thorn.sandbox._resolve` instead.
     """
 
     backend: Literal["subprocess", "container"] = Field(
@@ -754,10 +753,12 @@ class SandboxConfig(BaseModel):
     # ------------------------------------------------------------------
     # Phase E hardening fields
     #
-    # Conservative defaults match the threat-model document
-    # ([docs/plans/sandbox-threat-model.md]): drop all caps, enable
-    # no-new-privileges, run with a read-only rootfs (with tmpfs
-    # scratch space), and apply 2 GiB / 2 CPU / 512 pid limits.
+    # Conservative defaults match the current threat model
+    # (docs/threat-model.md): request cap-drop=ALL, enable
+    # no-new-privileges, run with a read-only rootfs (with tmpfs scratch
+    # space), and apply 2 GiB / 2 CPU / 512 pid limits. The container
+    # host adds only the short-lived entrypoint capabilities needed to
+    # install the broker CA and transition to the gateway operator's identity.
     # Operators with heavier workloads expand these per agent in
     # ``agent.json sandbox`` (see :class:`AgentSandboxOverride`).
     # ------------------------------------------------------------------
@@ -765,12 +766,13 @@ class SandboxConfig(BaseModel):
     capabilities_drop: list[str] = Field(
         default_factory=lambda: ["ALL"],
         description=(
-            "Phase E: Linux capability names dropped from every "
+            "Linux capability names dropped from every "
             "sandbox container's bounding set (each entry becomes "
             "``--cap-drop=<name>``).  The literal ``\"ALL\"`` drops "
-            "every capability the runtime would otherwise grant; "
-            "this is the recommended Phase-E default and removes "
-            "kernel-level privilege as an attack surface entirely.  "
+            "every capability the runtime would otherwise grant. The "
+            "container host separately adds the minimal capabilities "
+            "needed by the root entrypoint, which clears its bounding "
+            "set before executing the operator-identity toolhost.  "
             "Per-agent ``agent.json sandbox.capabilities_drop`` "
             "extends this list additively (see "
             ":class:`AgentSandboxOverride`)."
@@ -869,9 +871,8 @@ class AgentSandboxOverride(BaseModel):
       agency-wide list and a particular agent silently lost it".
     * Other fields -- replace the agency value verbatim when set.
 
-    The merge happens in :func:`thorn.runtime._sandbox.resolve_sandbox_config`
-    (see Phase B plan, "Configuration"), not here -- this class is
-    just the on-disk shape.
+    The merge happens in :func:`thorn.runtime._sandbox.resolve_sandbox_config`,
+    not here; this class is just the on-disk shape.
     """
 
     backend: Literal["subprocess", "container"] | None = Field(
@@ -919,11 +920,10 @@ class AgentSandboxOverride(BaseModel):
     # are *additive* (agency + agent, dedup, agency-first); scalars
     # replace when the agent value is non-``None``.
     #
-    # Per the Phase E plan the per-agent override surface is broad:
-    # both ``gateway.json`` and ``agent.json`` are operator-controlled,
-    # so per-agent overrides are an operator-convenience knob, not a
-    # security boundary.  Agencies that want a uniform policy simply
-    # do not set per-agent fields.
+    # The per-agent override surface is broad because both the agency
+    # configuration and ``agent.json`` are operator-controlled. These
+    # overrides are a convenience knob, not a security boundary. Agencies
+    # that want a uniform policy simply do not set per-agent fields.
     # ------------------------------------------------------------------
 
     capabilities_drop: list[str] = Field(

@@ -221,9 +221,9 @@ class Runtime:
             )
         self.paths = paths
 
-        # Fail loudly if we're running against a pre-Phase-A on-disk
-        # layout.  No silent migration -- see the plan's "No automatic
-        # migration" section.
+        # Fail loudly against a pre-Phase-A on-disk layout. Thorn has no
+        # in-place migrator, and continuing would risk producing a mixed
+        # layout whose framework-owned state cannot be interpreted safely.
         paths.raise_if_legacy_layout()
 
         if session_store is None:
@@ -499,14 +499,15 @@ class Runtime:
 
     @property
     def sandbox_config(self) -> SandboxConfig | None:
-        """The agency-wide :class:`SandboxConfig`, or ``None`` if absent.
+        """The supplied agency-wide :class:`SandboxConfig`, if any.
 
         Exposed read-only so the gateway (and tests) can inspect
         the resolved sandbox block without reaching into the
-        private ``_sandbox_config`` attribute.  ``None`` matches the
-        constructor default and means the operator did not write a
-        ``sandbox`` block in ``gateway.json`` -- the runtime keeps
-        Phase-A subprocess defaults in that case.
+        private ``_sandbox_config`` attribute. A parsed gateway
+        configuration always materializes its secure container default, even
+        when the input omitted ``sandbox``. ``None`` instead identifies local
+        CLI or direct ``Runtime`` construction without an agency-wide sandbox
+        model; the sandbox resolver uses its subprocess fallback in that case.
         """
         return self._sandbox_config
 

@@ -159,11 +159,10 @@ def session_key_from_path(rel_path: Path) -> SessionKey:
 class LegacyLayoutError(RuntimeError):
     """Raised when an on-disk agency uses the pre-Phase-A layout.
 
-    Phase A does not ship an in-place migrator (see the plan's
-    *No automatic migration* section).  Operators are expected to
-    either re-create the agency from scratch or hand-migrate.  This
-    exception exists so that running against a legacy layout fails
-    loudly rather than silently producing half-migrated state.
+    Thorn does not ship an in-place migrator. Operators are expected to
+    either re-create the agency from scratch or hand-migrate. This exception
+    exists so that running against a legacy layout fails loudly rather than
+    silently producing half-migrated state.
     """
 
 

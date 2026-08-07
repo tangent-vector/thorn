@@ -366,21 +366,16 @@ class ContainerHostConfig:
     Identity-model notes:
 
     * The final daemon runs as the gateway operator's uid, both
-      inside and outside the container, by design.  See
-      :doc:`/docs/plans/sandbox-threat-model` for the rationale; the
-      short version is that the sandbox's load-bearing security
-      properties (G1: credential isolation, G2: rm-rf containment)
-      come from filesystem mount selection and network policy, not
-      from uid separation, and operator workflows depend on full
-      read/write access to bind-mounted state.
-    * On rootless podman, "container boots as root" relies on the
-      default user-namespace mapping (root-in-container = host
-      rootless user) rather than ``--userns=keep-id``; operators
-      running rootless podman with a non-default mapping may need
-      to adjust ``extra_run_args`` so that the entrypoint's
-      ``setpriv`` + ``update-ca-certificates`` run in the expected
-      identity.  Rootful docker (the common case for the gateway)
-      is unaffected.
+      inside and outside the container, by design. The process-identity
+      section of ``docs/threat-model.md`` records the rationale: isolation
+      comes from mount selection and network policy, not uid separation,
+      while operator workflows depend on read/write access to bind-mounted
+      state.
+    * :class:`~thorn.sandbox.PodmanAdapter` adds ``--userns=keep-id`` by
+      default so rootless podman maps the final daemon's numeric identity
+      back to the operator. An explicit operator ``--userns`` override takes
+      responsibility for preserving that mapping. Rootful docker does not
+      need the podman-specific flag.
     """
 
     extra_run_args: tuple[str, ...] = ()
@@ -511,9 +506,9 @@ class ContainerDaemonHost:
 
     1. *Image check* -- ``adapter.image_exists(image)`` must return
        ``True``; otherwise we raise :class:`SandboxImageMissingError`
-       with a remediation command.  Phase B explicitly does **not**
-       auto-build or auto-pull; see the plan's "Behavior when the
-       image is missing" decision.
+       with a remediation command. Thorn does **not** auto-build or
+       auto-pull because an operator should explicitly choose which
+       executable image crosses the sandbox boundary.
     2. *Container running* -- after ``adapter.run`` returns, we poll
        ``adapter.inspect`` until either the container reports
        ``Running=True`` (success), enters a terminal state without

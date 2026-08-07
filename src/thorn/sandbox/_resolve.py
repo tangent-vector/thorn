@@ -62,12 +62,12 @@ class ResolvedSandboxConfig:
 
 
 _DEFAULT_AGENCY_SANDBOX = SandboxConfig(backend="subprocess")
-"""Used when ``gateway.json`` omits the ``sandbox`` block entirely.
+"""Fallback when a ``Runtime`` has no agency-wide sandbox configuration.
 
-Phase B's stance is that an agency must explicitly opt into the
-container backend by writing the block, so the implicit default is
-the Phase-A subprocess executor.  This keeps existing agencies that
-have not been told about Phase B running unchanged.
+Local CLI and direct ``Runtime`` construction use this subprocess default.
+A parsed :class:`~thorn.gateway._config.GatewayConfig` does not reach this
+fallback merely because its input omitted ``sandbox``: its model validator
+materializes the gateway's secure container default.
 """
 
 
@@ -116,8 +116,8 @@ def resolve_sandbox_config(
       :func:`default_sandbox_image_tag`.
     * ``env_passthrough``: *additive* -- the agent's list is
       concatenated to the agency's, with duplicates removed while
-      preserving first-occurrence order.  Per the Phase-B plan,
-      per-agent config can broaden the allow-list but not narrow it.
+      preserving first-occurrence order. Per-agent config can broaden
+      the allow-list but cannot silently remove agency-required values.
     * ``extra_env``: agent-only (literal env entries; the agency
       block has no equivalent because forwarding non-secret literal
       env entries agency-wide is rare and we'd rather force
@@ -127,10 +127,11 @@ def resolve_sandbox_config(
       that should apply uniformly across an agency).
     * ``container_ready_timeout_s``: agent overrides agency overrides
       30s default.
-    * ``egress_network``: agency-only at this writing.  See the
-      Phase D retro for rationale.  ``planned_egress_allowlist`` is
-      deliberately not projected into this runtime config because it
-      records future operator intent, not current executable policy.
+    * ``egress_network``: agency-only so every per-agent container uses
+      the network topology selected for the agency.
+      ``planned_egress_allowlist`` is deliberately not projected into
+      this runtime config because it records future operator intent,
+      not current executable policy.
     * Phase E hardening lists (``capabilities_drop``,
       ``capabilities_add``, ``security_opts``): *additive*, same
       semantics as ``env_passthrough``.  An empty per-agent list

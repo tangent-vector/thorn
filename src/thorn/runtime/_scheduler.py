@@ -43,9 +43,9 @@ What the scheduler does NOT do
 
 - **Prompt construction.**  The injected :data:`PromptDispatcher`
   receives the session and its inbox and is responsible for building
-  whatever prompt shape is appropriate.  The "prompt-format" work
-  item in the plan ships a real dispatcher; tests and intermediate
-  integrations can pass any async callable.
+  whatever prompt shape is appropriate. Production supplies the inbox
+  prompt dispatcher; tests and intermediate integrations can pass any
+  async callable.
 
 - **Status transitions on notifications.**  Claiming focused work
   and completing or parking it is the agent's job (via the focused
@@ -199,7 +199,8 @@ the strike counter is left untouched, so the next round retries.
 DEFAULT_AGENT_CONCURRENCY = 3
 """Default agent-level concurrency cap.
 
-Matches the plan's recommended baseline.  Gateway-level
+Three is a conservative baseline that permits useful cross-session work
+without allowing one agent to fan out without bound. Gateway-level
 configuration and per-agent overrides are plumbed in by the
 ``Runtime`` / ``Gateway`` layers; this scheduler module just picks
 the value up from its constructor.

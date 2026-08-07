@@ -12,20 +12,25 @@ start.
 
 The short version:
 
-- The hard security boundary is the **container sandbox + broker**
-  around tool-calling.  Compromise of the agent's instructions does
-  not, on its own, get an attacker outside that boundary.
+- In gateway mode, the default **container sandbox + broker** limits
+  the filesystem, credentials, and network available to tools tagged
+  `SANDBOX`. Compromise of the agent's instructions does not, on its
+  own, give those tools the gateway process's host authority.
+- Tools tagged `IN_PROCESS` deliberately run in the trusted gateway
+  process. Forge, peer, inbox, and coordination tools are not contained
+  by the tool sandbox; their application logic and configured account
+  scopes bound what they can do.
 - The peer-identity machinery is **trigger authorization**: a
   best-effort filter that decides which messages the agent will *act
   on*.  It is what stops the agent from happily following a stranger
   on the public internet who tells it to delete the repo.
-- Personally:  treat your Thorn agent as **a personal assistant, not
-  a vault.**  Its containerization is good enough that a single
-  compromised conversation does not leak the host, but anything you
-  tell it -- and anything any peer tells it -- can plausibly resurface
-  in agent reasoning, journaled notes, or downstream conversations.
+- Treat your Thorn agent as **a personal assistant, not a vault.** The default
+  container bounds `SANDBOX` tools; it does not compartmentalize information
+  between conversations or contain the effects of `IN_PROCESS` tools. Anything
+  you or a peer tells the agent can plausibly resurface in its reasoning,
+  journaled notes, or downstream conversations.
 
-## Two boundaries, two failure modes
+## Trust, venue, and sandbox boundaries
 
 ```
        ┌──────────────────────────────────────┐
@@ -36,36 +41,60 @@ The short version:
                       │ (peer registry, envelope wrapping,
                       │  bot-default-deny)
        ┌──────────────▼───────────────────────┐
-       │  Running Thorn agency / reasoning    │
-       │  (gateway mode)                      │
-       │  (LLM, prompts, journals, memory)    │
-       └──────────────┬───────────────────────┘
-                      │ tool-call sandbox + broker
-                      │ (containerization, credential brokering)
-       ┌──────────────▼───────────────────────┐
-       │     Host / runtime resources         │
-       │  (filesystem, network, secrets)      │
-       └──────────────────────────────────────┘
+       │ Trusted agency host process          │
+       │ LLM, scheduler, runtime state         │
+       └───────┬──────────────────────┬───────┘
+               │ IN_PROCESS tools     │ SANDBOX tools
+               │                     │
+       ┌───────▼──────────┐   ┌──────▼───────────────┐
+       │ Service APIs and │   │ Toolhost             │
+       │ control state    │   │ subprocess (CLI) or  │
+       │ account scopes   │   │ OCI container        │
+       └──────────────────┘   └──────┬───────────────┘
+                                     │ gateway default:
+                                     │ bounded mounts + broker
+                              ┌──────▼───────────────┐
+                              │ Workspace and       │
+                              │ outbound services   │
+                              └──────────────────────┘
 ```
 
-There are two boundaries here, and they defend against different
-failure modes.
+These layers defend against different failure modes. None substitutes for
+another: peer checks do not contain tool execution, and the container does not
+mediate a tool that is explicitly assigned to the host process.
 
-### The sandbox is the security boundary
+### The container is the boundary for sandbox-venue tools
 
-Tool calls (`run_shell`, `forge_*`, etc.) execute inside a
-container with brokered credentials.  An attacker who manages to
-compromise the agent's *reasoning* -- e.g. by getting the model to
-emit a malicious tool call -- still has to go through the broker for
-credentials and through the sandbox for code execution.  This is the
-boundary that protects the **host** and the **operator's secrets**.
+In the default gateway configuration, tools tagged `SANDBOX` execute in a
+per-agent OCI container. This includes the built-in filesystem, shell, journal,
+and optional MCP surfaces. A model-induced `run_shell` call therefore sees
+only configured mounts and reaches HTTP(S) services through the credential
+broker's network path.
 
 Anything that is reachable inside the sandbox (the workspace, the
 project checkout, the agent's home directory) must be assumed to be
 potentially reachable by anyone whose content the agent reads.  Do
-not put long-lived secrets there.  See
-[`docs/plans/sandbox-threat-model.md`](plans/sandbox-threat-model.md)
-for the detailed sandbox model.
+not put long-lived secrets there.
+
+The local CLI deliberately uses a subprocess toolhost by default. That process
+runs with the invoking user's OS authority and is not a security boundary.
+Gateway operators can also opt into subprocess mode or container mode without
+a broker; those choices weaken the default guarantees as described below.
+
+### In-process tools are trusted host capabilities
+
+Tools tagged `IN_PROCESS` execute in the same trusted host process as the
+runtime and LLM-facing loop. Forge tools need live service clients; peer, inbox,
+and coordination tools need framework-owned state. Sending those calls through
+the container would not provide their required runtime context, so Thorn makes
+the venue explicit instead.
+
+The consequence is security-relevant: a compromised reasoning turn may invoke
+an in-process forge tool with the authority of the configured forge account.
+The container and credential broker do not limit that effect. Narrow account
+scopes, tool-specific validation, peer-trigger policy, protected branches, and
+human review are the applicable controls. Moving a tool between venues changes
+the threat model even if its function signature does not change.
 
 ### Trigger authorization is the trust boundary
 
@@ -76,10 +105,101 @@ configuration: the operator declares an explicit list of accounts whose
 messages count as authoritative directions.
 
 Trigger authorization is **best-effort**.  It is not the security
-boundary -- the sandbox is -- but it is what keeps a public bot from
-turning every drive-by GitHub user into a co-developer.  When it
-fails, the consequence is "the agent did something it should not have
-done"; the failure does not on its own escape the sandbox.
+boundary for host resources, but it is what keeps a public bot from
+turning every drive-by GitHub user into a co-developer. When it fails,
+the consequence is “the agent did something it should not have done.”
+That may include sandboxed workspace changes and any forge effects allowed by
+an in-process tool's configured account; it does not automatically grant
+arbitrary host-filesystem access to sandbox-venue tools.
+
+## Container sandbox invariants
+
+The following claims apply to the gateway's default container-and-broker path.
+They do not apply to local CLI subprocess execution, an explicit gateway
+subprocess backend, or operator overrides that weaken the stated configuration.
+
+### Filesystem mounts
+
+The normal sandbox has three writable host-directory mounts:
+
+- the agent-authored home at `/agent/home`;
+- the agent workspace at `/agent/workspace`; and
+- the framework-owned toolhost rendezvous at `/agent/control`.
+
+Agent identities, session histories, durable inboxes, service queues, agency
+configuration, and other framework state are outside those mounts. The
+container cannot reach arbitrary host paths merely because its final process
+runs under the operator's numeric user ID.
+
+Brokered operation adds narrowly scoped read-only mounts for the broker CA and,
+when needed, a generated Git configuration containing placeholder credentials.
+Development mode can add a read-only Thorn source-tree mount. Those operational
+mounts mean “exactly three host paths” is not a valid general claim; the
+security invariant is that every additional mount is deliberate, contains no
+literal secret, and exposes no unrelated host or framework state. The
+low-level container-host configuration has a raw-OCI-argument extension seam
+that can weaken this invariant. It is not exposed by the agency configuration;
+contributors who introduce or pass such arguments must review them like code.
+
+### Credentials and network
+
+With the bundled broker, literal upstream service credentials remain in the
+trusted gateway and broker. The container receives non-secret service
+placeholders, a broker CA, and a per-agent OneCLI access token embedded in its
+proxy URL. That access token is a real, agent-visible credential: it authorizes
+the holder to use the agent's registered broker bindings, even though it does
+not reveal the upstream tokens. Anyone who controls the sandbox can use that
+authority for the registration's lifetime, so its scope and rotation are part
+of the credential boundary.
+
+The container otherwise has an internal OCI network with no direct public
+route. HTTP(S) requests pass through OneCLI, which authenticates the proxy
+token, substitutes a matching upstream credential, and forwards the request.
+The broker can forward arbitrary HTTP(S), so this is credential isolation and
+an egress funnel—not a destination allowlist or a complete network-audit
+facility. Non-HTTP protocols have no broker path under the default
+internal-network topology.
+
+An externally managed broker must recreate the same network isolation for
+these claims to hold. Container mode without a broker uses the OCI runtime's
+ordinary network and may inject configured credentials through environment
+handling. Explicit `env_passthrough` values are also operator-controlled; adding
+a secret there defeats credential isolation for that secret.
+
+The LLM provider credential and broker administration credential remain in the
+trusted host process. The sandbox does not protect against compromise of that
+process or of the broker itself.
+
+### Process identity and defense in depth
+
+The sandbox image starts with a short root entrypoint so it can install the
+broker CA, then uses `setpriv` to run the long-lived toolhost under the gateway
+operator's numeric user and group IDs. With the normal defaults, the container
+is granted only the capabilities needed by that entrypoint; it clears the
+bounding set before executing the toolhost. The defaults also use a read-only root
+filesystem, bounded tmpfs scratch space, `no-new-privileges`, the OCI runtime's
+default seccomp profile, and memory, CPU, and process limits.
+
+Using the operator's numeric identity keeps bind-mounted files usable by normal
+operator workflows. It is not the isolation mechanism: mount selection and the
+broker-only network are load-bearing. Capability, root-filesystem, seccomp, and
+resource settings provide defense in depth, and supported per-agent overrides
+can deliberately weaken them.
+
+### Changes that require threat-model review
+
+Revisit this analysis when a change:
+
+- moves a tool between `SANDBOX` and `IN_PROCESS` venues;
+- adds or broadens a container mount or passes new raw OCI arguments;
+- gives the sandbox direct network egress or changes broker forwarding;
+- puts a literal credential into agent-visible files, mounts, environment, or
+  tool results;
+- changes the root entrypoint, final toolhost identity, or capability-drop
+  sequence;
+- weakens the default read-only root, seccomp, or resource posture; or
+- moves framework-owned identity, session, inbox, or configuration state into
+  a mounted subtree.
 
 ## How peers work
 
@@ -145,10 +265,9 @@ about* without being *instructed by*.  Configure
   still forbidding code changes, forge-state changes, private
   disclosure, and authority claims without peer authorization.
   This is trigger/prompt-level handling, not an enforcement boundary.
-  For the current Thorn threat model, sandboxing and carefully scoped
-  agent credentials are the authority boundary; runtime taint tracking
-  and human approval gates are out of scope unless a concrete deployment
-  requires them.
+  Tool venues, tool-specific validation, carefully scoped accounts, and the
+  container boundary for sandbox tools limit the resulting authority. Runtime
+  taint tracking and general human approval gates are not implemented.
 
 The bot-default-deny rule mirrors Claude Code's `allowed_bots`
 posture: a bot account that has not been registered as a peer is
@@ -200,11 +319,19 @@ instructions do not depend on which path the content came in on.
 - **A compromised peer.**  If a peer's GitHub account is taken over,
   the attacker can do everything that peer could.  The threat model
   is "stranger on the internet", not "insider attack."
-- **A determined adversary with code execution inside the sandbox.**
-  Sandbox compromise is not a goal of the trigger-authorization
-  layer; the sandbox itself is what defends against that, with the
-  explicit caveat that anything readable inside the sandbox is at
-  risk.  Do not put long-lived secrets in the workspace.
+- **Anything deliberately available inside the sandbox.** An adversarial tool
+  can read and modify writable mounts and use configured outbound service
+  access. Do not put long-lived secrets in agent home or workspace content.
+- **Host execution of agent-authored files.** Treat agent home and workspace
+  output as untrusted. If an operator executes that code directly on the host,
+  it bypasses the container boundary and runs with the operator's authority.
+- **Kernel or OCI-runtime escapes.** Thorn assumes the host kernel and
+  container runtime enforce their isolation. Keep both patched; a successful
+  container escape defeats the sandbox.
+- **Compromise of the trusted host process or broker.** The gateway holds the
+  LLM provider credential and privileged runtime state, while the broker holds
+  sandbox-facing service credentials. The container does not protect either
+  component from its own compromise.
 - **Subtle prompt-injection through formally-correct content.**
   A peer who has been social-engineered or whose account has been
   borrowed can paste content that, while well-formed, manipulates
@@ -267,13 +394,18 @@ warranted:
   came from non-peer text.  The envelope guidance reduces but does
   not eliminate the risk that the agent will incorporate non-peer
   suggestions; the operator is the last line of defence.
-- **Limit broker-issued credentials by scope.**  The broker is the
-  single point at which the agent gets credentials for the forge,
-  the LLM provider, and any other external service.  Issue
-  per-agent tokens with the narrowest scope that lets the agent do
-  its job.  Prefer a GitHub App installation token, fine-grained
-  GitHub PAT, or GitLab project/group/service token that is limited
-  to the repository or fork the agency manages.  The useful envelope
+- **Limit every configured account by scope.** In-process forge tools act
+  through trusted host-side clients, while sandbox tools can reach configured
+  services through the broker. The broker keeps literal credentials out of the
+  container; it does not make an overly broad credential safe. The LLM provider
+  credential remains in the gateway host process. Issue per-agent forge tokens
+  with the narrowest scope that lets the agent do its job. For the current
+  container-and-broker path, prefer a fine-grained GitHub PAT or a GitLab
+  project, group, or service token limited to the repository or fork the agency
+  manages. GitHub App credentials work for trusted host-side forge calls, but
+  the broker does not mint or refresh installation tokens or make them available
+  to sandboxed Git and HTTP tools; an app-only GitHub account therefore cannot
+  authenticate sandbox Git operations. The useful envelope
   is: read the target repository, push branches in the agent-owned
   fork or namespace, open change requests, comment on relevant
   issues/change requests, and receive or acknowledge notifications.
@@ -287,8 +419,9 @@ warranted:
   token's scopes through their APIs.
 - **Roll secrets when the gateway gets compromised.**  If a Thorn
   agent does something it should not have, treat it as if its
-  brokered credentials were exposed: revoke and reissue them
-  before resuming.
+  brokered credentials were exposed: revoke and reissue the upstream
+  credentials, and recreate any still-live per-agent broker registration and
+  access token, before resuming.
 
 ## Where this is going
 

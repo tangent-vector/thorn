@@ -166,12 +166,13 @@ _KNOWN_BUILTIN_TOOLS: set[Any] | None = None
 def _known_builtin_tools() -> set[Any]:
     """Return the set of callable references that are valid Thorn built-ins.
 
-    Used by :func:`_prepare_tools` to enforce the Phase A rule: agents
+    Used by :func:`_prepare_tools` to enforce the built-in-tool contract: agents
     may pass references to known built-ins (and pre-packaged toolset
     constants like ``FILE_READING``), but arbitrary user-supplied
-    callables are rejected.  The substitute for user-authored behavior
-    is skills + scripts invoked via ``run_shell`` (see
-    ``docs/plans/sandbox_tool_execution_*.plan.md``).
+    callables are rejected. User-authored behavior belongs in skills and
+    scripts invoked through the sandbox-routed ``run_shell`` tool; accepting
+    arbitrary callables here would bypass venue review and let the brain and
+    toolhost registries drift apart.
 
     The set is built lazily because importing the catalog module at
     decorator-evaluation time would create circular imports against

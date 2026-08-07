@@ -1,9 +1,10 @@
 # Thorn Documentation
 
 This index distinguishes documentation of the system that exists today from
-operator guidance, future designs, research ideas, and historical development
-plans. A document's location is part of its status: aspirational and historical
-material does not override current reference or executable behavior.
+operator guidance, future designs, and research ideas. A document's location is
+part of its status: aspirational material does not override current reference
+or executable behavior. Completed implementation plans live in Git history
+rather than the current documentation tree.
 
 ## Start here
 
@@ -68,15 +69,3 @@ implementation or roadmap position:
 
 - [Entity templates](ideas/entity-templates.md)
 - [Hierarchical context management](ideas/hierarchical-context-management.md)
-
-## Historical implementation plans
-
-Documents in [`docs/plans/`](plans/) are development records. They explain how
-particular changes were staged and often preserve useful rationale, but their
-phase labels, status notes, deferred work, and implementation sketches are not
-current product documentation. Verify any claim against current reference and
-code before relying on it.
-
-These records are candidates for later removal after load-bearing rationale has
-been moved into current architecture, operator documentation, code comments,
-or public issues. Git history will remain the archive.
