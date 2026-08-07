@@ -8,8 +8,8 @@ service that responds to GitHub and GitLab activity.
 
 Thorn persists agent identity, sessions, inbox work, and working state across
 invocations. Its gateway mode adds forge event sources, concurrent session
-scheduling, sandboxed tool execution, and brokered credentials around that same
-runtime.
+scheduling, explicit host and sandbox tool venues, and brokered credentials for
+sandboxed outbound access around that same runtime.
 
 > [!IMPORTANT]
 > Thorn is research software under active development. Use dedicated,
@@ -72,8 +72,8 @@ uses a source checkout plus the explicit extra for each configured forge.
 
 Gateway operation adds a forge identity, one or more projects and peers, a
 long-lived event loop, and a stronger default tool boundary. The recommended
-deployment keeps Thorn's LLM-facing process on the host while each agent's
-tools run in a separate OCI sandbox.
+deployment keeps Thorn's LLM-facing process and trusted `IN_PROCESS` tools on
+the host while each agent's `SANDBOX` tools run in a separate OCI container.
 
 ```console
 $ git clone https://github.com/tangent-vector/thorn.git
@@ -100,41 +100,49 @@ credentials, bootstrap, preflight, deployment choices, status, and recovery.
 ## Current system shape
 
 ```text
- local user                         configured forge peers
-     |                                       |
- thorn run / chat                  GitHub / GitLab events
-     |                                       |
-     +---------------+   +-------------------+
-                     v   v
-             +------------------+
-             |  running agency  |---------> LLM provider API
-             |                  |
-             | agents           |
-             | sessions         |
-             | durable inboxes  |
-             | schedulers       |
-             +--------+---------+
-                      |
-                tool protocol
-                      |
-             +--------v---------+
-             | per-agent        |
-             | toolhost         |
-             | subprocess or    |
-             | OCI sandbox      |
-             +--------+---------+
-                      |
-               workspace, Git,
-              forge APIs (with
-             brokered credentials)
+ Direct CLI turn                         Remote forge activity
+        |                                         |
+        +-------------------+   +-----------------+
+                            v   v
+                 +------------------------+
+                 | Running agency         |
+                 | agents, sessions,      |
+                 | inboxes, schedulers    |
+                 +-----------+------------+
+                             |
+                    +--------v--------+       +------------------+
+                    | LLM-facing      +------>| LLM provider API |
+                    | agent loop      |       +------------------+
+                    +--------+--------+
+                             |
+                    venue-selected dispatch
+                 +-----------+-----------+
+                 |                       |
+          IN_PROCESS tools          SANDBOX tools
+                 |                       |
+       +---------v----------+   +--------v-------------+
+       | trusted CLI or     |   | per-agent toolhost   |
+       | gateway process    |   | subprocess (CLI) or  |
+       | forge, peer, inbox |   | OCI container        |
+       | and control tools  |   | (gateway default)    |
+       +---------+----------+   +---+---------------+--+
+                 |                  |               |
+        service APIs and        workspace   credential broker
+          runtime state                     (gateway default)
+                                                    |
+                                                    v
+                                              service APIs
 ```
 
-Both entry paths use the same persistent runtime and session machinery. In the
-local CLI today, tools run through a subprocess toolhost with the invoking
-user's authority. In the default gateway configuration, tools run inside
-per-agent containers and reach credential-bearing services through a broker.
-The LLM-facing process and framework-owned state remain outside the tool
-sandbox.
+Both entry paths use the same persistent runtime and session machinery. Tools
+assigned to `IN_PROCESS` remain in the trusted CLI or gateway process; their
+application logic and configured account scopes bound their effects. Local CLI
+`SANDBOX` tools use a subprocess toolhost with the invoking user's authority,
+which is not a security boundary. In the default gateway configuration,
+`SANDBOX` tools run in per-agent OCI containers and reach matching
+credential-bearing services through a broker. The broker does not contain
+`IN_PROCESS` tool effects. See the [current architecture](docs/architecture.md)
+and [threat model](docs/threat-model.md) for the complete boundary.
 
 ## Implemented and exploratory scope
 
