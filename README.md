@@ -162,7 +162,8 @@ Still exploratory or incomplete:
 - explicit agent-to-agent and cross-session coordination primitives;
 - adversarial multi-tenant isolation;
 - bounded provider-spend and unattended-work controls; and
-- reproducible performance measurements from the existing evaluation adapter.
+- reproducible performance measurements from the existing
+  [evaluation infrastructure](docs/evaluation.md).
 
 The [roadmap](ROADMAP.md) distinguishes implemented foundations from these
 research directions.

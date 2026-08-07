@@ -12,7 +12,7 @@ agency reads the literal values from the gateway process environment.
 
 `github-pat/` shows the smallest public GitHub shape:
 
-- The compatibility-named `gateway.json` declares a workspace, an
+- The compatibility-named `gateway.json` declares a workspace, a
   project URL, and a peer.
 - No `forges` block is needed because `github.com` is inferred.
 - No `sandbox` or `broker` block is needed because `thorn serve` defaults to
@@ -27,27 +27,6 @@ agency reads the literal values from the gateway process environment.
 - `gitlab.com` is inferred from the project URL.
 - The agent account uses a `gitlab-pat` credential read from `GITLAB_TOKEN`.
 - The project path in the URL is used as the GitLab native project path.
-
-## Lean Coordinator Calibration
-
-For prompt/tool overhead experiments, bootstrap a coordinator with the reduced
-agent-computer-interface surface:
-
-```console
-$ thorn serve bootstrap \
-    --agent-id thorn-agent \
-    --project-name tasknote \
-    --project-url https://gitlab.com/group/tasknote \
-    --agent-class LeanProjectCoordinator \
-    --agency-home ./agency \
-    --agency-workspace ./workspace
-```
-
-For an existing agency, edit `agents/<agent-id>/agent.json` and set
-`"agent_class": "LeanProjectCoordinator"`. This is an opt-in calibration role,
-not the default production coordinator. It keeps local code tools, shell,
-focused-work/TODO/journal tools, and a small Forge subset for issue and merge
-request handoff while omitting the broad Forge and peer lookup surfaces.
 
 ## Subprocess Opt-Out
 
