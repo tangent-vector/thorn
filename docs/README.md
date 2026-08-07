@@ -31,18 +31,17 @@ rather than the current documentation tree.
 - [Agency policy templates](policy-templates/README.md) — reusable starting
   policy for agencies that work through GitHub or GitLab.
 - [`examples/gateway/`](../examples/gateway/) — complete configuration
-  skeletons for supported forge, broker, sandbox, and peer shapes. The lean
-  coordinator calibration example is an evaluation aid, not a recommended
-  production architecture.
+  skeletons for supported forge, broker, sandbox, and peer shapes.
 
 ## Deployment and evaluation
 
 - [NVIDIA Brev deployment](../deploy/brev/README.md) — optional
   provider-specific deployment recipe. It is not Thorn's primary deployment
   model and still needs an outside-NVIDIA public-account rehearsal.
-- [Harbor adapter](../evals/harbor/README.md) — reproducible adapter and bounded
-  experiment machinery. Its presence is infrastructure evidence, not a claim
-  of benchmark performance.
+- [Evaluation status](evaluation.md) — what the current tests, Harbor adapter,
+  task admissions, and declared model-backed gate do and do not establish.
+- [Harbor adapter](../evals/harbor/README.md) — detailed setup, execution,
+  provenance, and bounded experiment procedures.
 
 ## Supporting Python API
 

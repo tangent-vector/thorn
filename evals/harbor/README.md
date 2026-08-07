@@ -6,6 +6,10 @@ local/direct `thorn run` path inside Harbor's task container. Thorn uses its
 subprocess tool executor, so the Harbor task container remains the isolation
 boundary; no broker, OCI sidecar, or nested container runtime is involved.
 
+See [Evaluation status](../../docs/evaluation.md) for what this infrastructure
+does and does not establish. The adapter and its admission receipts are not a
+published Thorn performance result.
+
 The integration is pinned to Harbor commit
 `071281b3d931aafd6a5375fa7d5933e23054d784`. Harbor is an external evaluation
 tool, not a Thorn package dependency. The adapter installs a caller-supplied
