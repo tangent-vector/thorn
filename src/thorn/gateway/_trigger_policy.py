@@ -120,7 +120,7 @@ class Drop:
     INFO-level logs.  Dropped events are *terminal*: the source
     treats "delivered," "deduped," and "dropped" as three
     equivalent resolutions and marks the platform entity handled
-    in all three cases (see the plan document, open question #8).
+    in all three cases so rejected events do not remain pending for replay.
     """
 
     reason: str

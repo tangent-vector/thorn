@@ -25,10 +25,7 @@ The drain flow classifies each notification by inspecting its fields:
 Completion ceremony for fresh and RSVP arrivals is owned by the
 framework, not the handler: on handler return-normally, the queue
 writes ``status = confirmed`` and then deletes the file.  This
-departs from the original plan wording ("handler internally does step
-1 + step 2") on deliberate grounds -- see the explanation in the
-Session Inbox Abstraction plan's discussion of completion ownership.
-The short version: putting the ceremony in the framework makes
+puts the ceremony in the framework because doing so makes
 handlers simpler, keeps the two-step recovery semantics uniform
 across handlers, and relies only on the idempotence property we
 already need for handler retry anyway.

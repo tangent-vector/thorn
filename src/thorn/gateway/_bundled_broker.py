@@ -767,10 +767,9 @@ class BundledBrokerSupervisor:
           ``POST /api/user/api-key/regenerate`` to mint one and parse
           ``apiKey`` out of the response.
 
-        This is the path documented in the plan.  Any other status
-        code is surfaced as :class:`BundledBrokerError` -- we do not
-        retry, because all the transient-error remediation has
-        already happened in :meth:`_wait_for_health`.
+        Any other status code is surfaced as :class:`BundledBrokerError`;
+        we do not retry because all transient-error remediation has already
+        happened in :meth:`_wait_for_health`.
         """
         if self._endpoints is None:
             raise RuntimeError(

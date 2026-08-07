@@ -20,8 +20,12 @@ Near-term work prioritizes a trustworthy first-run and recovery path:
 
 - settle external-notification acknowledgement and local recovery semantics;
 - make multi-project routing explicit instead of relying on fallback agents;
+- replace Python class-selected roles and tool bundles with explicit agency
+  configuration and operator-policy boundaries;
 - add bounded-work, interruption, and provider-spend controls;
-- improve lifecycle cleanup, status, diagnostics, and operator approvals;
+- improve lifecycle cleanup, status, and diagnostics;
+- add typed command-risk classification and operator approval flows for
+  higher-risk shell commands;
 - validate installation artifacts and deployment from fresh public machines;
   and
 - keep documentation and CI aligned with executable behavior.

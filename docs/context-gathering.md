@@ -8,10 +8,9 @@ is the one source of truth for that decision regardless of whether the
 session was started by `thorn chat`, `thorn run`, or the gateway --
 reducing the surface area where CLI and gateway behaviour can drift.
 
-This document describes the shipped shape of that pipeline.  It
-supersedes an earlier aspirational design doc that was used during
-the refactor's planning phase; whenever this document and any older
-docstring or comment disagree, this document wins.
+This document is the canonical reference for the shipped pipeline. When an
+older docstring or comment disagrees with it, this document and executable
+behavior take precedence.
 
 
 Official prompt-source model
@@ -52,13 +51,11 @@ must not be able to edit through its normal tools.  The next
 chain.  `MEMORY.md`, MCP configs, and skills continue to follow their
 per-kind policy in the table below.
 
-The static role-prompt path is intentionally transitional.  The
-remaining migration work is tracked in `ROADMAP.md` and in
-`docs/plans/gateway-config-followups.md`: split framework-owned
-gateway guidance from operator-authored role policy, stop selecting
-agent behavior through `agent_class`, and derive gateway tool
-availability from runtime/account configuration rather than a Python
-class name.
+The static role-prompt path remains a known architectural limitation. Future
+work tracked in the [roadmap](../ROADMAP.md) needs to split framework-owned
+gateway guidance from operator-authored role policy, stop selecting agent
+behavior through `agent_class`, and derive gateway tool availability from
+runtime/account configuration rather than a Python class name.
 
 
 Why a single pipeline
@@ -369,7 +366,7 @@ Future work
 
 These are extensions of the pipeline's ontology or mechanism, not
 loose ends from the refactor. Selected product-level follow-ups live in
-`ROADMAP.md`.
+the [roadmap](../ROADMAP.md).
 
 ### Operator-policy population
 
@@ -426,7 +423,7 @@ on?" -- is still unanswered.  Today gateway agents have exactly
 one such rung (the agent itself) while CLI agents may have many
 (one per project the user runs Thorn from).  Container isolation
 will eventually force a real type here.  Scoped out of the
-context-gathering refactor by design; tracked in `ROADMAP.md` so it
+context-gathering refactor by design; tracked in the [roadmap](../ROADMAP.md) so it
 doesn't get lost.
 
 ### Skills/tools discovery unification
@@ -434,7 +431,7 @@ doesn't get lost.
 The pipeline owns `SKILL.md` discovery and `mcp.json` discovery
 today.  `@tool` / `@skill` Python decorator discovery (in
 `thorn.core._discovery.discover_tools`) still has its own ancestor
-walker that runs separately. Tracked in `ROADMAP.md`; the natural
+walker that runs separately. Tracked in the [roadmap](../ROADMAP.md); the natural
 unification is to route `discover_tools` through the same
 phase-1/phase-2 walkers, so directory selection and dedup live in
 one place.
@@ -449,5 +446,5 @@ is real, in-use content baked into Python; `LocalCodingAgent`,
 paths that remain load-bearing today.  Migrating that content into
 discovered context requires first deciding which parts are
 non-overridable Thorn infrastructure and which parts are
-operator-authored role policy. Tracked in `ROADMAP.md` and in
-`docs/plans/gateway-config-followups.md`.
+operator-authored role policy. This boundary is tracked in the
+[roadmap](../ROADMAP.md).

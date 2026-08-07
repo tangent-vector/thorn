@@ -56,16 +56,18 @@ agency:
    existing one.
 4. The user's turn is posted to the session inbox and dispatched through the
    same per-agent scheduler abstraction used by the gateway.
-5. The session invokes the LLM and routes tool calls through a toolhost daemon.
+5. The session invokes the LLM and dispatches each tool by its declared venue:
+   in-process tools run in the trusted CLI process, while sandbox tools go
+   through the subprocess toolhost.
 
 Local CLI configuration is currently partly implicit: provider settings come
 from command environment, and no `agency.yaml` is required for the first run.
 The resulting agent and session state are nevertheless an agency, not a
 separate persistence model.
 
-The local CLI's default toolhost is a subprocess running with the invoking
-user's OS authority. This provides process separation and the common tool
-protocol, but not a security boundary against hostile tool calls.
+The local CLI's default sandbox-venue toolhost is a subprocess running with the
+invoking user's OS authority. This provides process separation and the common
+tool protocol, but not a security boundary against hostile tool calls.
 
 ### Gateway interaction
 
@@ -83,14 +85,16 @@ protocol, but not a security boundary against hostile tool calls.
    external content, and routes accepted work to an agent/session inbox.
 6. A per-agent scheduler allows different sessions to run concurrently while
    serializing work within each session.
-7. The agent loop calls the configured LLM and dispatches tool calls through
-   the agent's toolhost.
+7. The agent loop calls the configured LLM and dispatches each tool according
+   to its declared venue: sandbox tools go through the agent's toolhost, while
+   in-process tools run in the trusted host process.
 
-The default gateway configuration runs the LLM-facing process on the host and
-the toolhost inside a per-agent OCI container. A bundled credential broker
-injects service credentials into matching outbound requests without putting
-literal forge tokens in agent-visible state. Operators can explicitly choose a
-subprocess toolhost or an externally managed broker, with the weaker boundaries
+The default gateway configuration runs the LLM-facing process and in-process
+tools on the host, and runs the sandbox toolhost inside a per-agent OCI
+container. A bundled credential broker injects service credentials into
+matching outbound requests without putting literal forge tokens in
+agent-visible state. Operators can explicitly choose a subprocess toolhost or
+an externally managed broker, with the resulting operator-dependent boundaries
 described in the [threat model](threat-model.md).
 
 ## Component flow
@@ -119,26 +123,36 @@ described in the [threat model](threat-model.md).
                     | agent loop      |       +------------------+
                     +--------+--------+
                              |
-                       tool protocol
-                             |
-                  +----------v-----------+
-                  | per-agent toolhost   |
-                  | subprocess or OCI    |
-                  | container            |
-                  +-----+-----------+----+
-                        |           |
-                  workspace     service APIs
-                                    ^
-                                    |
-                          credential broker
-                          (gateway default)
+                    venue-selected dispatch
+                 +-----------+-----------+
+                 |                       |
+          IN_PROCESS tools          SANDBOX tools
+                 |                       |
+       +---------v----------+   +--------v-------------+
+       | trusted host       |   | per-agent toolhost   |
+       | forge, peer, inbox |   | subprocess or OCI    |
+       | and control tools  |   | container            |
+       +---------+----------+   +-----+-----------+-----+
+                 |                    |           |
+           service APIs          workspace   service APIs
+                                                  ^
+                                                  |
+                                        credential broker
+                                        (gateway default)
 ```
 
 The “brain” comprises the runtime, prompt/context assembly, and LLM-facing
-agent loop. It remains outside the tool sandbox. The toolhost exposes the
-built-in filesystem, shell, Git, forge, and optional MCP tool surface across a
-typed protocol. Container mode mounts only the agent-visible home and workspace
-subtrees plus a framework-owned control channel.
+agent loop. It remains outside the tool sandbox. Tools tagged `IN_PROCESS`,
+including forge, peer, inbox, and coordination controls, also remain outside
+the sandbox because they need trusted runtime state. Tools tagged `SANDBOX`,
+including filesystem, shell, journal, and optional MCP tools, cross a typed
+protocol into the toolhost.
+
+Container mode gives the toolhost writable mounts for the agent-visible home
+and workspace plus a framework-owned control channel. Brokered operation adds
+read-only CA and generated Git-configuration mounts; development mode can add a
+read-only Thorn source mount. The [threat model](threat-model.md) defines which
+of these boundaries are security-relevant.
 
 ## Persistent layout
 
@@ -173,9 +187,11 @@ of the supported files. CLI-only use may have no agency configuration file at
 all because its current configuration is constructed from CLI defaults and the
 environment.
 
-Only the agent `home/` and workspace subtrees are mounted into the container
-tool sandbox. Agent identities, session histories, durable inboxes, service
-queues, and control metadata remain framework-owned.
+Only the agent `home/`, workspace, and toolhost control subtrees are writable
+host-directory mounts in the normal container sandbox. Brokered operation can
+also mount a CA certificate and generated placeholder-only Git configuration
+read-only. Agent identities, session histories, durable inboxes, and service
+queues remain framework-owned and unmounted.
 
 ## Prompt and context path
 
@@ -199,9 +215,12 @@ Thorn separates two questions:
 1. **Who may trigger work?** Gateway event formatting resolves configured peers
    and applies trigger policy before treating external prose as an instruction.
    This is a trust boundary inside one agency, not tenant isolation.
-2. **What can tool execution reach?** The container sandbox limits filesystem
-   mounts and, with the broker, credential exposure and direct network access.
-   This is the main security boundary for agent-generated tool calls.
+2. **What can a tool execution venue reach?** The container sandbox limits the
+   filesystem, credentials, and network available to `SANDBOX` tools.
+   `IN_PROCESS` tools deliberately run in the trusted host process and are
+   constrained by their application logic and configured account authority,
+   not by the container. Venue assignment is therefore part of the security
+   design rather than an implementation detail.
 
 Important current limitations:
 

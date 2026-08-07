@@ -162,8 +162,8 @@ research directions.
 ## Documentation
 
 The [documentation index](docs/README.md) separates current reference and
-operator material from aspirational designs, research ideas, and historical
-implementation plans. Good starting points are:
+operator material from aspirational designs and research ideas. Good starting
+points are:
 
 - [Current architecture](docs/architecture.md)
 - [Agency operations](docs/operations.md)

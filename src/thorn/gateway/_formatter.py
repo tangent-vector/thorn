@@ -72,8 +72,8 @@ class FormatterDrop:
 
     The gateway logs *reason* and discards the event without
     touching session state.  The source's mark-read / mark-done
-    behaviour fires uniformly regardless (drops are terminal --
-    see plan open question #8).
+    behaviour fires uniformly regardless; drops are terminal so a
+    rejected event does not remain pending for replay.
     """
 
     reason: str

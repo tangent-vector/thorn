@@ -904,9 +904,9 @@ def select_oci_runtime(
       on ``PATH`` we raise :class:`OCIRuntimeNotFound` with a
       remediation hint.
 
-    No environment-variable override -- per the Phase-B plan,
-    configuration is the only knob so post-hoc diagnosis from a saved
-    ``gateway.json`` matches what actually ran.
+    There is no environment-variable override: configuration is the only
+    knob, so post-hoc diagnosis from a saved agency configuration matches
+    what actually ran.
 
     The ``*_factory`` parameters exist for tests to inject a
     :class:`FakeOCIRuntimeAdapter` without monkey-patching the module
